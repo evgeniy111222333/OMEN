@@ -53,12 +53,22 @@ class RotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (base ** (torch.arange(0, d_head, 2).float() / d_head))
         self.register_buffer("inv_freq", inv_freq)
         self.d_head = d_head
+        # OPT-ROPE: кеш cos/sin per (T, device) — ініціалізуємо в __init__
+        self._cs_cache: dict = {}
 
     def _get_cos_sin(self, T: int, device) -> Tuple[torch.Tensor, torch.Tensor]:
+        # OPT-ROPE: cos/sin залежать тільки від T (inv_freq — константа).
+        # Кешуємо на першому виклику для кожного T; всі наступні — dict lookup.
+        key = (T, str(device))
+        cached = self._cs_cache.get(key)
+        if cached is not None:
+            return cached
         t = torch.arange(T, device=device).float()
         freqs = torch.outer(t, self.inv_freq)           # (T, d/2)
         emb = torch.cat([freqs, freqs], dim=-1)         # (T, d)
-        return emb.cos()[None, None], emb.sin()[None, None]  # (1,1,T,d)
+        result = (emb.cos()[None, None], emb.sin()[None, None])  # (1,1,T,d)
+        self._cs_cache[key] = result
+        return result
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -84,7 +94,8 @@ class SwiGLUFFN(nn.Module):
         self.gate  = nn.Linear(d, d_ff, bias=False)
         self.up    = nn.Linear(d, d_ff, bias=False)
         self.down  = nn.Linear(d_ff, d, bias=False)
-        self.drop  = nn.Dropout(dropout)
+        # OPT-4: inplace=True — dropout не виділяє новий тензор, пише поверх
+        self.drop  = nn.Dropout(dropout, inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.drop(self.down(F.silu(self.gate(x)) * self.up(x)))

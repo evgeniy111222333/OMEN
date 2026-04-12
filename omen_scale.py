@@ -97,9 +97,17 @@ class AsyncTensorProductMemory(nn.Module):
 
     # ── Читання (диференційоване, щоразу) ─────────────────────────────────────
     def read(self, z_query: torch.Tensor) -> torch.Tensor:
-        k   = self.key_proj(z_query).view(-1, self.H, self.d)
-        mem = self.memory.clone()
-        v   = torch.einsum('bhd,hde->bhe', k, mem)
+        # FIX: self.memory оновлюється в flush() через `self.memory += delta`
+        # (in-place операція), що інкрементує version-counter НАВІТЬ під @no_grad.
+        # Autograd зберігає посилання на self.memory під час forward і очікує
+        # version=N під час backward, але знаходить version=N+1 → RuntimeError.
+        #
+        # Рішення: .detach() ізолює self.memory від autograd-графу.
+        # Градієнти все одно течуть через key_proj → z (диференційовані),
+        # а self.memory — register_buffer з requires_grad=False, тому
+        # PyTorch ніколи і не намагався обчислити d/d(memory).
+        k = self.key_proj(z_query).view(-1, self.H, self.d)
+        v = torch.einsum('bhd,hde->bhe', k, self.memory.detach())
         return self.out_proj(v.mean(1))                            # (B, d)
 
     # ── Буферизація запису ─────────────────────────────────────────────────────
@@ -579,8 +587,33 @@ class OMENScale(nn.Module):
     @torch.no_grad()
     def generate(self, prompt: torch.Tensor,
                  max_new: int = 32,
-                 temperature: float = 0.8) -> torch.Tensor:
+                 temperature: float = 0.8,
+                 dynamic_reasoning: bool = True) -> torch.Tensor:
+        """
+        Генерує max_new токенів після prompt.
+
+        dynamic_reasoning=True (за замовчуванням):
+          На КОЖНОМУ кроці генерації перекодуємо поточний контекст ctx_t
+          і запускаємо повний «повільний контур»:
+
+            ctx_t ──[NET/TokenEnc]──> h_ctx
+            h_ctx ──[Perceiver]─────> z_ctx       (концепт поточного контексту)
+            z_ctx ──[∂-Prolog]──────> z_sym_step  (verified правила з LTM)
+            z_ctx ──[M-Core read]───> v_mem_step  (episodic recall)
+            z_final = z_ctx + 0.1·z_sym_step + 0.1·v_mem_step
+
+          Це відповідає «Сценарію Б» (живе міркування під час генерації):
+          S-Core динамічно зміщує розподіл ймовірностей декодера,
+          спираючись на актуальний символьний стан знань.
+
+        dynamic_reasoning=False:
+          Класичний режим: z_final обчислюється ОДИН РАЗ по prompt
+          і залишається фіксованим протягом всієї генерації.
+          Швидший, але без динамічного «розуміння».
+        """
         self.eval()
+
+        # ── Ініціальний стан (для dynamic=False або як база) ─────────────────
         if self.net_enabled:
             h_tok, _, _ = self.net.encode(prompt)
         else:
@@ -593,13 +626,33 @@ class OMENScale(nn.Module):
         generated = prompt.clone()
         for _ in range(max_new):
             ctx = generated[:, -self.cfg.seq_len:]
+
+            if dynamic_reasoning:
+                # ── reasoning_step: перекодуємо + оновлюємо ∂-Prolog / M-Core
+                if self.net_enabled:
+                    h_ctx, _, _ = self.net.encode(ctx)
+                else:
+                    h_ctx = self.tok_encoder(ctx)
+                _, z_ctx      = self.perceiver(h_ctx)
+                z_sym_step, _ = self.prover(
+                    z_ctx, torch.tensor(0.0, device=z_ctx.device))
+                v_mem_step    = self.memory.read(z_ctx)
+                z_final       = z_ctx + 0.1 * z_sym_step + 0.1 * v_mem_step
+                h_for_decode  = h_ctx
+            else:
+                if self.net_enabled:
+                    h_for_decode, _, _ = self.net.encode(ctx)
+                else:
+                    h_for_decode = None   # tok_decoder не потребує h_tok
+
             if self.net_enabled:
-                h_ctx, _, _ = self.net.encode(ctx)
-                logits, _   = self.net.decode(ctx, z_final, h_ctx)
+                logits, _ = self.net.decode(ctx, z_final, h_for_decode)
             else:
                 logits = self.tok_decoder(ctx, z_final)
+
             probs     = F.softmax(logits[:, -1] / temperature, -1)
             generated = torch.cat([generated, torch.multinomial(probs, 1)], 1)
+
         return generated
 
     def memory_report(self) -> str:
@@ -851,14 +904,22 @@ def run_tests_scale(cfg: OMENScaleConfig) -> None:
     assert last5 < first5, "FAIL: CE не знижується"
     print("  [PASS]")
 
-    sep("TEST S7 · Генерація токенів")
+    sep("TEST S7 · Генерація токенів (dynamic_reasoning=True/False)")
     model.eval()
     prompt = torch.randint(10, 100, (1, 8), device=DEVICE)
+
+    # dynamic_reasoning=True — S-Core + M-Core оновлюються на кожному кроці
     with torch.no_grad():
-        gen = model.generate(prompt, max_new=12)
-    assert gen.shape[1] == 20, f"FAIL: gen shape {gen.shape}"
-    print(f"  Prompt : {prompt[0].tolist()}")
-    print(f"  Output : {gen[0, 8:].tolist()}")
+        gen_dyn = model.generate(prompt, max_new=12, dynamic_reasoning=True)
+    assert gen_dyn.shape[1] == 20, f"FAIL: gen_dyn shape {gen_dyn.shape}"
+    print(f"  Prompt          : {prompt[0].tolist()}")
+    print(f"  Output (dynamic): {gen_dyn[0, 8:].tolist()}")
+
+    # dynamic_reasoning=False — класичний режим (z_final фіксований)
+    with torch.no_grad():
+        gen_static = model.generate(prompt, max_new=12, dynamic_reasoning=False)
+    assert gen_static.shape[1] == 20, f"FAIL: gen_static shape {gen_static.shape}"
+    print(f"  Output (static) : {gen_static[0, 8:].tolist()}")
     print("  [PASS]")
 
     print(f"\n{'═'*70}")

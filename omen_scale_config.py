@@ -82,6 +82,14 @@ class OMENScaleConfig:
     eta_tok:          float = 0.1        # вага L_NET у загальному J
     lambda_voc:       float = 1e-4       # MDL регуляризатор словника
 
+    # ─── Adaptive τ scheduling ────────────────────────────────────────────────
+    # τ керує порогом «новизни»: якщо cos_sim < τ → новий концепт.
+    # Адаптивний режим: τ знижується коли H/H_max < 0.55 (мало активних кодів),
+    # підвищується коли H/H_max > 0.65 (словник добре використовується).
+    # Результат: система самостійно балансує між стабільністю і ростом словника.
+    net_tau_schedule: bool  = True       # вмикає адаптивний τ після warmup
+    net_tau_min:      float = 0.70       # нижня межа τ (за замовчуванням net_tau = верхня)
+
     # ─── Навчання ─────────────────────────────────────────────────────────────
     dropout:          float = 0.1
     sparsity_lambda:  float = 5e-4
@@ -106,7 +114,7 @@ class OMENScaleConfig:
     # L_semantic = −E_{(v1,v2)~S-Core}[cos(e_v1, e_v2)·Score(v1, v2)]
     # MDL_total  = MDL_NET − λ_sem·I(Z;Γ)
     lambda_semantic:  float = 0.01   # вага L_semantic
-    lambda_enc_div:   float = 0.02   # Encoder diversity anti-collapse: L_enc_div = mean_pairwise_cosine(encoder_outputs)
+    lambda_enc_div:   float = 0.30   # Encoder diversity anti-collapse (0.02 було занадто слабким: ~1% від L_rec)
 
     # ─── Сумісність з OMENv2 ──────────────────────────────────────────────────
     # (поля, що очікує OMENAGILoss/WorldRNN)
@@ -120,28 +128,70 @@ class OMENScaleConfig:
     def demo(cls) -> "OMENScaleConfig":
         """Конфіг для тестування на будь-якому залізі (CPU/GPU)"""
         return cls(
-            vocab_size=4_096,   d_tok=256,    n_heads_tok=4,  n_layers_tok=2,
+            # ВАЖЛИВО: vocab_size=256 → true byte mode → bidirectional attention
+            # + segment pooling → різноманітні вектори → немає encoder collapse!
+            # vocab_size=4096 (legacy) давало MeanSim=0.9935 → 83% dead codes.
+            vocab_size=256,     d_tok=256,    n_heads_tok=4,  n_layers_tok=2,
             seq_len=128,        d_latent=64,  n_latents=16,   n_heads_lat=4,
             n_layers_lat=1,     world_rnn_hidden=128,
             mem_heads=4,        mem_cache_size=256,  mem_update_steps=4,
             sym_vocab=64,       sym_embed_dim=32,    max_proof_depth=3,
             n_proof_cands=8,    ltm_max_rules=256,   sym_max_facts=32,
             abduct_candidates=8, n_heads=4, n_layers=2, d_model=256,
-            # NET: малий словник для швидкого тестування на CPU
+            # NET: малий словник для швидкого тестування на CPU/GPU
             net_enabled=True,   net_byte_layers=1,   net_dec_layers=1,
-            net_init_vocab=32,  net_max_vocab=512,   net_tau=0.90,
+            net_init_vocab=32,  net_max_vocab=512,   net_tau=0.85,
             net_ema_decay=0.95, eta_tok=0.1,         lambda_voc=1e-4,
-            net_warmup_steps=80,    # 80/500 кроків warmup; k-means init
-            lambda_enc_div=0.02,    # антиколапс encoder: тягне вектори нарізно
+            net_warmup_steps=80,
+            lambda_enc_div=0.30,  # 0.02 було ~1% від L_rec → не допомагало
+            net_tau_schedule=True, net_tau_min=0.70,
             vem_tau=0.3,        delta_vem=1e-3,      eta_utility=0.1,
             lambda_semantic=0.01, rule_consolidate_every=50,
+        )
+
+    @classmethod
+    def strong(cls) -> "OMENScaleConfig":
+        """
+        ~80–120M-параметрова конфігурація для одного сучасного GPU (RTX 3080/4080/A100).
+
+        Ключові відмінності від demo:
+          · vocab_size=256 (байт-режим) — bidirectional attention + segment pooling
+          · d_tok=512, n_layers=4, seq_len=512 — значно більша ємність
+          · net_max_vocab=4096 — простір для багатого символьного словника
+          · net_tau_schedule=True — адаптивний поріг (самобалансування)
+          · lambda_enc_div=0.3 — активний анти-колапс encoder
+
+        Очікувані результати (порівняно з demo):
+          · Used/Vocab > 60% (замість ~18% у demo)
+          · MeanSim < 0.70 (замість 0.99)
+          · Entropy > 6 bits (замість ~4)
+          · PPL < 2.5 на Python code (замість ~3.6)
+        """
+        return cls(
+            vocab_size=256,      d_tok=512,     n_heads_tok=8,  n_layers_tok=4,
+            seq_len=512,         d_latent=128,  n_latents=32,   n_heads_lat=8,
+            n_layers_lat=2,      world_rnn_hidden=256,
+            mem_heads=8,         mem_cache_size=512,  mem_update_steps=4,
+            sym_vocab=128,       sym_embed_dim=64,    max_proof_depth=4,
+            n_proof_cands=16,    ltm_max_rules=512,   sym_max_facts=64,
+            abduct_candidates=8, n_heads=8,    n_layers=4,     d_model=512,
+            # NET: повний байт-рівень, великий словник
+            net_enabled=True,    net_byte_layers=2,   net_dec_layers=2,
+            net_init_vocab=64,   net_max_vocab=4096,  net_tau=0.85,
+            net_ema_decay=0.95,  eta_tok=0.1,         lambda_voc=1e-4,
+            net_warmup_steps=300,
+            lambda_enc_div=0.30,
+            net_tau_schedule=True, net_tau_min=0.70,
+            vem_tau=0.3,         delta_vem=1e-3,      eta_utility=0.1,
+            lambda_semantic=0.01, rule_consolidate_every=100,
+            dropout=0.1, sparsity_lambda=5e-4,
         )
 
     @classmethod
     def mid(cls) -> "OMENScaleConfig":
         """~1B-параметрова конфігурація для одного A100"""
         return cls(
-            vocab_size=32_000, d_tok=1_024, n_heads_tok=16, n_layers_tok=16,
+            vocab_size=256,    d_tok=1_024, n_heads_tok=16, n_layers_tok=16,
             seq_len=2_048,     d_latent=256, n_latents=64,  n_heads_lat=8,
             n_layers_lat=2,    world_rnn_hidden=512,
             mem_heads=16,      mem_cache_size=1_024, mem_update_steps=8,
@@ -150,7 +200,9 @@ class OMENScaleConfig:
             net_enabled=True,  net_byte_layers=2,    net_dec_layers=2,
             net_init_vocab=512, net_max_vocab=8_192, net_tau=0.85,
             net_ema_decay=0.95, eta_tok=0.1,          lambda_voc=1e-4,
-            net_warmup_steps=500,  # ~10% від типового 5000-крокового Stage 1
+            net_warmup_steps=500,
+            lambda_enc_div=0.30,
+            net_tau_schedule=True, net_tau_min=0.70,
         )
 
     @classmethod

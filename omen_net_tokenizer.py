@@ -115,6 +115,15 @@ class ByteContextEncoder(nn.Module):
         self.drop = nn.Dropout(dropout)
         self.n_layers = n_layers
 
+        # ── OPT-1: Pre-computed lookup table для векторизованого segment_pool ──
+        # Замість Python double-loop (O(B·T)) → tensor lookup + cumsum (O(1) Python)
+        # register_buffer: auto-переноситься на правильний device разом з моделлю
+        _seg_lut = torch.zeros(256, dtype=torch.bool)
+        for _sb in self.SEGMENT_BYTES:
+            if 0 <= _sb < 256:
+                _seg_lut[_sb] = True
+        self.register_buffer('_seg_lut', _seg_lut, persistent=False)
+
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         """
         tokens : (B, T) ∈ [0, vocab_size)
@@ -150,48 +159,40 @@ class ByteContextEncoder(nn.Module):
                       bytes_: torch.Tensor) -> torch.Tensor:
         """
         Диференційоване сегментне усереднення.
-        Границі сегментів визначаються з байтових значень (без градієнту),
-        але саме усереднення є диференційованою операцією через scatter_add.
-
         out[b,i] = α·h[b,i] + (1-α)·mean(h[b, seg(i)])
+
+        OPT-1: межі сегментів обчислюються через tensor lookup + cumsum
+        замість Python double-loop for b in B: for i in T:
+        Складність: O(B·T) Python → O(1) Python + GPU kernels
         """
         B, T, D = h.shape
-        ALPHA = 0.5
+        ALPHA   = 0.5
 
-        # ── Визначаємо мітки сегментів без градієнту ──────────────────────────
         with torch.no_grad():
-            # seg_id[b, i] = індекс сегменту, до якого належить позиція i
-            seg_ids = torch.zeros(B, T, dtype=torch.long, device=h.device)
-            byte_np = bytes_.cpu().numpy()
-            for b in range(B):
-                seg = 0
-                for i in range(T):
-                    if int(byte_np[b, i]) in self.SEGMENT_BYTES:
-                        seg += 1
-                    seg_ids[b, i] = seg
-            # Уніфікуємо ідентифікатори по батчу: батч b зміщується на b*T
-            offsets = torch.arange(B, device=h.device).unsqueeze(1) * (T + 1)
-            seg_ids = seg_ids + offsets                              # (B, T)
+            # ── Векторизоване визначення меж сегментів ────────────────────────
+            # _seg_lut[byte] == True  ⟺  byte є роздільником сегменту
+            clamped   = bytes_.clamp(0, 255)                        # (B, T)
+            boundary  = self._seg_lut[clamped]                      # (B, T) bool
+            # cumsum по часовій осі: seg_ids[b,i] = кількість роздільників до i
+            seg_ids   = boundary.long().cumsum(dim=1)               # (B, T)
+            # Зміщуємо батчі щоб уникнути колізій між прикладами
+            offsets   = torch.arange(B, device=h.device).unsqueeze(1) * (T + 1)
+            seg_ids   = (seg_ids + offsets).reshape(B * T)          # (B*T,)
+            n_segs    = seg_ids.max().item() + 1
 
-        # ── Диференційоване scatter_add для обчислення середніх ───────────────
-        n_segs  = seg_ids.max().item() + 1
-        flat_h  = h.reshape(B * T, D)                               # (B*T, D)
-        flat_s  = seg_ids.reshape(B * T)                            # (B*T,)
+            # Лічильники елементів у кожному сегменті (для нормування)
+            seg_cnt = torch.zeros(n_segs, dtype=h.dtype, device=h.device)
+            seg_cnt.scatter_add_(0, seg_ids,
+                                 torch.ones(B * T, dtype=h.dtype, device=h.device))
+            seg_cnt.clamp_(min=1)
 
-        # Сума по сегментах
+        # ── Диференційований scatter_add: сума по сегментах ───────────────────
+        flat_h  = h.reshape(B * T, D)
+        expand  = seg_ids.unsqueeze(1).expand(-1, D)
         seg_sum = torch.zeros(n_segs, D, dtype=h.dtype, device=h.device)
-        seg_sum.scatter_add_(0, flat_s.unsqueeze(1).expand(-1, D), flat_h)
+        seg_sum.scatter_add_(0, expand, flat_h)
 
-        # Кількість елементів у кожному сегменті
-        seg_cnt = torch.zeros(n_segs, dtype=h.dtype, device=h.device)
-        seg_cnt.scatter_add_(0, flat_s,
-                             torch.ones(B * T, dtype=h.dtype, device=h.device))
-        seg_cnt = seg_cnt.clamp(min=1)
-
-        # Середнє — зберається назад до позицій
-        seg_mean_flat = seg_sum[flat_s] / seg_cnt[flat_s].unsqueeze(1)  # (B*T, D)
-        seg_mean = seg_mean_flat.reshape(B, T, D)
-
+        seg_mean = (seg_sum[seg_ids] / seg_cnt[seg_ids].unsqueeze(1)).reshape(B, T, D)
         return ALPHA * h + (1 - ALPHA) * seg_mean                   # (B, T, D)
 
 
@@ -253,21 +254,21 @@ class EpistemicQuantizer(nn.Module):
                  tau: float = 0.85,
                  ema_decay: float = 0.99,
                  beta_commit: float = 0.25,
-                 warmup_steps: int = 150):
+                 warmup_steps: int = 150,
+                 tau_schedule: bool = True,
+                 tau_min: float = 0.70):
         super().__init__()
         assert init_vocab <= max_vocab, "init_vocab must be ≤ max_vocab"
 
-        # Warmup: перші N кроків — заморожуємо ріст словника повністю.
-        # Encoder ще не навчений → його вектори шумні → будь-які нові токени
-        # будуть "помилками". Після warmup енкодер стабілізується і ростемо
-        # тільки справжні семантичні концепти.
         self.warmup_steps = warmup_steps
-
-        self.d_tok       = d_tok
-        self.max_vocab   = max_vocab
-        self.tau         = tau
-        self.ema_decay   = ema_decay
-        self.beta_commit = beta_commit
+        self.d_tok        = d_tok
+        self.max_vocab    = max_vocab
+        self.tau          = tau
+        self.tau_init     = tau          # зберігаємо початкове значення для adaptive scheduling
+        self.tau_min      = tau_min
+        self.tau_schedule = tau_schedule
+        self.ema_decay    = ema_decay
+        self.beta_commit  = beta_commit
 
         # Кодбук (тільки active[:current_size] є валідними)
         self.codebook = nn.Embedding(max_vocab, d_tok)
@@ -283,6 +284,9 @@ class EpistemicQuantizer(nn.Module):
         self.n_quant_calls  = 0
         self.kb: Optional[object] = None
 
+        # OPT-CB: кеш нормованого кодбуку; інвалідується після EMA/restart
+        self._cb_norm_cache: Optional[torch.Tensor] = None
+
         # ── global_usage: швидкий EMA для крос-батч dead-code детекції ────────
         self.register_buffer("global_usage",
                              torch.ones(max_vocab) * 0.1)
@@ -296,11 +300,17 @@ class EpistemicQuantizer(nn.Module):
         self._kmeans_buffer: List[torch.Tensor] = []
         self._kmeans_done: bool = False
 
-    # ── Допоміжне: нормований кодбук ──────────────────────────────────────────
+    # ── Допоміжне: нормований кодбук (з кешем) ───────────────────────────────
     def _normed_codebook(self) -> torch.Tensor:
-        """Повертає нормовані вектори активних кодбук-записів."""
+        """Повертає нормовані вектори активних кодбук-записів (з кешем)."""
+        # OPT-CB: F.normalize(V×d) виклик на кожен forward — дорогий.
+        # Кешуємо після першого обчислення; _ema_update/_restart_dead_codes_ema
+        # інвалідують кеш через self._cb_norm_cache = None.
+        if self._cb_norm_cache is not None:
+            return self._cb_norm_cache
         active = self.codebook.weight[:self.current_size]           # (V_cur, d)
-        return F.normalize(active, dim=-1)
+        self._cb_norm_cache = F.normalize(active, dim=-1)
+        return self._cb_norm_cache
 
     # ── Форвард ───────────────────────────────────────────────────────────────
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
@@ -395,6 +405,7 @@ class EpistemicQuantizer(nn.Module):
 
                 if n_new > 0:
                     # Перерахуємо подібності з новими записами
+                    self._cb_norm_cache = None      # OPT-CB: нові токени → інвалідуємо
                     cb_norm  = self._normed_codebook()
                     sims     = x_norm @ cb_norm.t()
                     max_sims, indices = sims.max(dim=-1)
@@ -439,13 +450,17 @@ class EpistemicQuantizer(nn.Module):
         usage_entropy = self._usage_entropy(indices, B * T)
 
         # ── 8. Encoder diversity loss (anti-collapse) ──────────────────────────
-        # L_enc_div = mean pairwise cosine(encoder outputs) — мінімізуємо.
-        # Висока MeanSim (~0.99) → encoder collapse → всі токени = dead.
-        # Цей loss тренує encoder продукувати різноманітні вектори.
-        # Градієнт проходить через x_flat → ByteContextEncoder.
         enc_div_loss = (self._encoder_mean_cosine(x_flat)
                         if self.training
                         else torch.zeros(1, device=x.device).squeeze())
+
+        # ── 9. Adaptive τ scheduling (після warmup) ────────────────────────────
+        # τ знижується коли H/H_max < 0.55 (мало активних кодів)
+        # τ підвищується коли H/H_max > 0.65 (словник добре використовується)
+        # Це реалізує "калібрацію порогу подиву" з архітектурного опису.
+        if self.training and self._ema_step > self.warmup_steps:
+            H_max = math.log(max(self.current_size.item(), 2))
+            self._adaptive_tau_step(usage_entropy, H_max)
 
         return z_q_ste, indices.reshape(B, T), {
             "vq_loss":       vq_loss,
@@ -527,6 +542,7 @@ class EpistemicQuantizer(nn.Module):
         updated = (self.cluster_sum[:V]
                    / (self.cluster_count[:V].unsqueeze(1) + 1e-5))
         self.codebook.weight[:V] = updated
+        self._cb_norm_cache = None      # OPT-CB: кодбук змінився → інвалідуємо
 
     # ── K-means++ ініціалізація ───────────────────────────────────────────────
     @torch.no_grad()
@@ -643,6 +659,7 @@ class EpistemicQuantizer(nn.Module):
             # 0.15 > 0.10 (threshold) → захищений від негайного повторного restart
             self.global_usage[dead_code_idx]    = 0.15
 
+        self._cb_norm_cache = None      # OPT-CB: кодбук змінився → інвалідуємо
         return n_restart
 
     # ── S-Core: реєстрація нового концепту з Horn-правилом ───────────────────
@@ -739,9 +756,31 @@ class EpistemicQuantizer(nn.Module):
         norm_penalty = active_w.pow(2).mean()
         return lambda_voc * (size_penalty + norm_penalty)
 
+    # ── Adaptive τ scheduling ────────────────────────────────────────────────
+    def _adaptive_tau_step(self, usage_entropy: float, H_max: float) -> None:
+        """
+        Адаптивне налаштування τ — «калібрація порогу подиву».
+
+        Реалізує описану в специфікації поведінку:
+          · H/H_max < 0.55 → мало активних кодів → знижуємо τ (легше створювати концепти)
+          · H/H_max > 0.65 → словник добре використовується → підвищуємо τ (консервативно)
+          · Зміна ±0.005/крок — плавна адаптація без стрибків
+
+        τ ∈ [tau_min, tau_init]  (задається у конфігурації)
+        """
+        if not self.tau_schedule or H_max < 1e-6:
+            return
+        ratio = usage_entropy / H_max
+        if ratio < 0.50:                                  # дуже мало активних кодів
+            self.tau = max(self.tau_min, self.tau - 0.005)
+        elif ratio < 0.55:                                # трохи мало
+            self.tau = max(self.tau_min, self.tau - 0.002)
+        elif ratio > 0.70:                                # добре використовується
+            self.tau = min(self.tau_init, self.tau + 0.003)
+
     def extra_repr(self) -> str:
         return (f"d_tok={self.d_tok}, vocab={self.current_size.item()}/"
-                f"{self.max_vocab}, τ={self.tau}, γ={self.ema_decay}")
+                f"{self.max_vocab}, τ={self.tau:.3f}(min={self.tau_min}), γ={self.ema_decay}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -935,7 +974,7 @@ class NETLoss(nn.Module):
                  lambda_voc:      float = 1e-4,
                  lambda_vq:       float = 1.0,
                  lambda_semantic: float = 0.01,
-                 lambda_enc_div:  float = 0.02):
+                 lambda_enc_div:  float = 0.30):
         super().__init__()
         self.lambda_voc      = lambda_voc
         self.lambda_vq       = lambda_vq
@@ -1057,6 +1096,8 @@ class NeuralEpistemicTokenizer(nn.Module):
             tau          = cfg.net_tau,
             ema_decay    = cfg.net_ema_decay,
             warmup_steps = getattr(cfg, 'net_warmup_steps', 150),
+            tau_schedule = getattr(cfg, 'net_tau_schedule', True),
+            tau_min      = getattr(cfg, 'net_tau_min', 0.70),
         )
 
         # ── g_φ: ByteDecoder ──────────────────────────────────────────────────

@@ -357,7 +357,7 @@ def smoke_test() -> None:
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--config",   default="demo", choices=["demo","mid","full"])
+    p.add_argument("--config",   default="demo", choices=["demo","strong","mid","full"])
     p.add_argument("--real_text", default=None)
     p.add_argument("--stage1_steps", type=int, default=300)
     p.add_argument("--stage2_epochs", type=int, default=10)
@@ -373,9 +373,10 @@ def parse_args():
 def main():
     args = parse_args()
     torch.manual_seed(args.seed); random.seed(args.seed)
-    cfg = {"demo": OMENScaleConfig.demo,
-           "mid":  OMENScaleConfig.mid,
-           "full": OMENScaleConfig.full}[args.config]()
+    cfg = {"demo":   OMENScaleConfig.demo,
+           "strong": OMENScaleConfig.strong,
+           "mid":    OMENScaleConfig.mid,
+           "full":   OMENScaleConfig.full}[args.config]()
     if args.no_net:
         cfg.net_enabled = False
 

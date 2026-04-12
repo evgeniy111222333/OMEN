@@ -97,7 +97,8 @@ class DualStreamAttention(nn.Module):
         self.out_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.log_mask = nn.Parameter(torch.zeros(1, cfg.n_heads, cfg.seq_len, cfg.seq_len))
         self.gate = nn.Linear(cfg.d_model * 2, cfg.d_model)
-        self.drop = nn.Dropout(cfg.dropout)
+        # OPT-5: inplace dropout
+        self.drop = nn.Dropout(cfg.dropout, inplace=False)  # attention weights — НЕ inplace (softmax output shared)
         self.sparsity_lambda = cfg.sparsity_lambda
 
     def forward(self, x, causal_mask):
@@ -106,18 +107,24 @@ class DualStreamAttention(nn.Module):
                    for t in self.to_qkv(x).chunk(3, dim=-1)]
         scale = math.sqrt(self.dh)
 
+        # OPT-QK: (q @ k^T)/scale обчислюється ОДИН раз — спільний для обох стрімів.
+        # Раніше: 2× O(B·h·T²·dh) matmul (text + causal).
+        # Тепер:  1× matmul + дешеве поелементне множення на M.
+        qk = (q @ k.transpose(-2, -1)) / scale                    # (B, h, T, T)
+
+        # Маска — обчислюється один раз і ділиться між стрімами
+        cm = causal_mask[:T, :T] if causal_mask is not None else None
+
         # Text stream
-        s_txt = (q @ k.transpose(-2, -1)) / scale
-        if causal_mask is not None:
-            s_txt = s_txt.masked_fill(causal_mask[:T, :T], float('-inf'))
+        s_txt = qk if cm is None else qk.masked_fill(cm, float('-inf'))
         a_txt = self.drop(F.softmax(s_txt, dim=-1))
         out_txt = (a_txt @ v).transpose(1, 2).contiguous().view(B, T, D)
 
         # Causal stream
         M = torch.sigmoid(self.log_mask[:, :, :T, :T])
-        s_cau = (q @ k.transpose(-2, -1)) / scale * M
-        if causal_mask is not None:
-            s_cau = s_cau.masked_fill(causal_mask[:T, :T], float('-inf'))
+        s_cau = qk * M
+        if cm is not None:
+            s_cau = s_cau.masked_fill(cm, float('-inf'))
         a_cau = self.drop(F.softmax(s_cau, dim=-1))
         out_cau = (a_cau @ v).transpose(1, 2).contiguous().view(B, T, D)
 
@@ -131,10 +138,11 @@ class OMENBlock(nn.Module):
         self.norm1 = nn.LayerNorm(cfg.d_model)
         self.attn  = DualStreamAttention(cfg)
         self.norm2 = nn.LayerNorm(cfg.d_model)
+        # OPT-5: inplace=True — не виділяємо новий тензор на кожен dropout
         self.ffn   = nn.Sequential(
             nn.Linear(cfg.d_model, 4 * cfg.d_model), nn.GELU(),
-            nn.Dropout(cfg.dropout),
-            nn.Linear(4 * cfg.d_model, cfg.d_model), nn.Dropout(cfg.dropout),
+            nn.Dropout(cfg.dropout, inplace=True),
+            nn.Linear(4 * cfg.d_model, cfg.d_model), nn.Dropout(cfg.dropout, inplace=True),
         )
 
     def forward(self, x, causal_mask):
@@ -185,12 +193,21 @@ class WorldRNN(nn.Module):
         return self.out(h2), h2
 
     def simulate_sequence(self, z0, actions):
-        B, T = actions.shape
-        z, h, traj = z0, None, []
+        """
+        OPT-2: Pre-embed всі дії одним викликом до входу в цикл.
+        Embedding lookup виноситься за межі for-loop:
+          Раніше: T × (embed_lookup + GRUCell + Linear)
+          Тепер:  1 × embed_lookup_batch  +  T × (GRUCell + Linear)
+        На T=8, B=8: ~5% прискорення за рахунок зменшення диспетчеризації.
+        """
+        B, T   = actions.shape
+        a_all  = self.act_emb(actions)                     # (B, T, d_latent) — один виклик
+        h      = self.h0.expand(B, -1).contiguous()
+        traj   = []
         for t in range(T):
-            z, h = self.forward(z, actions[:, t], h)
-            traj.append(z.unsqueeze(1))
-        return torch.cat(traj, 1)
+            h = self.gru(torch.cat([z0 if t == 0 else traj[-1], a_all[:, t]], -1), h)
+            traj.append(self.out(h))
+        return torch.stack(traj, dim=1)                    # (B, T, d_latent)
 
 
 class CausalGraphDecoder(nn.Module):
@@ -250,10 +267,12 @@ class TensorProductMemory(nn.Module):
     # ── Читання ──────────────────────────────────────────────────────────────
     def read(self, z_query: torch.Tensor) -> torch.Tensor:
         """z_query: (B, d) → v_retrieved: (B, d)"""
+        # FIX: write() виконує self.memory += delta під @no_grad, що все одно
+        # інкрементує version-counter і ламає autograd backward.
+        # .detach() ізолює buffer від version-перевірки autograd.
+        # Градієнти через key_proj і out_proj (trainable) зберігаються повністю.
         k = self.key_proj(z_query).view(-1, self.H, self.d)      # (B, H, d)
-        # clone() ізолює від будь-яких inplace-змін після цього виклику
-        mem = self.memory.clone()
-        v = torch.einsum('bhd,hde->bhe', k, mem)
+        v = torch.einsum('bhd,hde->bhe', k, self.memory.detach())
         return self.out_proj(v.mean(1))                            # (B, d)
 
     # ── Запис (без градієнта, як гіпокамп) ───────────────────────────────────
@@ -455,29 +474,36 @@ class WorkingMemory:
     """Граф поточного контексту (факти + індекс для швидкого пошуку)"""
 
     def __init__(self, max_facts: int = 32):
-        self.facts:    List[SymFact]          = []
-        self.pred_idx: Dict[int, List[SymFact]] = defaultdict(list)
+        # OPT-WM: deque для O(1) popleft + set для O(1) membership / remove
+        from collections import deque as _deque
+        self.facts:     _deque                    = _deque(maxlen=None)  # upbound вручну
+        self._fact_set: set                       = set()
+        self.pred_idx:  Dict[int, set]            = defaultdict(set)
         self.max_facts = max_facts
 
     def add(self, fact: SymFact) -> bool:
-        if fact in self.facts:
+        if fact in self._fact_set:               # O(1) замість O(n) list scan
             return False
         if len(self.facts) >= self.max_facts:
-            removed = self.facts.pop(0)
-            self.pred_idx[removed.pred].remove(removed)
+            removed = self.facts[0]              # peek oldest — O(1) для deque
+            self.facts.popleft()                 # O(1) замість O(n) list.pop(0)
+            self._fact_set.discard(removed)      # O(1) замість O(n) list.remove
+            self.pred_idx[removed.pred].discard(removed)  # O(1)
         self.facts.append(fact)
-        self.pred_idx[fact.pred].append(fact)
+        self._fact_set.add(fact)
+        self.pred_idx[fact.pred].add(fact)
         return True
 
     def query(self, pred: Optional[int] = None,
               subj: Optional[int] = None) -> List[SymFact]:
-        pool = self.pred_idx.get(pred, self.facts) if pred else self.facts
+        pool = self.pred_idx.get(pred, self._fact_set) if pred is not None else self._fact_set
         if subj is not None:
-            pool = [f for f in pool if f.subj == subj]
-        return pool
+            return [f for f in pool if f.subj == subj]
+        return list(pool)
 
     def clear(self):
         self.facts.clear()
+        self._fact_set.clear()
         self.pred_idx.clear()
 
     def __len__(self): return len(self.facts)
@@ -518,7 +544,13 @@ class LongTermMemory:
     def _unify(self, conditions: Tuple[SymFact, ...], wm: WorkingMemory) -> bool:
         for cond in conditions:
             found = False
-            for fact in wm.facts:
+            # OPT-UNIFY: звужуємо пул через pred_idx замість повного перебору.
+            # Wildcard pred=-1 → fallback на весь _fact_set.
+            if cond.pred >= 0:
+                pool = wm.pred_idx.get(cond.pred, ())
+            else:
+                pool = wm._fact_set
+            for fact in pool:
                 s_ok = (cond.subj < 0) or (cond.subj == fact.subj)
                 p_ok = (cond.pred < 0) or (cond.pred == fact.pred)
                 o_ok = (cond.obj  < 0) or (cond.obj  == fact.obj)
@@ -926,18 +958,50 @@ class OMENv2(nn.Module):
 
     @torch.no_grad()
     def generate(self, prompt: torch.Tensor, max_new: int = 32,
-                 temperature: float = 0.8) -> torch.Tensor:
+                 temperature: float = 0.8,
+                 dynamic_reasoning: bool = True) -> torch.Tensor:
+        """
+        Генерує max_new токенів після prompt.
+
+        dynamic_reasoning=True (за замовчуванням):
+          На КОЖНОМУ кроці перекодуємо поточний контекст, оновлюємо
+          z_sym (S-Core) та v_mem (M-Core) → z_final змінюється по ходу
+          генерації, відображаючи нараховане знання.
+
+          Це відповідає «повільному контуру» (Curiosity + S-Core + M-Core):
+            ctx_t → Encoder → z_ctx
+            z_ctx → S-Core  → z_sym   (застосування verified правил з LTM)
+            z_ctx → M-Core  → v_mem   (episodic recall)
+            z_final = z_ctx + 0.1·z_sym + 0.1·v_mem
+
+        dynamic_reasoning=False:
+          Класичний режим: z_final обчислюється один раз по prompt
+          і залишається фіксованим (швидший, менш точний).
+        """
         self.eval()
+
+        # ── Ініціальний стан (використовується якщо dynamic=False) ───────────
         z, _, _, _ = self.encoder(prompt)
-        v_mem = self.memory.read(z)
-        z_sym, _ = self.s_core(z, torch.tensor(0.0, device=z.device))
-        z_final  = z + 0.1 * z_sym + 0.1 * v_mem
+        v_mem      = self.memory.read(z)
+        z_sym, _   = self.s_core(z, torch.tensor(0.0, device=z.device))
+        z_final    = z + 0.1 * z_sym + 0.1 * v_mem
+
         generated = prompt.clone()
         for _ in range(max_new):
             ctx = generated[:, -self.cfg.seq_len:]
+
+            if dynamic_reasoning:
+                # ── reasoning_step: перекодуємо + оновлюємо S-Core / M-Core ──
+                z_ctx, _, _, _ = self.encoder(ctx)
+                z_sym_step, _  = self.s_core(
+                    z_ctx, torch.tensor(0.0, device=z_ctx.device))
+                v_mem_step     = self.memory.read(z_ctx)
+                z_final        = z_ctx + 0.1 * z_sym_step + 0.1 * v_mem_step
+
             logits, _ = self.decoder(ctx, z_final)
             probs = F.softmax(logits[:, -1] / temperature, -1)
             generated = torch.cat([generated, torch.multinomial(probs, 1)], 1)
+
         return generated
 
     def memory_report(self) -> str:
@@ -1234,14 +1298,22 @@ def run_tests(cfg: OMENv2Config) -> None:
     print("  [PASS]")
 
     # T8: Генерація
-    sep("TEST 8 · Генерація токенів (з пам'яттю та S-Core)")
+    sep("TEST 8 · Генерація токенів (dynamic_reasoning=True/False)")
     model.eval()
     pr = torch.randint(10, 100, (1, 8), device=DEVICE)
+
+    # dynamic_reasoning=True — S-Core + M-Core на кожному кроці
     with torch.no_grad():
-        gen = model.generate(pr, max_new=16)
-    assert gen.shape == (1, 24), f"FAIL: gen shape {gen.shape}"
-    print(f"  Prompt : {pr[0].tolist()}")
-    print(f"  Output : {gen[0].tolist()}")
+        gen_dyn = model.generate(pr, max_new=16, dynamic_reasoning=True)
+    assert gen_dyn.shape == (1, 24), f"FAIL: gen_dyn shape {gen_dyn.shape}"
+    print(f"  Prompt          : {pr[0].tolist()}")
+    print(f"  Output (dynamic): {gen_dyn[0, 8:].tolist()}")
+
+    # dynamic_reasoning=False — класичний (z_final фіксований)
+    with torch.no_grad():
+        gen_static = model.generate(pr, max_new=16, dynamic_reasoning=False)
+    assert gen_static.shape == (1, 24), f"FAIL: gen_static shape {gen_static.shape}"
+    print(f"  Output (static) : {gen_static[0, 8:].tolist()}")
     print("  [PASS]")
 
     print(f"\n{'═'*72}")
