@@ -454,6 +454,34 @@ class EpistemicQuantizer(nn.Module):
                         if self.training
                         else torch.zeros(1, device=x.device).squeeze())
 
+        # ── 8b. Soft-entropy loss (диференційована ентропія) ──────────────────
+        # ПРОБЛЕМА: l_code у NETLoss = torch.tensor(constant.item()) → 0 градієнту.
+        # РІШЕННЯ: soft assignments через Gumbel-temperature → справжній градієнт,
+        # який ненульовий навіть при повному encoder-collapse, якщо кодбук різноманітний.
+        #
+        # Математика: soft_p_v = mean_i softmax(sim(x_i, e_v) / τ_soft)
+        #             H_soft = -Σ_v soft_p_v · log(soft_p_v)
+        #             L_soft_H = -H_soft / log(V)  → мінімізуємо = максимізуємо H
+        #
+        # Градієнт штовхає encoder розподіляти токени рівномірніше по кодбуку.
+        # При collapse + РІЗНОМАНІТНИЙ кодбук → градієнт 10x сильніший ніж pairwise.
+        soft_entropy_loss = torch.zeros(1, device=x.device).squeeze()
+        if self.training:
+            V_cur = self.current_size.item()
+            if V_cur >= 2:
+                # cb_norm вже обчислено (з кешем), але детачимо кодбук:
+                # EMA кодбук не має навчатись через SGD (конфліктні сигнали)
+                cb_for_soft = cb_norm.detach()              # (V_cur, d) — немає градієнту
+                soft_tau_temp = 0.5                         # температура soft-quantizer
+                # sims вже є, але із non-detached cb_norm — перерахуємо для safety
+                sims_soft = x_norm @ cb_for_soft.t()       # (B*T, V_cur), grad через x_norm
+                soft_assign = F.softmax(sims_soft / soft_tau_temp, dim=-1)  # (B*T, V_cur)
+                avg_usage   = soft_assign.mean(dim=0)       # (V_cur,) — очікуване використання
+                H_soft      = -(avg_usage * (avg_usage + 1e-8).log()).sum()  # диференційована H
+                H_soft_max  = math.log(max(V_cur, 2))
+                # Нормуємо в [−1, 0]: −1 = рівномірно (добре), 0 = один код (погано)
+                soft_entropy_loss = -(H_soft / (H_soft_max + 1e-8))
+
         # ── 9. Adaptive τ scheduling (після warmup) ────────────────────────────
         # τ знижується коли H/H_max < 0.55 (мало активних кодів)
         # τ підвищується коли H/H_max > 0.65 (словник добре використовується)
@@ -463,12 +491,13 @@ class EpistemicQuantizer(nn.Module):
             self._adaptive_tau_step(usage_entropy, H_max)
 
         return z_q_ste, indices.reshape(B, T), {
-            "vq_loss":       vq_loss,
-            "n_new_tokens":  n_new,
-            "usage_entropy": usage_entropy,
-            "vocab_size":    self.current_size.item(),
-            "mean_sim":      max_sims.mean().item(),
-            "enc_div_loss":  enc_div_loss,
+            "vq_loss":          vq_loss,
+            "n_new_tokens":     n_new,
+            "usage_entropy":    usage_entropy,
+            "vocab_size":       self.current_size.item(),
+            "mean_sim":         max_sims.mean().item(),
+            "enc_div_loss":     enc_div_loss,
+            "soft_entropy_loss": soft_entropy_loss,   # ← новий диференційований сигнал
         }
 
     # ── Restart мертвих кодів (dead code collapse prevention) ────────────────
@@ -633,6 +662,14 @@ class EpistemicQuantizer(nn.Module):
             повторного restart ще ~10 кроків.
           · Protection buffer: коди щойно додані (usage=0.15) мають більше часу
             щоб набрати статистику перед наступним restart-циклом.
+
+        COLLAPSE-AWARE RESTART (нова логіка):
+          При encoder-collapse всі x_flat майже однакові → перезапуск мертвих кодів
+          encoder-виходами нічого не дає (нові коди відразу collapse до того самого).
+          FIX: виявляємо collapse (mean_sim > 0.90) і використовуємо RANDOM unit vectors
+          замість encoder-виходів для частини кодів. Це зберігає різноманітність кодбуку,
+          що є необхідною умовою для soft_entropy_loss та commit_loss надавати
+          значущий градієнт у бік виходу з collapse.
         """
         V = self.current_size.item()
         if V == 0:
@@ -643,6 +680,17 @@ class EpistemicQuantizer(nn.Module):
         if n_dead == 0:
             return 0
 
+        # ── Виявлення encoder collapse ─────────────────────────────────────────
+        # mean_sim > 0.90 → encoder вивів майже однакові вектори для всіх позицій.
+        # Samples: обмежуємо 64 токени для ефективності
+        N_samp  = min(64, x_flat.size(0))
+        x_samp  = F.normalize(x_flat[:N_samp], dim=-1)          # (N_samp, d)
+        # Середня подібність між парами (включає i==j → 1.0, але це лише зміщення)
+        gram    = x_samp @ x_samp.t()                            # (N_samp, N_samp)
+        off_diag_mask = ~torch.eye(N_samp, dtype=torch.bool, device=x_flat.device)
+        encoder_mean_sim = gram[off_diag_mask].mean().item() if N_samp > 1 else 0.0
+        is_collapsed = encoder_mean_sim > 0.90                   # поріг collapse
+
         cb_norm   = F.normalize(self.codebook.weight[:V], dim=-1)
         x_norm_r  = F.normalize(x_flat, dim=-1)
         sims_all  = x_norm_r @ cb_norm.t()
@@ -652,9 +700,21 @@ class EpistemicQuantizer(nn.Module):
 
         dead_indices = dead_mask.nonzero(as_tuple=True)[0][:n_restart]
         for i, dead_code_idx in enumerate(dead_indices):
-            src = x_flat[hard_idx[i]]
-            self.codebook.weight[dead_code_idx] = src
-            self.cluster_sum[dead_code_idx]     = src
+            if is_collapsed and (i % 2 == 0):
+                # При collapse: 50% кодів — RANDOM unit vectors (зберігаємо різноманітність)
+                # Зберігаємо різноманітний кодбук → soft_entropy та commit_loss надають
+                # реальний градієнт encoder'у до виходу з collapse.
+                rand_vec = F.normalize(
+                    torch.randn(self.d_tok, device=x_flat.device, dtype=x_flat.dtype
+                                ).unsqueeze(0), dim=-1).squeeze(0)
+                self.codebook.weight[dead_code_idx] = rand_vec
+                self.cluster_sum[dead_code_idx]     = rand_vec
+            else:
+                # Нормальний режим: restart з "найважчого" encoder-виходу
+                src = x_flat[hard_idx[i]]
+                self.codebook.weight[dead_code_idx] = src
+                self.cluster_sum[dead_code_idx]     = src
+
             self.cluster_count[dead_code_idx]   = 1.0
             # 0.15 > 0.10 (threshold) → захищений від негайного повторного restart
             self.global_usage[dead_code_idx]    = 0.15
@@ -731,12 +791,20 @@ class EpistemicQuantizer(nn.Module):
         Діапазон: [-1, 1], ціль: < 0.5 (краще < 0.3 для кодового корпусу).
 
         Ефективність: O(N²) де N=sample_n≤64 → ≤4096 mult per step (швидко).
+
+        FIX: використовуємо ВИПАДКОВІ індекси замість перших N.
+        Причина: перші N токенів з одного батч-елементу сильно корельовані
+        між собою (послідовний текст), що заниженно оцінює collapse між
+        різними елементами батчу. Випадкова вибірка дає репрезентативну
+        оцінку різноманітності МІЖ батч-елементами.
         """
         N = min(x_flat.size(0), sample_n)
         if N < 2:
             return torch.zeros(1, device=x_flat.device, requires_grad=x_flat.requires_grad).squeeze()
-        x_s      = F.normalize(x_flat[:N], dim=-1)              # (N, d)
-        pairwise = x_s @ x_s.t()                                 # (N, N)
+        # Випадкова вибірка (замість перших N) → кращий cross-batch diversity estimate
+        perm = torch.randperm(x_flat.size(0), device=x_flat.device)[:N]
+        x_s      = F.normalize(x_flat[perm], dim=-1)              # (N, d)
+        pairwise = x_s @ x_s.t()                                   # (N, N)
         mask     = ~torch.eye(N, dtype=torch.bool, device=x_s.device)
         return pairwise[mask].mean()
 
@@ -974,11 +1042,13 @@ class NETLoss(nn.Module):
                  lambda_voc:      float = 1e-4,
                  lambda_vq:       float = 1.0,
                  lambda_semantic: float = 0.01,
-                 lambda_enc_div:  float = 0.30):
+                 lambda_enc_div:  float = 0.30,
+                 lambda_soft_H:   float = 0.5):
         super().__init__()
         self.lambda_voc      = lambda_voc
         self.lambda_vq       = lambda_vq
         self.lambda_enc_div  = lambda_enc_div
+        self.lambda_soft_H   = lambda_soft_H   # ← вага диференційованої soft-entropy
         self.sem_loss_fn     = SemanticFeedbackLoss(lambda_semantic)
 
     def forward(self,
@@ -1022,25 +1092,38 @@ class NETLoss(nn.Module):
         else:
             l_enc_div = torch.tensor(float(raw_enc_div), device=l_rec.device)
 
+        # ── L_soft_H: диференційована soft-entropy (ключовий anti-collapse сигнал) ──
+        # l_code вище — КОНСТАНТА (torch.tensor з .item()) → нульовий градієнт.
+        # soft_entropy_loss — справжній тензор з градієнтом через encoder outputs.
+        # Максимізує ентропію розподілу soft-assignments по кодбуку.
+        # Ефективний навіть при повному collapse (на відміну від pairwise cosine).
+        raw_soft_H = vq_info.get("soft_entropy_loss", 0.0)
+        if torch.is_tensor(raw_soft_H):
+            l_soft_H = raw_soft_H.to(l_rec.device)
+        else:
+            l_soft_H = torch.tensor(float(raw_soft_H), device=l_rec.device)
+
         total = (l_code
                  + l_rec
                  + l_vocab
-                 + self.lambda_vq * l_vq
+                 + self.lambda_vq    * l_vq
                  + l_semantic
-                 + self.lambda_enc_div * l_enc_div)
+                 + self.lambda_enc_div * l_enc_div
+                 + self.lambda_soft_H  * l_soft_H)   # ← диференційована entropy
 
         return {
-            "net_total":      total,
-            "net_code":       l_code.item(),
-            "net_vq":         l_vq.item() if torch.is_tensor(l_vq) else float(l_vq),
-            "net_rec":        l_rec.item(),
-            "net_vocab_pen":  l_vocab.item(),
-            "net_semantic":   l_semantic.item() if torch.is_tensor(l_semantic) else float(l_semantic),
-            "net_enc_div":    l_enc_div.item() if torch.is_tensor(l_enc_div) else float(l_enc_div),
-            "net_vocab_size": vq_info["vocab_size"],
-            "net_entropy":    H_nats,
+            "net_total":        total,
+            "net_code":         l_code.item(),
+            "net_vq":           l_vq.item() if torch.is_tensor(l_vq) else float(l_vq),
+            "net_rec":          l_rec.item(),
+            "net_vocab_pen":    l_vocab.item(),
+            "net_semantic":     l_semantic.item() if torch.is_tensor(l_semantic) else float(l_semantic),
+            "net_enc_div":      l_enc_div.item() if torch.is_tensor(l_enc_div) else float(l_enc_div),
+            "net_soft_H":       l_soft_H.item() if torch.is_tensor(l_soft_H) else float(l_soft_H),
+            "net_vocab_size":   vq_info["vocab_size"],
+            "net_entropy":      H_nats,
             "net_entropy_bits": H_nats / math.log(2),
-            "net_mean_sim":   vq_info["mean_sim"],
+            "net_mean_sim":     vq_info["mean_sim"],
         }
 
 
@@ -1115,6 +1198,7 @@ class NeuralEpistemicTokenizer(nn.Module):
             lambda_voc      = cfg.lambda_voc,
             lambda_semantic = getattr(cfg, 'lambda_semantic', 0.01),
             lambda_enc_div  = getattr(cfg, 'lambda_enc_div', 0.02),
+            lambda_soft_H   = getattr(cfg, 'lambda_soft_H',  0.5),
         )
 
     # ── encode ────────────────────────────────────────────────────────────────

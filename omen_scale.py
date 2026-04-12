@@ -308,27 +308,30 @@ class OMENScaleLoss(nn.Module):
                 ) -> Dict:
         cfg = self.cfg
 
-        # ── 1. Перплексія ─────────────────────────────────────────────────────
+        # ── 1. Перплексія (next-token prediction, зсунуте) ───────────────────
+        # FIX: logits[t] = P(next | tgt[0..t]) — прогнозує НАСТУПНИЙ токен.
+        # Попередня версія CE(logits, targets) порівнювала logits[t] з tgt[t]
+        # (поточним), що давало артефактно низький PPL (~1.4) бо токен tgt[t]
+        # вже присутній у контексті. Правильно: logits[:-1] → targets[1:].
         L_ce = F.cross_entropy(
-            logits.reshape(-1, cfg.vocab_size),
-            targets.reshape(-1),
+            logits[:, :-1].reshape(-1, cfg.vocab_size),
+            targets[:, 1:].reshape(-1),
             ignore_index=0,
         )
 
-        # ── 2. World Consistency: γ·||z - (z_sim + v_mem)||² ─────────────────
-        z_target     = (z_sim + v_mem).detach()
-        # Huber loss + log1p замість MSE + hard clamp:
-        #   Проблема MSE + clamp(10): MSE gradient ∝ error → вибух до 1607;
-        #   hard clamp повністю вбиває градієнт → WorldRNN перестає навчатись.
+        # ── 2. WorldRNN Training: huber(z_sim, z.detach()) ────────────────────
+        # FIX (критичне): попередній варіант
+        #   z_target = (z_sim + v_mem).detach()
+        #   L_world  = huber(z, z_target)   ← grad → z, НЕ WorldRNN
+        # WorldRNN.parameters() ніколи не отримували градієнту → random init назавжди.
+        # Безглузді z_sim → z тягнувся до сміттєвих цілей → CE 0.33→3.1 (деградація).
         #
-        #   Huber(δ=1.0): квадратичний для |e|<1, лінійний для |e|≥1
-        #     → gradient ≤ δ per element (bounded, ніколи не вибухає)
-        #     → grad завжди інформативний (не зупиняється)
-        #
-        #   log1p(): м'яке обмеження зверху на значення loss:
-        #     log1p(0.1)≈0.1 (малі помилки — без змін)
-        #     log1p(100)≈4.6 (великі помилки — стиснуті, не домінують total)
-        L_world_raw  = F.huber_loss(z, z_target, delta=1.0)
+        # РІШЕННЯ: перевертаємо напрямок.
+        #   L_world = huber(z_sim, z.detach())
+        # Градієнт тепер іде: L_world → z_sim → WorldRNN.parameters()
+        # WorldRNN навчається: "якщо концепт z, то симулюй z_sim ≈ z".
+        # z більше НЕ тягнеться до помилкових цілей WorldRNN.
+        L_world_raw  = F.huber_loss(z_sim, z.detach(), delta=1.0)
         L_world      = torch.log1p(L_world_raw)
 
         # ── 3. WorldRNN Complexity (скінченні різниці) ────────────────────────
@@ -508,8 +511,11 @@ class OMENScale(nn.Module):
         v_mem = self.memory.read(z)                                    # (B, d_lat)
 
         # ── Level 2: WorldRNN симуляція ───────────────────────────────────────
+        # FIX: z.detach() — WorldRNN отримує тільки «знімок» концепту z,
+        # без backprop крізь z. Це ізолює WorldRNN-градієнт від решти граду:
+        # градієнт L_world тече → z_sim → WorldRNN.params, а не → z → perceiver.
         sim_tgt  = tgt[:, -8:] if tgt.size(1) > 8 else tgt
-        z_sim_traj = self.world_rnn.simulate_sequence(z, sim_tgt)
+        z_sim_traj = self.world_rnn.simulate_sequence(z.detach(), sim_tgt)
         z_sim    = z_sim_traj[:, -1]                                   # (B, d_lat)
 
         # ── Epistemic Gap ─────────────────────────────────────────────────────

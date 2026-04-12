@@ -115,6 +115,9 @@ class OMENScaleConfig:
     # MDL_total  = MDL_NET − λ_sem·I(Z;Γ)
     lambda_semantic:  float = 0.01   # вага L_semantic
     lambda_enc_div:   float = 0.30   # Encoder diversity anti-collapse (0.02 було занадто слабким: ~1% від L_rec)
+    lambda_soft_H:    float = 0.5    # Диференційована soft-entropy (anti-collapse ключовий сигнал)
+                                     # Вирішує проблему нульового градієнту l_code (torch.tensor константа).
+                                     # Soft assignments через temperature=0.5 → H градієнт ненульовий при collapse.
 
     # ─── Сумісність з OMENv2 ──────────────────────────────────────────────────
     # (поля, що очікує OMENAGILoss/WorldRNN)
@@ -144,6 +147,7 @@ class OMENScaleConfig:
             net_ema_decay=0.95, eta_tok=0.1,         lambda_voc=1e-4,
             net_warmup_steps=80,
             lambda_enc_div=0.30,  # 0.02 було ~1% від L_rec → не допомагало
+            lambda_soft_H=0.5,    # диференційована soft-entropy anti-collapse
             net_tau_schedule=True, net_tau_min=0.70,
             vem_tau=0.3,        delta_vem=1e-3,      eta_utility=0.1,
             lambda_semantic=0.01, rule_consolidate_every=50,
@@ -181,6 +185,7 @@ class OMENScaleConfig:
             net_ema_decay=0.95,  eta_tok=0.1,         lambda_voc=1e-4,
             net_warmup_steps=300,
             lambda_enc_div=0.30,
+            lambda_soft_H=0.5,    # диференційована soft-entropy anti-collapse
             net_tau_schedule=True, net_tau_min=0.70,
             vem_tau=0.3,         delta_vem=1e-3,      eta_utility=0.1,
             lambda_semantic=0.01, rule_consolidate_every=100,
@@ -202,6 +207,7 @@ class OMENScaleConfig:
             net_ema_decay=0.95, eta_tok=0.1,          lambda_voc=1e-4,
             net_warmup_steps=500,
             lambda_enc_div=0.30,
+            lambda_soft_H=0.5,
             net_tau_schedule=True, net_tau_min=0.70,
         )
 

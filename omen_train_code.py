@@ -34,7 +34,11 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    LinearLR,
+    SequentialLR,
+)
 
 from omen_scale_config import OMENScaleConfig
 from omen_scale import OMENScale
@@ -113,7 +117,7 @@ def pretrain_net(model: OMENScale,
     print(f"  NET params: {sum(p.numel() for p in net_params):,}")
 
     opt   = AdamW(net_params, lr=lr, weight_decay=1e-5)
-    sched = CosineAnnealingWarmRestarts(opt, T_0=max(n_steps // 4, 10))
+    sched = CosineAnnealingLR(opt, T_max=max(n_steps, 1), eta_min=lr * 0.01)
     history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=log_every))
 
     model.net.train()
@@ -178,15 +182,24 @@ def joint_train(model: OMENScale,
                 batch_size: int = 8,
                 lr: float = 1e-4,
                 weight_decay: float = 1e-2,
-                max_batches_per_epoch: int = 32,
+                max_batches_per_epoch: Optional[int] = None,
                 checkpoint_dir: Optional[str] = None) -> List[Dict]:
     """
     Stage 2: спільне навчання OMEN-Scale.
     NET має менший LR (0.3x) щоб не зруйнувати Stage-1 кодбук.
+
+    max_batches_per_epoch=None → весь датасет за кожну епоху.
+    Задай числом щоб обмежити (наприклад 256 = 2048 зразків / епоха).
     """
     print("\n" + "═" * 68)
     print("  STAGE 2: Joint Training  (OMEN-Scale + NET)")
     print("═" * 68)
+
+    # Обчислюємо ефективний ліміт батчів (None = весь датасет)
+    n_total_batches = len(dataset) // batch_size
+    _max_bat = max_batches_per_epoch if max_batches_per_epoch is not None else n_total_batches
+    print(f"  batches/epoch : {min(_max_bat, n_total_batches)}"
+          f"  ({min(_max_bat, n_total_batches) * batch_size} samples)")
 
     net_params   = [p for n, p in model.named_parameters() if "net." in n]
     other_params = [p for n, p in model.named_parameters() if "net." not in n]
@@ -195,7 +208,17 @@ def joint_train(model: OMENScale,
         {"params": net_params,   "lr": lr * 0.3, "weight_decay": 1e-5},
         {"params": other_params, "lr": lr,        "weight_decay": weight_decay},
     ])
-    sched = CosineAnnealingWarmRestarts(opt, T_0=max(n_epochs // 2, 2))
+
+    # FIX ❸: CosineAnnealingWarmRestarts(T_0=10) → LR-спайк на epoch 11 (PPL=1454).
+    # Замінюємо на: 2-епохний лінійний warmup + CosineAnnealingLR без рестартів.
+    # Результат: LR плавно зростає перші 2 епохи, потім монотонно спадає до lr*0.01.
+    _warmup_ep = min(2, n_epochs)
+    _decay_ep  = max(n_epochs - _warmup_ep, 1)
+    warmup_sched = LinearLR(opt, start_factor=0.1, end_factor=1.0,
+                            total_iters=_warmup_ep)
+    decay_sched  = CosineAnnealingLR(opt, T_max=_decay_ep, eta_min=lr * 0.01)
+    sched = SequentialLR(opt, schedulers=[warmup_sched, decay_sched],
+                         milestones=[_warmup_ep])
 
     hdr = (f"{'Ep':>4} {'CE':>7} {'World':>7} {'LScale':>7} "
            f"{'NetL':>7} {'Voc':>4} {'KBf':>4} {'PPL':>8} {'ms':>6}")
@@ -234,7 +257,7 @@ def joint_train(model: OMENScale,
                 if k not in ("logits", "z"):
                     agg[k] += float(v) if not isinstance(v, float) else v
             n_bat += 1
-            if n_bat >= max_batches_per_epoch:
+            if n_bat >= _max_bat:
                 break
 
         sched.step()
@@ -370,6 +393,15 @@ def parse_args():
     p.add_argument("--resume", default=None)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--no_net", action="store_true")
+    # FIX ❹: раніше max_batches хардкодовано 32 → 256 зразків / 45 000 = 0.57%.
+    # None = весь датасет (одна повна епоха). Числове значення = ліміт батчів.
+    # Рекомендація для RTX 3080 + strong config:
+    #   --max_batches 256  (≈ 2048 зразків / епоха, ~2 хв / епоха)
+    #   --max_batches 500  (≈ 4000 зразків / епоха, ~4 хв / епоха)
+    #   без аргументу     = весь датасет, але довго
+    p.add_argument("--max_batches", type=int, default=None,
+                   help="Ліміт батчів/епоху (None = весь датасет). "
+                        "Рекомендовано: 256-500 для швидких ітерацій.")
     return p.parse_args()
 
 
@@ -405,6 +437,7 @@ def main():
 
     joint_train(model, train_ds, n_epochs=args.stage2_epochs,
                 batch_size=args.batch_size, lr=args.lr,
+                max_batches_per_epoch=args.max_batches,
                 checkpoint_dir=args.checkpoint_dir)
     print(model.memory_report())
 
