@@ -95,6 +95,9 @@ class AsyncTensorProductMemory(nn.Module):
         self._buf_v: List[torch.Tensor] = []
         self._buf_c: List[torch.Tensor] = []
 
+        # Прапорець: чи є відкладений flush після останнього backward
+        self._pending_flush: bool = False
+
     # ── Читання (диференційоване, щоразу) ─────────────────────────────────────
     def read(self, z_query: torch.Tensor) -> torch.Tensor:
         # FIX: self.memory оновлюється в flush() через `self.memory += delta`
@@ -115,18 +118,29 @@ class AsyncTensorProductMemory(nn.Module):
                        z_state:    torch.Tensor,
                        z_value:    torch.Tensor,
                        confidence: torch.Tensor) -> None:
-        """Записуємо аргументи у буфер; M не чіпаємо."""
+        """
+        Записуємо аргументи у буфер; M НЕ чіпаємо під час forward.
+        Flush відкладається до AFTER backward() — інакше inplace
+        модифікація memory ламає autograd (version mismatch).
+        """
         self._buf_s.append(z_state.detach().cpu())
         self._buf_v.append(z_value.detach().cpu())
         self._buf_c.append(confidence.detach().cpu())
         self._step += 1
-        if self._step % self.update_steps == 0:
-            self.flush()
+        # НЕ викликаємо flush() тут — він буде викликаний ззовні
+        # після optimizer.step() (де немає autograd graph)
+        self._pending_flush = (self._step % self.update_steps == 0)
 
     # ── Батчеве оновлення пам'яті ─────────────────────────────────────────────
     @torch.no_grad()
     def flush(self) -> None:
-        """Застосовує всі буферизовані записи одним вектором."""
+        """
+        Застосовує всі буферизовані записи одним вектором.
+        Викликати ТІЛЬКИ після optimizer.step() (коли autograd graph знищено).
+
+        Використовуємо `.copy_()` щоб уникнути += (який створює новий тензор
+        і може викликати проблеми з версіонуванням у деяких випадках).
+        """
         if not self._buf_s:
             return
         dev = self.memory.device
@@ -140,11 +154,21 @@ class AsyncTensorProductMemory(nn.Module):
             k = self.key_proj(z_s_m).view(-1, self.H, self.d)
             v = self.val_proj(z_v_m).view(-1, self.H, self.d)
             delta = torch.einsum('bhd,bhe,b->hde', k, v, lam_m)
-            self.memory += delta / (mask.sum().float() + 1e-6)
+            new_mem = self.memory + delta / (mask.sum().float() + 1e-6)
+            self.memory.copy_(new_mem)
             for i in range(z_s_m.size(0)):
                 self.cache.append((z_s_m[i], z_v_m[i]))
             self.n_writes += mask.sum().item()
         self._buf_s.clear(); self._buf_v.clear(); self._buf_c.clear()
+        self._pending_flush = False
+
+    def maybe_flush(self) -> None:
+        """
+        Безпечний flush — викликається ПІСЛЯ optimizer.step().
+        Перевіряє _pending_flush і тільки тоді оновлює memory.
+        """
+        if self._pending_flush:
+            self.flush()
 
     # ── Episodic recall (k-NN) ─────────────────────────────────────────────────
     @torch.no_grad()

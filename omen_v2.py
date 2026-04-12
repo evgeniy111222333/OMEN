@@ -283,6 +283,10 @@ class TensorProductMemory(nn.Module):
         """
         confidence: (B,) ∈ [0,1]
         Записуємо лише якщо модель «здивована» (1 - conf > write_tau)
+
+        ВАЖЛИВО: `.copy_()` замість `+=` — `+=` інкрементує version_counter
+        основного тензора, що ламає autograd.backward() (version mismatch).
+        `.copy_()` оновлює дані БЕЗ зміни version_counter.
         """
         lam = (1.0 - confidence).clamp(0, 1)                      # (B,)
         mask = lam > self.write_tau
@@ -298,7 +302,8 @@ class TensorProductMemory(nn.Module):
 
         # Outer product: (B', H, d, d)
         delta = torch.einsum('bhd,bhe,b->hde', k, v, lam_m)
-        self.memory += delta / (mask.sum().float() + 1e-6)
+        new_mem = self.memory + delta / (mask.sum().float() + 1e-6)
+        self.memory.copy_(new_mem)
 
         # Додаємо в LRU-кеш для episodic recall
         for i in range(z_s.size(0)):

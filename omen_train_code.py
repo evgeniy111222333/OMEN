@@ -138,6 +138,7 @@ def pretrain_net(model: OMENScale,
         loss.backward()
         torch.nn.utils.clip_grad_norm_(net_params, 1.0)
         opt.step()
+        model.memory.maybe_flush()
         sched.step()
 
         for k in ("net_total", "net_code", "net_rec", "net_vq", "net_entropy_bits"):
@@ -226,6 +227,9 @@ def joint_train(model: OMENScale,
             torch.nn.utils.clip_grad_norm_(other_params, 1.0)
             opt.step()
 
+            # Flush memory AFTER optimizer step (no autograd graph)
+            model.memory.maybe_flush()
+
             for k, v in out.items():
                 if k not in ("logits", "z"):
                     agg[k] += float(v) if not isinstance(v, float) else v
@@ -233,7 +237,6 @@ def joint_train(model: OMENScale,
             if n_bat >= max_batches_per_epoch:
                 break
 
-        model.memory.flush()
         sched.step()
 
         if n_bat == 0:
