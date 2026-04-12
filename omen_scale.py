@@ -238,15 +238,21 @@ class TokenDecoder(nn.Module):
 
 class OMENScaleLoss(nn.Module):
     """
-    Повний Епістемічний Функціонал Якості:
+    Повний Епістемічний Функціонал Якості (оновлена версія):
 
-      J(θ,Γ,M) = Perplexity(θ)                      ← ймовірнісна модель
-              + β·L_proof(π,Γ)                       ← символьне узагальнення
-              + γ·||z - Read(M,z) - Sim(z)||²        ← консистентність світу
-              - α·I(Z;Mem)                            ← стиснення/новизна
-              + λ_tok·||z_tok||² + λ_conc·||z_con||² ← L_scale MDL рівнів
-              + λ_rule·Complexity(Γ)                  ← MDL правил
-              + η·L_recall                            ← пам'ять точність
+      J(θ,Γ,M) = Perplexity(θ)                               ← ймовірнісна модель
+              + β·L_proof(π,Γ)                               ← символьне узагальнення
+              + γ·||z - Read(M,z) - Sim(z)||²                ← консистентність світу
+              - α·I(Z;Γ)                                     ← взаємна інф. (семантичний feedback)
+              + λ_tok·||z_tok||² + λ_conc·||z_con||²         ← L_scale MDL рівнів
+              + λ_rule·Σ_{R∈Γ}(Complexity(R) − η·Utility(R)) ← MDL правил з корисністю
+              + η·L_recall                                   ← пам'ять точність
+              + δ·E_{R~Abduction}[max(0,τ−U(R))]            ← VeM штраф
+
+    Порівняно з v1:
+      · λ_rule·Complexity(Γ) → λ_rule·Σ(Complexity−η·Utility): корисні правила не штрафуються
+      · Додано -α·I(Z;Γ) через L_semantic (NET semantic feedback)
+      · Додано δ·VeM_penalty: скеровує AbductionHead до корисних правил
     """
 
     def __init__(self, cfg: OMENScaleConfig):
@@ -254,18 +260,19 @@ class OMENScaleLoss(nn.Module):
         self.cfg = cfg
 
     def forward(self,
-                logits:      torch.Tensor,
-                targets:     torch.Tensor,
-                z:           torch.Tensor,        # (B, d_latent)
-                z_tok:       torch.Tensor,        # (B, T, d_tok)
-                z_latents:   torch.Tensor,        # (B, n, d_latent)
-                z_sim:       torch.Tensor,        # (B, d_latent)
-                v_mem:       torch.Tensor,        # (B, d_latent)
-                sym_loss:    torch.Tensor,
-                ltm_penalty: float,
-                curiosity_l: torch.Tensor,
-                world_rnn:   WorldRNN,
-                net_loss:    torch.Tensor,        # L_NET від NeuralEpistemicTokenizer
+                logits:       torch.Tensor,
+                targets:      torch.Tensor,
+                z:            torch.Tensor,        # (B, d_latent)
+                z_tok:        torch.Tensor,        # (B, T, d_tok)
+                z_latents:    torch.Tensor,        # (B, n, d_latent)
+                z_sim:        torch.Tensor,        # (B, d_latent)
+                v_mem:        torch.Tensor,        # (B, d_latent)
+                sym_loss:     torch.Tensor,
+                ltm_penalty:  float,
+                curiosity_l:  torch.Tensor,
+                world_rnn:    WorldRNN,
+                net_loss:     torch.Tensor,        # L_NET від NeuralEpistemicTokenizer
+                vem_penalty:  Optional[torch.Tensor] = None,  # δ·E[max(0,τ−U(R))]
                 ) -> Dict:
         cfg = self.cfg
 
@@ -314,6 +321,14 @@ class OMENScaleLoss(nn.Module):
         # ── 7. Symbolic Generalization ────────────────────────────────────────
         L_sym   = sym_loss
 
+        # ── 8. VeM Penalty: δ·E[max(0, τ − U(R))] ───────────────────────────
+        # Штрафує AbductionHead якщо він генерує кандидати, які VeM відхиляє.
+        # ltm_penalty вже включає utility_adjusted_penalty з prover.rule_regularizer()
+        if vem_penalty is not None and torch.is_tensor(vem_penalty):
+            L_vem = vem_penalty
+        else:
+            L_vem = torch.zeros(1, device=z.device).squeeze()
+
         # ── Збираємо J(θ,Γ,M) ────────────────────────────────────────────────
         total = (
             L_ce
@@ -325,7 +340,8 @@ class OMENScaleLoss(nn.Module):
           + cfg.beta   * L_sym
           + ltm_penalty
           + curiosity_l * 0.1
-          + cfg.eta_tok * net_loss      # ← L_NET: Neural Epistemic Tokenizer
+          + cfg.eta_tok * net_loss          # ← L_NET (включає L_semantic)
+          + getattr(cfg, 'delta_vem', 1e-3) * L_vem  # ← δ·VeM
         )
 
         # net_loss може бути dict або scalar — нормалізуємо
@@ -346,6 +362,7 @@ class OMENScaleLoss(nn.Module):
             "ltm_pen":    ltm_penalty,
             "curiosity":  curiosity_l.item(),
             "net_loss":   net_loss_scalar,
+            "vem_pen":    L_vem.item() if torch.is_tensor(L_vem) else float(L_vem),
         }
 
 
@@ -412,6 +429,9 @@ class OMENScale(nn.Module):
             max_depth  = cfg.max_proof_depth,
             n_cands    = cfg.n_proof_cands,
             alpha      = cfg.alpha,
+            vem_tau    = getattr(cfg, 'vem_tau', 0.3),
+            eta_utility = getattr(cfg, 'eta_utility', 0.1),
+            consolidate_every = getattr(cfg, 'rule_consolidate_every', 100),
         )
 
         # ─── KB ↔ NET інтеграція: NET реєструє концепти прямо в Prolog-KB ──────
@@ -472,6 +492,26 @@ class OMENScale(nn.Module):
         world_err  = F.mse_loss(z_sim, z.detach()).detach()
         z_sym, sym_loss = self.prover(z_enr, world_err)
 
+        # ── Semantic Feedback Pairs для NET (I(Z;Γ) апроксимація) ────────────
+        # S-Core виявляє логічно пов'язані токени → NET наближає їх вектори.
+        # Перетворюємо HornClause-пари на (token_idx_1, token_idx_2, score).
+        sem_pairs_raw = self.prover.semantic_feedback_pairs(max_pairs=32)
+        sem_pairs_net: list = []
+        if self.net_enabled and sem_pairs_raw:
+            V_cur = self.net.quantizer.current_size.item()
+            for (r1, r2, score) in sem_pairs_raw:
+                # Використовуємо pred як проксі для token_idx (обидва < V_cur)
+                i1 = r1.head.pred % max(V_cur, 1)
+                i2 = r2.head.pred % max(V_cur, 1)
+                if i1 != i2:
+                    sem_pairs_net.append((i1, i2, score))
+
+        # ── VeM Penalty: δ·E[max(0, τ − U(R))] ─────────────────────────────
+        vem_pen = self.prover.vem_loss(
+            z_enr,
+            delta=getattr(self.cfg, 'delta_vem', 1e-3)
+        )
+
         # ── Об'єднуємо рівні ─────────────────────────────────────────────────
         z_final = z_enr + 0.1 * z_sym + 0.1 * v_mem                   # (B, d_lat)
 
@@ -483,21 +523,30 @@ class OMENScale(nn.Module):
         if self.net_enabled:
             # NET декодер: реконструює оригінальні токени з h_tok + z_final
             logits, l_rec = self.net.decode(tgt, z_final, h_tok)      # (B,T,V), scalar
-            net_loss_dict = self.net.compute_loss(net_info, l_rec)
+            # L_NET з семантичним feedback: -λ·I(Z;Γ) через sem_pairs_net
+            net_loss_dict = self.net.compute_loss(
+                net_info, l_rec,
+                sem_pairs=sem_pairs_net if sem_pairs_net else None
+            )
             net_loss = net_loss_dict["net_total"]
         else:
             logits   = self.tok_decoder(tgt, z_final)                  # (B, T, V)
             net_loss = torch.tensor(0.0, device=src.device)
             net_loss_dict = {}
+            sem_pairs_net = []
 
-        # ── Loss J(θ,Γ,M) + η_tok·L_NET ──────────────────────────────────────
-        ltm_pen = self.prover.rule_regularizer(self.cfg.lam_sym)
+        # ── Loss J(θ,Γ,M) + η_tok·L_NET + δ·VeM ─────────────────────────────
+        ltm_pen = self.prover.rule_regularizer(
+            self.cfg.lam_sym,
+            eta_utility=getattr(self.cfg, 'eta_utility', 0.1)
+        )
         out = self.loss_fn(
             logits, tgt, z_final,
             h_tok, latents,
             z_sim, v_mem, sym_loss, ltm_pen, cf_loss,
             self.world_rnn,
             net_loss,
+            vem_penalty=vem_pen,
         )
 
         out["logits"]    = logits
@@ -510,9 +559,20 @@ class OMENScale(nn.Module):
 
         # NET-специфічна статистика
         if self.net_enabled:
-            out["net_vocab"]   = net_loss_dict.get("net_vocab_size", 0)
-            out["net_entropy"] = net_loss_dict.get("net_entropy", 0.0)
-            out["net_mean_sim"]= net_loss_dict.get("net_mean_sim",  0.0)
+            out["net_vocab"]    = net_loss_dict.get("net_vocab_size", 0)
+            out["net_entropy"]  = net_loss_dict.get("net_entropy", 0.0)
+            out["net_mean_sim"] = net_loss_dict.get("net_mean_sim",  0.0)
+            out["net_semantic"] = net_loss_dict.get("net_semantic",  0.0)
+        # VeM / Epistemic Rule Tracker статистика
+        out["vem_pen"]      = out.get("vem_pen", 0.0)
+        out["n_proposed"]   = sum(
+            1 for rec in self.prover.kb._records.values()
+            if rec.status.value == "proposed"
+        )
+        out["n_verified"]   = sum(
+            1 for rec in self.prover.kb._records.values()
+            if rec.status.value == "verified"
+        )
         return out
 
     # ── Генерація ─────────────────────────────────────────────────────────────
@@ -551,6 +611,17 @@ class OMENScale(nn.Module):
                  for p in self.parameters()) / 1024 / 1024
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         mode = "NET (байт-рівень)" if self.net_enabled else "Classic (BPE)"
+
+        # Epistemic Rule Tracker stats
+        n_prop = sum(1 for r in self.prover.kb._records.values()
+                     if r.status.value == "proposed")
+        n_ver  = sum(1 for r in self.prover.kb._records.values()
+                     if r.status.value == "verified")
+        n_cont = sum(1 for r in self.prover.kb._records.values()
+                     if r.status.value == "contradicted")
+        avg_util = (sum(r.utility() for r in self.prover.kb._records.values())
+                    / max(len(self.prover.kb._records), 1))
+
         base = (
             f"  Режим токенайзера: {mode}\n"
             f"  Параметри      : {n_params:,}\n"
@@ -561,7 +632,14 @@ class OMENScale(nn.Module):
             f"  ∂-Prolog rules : {len(self.prover)}\n"
             f"  KB facts       : {self.prover.kb.n_facts()}\n"
             f"  KB↔NET linked  : {self.net_enabled and self.net.quantizer.kb is not None}\n"
-            f"  UNKNOWN flags  : {self.curiosity.unknown_flag_count}"
+            f"  UNKNOWN flags  : {self.curiosity.unknown_flag_count}\n"
+            f"  ── Epistemic Rule Tracker ──\n"
+            f"  Rules proposed   : {n_prop}\n"
+            f"  Rules verified   : {n_ver}\n"
+            f"  Rules contrad.   : {n_cont}\n"
+            f"  Avg Utility(R)   : {avg_util:.4f}\n"
+            f"  VeM tau          : {getattr(self.cfg, 'vem_tau', 0.3)}\n"
+            f"  VeM buffer       : {len(self.prover.vem._train_embs)}"
         )
         if self.net_enabled:
             base += "\n" + self.net.tokenizer_report()

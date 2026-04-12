@@ -63,7 +63,7 @@ class OMENScaleConfig:
     gamma:       float = 0.1    # World consistency
     delta:       float = 1e-3   # WorldRNN complexity
     eta:         float = 0.05   # Memory recall
-    lam_sym:     float = 0.02   # LTM regularizer (сумісність v2)
+    lam_sym:     float = 0.005   # LTM regularizer (сумісність v2)
 
     # ─── Neural Epistemic Tokenizer (NET) ─────────────────────────────────────
     # Замінює GPT-2 BPE (vocab=50257) нейро-символьним компресором.
@@ -76,7 +76,9 @@ class OMENScaleConfig:
     net_init_vocab:   int   = 512        # початковий розмір NET-словника
     net_max_vocab:    int   = 8_192      # максимальний розмір NET-словника
     net_tau:          float = 0.85       # поріг cos-подібності (новий токен)
-    net_ema_decay:    float = 0.99       # EMA для оновлення кодбуку
+    net_ema_decay:    float = 0.95       # EMA для оновлення кодбуку (0.95 > 0.99: швидша адаптація)
+    net_warmup_steps: int   = 150        # кроків заморожування росту словника на старті
+                                         # (encoder нестабільний → не додаємо токени)
     eta_tok:          float = 0.1        # вага L_NET у загальному J
     lambda_voc:       float = 1e-4       # MDL регуляризатор словника
 
@@ -85,6 +87,26 @@ class OMENScaleConfig:
     sparsity_lambda:  float = 5e-4
     compile_model:    bool  = False   # torch.compile (вмикати на A100/H100)
     use_flash_attn:   bool  = True    # FlashAttention якщо доступна
+
+    # ─── Verification Module (VeM) ────────────────────────────────────────────
+    # Фільтрує кандидати AbductionHead до додавання в LTM.
+    # U(R) = E[Success(R) − α·Cost(R)]
+    # Candidates = {R ~ AbductionHead(z) | U(R) > vem_tau}
+    # δ·E_{R~Abduction}[max(0, τ − U(R))] ← штраф за генерацію поганих кандидатів
+    vem_tau:          float = 0.3    # поріг корисності (U(R) > vem_tau → приймається)
+    delta_vem:        float = 1e-3   # вага VeM-штрафу у загальному J
+
+    # ─── Epistemic Rule Tracker ───────────────────────────────────────────────
+    # Кожне правило: proposed → verified / contradicted
+    # L_rule = Σ_{R∈LTM} (Complexity(R) − η·Utility(R))
+    eta_utility:      float = 0.1    # винагорода за корисні правила (−η·Utility)
+    rule_consolidate_every: int = 100  # кроків між Rule Consolidation
+
+    # ─── Semantic Feedback Loop ───────────────────────────────────────────────
+    # L_semantic = −E_{(v1,v2)~S-Core}[cos(e_v1, e_v2)·Score(v1, v2)]
+    # MDL_total  = MDL_NET − λ_sem·I(Z;Γ)
+    lambda_semantic:  float = 0.01   # вага L_semantic
+    lambda_enc_div:   float = 0.02   # Encoder diversity anti-collapse: L_enc_div = mean_pairwise_cosine(encoder_outputs)
 
     # ─── Сумісність з OMENv2 ──────────────────────────────────────────────────
     # (поля, що очікує OMENAGILoss/WorldRNN)
@@ -107,8 +129,12 @@ class OMENScaleConfig:
             abduct_candidates=8, n_heads=4, n_layers=2, d_model=256,
             # NET: малий словник для швидкого тестування на CPU
             net_enabled=True,   net_byte_layers=1,   net_dec_layers=1,
-            net_init_vocab=64,  net_max_vocab=512,   net_tau=0.80,
-            net_ema_decay=0.99, eta_tok=0.1,         lambda_voc=1e-4,
+            net_init_vocab=32,  net_max_vocab=512,   net_tau=0.90,
+            net_ema_decay=0.95, eta_tok=0.1,         lambda_voc=1e-4,
+            net_warmup_steps=80,    # 80/500 кроків warmup; k-means init
+            lambda_enc_div=0.02,    # антиколапс encoder: тягне вектори нарізно
+            vem_tau=0.3,        delta_vem=1e-3,      eta_utility=0.1,
+            lambda_semantic=0.01, rule_consolidate_every=50,
         )
 
     @classmethod
@@ -123,7 +149,8 @@ class OMENScaleConfig:
             # NET: повний розмір для серйозного тренування
             net_enabled=True,  net_byte_layers=2,    net_dec_layers=2,
             net_init_vocab=512, net_max_vocab=8_192, net_tau=0.85,
-            net_ema_decay=0.99, eta_tok=0.1,          lambda_voc=1e-4,
+            net_ema_decay=0.95, eta_tok=0.1,          lambda_voc=1e-4,
+            net_warmup_steps=500,  # ~10% від типового 5000-крокового Stage 1
         )
 
     @classmethod

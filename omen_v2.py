@@ -1004,6 +1004,13 @@ def make_rule_transfer(n, sl):
     return data
 
 def collate(batch):
+    # Підтримуємо два формати:
+    #   1) List[Tensor]               — синтетичний датасет (make_counting, …)
+    #   2) List[Tuple[Tensor,Tensor]] — реальний текст (load_text_corpus → (src, tgt))
+    if isinstance(batch[0], (tuple, list)):
+        src = torch.stack([item[0] for item in batch])
+        tgt = torch.stack([item[1] for item in batch])
+        return src, tgt
     s = torch.stack(batch)
     return s[:, :-1], s[:, 1:]
 

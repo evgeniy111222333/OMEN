@@ -22,6 +22,7 @@ omen_prolog.py — ∂-Prolog: Диференційований Theorem Prover
 """
 
 from __future__ import annotations
+import enum
 import math
 import random
 from dataclasses import dataclass, field
@@ -479,23 +480,206 @@ def unify_body(body: Tuple[HornAtom, ...],
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 2b.  EPISTEMIC RULE TRACKER  (контроль якості правил)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class EpistemicStatus(enum.Enum):
+    """
+    Епістемічний статус правила в LTM.
+
+      proposed      — щойно згенероване абдукцією, ще не перевірене.
+      verified      — підтверджене ≥1 успішним використанням у доведенні.
+      contradicted  — призвело до логічної суперечності; підлягає видаленню.
+
+    Перехід:
+      proposed → verified    (при successful proof step)
+      proposed → contradicted (при contradiction)
+      verified  може знову стати contradicted якщо виявлено суперечність пізніше.
+    """
+    proposed     = "proposed"
+    verified     = "verified"
+    contradicted = "contradicted"
+
+
+@dataclass
+class RuleRecord:
+    """
+    Запис правила з епістемічними метаданими.
+
+    Utility(R) = use_count / (1 + age_steps) — динамічна корисність.
+    Complexity(R) = rule.complexity()         — MDL статична складність.
+
+    L_rule = Complexity(R) − η·Utility(R)   (формула розд. 3)
+    """
+    rule:       "HornClause"
+    status:     EpistemicStatus      = EpistemicStatus.proposed
+    use_count:  int                  = 0
+    success_count: int               = 0     # кількість успішних доведень
+    age_steps:  int                  = 0     # кроків з моменту додавання
+    weight:     float                = 1.0
+
+    def utility(self) -> float:
+        """
+        Utility(R) = success_count / (1 + age_steps)
+
+        Висока корисність ≡ правило часто брало участь в успішних доведеннях.
+        Штрафуємо старі невикористані правила → видаляємо їх при консолідації.
+        """
+        return self.success_count / (1.0 + self.age_steps)
+
+    def l_rule_contribution(self, eta: float) -> float:
+        """
+        Внесок правила в L_rule = Complexity(R) − η·Utility(R).
+        Від'ємний лише якщо правило дуже корисне.
+        """
+        return float(self.rule.complexity()) - eta * self.utility()
+
+
+class VerificationModule(nn.Module):
+    """
+    Verification Module (VeM) — нейронний фільтр кандидатів AbductionHead.
+
+    Оцінює очікувану корисність кандидата-правила до додавання в LTM:
+      U(R) = E_{майбутні_задачі}[Success(R) − α·Cost(R)]
+
+    Апроксимація через retrospective self-supervised навчання:
+      - Якщо правило брало участь у успішному доведенні → ціль U=1
+      - Якщо правило не використовувалось / призводило до помилок → U≈0
+
+    Канідати фільтруються:
+      Candidates = {R ~ AbductionHead(z) | VeM(R) > vem_tau}
+
+    VeM штраф у функції втрат:
+      L_vem = δ · E_{R~Abduction}[max(0, τ − U(R))]
+
+    Навчання: MSE між predicted U(R) та retrospective utility target.
+    """
+
+    def __init__(self, d_latent: int, sym_vocab: int, vem_tau: float = 0.3):
+        super().__init__()
+        self.d       = d_latent
+        self.sv      = sym_vocab
+        self.vem_tau = vem_tau
+
+        # Ембеддер термів для отримання вектора правила
+        self.term_emb = TermEmbedder(sym_vocab, d_latent)
+
+        # Основна VeM мережа: rule_emb → U(R) ∈ [0, 1]
+        self.vem_net = nn.Sequential(
+            nn.Linear(d_latent, d_latent),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_latent, d_latent // 2),
+            nn.GELU(),
+            nn.Linear(d_latent // 2, 1),
+            nn.Sigmoid(),      # U(R) ∈ [0, 1]
+        )
+
+        # Буфери для самонавчання (retrospective analysis)
+        # Зберігаємо (rule_emb, utility_target) пари
+        self._train_embs:    List[torch.Tensor] = []
+        self._train_targets: List[float]        = []
+        self._max_buffer     = 256
+
+    def rule_embedding(self, clause: "HornClause",
+                       device: torch.device) -> torch.Tensor:
+        """Ембеддинг правила: mean(head + body atoms)."""
+        atoms = [clause.head] + list(clause.body)
+        embs  = self.term_emb(atoms, device)     # (n_atoms, d)
+        return embs.mean(0)                       # (d,)
+
+    def score(self, clause: "HornClause",
+              device: torch.device) -> float:
+        """Повертає U(R) ∈ [0,1] для одного правила (no_grad)."""
+        with torch.no_grad():
+            r_emb = self.rule_embedding(clause, device).unsqueeze(0)
+            return self.vem_net(r_emb).squeeze().item()
+
+    def score_batch(self, clauses: List["HornClause"],
+                    device: torch.device) -> torch.Tensor:
+        """
+        U(R_i) для кожного кандидата.
+        Returns: (n_clauses,) tensor
+        """
+        if not clauses:
+            return torch.zeros(0, device=device)
+        embs = torch.stack([self.rule_embedding(c, device) for c in clauses])
+        return self.vem_net(embs).squeeze(-1)    # (n,)
+
+    def filter_candidates(self,
+                          clauses:  List["HornClause"],
+                          device:   torch.device) -> Tuple[List["HornClause"], torch.Tensor]:
+        """
+        Фільтрує кандидатів: повертає (accepted, hinge_loss).
+
+        hinge_loss = Σ max(0, τ − U(R))  — штраф за генерацію поганих кандидатів.
+        Навіть відхилені кандидати вносять gradient сигнал через hinge.
+        """
+        if not clauses:
+            zero = torch.zeros(1, device=device)
+            return [], zero
+
+        scores = self.score_batch(clauses, device)           # (n,)
+        hinge  = torch.clamp(self.vem_tau - scores, min=0).mean()
+
+        accepted = [c for c, s in zip(clauses, scores.tolist())
+                    if s >= self.vem_tau]
+        return accepted, hinge
+
+    def record_outcome(self, clause: "HornClause",
+                       utility_target: float,
+                       device: torch.device) -> None:
+        """
+        Записує результат використання правила для самонавчання.
+        utility_target ∈ [0,1]: 1.0 → успішне доведення, 0.0 → невдача.
+        """
+        with torch.no_grad():
+            r_emb = self.rule_embedding(clause, device).cpu()
+        self._train_embs.append(r_emb)
+        self._train_targets.append(float(utility_target))
+        # Кільцевий буфер
+        if len(self._train_embs) > self._max_buffer:
+            self._train_embs.pop(0)
+            self._train_targets.pop(0)
+
+    def self_supervised_loss(self, device: torch.device) -> torch.Tensor:
+        """
+        MSE між predicted U(R) та retrospective targets.
+        Викликається раз на кілька кроків для донавчання VeM.
+        """
+        if len(self._train_embs) < 4:
+            return torch.zeros(1, device=device).squeeze()
+        embs    = torch.stack(self._train_embs).to(device)      # (N, d)
+        targets = torch.tensor(self._train_targets,
+                               dtype=torch.float32, device=device)  # (N,)
+        preds   = self.vem_net(embs).squeeze(-1)                 # (N,)
+        return F.mse_loss(preds, targets)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 3.  KNOWLEDGE BASE (Forward Chaining)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class KnowledgeBase:
     """
-    База знань: факти + правила.
-    Forward Chaining до fixpoint або max_depth.
+    База знань: факти + правила з Forward Chaining.
 
-    MDL-принцип: Complexity(Γ) = λ2·Σ_R len(R)
-    де len(R) = complexity() правила.
+    Розширено епістемічним трекером:
+      · Кожне правило має RuleRecord зі статусом (proposed/verified/contradicted)
+      · MDL-регуляризатор враховує динамічну корисність:
+          L_rule = Σ_{R∈LTM} (Complexity(R) − η·Utility(R))
+      · Consolidation: видаляємо слабкі proposed правила раз на N кроків.
     """
 
     def __init__(self, max_rules: int = 1024):
         self.facts:     FrozenSet[HornAtom] = frozenset()
-        self.rules:     List[HornClause]    = []   # правила (body не порожнє)
+        self.rules:     List[HornClause]    = []   # активні правила
         self._rule_set: Set[int]            = set()
         self.max_rules  = max_rules
+
+        # Епістемічний трекер: hash(rule) → RuleRecord
+        self._records:  Dict[int, RuleRecord] = {}
+        self._global_step: int = 0             # для age_steps
 
     # ── Додавання ──────────────────────────────────────────────────────────────
     def add_fact(self, atom: HornAtom) -> bool:
@@ -504,37 +688,97 @@ class KnowledgeBase:
             return True
         return False
 
-    def add_rule(self, clause: HornClause) -> bool:
+    def add_rule(self, clause: HornClause,
+                 status: EpistemicStatus = EpistemicStatus.proposed) -> bool:
+        """
+        Додає правило з початковим статусом (proposed за замовч.).
+        Якщо правило вже є — збільшуємо use_count.
+        """
         h = hash(clause)
         if h in self._rule_set:
-            # Правило вже є — збільшимо вагу
+            # Правило вже є — оновлюємо запис
             for r in self.rules:
                 if hash(r) == h:
                     r.use_count += 1
                     break
+            if h in self._records:
+                self._records[h].use_count += 1
             return False
         if len(self.rules) >= self.max_rules:
-            # LRU-евікція: видаляємо найменш уживане
-            worst_i = min(range(len(self.rules)),
-                          key=lambda i: self.rules[i].use_count)
-            self._rule_set.discard(hash(self.rules[worst_i]))
+            # LRU-евікція: видаляємо правило з найменшою корисністю (Utility)
+            worst_i = min(
+                range(len(self.rules)),
+                key=lambda i: self._records.get(hash(self.rules[i]),
+                              RuleRecord(rule=self.rules[i])).utility()
+            )
+            evicted_h = hash(self.rules[worst_i])
+            self._rule_set.discard(evicted_h)
+            self._records.pop(evicted_h, None)
             self.rules.pop(worst_i)
         self.rules.append(clause)
         self._rule_set.add(h)
+        self._records[h] = RuleRecord(rule=clause, status=status)
         return True
+
+    def mark_rule_verified(self, clause: HornClause) -> None:
+        """Позначити правило як verified після успішного доведення."""
+        h = hash(clause)
+        if h in self._records:
+            rec = self._records[h]
+            rec.status         = EpistemicStatus.verified
+            rec.success_count += 1
+            rec.weight        *= 1.05   # підвищуємо довіру
+        # Оновлюємо use_count у самому clause (для зворотньої сумісності)
+        for r in self.rules:
+            if hash(r) == h:
+                r.use_count    += 1
+                r.weight       *= 1.01
+                break
+
+    def mark_rule_contradicted(self, clause: HornClause) -> None:
+        """Позначити правило як contradicted (буде видалено при консолідації)."""
+        h = hash(clause)
+        if h in self._records:
+            self._records[h].status = EpistemicStatus.contradicted
+
+    def consolidate(self, use_count_threshold: int = 2) -> int:
+        """
+        Rule Consolidation: видаляємо слабкі правила.
+          · Contradicted → видаляємо завжди.
+          · Proposed + use_count < threshold → видаляємо.
+
+        Повертає кількість видалених правил.
+        """
+        to_remove: Set[int] = set()
+        for h, rec in list(self._records.items()):
+            if rec.status == EpistemicStatus.contradicted:
+                to_remove.add(h)
+            elif (rec.status == EpistemicStatus.proposed
+                  and rec.use_count < use_count_threshold):
+                to_remove.add(h)
+
+        if not to_remove:
+            return 0
+
+        self.rules     = [r for r in self.rules if hash(r) not in to_remove]
+        self._rule_set = {h for h in self._rule_set if h not in to_remove}
+        for h in to_remove:
+            self._records.pop(h, None)
+
+        return len(to_remove)
+
+    def tick(self) -> None:
+        """Оновлює вік всіх правил (викликати раз на крок)."""
+        self._global_step += 1
+        for rec in self._records.values():
+            rec.age_steps += 1
 
     # ── Forward Chaining ───────────────────────────────────────────────────────
     def forward_chain(self, max_depth: int = 5) -> FrozenSet[HornAtom]:
         """
         Застосовує правила до fixpoint або max_depth ітерацій.
         Повертає всі виведені + існуючі факти.
-
-        Ключові покращення порівняно з попередньою версією:
-          1. freshen_vars(clause): перейменовує змінні перед кожним застосуванням,
-             щоб уникнути конфліктів між різними застосуваннями одного правила.
-          2. find_all_substitutions: знаходить ВСІ підстановки через DFS+backtracking,
-             тому одне правило може дати кілька нових фактів за одну ітерацію.
-          3. is_ground(): додаємо лише повністю заземлені факти (ground atoms).
+        Успішне виведення → mark_rule_verified().
         """
         current = self.facts
         for _ in range(max_depth):
@@ -542,29 +786,77 @@ class KnowledgeBase:
             for clause in self.rules:
                 if not clause.body:
                     continue
-                # Перейменовуємо змінні щоб уникнути collision між застосуваннями
                 fresh = freshen_vars(clause)
-                # Знаходимо ВСІ підстановки через DFS + backtracking
                 for sigma in find_all_substitutions(fresh.body, current):
                     derived = sigma.apply_atom(fresh.head)
-                    # Лише ground-факти потрапляють до KB
                     if derived.is_ground() and derived not in current:
                         new_facts.add(derived)
                         clause.use_count += 1
                         clause.weight    *= 1.01
+                        # Оновлюємо епістемічний статус
+                        self.mark_rule_verified(clause)
             if not new_facts:
-                break           # fixpoint
+                break
             current = current | frozenset(new_facts)
         return current
 
-    # ── MDL-складність ─────────────────────────────────────────────────────────
+    # ── MDL-складність (оновлена: враховує корисність) ─────────────────────────
     def complexity_penalty(self) -> float:
-        """Σ_R len(R) — довжина всіх правил у символах."""
+        """Σ_R len(R) — довжина всіх правил у символах (базовий MDL)."""
         return sum(r.complexity() for r in self.rules)
+
+    def utility_adjusted_penalty(self, eta: float = 0.1) -> float:
+        """
+        L_rule = Σ_{R∈LTM} (Complexity(R) − η·Utility(R))
+
+        Заохочує зберігати корисні правила (від'ємний внесок),
+        штрафує за складні некорисні правила.
+        """
+        total = 0.0
+        for r in self.rules:
+            rec = self._records.get(hash(r))
+            util = rec.utility() if rec is not None else 0.0
+            total += float(r.complexity()) - eta * util
+        return total
 
     def weighted_complexity(self) -> float:
         """Σ_R use_count(R)·complexity(R)"""
         return sum(r.use_count * r.complexity() for r in self.rules)
+
+    def get_rule_pairs_for_semantic_feedback(
+            self,
+            max_pairs: int = 32
+    ) -> List[Tuple["HornClause", "HornClause", float]]:
+        """
+        Повертає пари правил (R1, R2, score) для семантичного feedback в NET.
+
+        Score = сила логічного зв'язку:
+          · synonym(v1, v2): cos(head_pred(v1), head_pred(v2)) ≈ 1.0
+          · implies(v1, v2): v1 у тілі → v2 у голові
+
+        Використовується для L_semantic в NET:
+          L_semantic = −E[(v1,v2)~pairs][cos(e_v1, e_v2)·score]
+        """
+        pairs: List[Tuple["HornClause", "HornClause", float]] = []
+        n = len(self.rules)
+        if n < 2:
+            return pairs
+        for i in range(min(max_pairs * 2, n)):
+            r1 = self.rules[i % n]
+            r2 = self.rules[(i + 1) % n]
+            # Перевіряємо імплікацію: якщо голова r1 входить в тіло r2
+            r1_head_pred = r1.head.pred
+            r2_body_preds = {a.pred for a in r2.body}
+            if r1_head_pred in r2_body_preds:
+                score = 0.9   # сильний логічний зв'язок
+            elif r1.head.pred == r2.head.pred:
+                score = 0.7   # synonym (спільний предикат голови)
+            else:
+                continue      # немає значущого зв'язку
+            pairs.append((r1, r2, score))
+            if len(pairs) >= max_pairs:
+                break
+        return pairs
 
     def __len__(self): return len(self.rules)
     def n_facts(self):  return len(self.facts)
@@ -1175,14 +1467,24 @@ class DifferentiableProver(nn.Module):
                  max_rules:  int = 1024,
                  max_depth:  int = 5,
                  n_cands:    int = 8,
-                 alpha:      float = 0.1):
+                 alpha:      float = 0.1,
+                 vem_tau:    float = 0.3,
+                 eta_utility: float = 0.1,
+                 consolidate_every: int = 100):
         super().__init__()
         self.d = d_latent
         self.alpha = alpha
         self.max_depth = max_depth
+        self.vem_tau    = vem_tau
+        self.eta_utility = eta_utility
+        self.consolidate_every = consolidate_every
 
         # Глобальна KnowledgeBase (оновлюється на повільному циклі)
         self.kb = KnowledgeBase(max_rules=max_rules)
+
+        # ── Нові компоненти ────────────────────────────────────────────────────
+        # VeM: фільтрує кандидати абдукції до додавання в LTM
+        self.vem = VerificationModule(d_latent, sym_vocab, vem_tau=vem_tau)
 
         # Нейронні компоненти (оновлюються на швидкому циклі)
         self.policy   = ProofPolicyNet(d_latent, max_rules)
@@ -1306,17 +1608,37 @@ class DifferentiableProver(nn.Module):
 
         return proved, trajectory, proof_loss
 
-    # ── Abduce and Learn (повільний цикл) ─────────────────────────────────────
-    def abduce_and_learn(self, z: torch.Tensor, error: float) -> int:
+    # ── Abduce and Learn (повільний цикл) з VeM фільтрацією ──────────────────
+    def abduce_and_learn(self, z: torch.Tensor, error: float) -> Tuple[int, torch.Tensor]:
         """
         Якщо error > threshold — генеруємо нові правила через абдукцію.
-        Повертає кількість доданих правил.
+        VeM фільтрує кандидатів до додавання в LTM.
+
+        Returns: (кількість доданих правил, hinge_loss для VeM)
         """
+        device = z.device
         if error < 0.5:
-            return 0
-        candidates = self.abductor(z[:1])
-        added = sum(1 for c in candidates if self.kb.add_rule(c))
-        return added
+            return 0, torch.zeros(1, device=device).squeeze()
+
+        # Генеруємо кандидатів через AbductionHead
+        raw_candidates  = self.abductor(z[:1])
+
+        # VeM фільтрація: тримаємо лише U(R) > vem_tau
+        accepted, hinge_loss = self.vem.filter_candidates(raw_candidates, device)
+
+        # Додаємо прийнятих кандидатів з епістемічним статусом proposed
+        added = 0
+        for c in accepted:
+            if self.kb.add_rule(c, status=EpistemicStatus.proposed):
+                added += 1
+
+        # Якщо нікого не прийнято — все одно записуємо VeM-сигнал
+        for c in raw_candidates:
+            score = self.vem.score(c, device)
+            # Поки target невідомий → 0.5 (нейтральний prior)
+            self.vem.record_outcome(c, utility_target=0.5, device=device)
+
+        return added, hinge_loss
 
     # ── Forward (інтеграція у тренувальний цикл) ──────────────────────────────
     def forward(self,
@@ -1326,9 +1648,20 @@ class DifferentiableProver(nn.Module):
         z           : (B, d)
         world_error : scalar
         Returns: z_sym (B, d),  sym_loss scalar
+
+        Нові складові sym_loss (порівняно з v1):
+          + 0.01 · L_vem            ← штраф за погані кандидати абдукції
+          + 0.01 · L_vem_self       ← самонавчання VeM
+        KB tick + консолідація кожні consolidate_every кроків.
         """
         B, device = z.shape[0], z.device
         self._step += 1
+
+        # 0. Оновлюємо вік правил і запускаємо консолідацію
+        self.kb.tick()
+        if self._step % self.consolidate_every == 0:
+            n_removed = self.kb.consolidate(use_count_threshold=2)
+            # (можна логувати: n_removed правил видалено)
 
         # 1. Perception: z → факт → додаємо у KB
         goal = self.perceive(z)
@@ -1342,44 +1675,93 @@ class DifferentiableProver(nn.Module):
         z_sym   = z_sym_1.expand(B, -1)                    # (B, d)
 
         # 4. Proof search (тільки під час навчання)
+        vem_hinge = torch.zeros(1, device=device).squeeze()
         if self.training and len(self.kb.rules) > 0:
-            _, _, proof_loss = self.prove_with_policy(goal, z[:1])
+            proved, traj, proof_loss = self.prove_with_policy(goal, z[:1])
+
+            # Оновлюємо VeM targets на основі результату доведення
+            if traj and self.kb.rules:
+                used_rule = self.kb.rules[traj[-1] % len(self.kb.rules)]
+                self.vem.record_outcome(
+                    used_rule,
+                    utility_target=1.0 if proved else 0.0,
+                    device=device
+                )
+                # Якщо доведення успішне → mark_rule_verified
+                if proved:
+                    self.kb.mark_rule_verified(used_rule)
+
             # GraphMatchingUnifier: консистентна soft-уніфікація (розділ 5.2)
             if self.kb.rules:
                 r = random.choice(self.kb.rules)
                 if r.body:
-                    # GraphMatchingUnifier: забезпечує ?Y → одне прив'язування
                     gm_energy, var_assign, gm_entropy = self.graph_unif(
                         r.body, all_facts, device, tau=0.5
                     )
-                    # SoftUnifier: додаткова soft-уніфікація
                     su_e, su_ent = self.soft_unif(r.body, all_facts, device)
-                    # E(σ) — мінімізуємо; ентропія — мінімізуємо (чіткі підстановки)
-                    # GraphMatching дає кращу консистентність змінних
                     proof_loss = (proof_loss
                                   + 0.01 * gm_energy
                                   - 0.001 * gm_entropy
                                   + 0.01 * su_e
                                   - 0.001 * su_ent)
         else:
-            proof_loss = torch.tensor(0.0, device=device)
+            proof_loss = torch.zeros(1, device=device).squeeze()
 
-        # 5. Abduce (раз на 5 кроків)
+        # 5. Abduce з VeM фільтрацією (раз на 5 кроків)
         if self._step % 5 == 0:
-            self.abduce_and_learn(z, world_error.item()
-                                  if torch.is_tensor(world_error) else world_error)
+            err_val = (world_error.item()
+                       if torch.is_tensor(world_error) else float(world_error))
+            _, vem_hinge = self.abduce_and_learn(z, err_val)
 
-        # 6. Symbolic Consistency Loss: MSE між z та z_sym
+        # 6. VeM self-supervised loss (раз на 10 кроків)
+        vem_self_loss = torch.zeros(1, device=device).squeeze()
+        if self.training and self._step % 10 == 0:
+            vem_self_loss = self.vem.self_supervised_loss(device)
+
+        # 7. Symbolic Consistency Loss: MSE між z та z_sym
         sym_consist = F.mse_loss(z, z_sym.detach()) + \
                       F.mse_loss(z_sym, z.detach())
-        sym_loss    = sym_consist + 0.1 * proof_loss
+        sym_loss    = (sym_consist
+                       + 0.1  * proof_loss
+                       + 0.01 * vem_hinge
+                       + 0.01 * vem_self_loss)
 
         return z_sym, sym_loss
 
     # ── Допоміжне ─────────────────────────────────────────────────────────────
-    def rule_regularizer(self, lam_sym: float) -> float:
-        """MDL: λ·Σ_R len(R)"""
-        return lam_sym * self.kb.complexity_penalty()
+    def rule_regularizer(self, lam_sym: float,
+                         eta_utility: float = 0.1) -> float:
+        """
+        MDL із урахуванням корисності правил:
+          L_rule = λ · Σ_{R∈Γ} (Complexity(R) − η·Utility(R))
+
+        Порівняно зі старим λ·Σ_R len(R):
+          · Корисні правила (high Utility) отримують знижку → залишаються.
+          · Некорисні складні правила → більший штраф → видаляються.
+        """
+        return lam_sym * self.kb.utility_adjusted_penalty(eta_utility)
+
+    def vem_loss(self, z: torch.Tensor, delta: float = 1e-3) -> torch.Tensor:
+        """
+        δ · E_{R~Abduction}[max(0, τ − U(R))]
+
+        Штрафує AbductionHead, якщо він генерує кандидати, яких VeM відхиляє.
+        Викликається окремо з OMENScaleLoss для включення у повний J(θ,Γ,M).
+        """
+        device = z.device
+        if not self.training:
+            return torch.zeros(1, device=device).squeeze()
+        raw_candidates  = self.abductor(z[:1])
+        if not raw_candidates:
+            return torch.zeros(1, device=device).squeeze()
+        _, hinge = self.vem.filter_candidates(raw_candidates, device)
+        return delta * hinge
+
+    def semantic_feedback_pairs(
+            self, max_pairs: int = 32
+    ) -> List[Tuple["HornClause", "HornClause", float]]:
+        """Делегує до KB: повертає пари правил для L_semantic в NET."""
+        return self.kb.get_rule_pairs_for_semantic_feedback(max_pairs)
 
     def __len__(self): return len(self.kb)
 
