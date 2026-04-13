@@ -235,10 +235,11 @@ class OSFSynthesizer(nn.Module):
         cfg_used   = self.cfg
         log_prob_meta  = torch.tensor(0.0, device=device)
         value_meta     = torch.tensor(0.0, device=device)
+        entropy_meta   = torch.tensor(0.0, device=device)
         strategy_id    = STRATEGY_CAREFUL
 
         if cfg_used.use_meta and self.training:
-            strat_cfg, log_prob_meta, value_meta = self.meta_ctrl.select_strategy(
+            strat_cfg, log_prob_meta, value_meta, entropy_meta = self.meta_ctrl.select_strategy(
                 gap_norm=gap_norm, ce_loss=ce_loss,
                 plan_depth=cfg_used.max_plan_depth,
                 n_rules=n_rules, n_writes=n_writes,
@@ -320,7 +321,7 @@ class OSFSynthesizer(nn.Module):
         if cfg_used.use_meta and self.training:
             quality   = self._quality_reward(ce_loss)
             meta_traj = self.meta_ctrl.compute_meta_loss(
-                log_prob_meta, value_meta, quality, strategy_id)
+                log_prob_meta, value_meta, quality, strategy_id, entropy=entropy_meta)
             l_meta    = meta_traj.meta_loss
 
         # ── J_OSF = L_plan + λ_sim·L_sim + λ_refl·L_refl + λ_meta·L_meta ───

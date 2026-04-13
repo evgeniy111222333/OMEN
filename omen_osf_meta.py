@@ -189,7 +189,7 @@ class SynthesisMetaController(nn.Module):
         plan_depth: int   = 0,
         n_rules:   int   = 0,
         n_writes:  int   = 0,
-    ) -> Tuple[StrategyConfig, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[StrategyConfig, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Вибирає стратегію σ.
 
@@ -202,20 +202,22 @@ class SynthesisMetaController(nn.Module):
 
         logits = self.actor(s)   # (1, N_strategies)
         value  = self.critic(s)  # (1, 1)
+        dist   = Categorical(logits=logits.squeeze(0))
+        entropy = dist.entropy()
 
         if self.training:
-            dist     = Categorical(logits=logits.squeeze(0))
             sigma_id = dist.sample().item()
             log_prob = dist.log_prob(
                 torch.tensor(sigma_id, device=logits.device))
         else:
             sigma_id = logits.squeeze(0).argmax().item()
             log_prob = torch.tensor(0.0, device=logits.device)
+            entropy = torch.tensor(0.0, device=logits.device)
 
         self._strategy_counts[sigma_id] += 1
 
         cfg = STRATEGY_CONFIGS[sigma_id]
-        return cfg, log_prob, value.squeeze()
+        return cfg, log_prob, value.squeeze(), entropy
 
     def compute_meta_loss(
         self,
@@ -262,6 +264,40 @@ class SynthesisMetaController(nn.Module):
             cost_penalty   = cost.item() * self.beta,
             net_reward     = R_net,
             meta_loss      = L_meta,
+        )
+
+    def compute_meta_loss(
+        self,
+        log_prob: torch.Tensor,
+        value: torch.Tensor,
+        quality_reward: float,
+        strategy_id: int,
+        entropy: torch.Tensor | None = None,
+    ) -> MetaTrajectory:
+        """
+        Перевизначена версія з реальною ентропією policy distribution.
+        """
+        device = log_prob.device
+        cost = STRATEGY_COSTS[strategy_id].to(device)
+        r_net = quality_reward - self.beta * cost.item()
+        r_tensor = torch.tensor(r_net, dtype=torch.float32, device=device)
+        advantage = (r_tensor - value.detach()).clamp(-5.0, 5.0)
+        l_actor = -(log_prob * advantage)
+        if entropy is not None and torch.is_tensor(entropy):
+            l_entropy = -self.entropy_beta * entropy
+        else:
+            l_entropy = torch.zeros(1, device=device).squeeze()
+        l_critic = (r_tensor - value).pow(2) * 0.5
+        l_meta = (l_actor + l_entropy + l_critic).clamp(-10.0, 10.0)
+        self._total_reward += r_net
+        self._n_episodes += 1
+        return MetaTrajectory(
+            strategy_id=strategy_id,
+            strategy_name=STRATEGY_NAMES[strategy_id],
+            quality_reward=quality_reward,
+            cost_penalty=cost.item() * self.beta,
+            net_reward=r_net,
+            meta_loss=l_meta,
         )
 
     def strategy_stats(self) -> Dict:

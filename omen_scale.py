@@ -167,7 +167,7 @@ class AsyncTensorProductMemory(nn.Module):
             v = self.val_proj(z_v_m).view(-1, self.H, self.d)
             delta = torch.einsum('bhd,bhe,b->hde', k, v, lam_m)
             new_mem = self.memory + delta / (mask.sum().float() + 1e-6)
-            self.memory.copy_(new_mem)
+            self.memory.data.copy_(new_mem)
             for i in range(z_s_m.size(0)):
                 self.cache.append((z_s_m[i], z_v_m[i]))
             self.n_writes += mask.sum().item()
@@ -314,6 +314,7 @@ class OMENScaleLoss(nn.Module):
                 z_tok:        torch.Tensor,        # (B, T, d_tok)
                 z_latents:    torch.Tensor,        # (B, n, d_latent)
                 z_sim:        torch.Tensor,        # (B, d_latent)
+                z_world_targets: torch.Tensor,     # (B, T_w, d_latent)
                 v_mem:        torch.Tensor,        # (B, d_latent)
                 sym_loss:     torch.Tensor,
                 ltm_penalty:  float,
@@ -323,6 +324,7 @@ class OMENScaleLoss(nn.Module):
                 vem_penalty:  Optional[torch.Tensor] = None,  # δ·E[max(0,τ−U(R))]
                 meta_loss:    Optional[torch.Tensor] = None,  # ω_meta·L_AC (EMC)
                 traj_reward:  Optional[float]       = None,   # Σ_t r_t траєкторії
+                train_step:   int                  = 0,
                 ) -> Dict:
         cfg = self.cfg
 
@@ -349,7 +351,8 @@ class OMENScaleLoss(nn.Module):
         # Градієнт тепер іде: L_world → z_sim → WorldRNN.parameters()
         # WorldRNN навчається: "якщо концепт z, то симулюй z_sim ≈ z".
         # z більше НЕ тягнеться до помилкових цілей WorldRNN.
-        L_world_raw  = F.huber_loss(z_sim, z.detach(), delta=1.0)
+        world_pred = z_sim if z_sim.dim() == z_world_targets.dim() else z_sim.unsqueeze(1)
+        L_world_raw  = F.huber_loss(world_pred, z_world_targets.detach(), delta=1.0)
         L_world      = torch.log1p(L_world_raw)
 
         # ── 3. WorldRNN Complexity (скінченні різниці) ────────────────────────
@@ -386,6 +389,15 @@ class OMENScaleLoss(nn.Module):
         else:
             L_meta = torch.zeros(1, device=z.device).squeeze()
         omega_meta = getattr(cfg, 'omega_meta', 0.05)
+        aux_warmup = max(int(getattr(cfg, 'loss_aux_warmup', 500)), 1)
+        aux_phase = min(max(float(train_step) / aux_warmup, 0.0), 1.0)
+        world_w = cfg.gamma * (0.35 + 0.65 * aux_phase)
+        sym_w = cfg.beta * (0.25 + 0.75 * aux_phase)
+        recall_w = cfg.eta * (0.50 + 0.50 * aux_phase)
+        curiosity_w = 0.05 + 0.05 * aux_phase
+        net_w = cfg.eta_tok * (0.40 + 0.60 * aux_phase)
+        vem_w = getattr(cfg, 'delta_vem', 1e-3) * (0.35 + 0.65 * aux_phase)
+        meta_w = omega_meta * (0.25 + 0.75 * aux_phase)
 
         # ── 10. J_OMEN+EMC: 7-ма компонента — траєкторна мета-винагорода ─────
         if traj_reward is not None and traj_reward != 0.0:
@@ -407,18 +419,18 @@ class OMENScaleLoss(nn.Module):
                             else min(float(curiosity_l), 5.0)
         total = (
             L_ce
-          + cfg.gamma  * L_world
+          + world_w    * L_world
           + cfg.delta  * L_complex
-          + cfg.eta    * L_recall
+          + recall_w   * L_recall
           - cfg.alpha  * I_zm
           + L_scale
-          + cfg.beta   * L_sym_clamped
+          + sym_w      * L_sym_clamped
           + ltm_penalty_clamped
-          + 0.1 * curiosity_clamped
-          + cfg.eta_tok * net_loss          # ← L_NET (включає L_semantic)
-          + getattr(cfg, 'delta_vem', 1e-3) * L_vem  # ← δ·VeM
-          + omega_meta  * L_meta            # ← ω_meta·L_AC (EMC Actor-Critic)
-          + omega_meta  * L_traj            # ← ω_meta·(-Σ_t r_t) (7-ма компонента)
+          + curiosity_w * curiosity_clamped
+          + net_w      * net_loss           # ← L_NET (включає L_semantic)
+          + vem_w      * L_vem              # ← δ·VeM
+          + meta_w     * L_meta             # ← ω_meta·L_AC (EMC Actor-Critic)
+          + meta_w     * L_traj             # ← ω_meta·(-Σ_t r_t) (7-ма компонента)
         )
 
         # Фінальна NaN-guard: якщо total=NaN → повертаємо тільки L_ce
@@ -447,6 +459,11 @@ class OMENScaleLoss(nn.Module):
             "vem_pen":    L_vem.item() if torch.is_tensor(L_vem) else float(L_vem),
             "meta_loss":  L_meta.item() if torch.is_tensor(L_meta) else float(L_meta),
             "traj_reward": traj_reward if traj_reward is not None else 0.0,
+            "aux_phase":  aux_phase,
+            "world_w":    world_w,
+            "sym_w":      sym_w,
+            "net_w":      net_w,
+            "meta_w":     meta_w,
         }
 
 
@@ -504,6 +521,18 @@ class OMENScale(nn.Module):
 
         self.epistemic = EpistemicGapDetector(v2cfg)
         self.curiosity = CuriosityModule(v2cfg)
+        self.world_target_proj = nn.Sequential(
+            nn.Linear(cfg.d_tok, cfg.d_latent),
+            nn.GELU(),
+            nn.Linear(cfg.d_latent, cfg.d_latent),
+        )
+        self.mem_query_proj = nn.Linear(cfg.d_latent, cfg.d_latent, bias=False)
+        self.mem_fusion_gate = nn.Sequential(
+            nn.Linear(cfg.d_latent * 3, cfg.d_latent),
+            nn.GELU(),
+            nn.Linear(cfg.d_latent, cfg.d_latent),
+            nn.Sigmoid(),
+        )
 
         # ─── Рівень 3: Symbolic (∂-Prolog) ────────────────────────────────────
         self.prover = DifferentiableProver(
@@ -585,6 +614,14 @@ class OMENScale(nn.Module):
         # Кешуємо результат; інвалідуємо тільки при зміні кількості правил.
         self._sem_pairs_cache: list = []
         self._sem_pairs_n_rules: int = -1
+        self.register_buffer("_train_step", torch.zeros((), dtype=torch.long), persistent=False)
+
+    def _world_teacher_forcing_ratio(self) -> float:
+        start = float(getattr(self.cfg, 'world_teacher_forcing_start', 0.35))
+        end = float(getattr(self.cfg, 'world_teacher_forcing_end', 0.05))
+        steps = max(int(getattr(self.cfg, 'world_teacher_forcing_steps', 2000)), 1)
+        progress = min(float(self._train_step.item()) / steps, 1.0)
+        return start + (end - start) * progress
 
 
     # ── Forward ──────────────────────────────────────────────────────────────
@@ -599,6 +636,8 @@ class OMENScale(nn.Module):
                                        → Perceiver → ... → ByteDecoder
           Classic (net_enabled=False): src → TokenEncoder → Perceiver → ... → TokenDecoder
         """
+        if self.training:
+            self._train_step.add_(1)
         # ══ Рівень 1: Token → Concept  ═══════════════════════════════════════
         net_info   = {}
         vq_indices = None
@@ -612,14 +651,18 @@ class OMENScale(nn.Module):
         latents, z = self.perceiver(h_tok)                             # (B,n,d_lat), (B,d_lat)
 
         # ── Level 2: M-Core читання ───────────────────────────────────────────
-        v_mem = self.memory.read(z)                                    # (B, d_lat)
+        v_mem = self.memory.read(self.mem_query_proj(z))               # (B, d_lat)
 
         # ── Level 2: WorldRNN симуляція ───────────────────────────────────────
         # FIX: z.detach() — WorldRNN отримує тільки «знімок» концепту z,
         # без backprop крізь z. Це ізолює WorldRNN-градієнт від решти граду:
         # градієнт L_world тече → z_sim → WorldRNN.params, а не → z → perceiver.
         sim_tgt  = tgt[:, -8:] if tgt.size(1) > 8 else tgt
-        z_sim_traj = self.world_rnn.simulate_sequence(z.detach(), sim_tgt)
+        world_targets = self.world_target_proj(h_tok[:, -sim_tgt.size(1):, :]).detach()
+        teacher_forcing_ratio = self._world_teacher_forcing_ratio() if self.training else 0.0
+        z_sim_traj = self.world_rnn.simulate_sequence(
+            z.detach(), sim_tgt, teacher_forcing_ratio=teacher_forcing_ratio
+        )
         z_sim    = z_sim_traj[:, -1]                                   # (B, d_lat)
 
         # ── Epistemic Gap ─────────────────────────────────────────────────────
@@ -631,7 +674,7 @@ class OMENScale(nn.Module):
             z, E, hot_dims, gap_norm, self.memory, self.world_rnn)
 
         # ── Level 3: ∂-Prolog (через EMC або напряму) ─────────────────────────
-        world_err  = F.mse_loss(z_sim, z.detach()).detach()
+        world_err  = F.mse_loss(z_sim_traj, world_targets).detach()
 
         if self.emc_enabled and self.training:
             # ── EMC: Адаптивний контролер міркування ───────────────────────────
@@ -656,7 +699,7 @@ class OMENScale(nn.Module):
         # OPT-SEM: кешуємо результат, інвалідуємо лише при зміні кількості правил.
         _n_rules_now = len(self.prover)
         if _n_rules_now != self._sem_pairs_n_rules:
-            self._sem_pairs_cache = self.prover.semantic_feedback_pairs(max_pairs=32)
+            self._sem_pairs_cache = []
             self._sem_pairs_n_rules = _n_rules_now
         sem_pairs_raw = self._sem_pairs_cache
         sem_pairs_net: list = []
@@ -670,17 +713,19 @@ class OMENScale(nn.Module):
                     sem_pairs_net.append((i1, i2, score))
 
         # ── VeM Penalty: δ·E[max(0, τ − U(R))] ─────────────────────────────
+        sem_pairs_net = self.prover.semantic_feedback_pairs(max_pairs=64) if self.net_enabled else []
         vem_pen = self.prover.vem_loss(
             z_enr,
             delta=getattr(self.cfg, 'delta_vem', 1e-3)
         )
 
         # ── Об'єднуємо рівні ─────────────────────────────────────────────────
-        z_final = z_enr + 0.1 * z_sym + 0.1 * v_mem                   # (B, d_lat)
+        fusion_gate = self.mem_fusion_gate(torch.cat([z_enr, z_sym, v_mem], dim=-1))
+        z_final = z_enr + 0.1 * z_sym + fusion_gate * v_mem          # (B, d_lat)
 
         # ── M-Core: буферизований запис ───────────────────────────────────────
         conf = (1.0 - gap_norm.clamp(0, 1))
-        self.memory.schedule_write(z.detach(), z_sim.detach(), conf.detach())
+        self.memory.schedule_write(z.detach(), world_targets[:, -1].detach(), conf.detach())
 
         # ══ Рівень 1: Decode  ════════════════════════════════════════════════
         # Ініціалізуємо osf_out заздалегідь — завжди визначена змінна незалежно
@@ -728,12 +773,13 @@ class OMENScale(nn.Module):
         out = self.loss_fn(
             logits, tgt, z_final,
             h_tok, latents,
-            z_sim, v_mem, sym_loss, ltm_pen, cf_loss,
+            z_sim_traj, world_targets, v_mem, sym_loss, ltm_pen, cf_loss,
             self.world_rnn,
             net_loss,
             vem_penalty=vem_pen,
             meta_loss=meta_loss,
             traj_reward=traj_reward,
+            train_step=int(self._train_step.item()),
         )
 
         # ── OSF: додаємо J_OSF до загального лосу ─────────────────────────────
@@ -770,6 +816,7 @@ class OMENScale(nn.Module):
         out["n_writes"]  = self.memory.n_writes
         out["pend_writes"] = len(self.memory._buf_s)
         out["unknown_ex"]= self.curiosity.unknown_flag_count
+        out["teacher_forcing"] = teacher_forcing_ratio
 
         # EMC-специфічна статистика (доступна лише при emc_enabled=True у training)
         if traj_stats is not None:
@@ -838,7 +885,7 @@ class OMENScale(nn.Module):
         else:
             h_tok = self.tok_encoder(prompt)
         _, z  = self.perceiver(h_tok)
-        v_mem = self.memory.read(z)
+        v_mem = self.memory.read(self.mem_query_proj(z))
 
         # Початкове символьне представлення: через EMC (якщо ввімкнено) або прямо
         if self.emc_enabled:
@@ -858,7 +905,8 @@ class OMENScale(nn.Module):
         else:
             z_sym, _ = self.prover(z, torch.tensor(0.0, device=z.device))
 
-        z_final = z + 0.1 * z_sym + 0.1 * v_mem
+        fusion_gate = self.mem_fusion_gate(torch.cat([z, z_sym, v_mem], dim=-1))
+        z_final = z + 0.1 * z_sym + fusion_gate * v_mem
 
         generated = prompt.clone()
         for _ in range(max_new):
@@ -888,14 +936,15 @@ class OMENScale(nn.Module):
                     # ── Класичний шлях: прямий prover ────────────────────────
                     z_sym_step, _ = self.prover(
                         z_ctx, torch.tensor(0.0, device=z_ctx.device))
-                    v_mem_step = self.memory.read(z_ctx)
+                    v_mem_step = self.memory.read(self.mem_query_proj(z_ctx))
 
                 if self.emc_enabled and v_mem_step.norm() > 1e-6:
                     v_mem_use = v_mem_step
                 else:
-                    v_mem_use = self.memory.read(z_ctx)
+                    v_mem_use = self.memory.read(self.mem_query_proj(z_ctx))
 
-                z_final      = z_ctx + 0.1 * z_sym_step + 0.1 * v_mem_use
+                fusion_gate  = self.mem_fusion_gate(torch.cat([z_ctx, z_sym_step, v_mem_use], dim=-1))
+                z_final      = z_ctx + 0.1 * z_sym_step + fusion_gate * v_mem_use
                 h_for_decode = h_ctx
             else:
                 if self.net_enabled:
@@ -1162,7 +1211,7 @@ def run_tests_scale(cfg: OMENScaleConfig) -> None:
     assert 51 in derived_preds, f"FAIL: правило не застосувалось, derived={derived_preds}"
 
     z_abd = torch.randn(1, cfg.d_latent, device=DEVICE)
-    n_add  = prover.abduce_and_learn(z_abd, error=2.0)
+    n_add, _, _, _ = prover.abduce_and_learn(z_abd, error=2.0, force=True)
     print(f"  Abduce додав: {n_add} правил  [PASS]")
 
     sep("TEST S5 · L_scale penalty — MDL ефект")

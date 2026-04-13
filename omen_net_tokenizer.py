@@ -83,33 +83,21 @@ class ByteContextEncoder(nn.Module):
         super().__init__()
         assert d_tok % n_heads == 0, f"d_tok={d_tok} не ділиться на n_heads={n_heads}"
 
-        # Режим: справжні байти (256) або legacy-токени
-        self.is_byte_mode  = (vocab_size <= 256)
-        self.byte_vocab    = 256 if self.is_byte_mode else vocab_size
-        self.segment_pool  = segment_pool and self.is_byte_mode
+        # Byte-mode є безумовним: NET завжди працює на UTF-8 байтах [0..255].
+        self.byte_vocab    = 256
+        self.segment_pool  = segment_pool
         self.d_tok         = d_tok
 
         self.embed = nn.Embedding(self.byte_vocab, d_tok)
         nn.init.normal_(self.embed.weight, std=d_tok ** -0.5)
-
-        if self.is_byte_mode:
-            # Двонапрямна увага: для байтового кодування важливий правий контекст
-            # Реалізуємо через окремий список LlamaAttention + RMSNorm + FFN
-            self.attn_norms = nn.ModuleList([RMSNorm(d_tok) for _ in range(n_layers)])
-            self.attns = nn.ModuleList([
-                LlamaAttention(d_tok, n_heads, dropout=dropout, causal=False)
-                for _ in range(n_layers)
-            ])
-            self.ffn_norms = nn.ModuleList([RMSNorm(d_tok) for _ in range(n_layers)])
-            self.ffns = nn.ModuleList([SwiGLUFFN(d_tok, dropout=dropout) for _ in range(n_layers)])
-            self.blocks = nn.ModuleList()   # порожній, для уніфікації
-        else:
-            # Legacy: авторегресивна causal увага (сумісність із тестами)
-            self.blocks = nn.ModuleList([
-                LlamaDecoderBlock(d_tok, n_heads, dropout)
-                for _ in range(n_layers)
-            ])
-            self.attn_norms = self.ffn_norms = self.attns = self.ffns = nn.ModuleList()
+        self.attn_norms = nn.ModuleList([RMSNorm(d_tok) for _ in range(n_layers)])
+        self.attns = nn.ModuleList([
+            LlamaAttention(d_tok, n_heads, dropout=dropout, causal=False)
+            for _ in range(n_layers)
+        ])
+        self.ffn_norms = nn.ModuleList([RMSNorm(d_tok) for _ in range(n_layers)])
+        self.ffns = nn.ModuleList([SwiGLUFFN(d_tok, dropout=dropout) for _ in range(n_layers)])
+        self.blocks = nn.ModuleList()
 
         self.norm = RMSNorm(d_tok)
         self.drop = nn.Dropout(dropout)
@@ -134,20 +122,13 @@ class ByteContextEncoder(nn.Module):
         """
         B, T = tokens.shape
 
-        if self.is_byte_mode:
-            # Клампуємо на випадок out-of-range (legacy compat)
-            tokens = tokens.clamp(0, 255)
+        tokens = tokens.clamp(0, 255)
 
         x = self.drop(self.embed(tokens))              # (B, T, d_tok)
-
-        if self.is_byte_mode:
-            for norm_a, attn, norm_f, ffn in zip(
-                    self.attn_norms, self.attns, self.ffn_norms, self.ffns):
-                x = x + attn(norm_a(x))
-                x = x + ffn(norm_f(x))
-        else:
-            for blk in self.blocks:
-                x = blk(x)
+        for norm_a, attn, norm_f, ffn in zip(
+                self.attn_norms, self.attns, self.ffn_norms, self.ffns):
+            x = x + attn(norm_a(x))
+            x = x + ffn(norm_f(x))
         x = self.norm(x)
 
         if self.segment_pool:
@@ -309,6 +290,7 @@ class EpistemicQuantizer(nn.Module):
         self._ema_freeze_steps: int = 20
         self.register_buffer("_restart_step",
                              torch.full((max_vocab,), -1000, dtype=torch.long))
+        self.gumbel_tau: float = 0.7
 
         # OPT-RST: _restart_dead_codes_ema містить дорогу gram-матрицю (64×64) і
         # codebook similarity (B*T × V) — разом ~970 MFLOPs на strong config.
@@ -445,11 +427,16 @@ class EpistemicQuantizer(nn.Module):
                     max_sims, indices = sims.max(dim=-1)
 
         # ── 3. Квантовані вектори ──────────────────────────────────────────────
-        z_q_flat = self.codebook(indices)                           # (B*T, d)
-        z_q      = z_q_flat.reshape(B, T, D)
+        v_cur = self.current_size.item()
+        active_codebook = self.codebook.weight[:v_cur]
+        hard_assign = F.one_hot(indices, num_classes=v_cur).to(x_flat.dtype)
+        soft_assign = F.gumbel_softmax(sims, tau=self.gumbel_tau, hard=False, dim=-1)
+        assign_st   = hard_assign + soft_assign - soft_assign.detach()
+        z_q_flat    = assign_st @ active_codebook
+        z_q         = z_q_flat.reshape(B, T, D)
 
         # ── 4. STE: градієнт через f_θ ────────────────────────────────────────
-        z_q_ste = x + (z_q - x).detach()                           # STE trick
+        z_q_ste = x + (z_q - x).detach() + (z_q - z_q.detach())
 
         # ── 5. EMA оновлення кодбуку ───────────────────────────────────────────
         # ВАЖЛИВО: при EMA-оновленні кодбуку (без градієнта) НЕ додаємо
@@ -481,8 +468,9 @@ class EpistemicQuantizer(nn.Module):
                     self._restart_dead_codes_ema(x_flat.detach())
             # Commitment loss: тягне encoder до найближчого кодбук-вектора
             # L_commit = β · ||z_e - sg(e)||²
-            commit = F.mse_loss(x_flat, z_q_flat.detach())
-            vq_loss = commit * self.beta_commit
+            commit      = F.mse_loss(x_flat, z_q_flat.detach())
+            codebook_lr = F.mse_loss(z_q_flat, x_flat.detach())
+            vq_loss     = self.beta_commit * commit + 0.25 * codebook_lr
 
         # ── 7. Usage entropy (оцінка якості використання словника) ───────────
         usage_entropy = self._usage_entropy(indices, B * T)
@@ -517,7 +505,7 @@ class EpistemicQuantizer(nn.Module):
             if V_cur >= 2:
                 # cb_norm вже обчислено (з кешем), але детачимо кодбук:
                 # EMA кодбук не має навчатись через SGD (конфліктні сигнали)
-                cb_for_soft = cb_norm.detach()              # (V_cur, d) — немає градієнту
+                cb_for_soft = F.normalize(active_codebook, dim=-1)
                 soft_tau_temp = 0.5                         # температура soft-quantizer
                 # OPT-SOFT: subsample x_norm до _SOFT_N позицій замість усіх B*T.
                 # Для B=8, T=512: B*T=4096 → _SOFT_N=256 → 16× менше MACs у matmul.
@@ -540,8 +528,13 @@ class EpistemicQuantizer(nn.Module):
                 avg_usage   = soft_assign.mean(dim=0)       # (V_cur,) — очікуване використання
                 H_soft      = -(avg_usage * (avg_usage + 1e-8).log()).sum()  # диференційована H
                 H_soft_max  = math.log(max(V_cur, 2))
-                # max(0, 1 - H/H_max): 0 при collapse (H≈H_max), >0 при poor usage
-                soft_entropy_loss = (1.0 - H_soft / (H_soft_max + 1e-8)).clamp(min=0.0)
+                entropy_pen = (1.0 - H_soft / (H_soft_max + 1e-8)).clamp(min=0.0)
+                diversity_pen = torch.zeros(1, device=x.device).squeeze()
+                if V_cur > 1:
+                    cb_pair = cb_for_soft @ cb_for_soft.t()
+                    off_diag = ~torch.eye(V_cur, dtype=torch.bool, device=cb_pair.device)
+                    diversity_pen = cb_pair[off_diag].pow(2).mean()
+                soft_entropy_loss = entropy_pen + 0.1 * diversity_pen
 
         # ── 9. Adaptive τ scheduling (після warmup) ────────────────────────────
         # τ знижується коли H/H_max < 0.55 (мало активних кодів)
@@ -868,26 +861,7 @@ class EpistemicQuantizer(nn.Module):
         if self.kb is None:
             return
         try:
-            from omen_prolog import HornAtom, HornClause, Const
-
-            NET_TOKEN_PRED = 100
-            NET_RULE_PRED  = 101
-
-            # Крок 1: базовий факт
-            fact = HornAtom(pred=NET_TOKEN_PRED, args=(Const(token_idx),))
-            self.kb.add_fact(fact)
-
-            # Крок 2: Horn-правило через контекст
-            if context_indices and len(context_indices) >= 2:
-                ctx_a, ctx_b = int(context_indices[0]), int(context_indices[1])
-                head = HornAtom(pred=NET_RULE_PRED,
-                                args=(Const(token_idx), Const(ctx_a)))
-                body = (
-                    HornAtom(pred=NET_TOKEN_PRED, args=(Const(ctx_a),)),
-                    HornAtom(pred=NET_TOKEN_PRED, args=(Const(ctx_b),)),
-                )
-                self.kb.add_rule(HornClause(head=head, body=body))
-
+            self.kb.add_concept_fact(token_idx, context_indices=context_indices)
         except Exception:
             pass
 
@@ -1286,7 +1260,7 @@ class NeuralEpistemicTokenizer(nn.Module):
         # ВАЖЛИВО: НЕ робимо min(vocab_size, 256) — це призводить до
         # примусового byte-mode і clamp(0,255) для токенів > 255,
         # що колапсує 94% токенів в одну позицію і вбиває кодбук.
-        byte_vocab = cfg.vocab_size  # ByteContextEncoder сам визначає режим
+        byte_vocab = 256
 
         # ── f_θ: ByteContextEncoder ───────────────────────────────────────────
         self.byte_encoder = ByteContextEncoder(

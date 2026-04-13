@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 @dataclass
 class OMENScaleConfig:
     # ─── Рівень 1: Token-level (Fine) ─────────────────────────────────────────
-    vocab_size:      int   = 50_257   # GPT-2 BPE  (≥50k)
+    vocab_size:      int   = 256      # NET працює на сирих байтах UTF-8 [0..255]
     d_tok:           int   = 1_024    # Розмірність токен-рівня  (≥1024)
     n_heads_tok:     int   = 16       # Головки уваги токен-рівня
     n_layers_tok:    int   = 12       # Шарів трансформера токен-рівня
@@ -31,6 +31,9 @@ class OMENScaleConfig:
 
     # ─── WorldRNN (концепт-рівень) ─────────────────────────────────────────────
     world_rnn_hidden: int  = 512
+    world_teacher_forcing_start: float = 0.35
+    world_teacher_forcing_end:   float = 0.05
+    world_teacher_forcing_steps: int   = 2_000
 
     # ─── M-Core (async updates) ───────────────────────────────────────────────
     mem_heads:        int   = 16
@@ -143,6 +146,7 @@ class OMENScaleConfig:
     emc_c_fc:          float = 0.05    # вартість дії ForwardChainStep
     emc_c_abduce:      float = 0.10    # вартість дії Abduce
     omega_meta:        float = 0.05    # ω_meta: вага meta_loss у загальному J
+    loss_aux_warmup:   int   = 500     # розігрів auxiliary loss-ів, щоб CE не домінував вічно
 
     # ─── EMC розширення: GAE + MDL(proof) + History ───────────────────────────
     # GAE (Generalized Advantage Estimation):

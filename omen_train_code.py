@@ -43,7 +43,7 @@ import random
 import time
 from collections import defaultdict, deque
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -53,7 +53,7 @@ from torch.optim.lr_scheduler import (
     LinearLR,
     SequentialLR,
 )
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 import contextlib
 import pickle
@@ -108,7 +108,55 @@ class StackedDataset(Dataset):
         return self.src[i], self.tgt[i]
 
 
-def build_loader(dataset_obj: StackedDataset,
+class StreamingTextDataset(Dataset):
+    """
+    File-backed UTF-8 byte dataset.
+
+    Не тримає весь корпус у RAM: кожен __getitem__ дочитує лише потрібне вікно
+    байтів з диска. Це не IterableDataset у вузькому сенсі, але для тренування
+    вирішує головну проблему: корпус масштабується без повного preload.
+    """
+    def __init__(self, path: Union[str, Path], seq_len: int, max_samples: int = 50_000):
+        self.path = Path(path)
+        self.seq_len = int(seq_len)
+        self.stride = max(1, self.seq_len // 2)
+        file_size = self.path.stat().st_size
+        usable = max(0, file_size - self.seq_len - 1)
+        n_samples = 0 if usable <= 0 else (usable // self.stride) + 1
+        self.n_samples = min(int(max_samples), int(n_samples))
+        self.file_size = int(file_size)
+        print(f"  [StreamingTextDataset] {self.path}: {self.n_samples:,} samples x {self.seq_len} bytes "
+              f"(file={self.file_size/1e6:.1f} MB, stride={self.stride})")
+
+    def __len__(self) -> int:
+        return self.n_samples
+
+    def __getitem__(self, i: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        if i < 0 or i >= self.n_samples:
+            raise IndexError(i)
+        start = i * self.stride
+        with self.path.open("rb") as fh:
+            fh.seek(start)
+            chunk = fh.read(self.seq_len + 1)
+        if len(chunk) < self.seq_len + 1:
+            raise IndexError(i)
+        src = torch.tensor(list(chunk[:-1]), dtype=torch.long)
+        tgt = torch.tensor(list(chunk[1:]), dtype=torch.long)
+        return src, tgt
+
+
+def sample_examples(dataset: Union[Sequence, Dataset],
+                    n_samples: int) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    """Вибирає кілька прикладів з list/Subset/file-backed Dataset без preload."""
+    total = len(dataset)
+    if total == 0:
+        return []
+    take = min(n_samples, total)
+    indices = random.sample(range(total), take)
+    return [dataset[i] for i in indices]
+
+
+def build_loader(dataset_obj: Dataset,
                  batch_size: int,
                  num_workers: int = 0,
                  shuffle: bool = True) -> DataLoader:
@@ -132,28 +180,14 @@ def build_loader(dataset_obj: StackedDataset,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_text_corpus(path: str, seq_len: int,
-                     max_samples: int = 50_000) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+                     max_samples: int = 50_000) -> StreamingTextDataset:
     """
     Завантажує реальний текст як байтові послідовності.
 
     UTF-8 текст → int байти [0..255] → (src, tgt) пари.
     Stride = seq_len//2 для 50% overlap між сусідніми прикладами.
     """
-    text = Path(path).read_bytes()
-    samples: List[Tuple[torch.Tensor, torch.Tensor]] = []
-    stride = seq_len // 2
-
-    for start in range(0, len(text) - seq_len - 1, stride):
-        chunk = list(text[start: start + seq_len + 1])
-        src   = torch.tensor(chunk[:-1], dtype=torch.long)
-        tgt   = torch.tensor(chunk[1:],  dtype=torch.long)
-        samples.append((src, tgt))
-        if len(samples) >= max_samples:
-            break
-
-    random.shuffle(samples)
-    print(f"  [Dataset] {path}: {len(samples):,} samples x {seq_len} bytes")
-    return samples
+    return StreamingTextDataset(path, seq_len=seq_len, max_samples=max_samples)
 
 
 def make_synthetic_dataset(cfg: OMENScaleConfig,
@@ -171,7 +205,7 @@ def make_synthetic_dataset(cfg: OMENScaleConfig,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def pretrain_net(model: OMENScale,
-                 dataset: List[Tuple[torch.Tensor, torch.Tensor]],
+                 dataset: Union[Sequence[Tuple[torch.Tensor, torch.Tensor]], Dataset],
                  n_steps: int = 500,
                  batch_size: int = 8,
                  lr: float = 3e-4,
@@ -204,7 +238,7 @@ def pretrain_net(model: OMENScale,
     t0 = time.perf_counter()
 
     for step in range(1, n_steps + 1):
-        batch    = random.sample(dataset, min(batch_size, len(dataset)))
+        batch    = sample_examples(dataset, batch_size)
         src, tgt = collate(batch)
         src, tgt = src.to(DEVICE), tgt.to(DEVICE)
 
@@ -264,7 +298,7 @@ def pretrain_net(model: OMENScale,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def joint_train(model: OMENScale,
-                dataset: List[Tuple[torch.Tensor, torch.Tensor]],
+                dataset: Union[Sequence[Tuple[torch.Tensor, torch.Tensor]], Dataset],
                 n_epochs: int = 10,
                 batch_size: int = 8,
                 lr: float = 1e-4,
@@ -303,8 +337,8 @@ def joint_train(model: OMENScale,
     print("═" * 68)
 
     # ── StackedDataset + DataLoader ───────────────────────────────────────────
-    stacked = StackedDataset(dataset)
-    loader  = build_loader(stacked, batch_size, num_workers=num_workers, shuffle=True)
+    dataset_obj = dataset if isinstance(dataset, Dataset) else StackedDataset(dataset)
+    loader  = build_loader(dataset_obj, batch_size, num_workers=num_workers, shuffle=True)
 
     # Обчислюємо ефективний ліміт батчів
     n_total_batches = len(loader)
@@ -676,14 +710,15 @@ def _save_ckpt(model, optimizer, epoch, metrics, save_dir):
 
 @torch.no_grad()
 def net_diagnostics(model: OMENScale,
-                    dataset: List[Tuple[torch.Tensor, torch.Tensor]],
+                    dataset: Union[Sequence[Tuple[torch.Tensor, torch.Tensor]], Dataset],
                     n_samples: int = 32) -> None:
     if not model.net_enabled:
         return
     model.eval()
     q   = model.net.quantizer
     V   = q.current_size.item()
-    src, _ = collate(random.sample(dataset, min(n_samples, len(dataset))))
+    batch = sample_examples(dataset, n_samples)
+    src, _ = collate(batch)
     _, idx, info = model.net.encode(src.to(DEVICE))
 
     counts = torch.bincount(idx.view(-1).clamp(0, V - 1), minlength=V).float()
@@ -807,8 +842,11 @@ def main():
     else:
         dataset = make_synthetic_dataset(cfg, n=512)
 
-    split    = int(0.9 * len(dataset))
-    train_ds = dataset[:split]
+    split = int(0.9 * len(dataset))
+    if isinstance(dataset, Dataset):
+        train_ds = Subset(dataset, range(split))
+    else:
+        train_ds = dataset[:split]
 
     model = OMENScale(cfg).to(DEVICE)
     _resume_opt_state = None

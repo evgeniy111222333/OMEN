@@ -1402,12 +1402,80 @@ class TensorKnowledgeBase:
                 break
         return pairs
 
+    def get_token_pairs_for_semantic_feedback(
+            self, max_pairs: int = 32
+    ) -> List[Tuple[int, int, float]]:
+        NET_CONTEXT_PRED = 101
+        NET_MEANS_PRED = 102
+
+        def _const_int(term) -> Optional[int]:
+            if isinstance(term, Const):
+                return int(term.val)
+            if isinstance(term, int):
+                return int(term)
+            return None
+
+        ctx_to_tokens: Dict[int, Set[int]] = {}
+        for fact in self.facts:
+            if fact.pred != NET_CONTEXT_PRED or len(fact.args) < 2:
+                continue
+            tok = _const_int(fact.args[0])
+            ctx = _const_int(fact.args[1])
+            if tok is None or ctx is None:
+                continue
+            ctx_to_tokens.setdefault(ctx, set()).add(tok)
+
+        scores: Dict[Tuple[int, int], float] = {}
+        for tokens in ctx_to_tokens.values():
+            ordered = sorted(tokens)
+            for i in range(len(ordered)):
+                for j in range(i + 1, len(ordered)):
+                    scores[(ordered[i], ordered[j])] = max(
+                        scores.get((ordered[i], ordered[j]), 0.0), 1.0
+                    )
+
+        for rule in self.rules:
+            if rule.head.pred != NET_MEANS_PRED or len(rule.head.args) < 2:
+                continue
+            tok = _const_int(rule.head.args[0])
+            concept = _const_int(rule.head.args[1])
+            if tok is None or concept is None:
+                continue
+            for other in ctx_to_tokens.get(concept, set()):
+                if other == tok:
+                    continue
+                key = tuple(sorted((tok, other)))
+                scores[key] = max(scores.get(key, 0.0), 0.85)
+
+        items = [(a, b, s) for (a, b), s in scores.items()]
+        items.sort(key=lambda x: x[2], reverse=True)
+        return items[:max_pairs]
+
     def add_concept_fact(self, token_idx: int,
                          context_indices: Optional[List[int]] = None) -> None:
         """Сумісність з NET: реєструємо NET токен як факт."""
         NET_TOKEN_PRED = 100
+        NET_CONTEXT_PRED = 101
+        NET_MEANS_PRED = 102
         fact = HornAtom(pred=NET_TOKEN_PRED, args=(Const(token_idx),))
         self.add_fact(fact)
+        ctx = [int(c) for c in (context_indices or []) if int(c) != int(token_idx)]
+        ctx = list(dict.fromkeys(ctx))
+        for ctx_idx in ctx:
+            self.add_fact(HornAtom(pred=NET_CONTEXT_PRED,
+                                   args=(Const(token_idx), Const(ctx_idx))))
+        if len(ctx) >= 2:
+            self.add_rule(
+                HornClause(
+                    head=HornAtom(pred=NET_MEANS_PRED,
+                                  args=(Const(token_idx), Const(ctx[0]))),
+                    body=(
+                        HornAtom(pred=NET_CONTEXT_PRED, args=(Const(token_idx), Const(ctx[0]))),
+                        HornAtom(pred=NET_CONTEXT_PRED, args=(Const(token_idx), Const(ctx[1]))),
+                    ),
+                ),
+                status=EpistemicStatus.proposed,
+            )
 
     @property
     def n_proposed(self) -> int:
@@ -1991,6 +2059,10 @@ class NeuralAbductionHead(nn.Module):
         self.slots = n_slots_total
 
     def forward(self, z: torch.Tensor) -> List[HornClause]:
+        clauses, _ = self.sample_candidates(z)
+        return clauses
+
+    def sample_candidates(self, z: torch.Tensor) -> Tuple[List[HornClause], torch.Tensor]:
         """
         z: (1, d_latent)
         Returns: список HornClause-кандидатів зі ЗМІННИМИ у args.
@@ -2014,11 +2086,16 @@ class NeuralAbductionHead(nn.Module):
         all_vars = [Var(f"X{i}") for i in range(self.max_arity + 1)]
 
         clauses = []
+        log_probs: List[torch.Tensor] = []
         for cand_i in range(self.n_cands):
-            indices = [
-                F.gumbel_softmax(logits[i], tau=0.7, hard=True).argmax().item()
-                for i in range(self.slots)
-            ]
+            indices: List[int] = []
+            lp_sum = torch.zeros(1, device=z.device).squeeze()
+            for i in range(self.slots):
+                noisy_logits = logits[i] + torch.randn_like(logits[i]) * 0.05
+                dist = Categorical(logits=noisy_logits / 0.7)
+                idx = dist.sample()
+                indices.append(int(idx.item()))
+                lp_sum = lp_sum + dist.log_prob(idx)
             head_pred = indices[0]
             body_pred = indices[1 + self.max_arity]
 
@@ -2045,8 +2122,9 @@ class NeuralAbductionHead(nn.Module):
 
             clause = HornClause(head=head, body=(body_atom,))
             clauses.append(clause)
+            log_probs.append(lp_sum)
 
-        return clauses
+        return clauses, torch.stack(log_probs) if log_probs else torch.zeros(0, device=z.device)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2233,7 +2311,12 @@ class DifferentiableProver(nn.Module):
         return proved, trajectory, proof_loss
 
     # ── Abduce and Learn (повільний цикл) з VeM фільтрацією ──────────────────
-    def abduce_and_learn(self, z: torch.Tensor, error: float) -> Tuple[int, torch.Tensor]:
+    def abduce_and_learn(
+        self,
+        z: torch.Tensor,
+        error: float,
+        force: bool = False,
+    ) -> Tuple[int, torch.Tensor, torch.Tensor, float]:
         """
         Якщо error > threshold — генеруємо нові правила через абдукцію.
         VeM фільтрує кандидатів до додавання в LTM.
@@ -2241,14 +2324,20 @@ class DifferentiableProver(nn.Module):
         Returns: (кількість доданих правил, hinge_loss для VeM)
         """
         device = z.device
-        if error < 0.5:
-            return 0, torch.zeros(1, device=device).squeeze()
+        if (error < 0.5) and not force:
+            zero = torch.zeros(1, device=device).squeeze()
+            return 0, zero, zero, 0.0
 
         # Генеруємо кандидатів через AbductionHead
-        raw_candidates  = self.abductor(z[:1])
+        raw_candidates, log_probs = self.abductor.sample_candidates(z[:1])
+        utilities = self.vem.score_batch(raw_candidates, device) if raw_candidates else torch.zeros(0, device=device)
 
         # VeM фільтрація: тримаємо лише U(R) > vem_tau
         accepted, hinge_loss = self.vem.filter_candidates(raw_candidates, device)
+        if log_probs.numel() == utilities.numel() and log_probs.numel() > 0:
+            abductor_loss = -((utilities.detach() - self.vem_tau) * log_probs).mean()
+        else:
+            abductor_loss = torch.zeros(1, device=device).squeeze()
 
         # Додаємо прийнятих кандидатів з епістемічним статусом proposed
         added = 0
@@ -2262,7 +2351,8 @@ class DifferentiableProver(nn.Module):
             # Поки target невідомий → 0.5 (нейтральний prior)
             self.vem.record_outcome(c, utility_target=0.5, device=device)
 
-        return added, hinge_loss
+        mean_utility = float(utilities.mean().item()) if utilities.numel() > 0 else 0.0
+        return added, hinge_loss, abductor_loss, mean_utility
 
     # ── Forward (інтеграція у тренувальний цикл) ──────────────────────────────
     def forward(self,
@@ -2306,6 +2396,7 @@ class DifferentiableProver(nn.Module):
 
         # 4. Proof search (тільки під час навчання)
         vem_hinge = torch.zeros(1, device=device).squeeze()
+        abductor_aux = torch.zeros(1, device=device).squeeze()
         if self.training and len(self.kb.rules) > 0:
             proved, traj, proof_loss = self.prove_with_policy(goal, z[:1])
 
@@ -2347,7 +2438,7 @@ class DifferentiableProver(nn.Module):
         if self._step % 5 == 0:
             err_val = (world_error.item()
                        if torch.is_tensor(world_error) else float(world_error))
-            _, vem_hinge = self.abduce_and_learn(z, err_val)
+            _, vem_hinge, abductor_aux, _ = self.abduce_and_learn(z, err_val)
 
         # 6. VeM self-supervised loss (раз на 10 кроків)
         vem_self_loss = torch.zeros(1, device=device).squeeze()
@@ -2360,6 +2451,7 @@ class DifferentiableProver(nn.Module):
         sym_loss    = (sym_consist
                        + 0.1  * proof_loss
                        + 0.01 * vem_hinge
+                       + 0.05 * abductor_aux
                        + 0.01 * vem_self_loss)
 
         return z_sym, sym_loss
@@ -2387,17 +2479,19 @@ class DifferentiableProver(nn.Module):
         device = z.device
         if not self.training:
             return torch.zeros(1, device=device).squeeze()
-        raw_candidates  = self.abductor(z[:1])
+        raw_candidates, log_probs = self.abductor.sample_candidates(z[:1])
         if not raw_candidates:
             return torch.zeros(1, device=device).squeeze()
+        utilities = self.vem.score_batch(raw_candidates, device)
         _, hinge = self.vem.filter_candidates(raw_candidates, device)
-        return delta * hinge
+        rl = -((utilities.detach() - self.vem_tau) * log_probs).mean()
+        return delta * (hinge + rl)
 
     def semantic_feedback_pairs(
             self, max_pairs: int = 32
-    ) -> List[Tuple["HornClause", "HornClause", float]]:
-        """Делегує до KB: повертає пари правил для L_semantic в NET."""
-        return self.kb.get_rule_pairs_for_semantic_feedback(max_pairs)
+    ) -> List[Tuple[int, int, float]]:
+        """Повертає пари NET-токенів, пов'язаних через факти/абдукцію в KB."""
+        return self.kb.get_token_pairs_for_semantic_feedback(max_pairs)
 
     def __len__(self): return len(self.kb)
 
@@ -2659,7 +2753,7 @@ def _run_prolog_tests() -> None:
     # ══ T10: Абдукція ═════════════════════════════════════════════════════════
     sep("T10 · abduce_and_learn")
     n_before = len(prover.kb)
-    added    = prover.abduce_and_learn(z_in, error=2.0)
+    added, _, _, _ = prover.abduce_and_learn(z_in, error=2.0, force=True)
     n_after  = len(prover.kb)
     print(f"  rules before={n_before}  added={added}  after={n_after}  [PASS]")
 

@@ -250,7 +250,7 @@ class EMCStateEncoder(nn.Module):
         Returns     : (B, d_latent) — стан для Actor/Critic
         """
         B = z.shape[0]
-        z_enc = self.z_proj(z.detach())  # детач: EMC не тягне gradient через z
+        z_enc = self.z_proj(z)
 
         def _as_col(t: torch.Tensor) -> torch.Tensor:
             """() або (B,) → (B, 1)"""
@@ -672,8 +672,9 @@ class EfficientMetaController(nn.Module):
 
             elif a == ACTION_ABDUCE:
                 err_val = world_err.item() if torch.is_tensor(world_err) else float(world_err)
-                n_added, _ = prover.abduce_and_learn(z_cur, err_val)
-                r_int   = float(n_added) / max(getattr(self.cfg, 'n_proof_cands', 8), 1)
+                n_added, _, _, mean_utility = prover.abduce_and_learn(z_cur, err_val, force=True)
+                r_int   = max(float(n_added) / max(getattr(self.cfg, 'n_proof_cands', 8), 1),
+                              mean_utility)
                 # Абдукція може суттєво зменшити GapNorm
                 if n_added > 0:
                     gap_norm_cur = (gap_norm_cur * 0.85).clamp(0.0, 5.0)
@@ -746,9 +747,12 @@ class EfficientMetaController(nn.Module):
         if self.training and prover._step % 10 == 0:
             vem_self_loss = prover.vem.self_supervised_loss(device)
 
+        abductor_aux = torch.zeros(1, device=device).squeeze()
         if prover._step % 5 == 0:
             err_val = (world_err.item() if torch.is_tensor(world_err) else float(world_err))
-            _, vem_hinge = prover.abduce_and_learn(z_cur, err_val)
+            _, vem_hinge, abductor_aux, _ = prover.abduce_and_learn(
+                z_cur, err_val, force=True
+            )
 
         # ── 5. Symbolic Consistency Loss ──────────────────────────────────────
         sym_consist = (F.mse_loss(z, z_sym.detach()) +
@@ -756,6 +760,7 @@ class EfficientMetaController(nn.Module):
         sym_loss = (sym_consist
                     + 0.1  * proof_loss
                     + 0.01 * vem_hinge
+                    + 0.05 * abductor_aux
                     + 0.01 * vem_self_loss)
 
         # ── 6. Фінальна нагорода за задачу + оновлення траєкторії ─────────────
@@ -896,8 +901,13 @@ class EfficientMetaController(nn.Module):
                     gap_norm_cur = (gap_norm_cur * 0.95).clamp(0.0, 5.0)
 
             elif a == ACTION_ABDUCE:
-                n_added, _ = prover.abduce_and_learn(z_cur, 0.5)
-                r_int = float(n_added) / max(getattr(self.cfg, 'n_proof_cands', 8), 1)
+                n_added, _, _, mean_utility = prover.abduce_and_learn(
+                    z_cur, 0.5, force=True
+                )
+                r_int = max(
+                    float(n_added) / max(getattr(self.cfg, 'n_proof_cands', 8), 1),
+                    mean_utility,
+                )
                 if n_added > 0:
                     gap_norm_cur = (gap_norm_cur * 0.85).clamp(0.0, 5.0)
 

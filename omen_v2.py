@@ -192,7 +192,7 @@ class WorldRNN(nn.Module):
         h2 = self.gru(torch.cat([z, a], -1), h)
         return self.out(h2), h2
 
-    def simulate_sequence(self, z0, actions):
+    def simulate_sequence(self, z0, actions, teacher_forcing_ratio: float = 0.0):
         """
         OPT-2: Pre-embed всі дії одним викликом до входу в цикл.
         Embedding lookup виноситься за межі for-loop:
@@ -212,11 +212,17 @@ class WorldRNN(nn.Module):
         a_all  = self.act_emb(actions)                     # (B, T, d_latent) — один виклик
         h      = self.h0.expand(B, -1).contiguous()
         traj   = []
+        z_prev = z0
         for t in range(T):
             # FIXED: завжди z0 (а не traj[-1]) — GRU h несе динаміку,
             # z0 — стабільний anchor. Усуває 17x дрейф world loss.
-            h = self.gru(torch.cat([z0, a_all[:, t]], -1), h)
-            traj.append(self.out(h))
+            z_in = z_prev
+            if t > 0 and teacher_forcing_ratio > 0.0 and self.training:
+                use_teacher = (torch.rand(B, 1, device=z0.device) < teacher_forcing_ratio).to(z0.dtype)
+                z_in = use_teacher * z0 + (1.0 - use_teacher) * z_prev
+            h = self.gru(torch.cat([z_in, a_all[:, t]], -1), h)
+            z_prev = self.out(h)
+            traj.append(z_prev)
         return torch.stack(traj, dim=1)                    # (B, T, d_latent)
 
 
@@ -313,7 +319,7 @@ class TensorProductMemory(nn.Module):
         # Outer product: (B', H, d, d)
         delta = torch.einsum('bhd,bhe,b->hde', k, v, lam_m)
         new_mem = self.memory + delta / (mask.sum().float() + 1e-6)
-        self.memory.copy_(new_mem)
+        self.memory.data.copy_(new_mem)
 
         # Додаємо в LRU-кеш для episodic recall
         for i in range(z_s.size(0)):
