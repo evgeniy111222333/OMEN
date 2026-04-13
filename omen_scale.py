@@ -144,9 +144,15 @@ class AsyncTensorProductMemory(nn.Module):
         if not self._buf_s:
             return
         dev = self.memory.device
-        z_s = torch.cat(self._buf_s, 0).to(dev)
-        z_v = torch.cat(self._buf_v, 0).to(dev)
-        lam = torch.cat(self._buf_c, 0).to(dev)
+        # FIX-AMP: schedule_write() зберігає тензори у dtype forward-пасу.
+        # Під torch.autocast(fp16) вони стають FP16, але key_proj / val_proj
+        # є nn.Linear поза autocast → weights FP32 → «Half != float» RuntimeError.
+        # Рішення: кастуємо до dtype вагів (FP32 або BF16 при BF16 training).
+        # `.to(device, dtype=)` — один kernel-call замість двох окремих викликів.
+        w_dtype = self.key_proj.weight.dtype
+        z_s = torch.cat(self._buf_s, 0).to(dev, dtype=w_dtype)
+        z_v = torch.cat(self._buf_v, 0).to(dev, dtype=w_dtype)
+        lam = torch.cat(self._buf_c, 0).to(dev, dtype=w_dtype)
         lam = (1.0 - lam).clamp(0, 1)
         mask = lam > self.write_tau
         if mask.any():
@@ -175,8 +181,12 @@ class AsyncTensorProductMemory(nn.Module):
     def episodic_recall(self, z_query: torch.Tensor, k: int = 4) -> torch.Tensor:
         if len(self.cache) == 0:
             return torch.zeros_like(z_query)
-        cache_keys = torch.stack([c[0] for c in self.cache], 0).to(z_query.device)
-        cache_vals = torch.stack([c[1] for c in self.cache], 0).to(z_query.device)
+        # FIX-AMP: кеш зберігається через flush() (вже FP32 після виправлення),
+        # але z_query під autocast може бути FP16.  Кастуємо кеш до dtype запиту.
+        cache_keys = torch.stack([c[0] for c in self.cache], 0).to(
+            z_query.device, dtype=z_query.dtype)
+        cache_vals = torch.stack([c[1] for c in self.cache], 0).to(
+            z_query.device, dtype=z_query.dtype)
         sims = F.cosine_similarity(
             z_query.unsqueeze(1), cache_keys.unsqueeze(0), dim=-1)
         topk = sims.topk(min(k, len(self.cache)), dim=1).indices
@@ -482,6 +492,13 @@ class OMENScale(nn.Module):
             self.tok_encoder = torch.compile(self.tok_encoder)
             self.tok_decoder = torch.compile(self.tok_decoder)
 
+        # ─── OPT-SEM: кеш semantic_feedback_pairs ─────────────────────────────
+        # semantic_feedback_pairs() — O(n_rules) Python-цикл, кликається кожен батч.
+        # Пари правил змінюються лише при додаванні/видаленні правил у KB.
+        # Кешуємо результат; інвалідуємо тільки при зміні кількості правил.
+        self._sem_pairs_cache: list = []
+        self._sem_pairs_n_rules: int = -1
+
 
     # ── Forward ──────────────────────────────────────────────────────────────
     def forward(self, src: torch.Tensor,
@@ -533,7 +550,12 @@ class OMENScale(nn.Module):
         # ── Semantic Feedback Pairs для NET (I(Z;Γ) апроксимація) ────────────
         # S-Core виявляє логічно пов'язані токени → NET наближає їх вектори.
         # Перетворюємо HornClause-пари на (token_idx_1, token_idx_2, score).
-        sem_pairs_raw = self.prover.semantic_feedback_pairs(max_pairs=32)
+        # OPT-SEM: кешуємо результат, інвалідуємо лише при зміні кількості правил.
+        _n_rules_now = len(self.prover)
+        if _n_rules_now != self._sem_pairs_n_rules:
+            self._sem_pairs_cache = self.prover.semantic_feedback_pairs(max_pairs=32)
+            self._sem_pairs_n_rules = _n_rules_now
+        sem_pairs_raw = self._sem_pairs_cache
         sem_pairs_net: list = []
         if self.net_enabled and sem_pairs_raw:
             V_cur = self.net.quantizer.current_size.item()
@@ -603,14 +625,10 @@ class OMENScale(nn.Module):
             out["net_semantic"] = net_loss_dict.get("net_semantic",  0.0)
         # VeM / Epistemic Rule Tracker статистика
         out["vem_pen"]      = out.get("vem_pen", 0.0)
-        out["n_proposed"]   = sum(
-            1 for rec in self.prover.kb._records.values()
-            if rec.status.value == "proposed"
-        )
-        out["n_verified"]   = sum(
-            1 for rec in self.prover.kb._records.values()
-            if rec.status.value == "verified"
-        )
+        # PERF FIX: використовуємо кешовані O(1) лічильники замість
+        # O(n_records) sum comprehension по _records на кожному батчі.
+        out["n_proposed"]   = self.prover.kb.n_proposed
+        out["n_verified"]   = self.prover.kb.n_verified
         return out
 
     # ── Генерація ─────────────────────────────────────────────────────────────
@@ -695,11 +713,11 @@ class OMENScale(nn.Module):
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         mode = "NET (байт-рівень)" if self.net_enabled else "Classic (BPE)"
 
-        # Epistemic Rule Tracker stats
-        n_prop = sum(1 for r in self.prover.kb._records.values()
-                     if r.status.value == "proposed")
-        n_ver  = sum(1 for r in self.prover.kb._records.values()
-                     if r.status.value == "verified")
+        # OPT-REPORT: використовуємо O(1) кешовані лічильники замість
+        # O(n_records) sum comprehension по _records.values().
+        n_prop = self.prover.kb.n_proposed
+        n_ver  = self.prover.kb.n_verified
+        # n_contradicted: окремий O(n) обхід лише у звіті (не на кожному батчі)
         n_cont = sum(1 for r in self.prover.kb._records.values()
                      if r.status.value == "contradicted")
         avg_util = (sum(r.utility() for r in self.prover.kb._records.values())

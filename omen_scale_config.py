@@ -114,9 +114,10 @@ class OMENScaleConfig:
     # L_semantic = −E_{(v1,v2)~S-Core}[cos(e_v1, e_v2)·Score(v1, v2)]
     # MDL_total  = MDL_NET − λ_sem·I(Z;Γ)
     lambda_semantic:  float = 0.01   # вага L_semantic
-    lambda_enc_div:   float = 0.30   # Encoder diversity anti-collapse (0.02 було занадто слабким: ~1% від L_rec)
-    lambda_soft_H:    float = 0.5    # Диференційована soft-entropy (anti-collapse ключовий сигнал)
-                                     # Вирішує проблему нульового градієнту l_code (torch.tensor константа).
+    lambda_enc_div:   float = 1.5    # Encoder diversity anti-collapse
+                                     # FIX Bug1: 0.30→1.5 (при 0.30 enc_div grad ~87x слабший за l_rec)
+    lambda_soft_H:    float = 2.0    # Диференційована soft-entropy (anti-collapse ключовий сигнал)
+                                     # FIX Bug2: 0.5→2.0 (при 0.5 soft_H grad ~4600x слабший за l_rec)
                                      # Soft assignments через temperature=0.5 → H градієнт ненульовий при collapse.
 
     # ─── Сумісність з OMENv2 ──────────────────────────────────────────────────
@@ -146,8 +147,8 @@ class OMENScaleConfig:
             net_init_vocab=32,  net_max_vocab=512,   net_tau=0.85,
             net_ema_decay=0.95, eta_tok=0.1,         lambda_voc=1e-4,
             net_warmup_steps=80,
-            lambda_enc_div=0.30,  # 0.02 було ~1% від L_rec → не допомагало
-            lambda_soft_H=0.5,    # диференційована soft-entropy anti-collapse
+            lambda_enc_div=1.5,   # FIX Bug1: 0.30→1.5
+            lambda_soft_H=2.0,    # FIX Bug2: 0.5→2.0
             net_tau_schedule=True, net_tau_min=0.70,
             vem_tau=0.3,        delta_vem=1e-3,      eta_utility=0.1,
             lambda_semantic=0.01, rule_consolidate_every=50,
@@ -163,7 +164,7 @@ class OMENScaleConfig:
           · d_tok=512, n_layers=4, seq_len=512 — значно більша ємність
           · net_max_vocab=4096 — простір для багатого символьного словника
           · net_tau_schedule=True — адаптивний поріг (самобалансування)
-          · lambda_enc_div=0.3 — активний анти-колапс encoder
+          · lambda_enc_div=1.5 — активний анти-колапс encoder (FIX Bug1: 0.3→1.5)
 
         Очікувані результати (порівняно з demo):
           · Used/Vocab > 60% (замість ~18% у demo)
@@ -184,8 +185,8 @@ class OMENScaleConfig:
             net_init_vocab=64,   net_max_vocab=4096,  net_tau=0.85,
             net_ema_decay=0.95,  eta_tok=0.1,         lambda_voc=1e-4,
             net_warmup_steps=300,
-            lambda_enc_div=0.30,
-            lambda_soft_H=0.5,    # диференційована soft-entropy anti-collapse
+            lambda_enc_div=1.5,           # FIX Bug1: 0.30→1.5
+            lambda_soft_H=2.0,            # FIX Bug2: 0.5→2.0
             net_tau_schedule=True, net_tau_min=0.70,
             vem_tau=0.3,         delta_vem=1e-3,      eta_utility=0.1,
             lambda_semantic=0.01, rule_consolidate_every=100,
@@ -206,8 +207,8 @@ class OMENScaleConfig:
             net_init_vocab=512, net_max_vocab=8_192, net_tau=0.85,
             net_ema_decay=0.95, eta_tok=0.1,          lambda_voc=1e-4,
             net_warmup_steps=500,
-            lambda_enc_div=0.30,
-            lambda_soft_H=0.5,
+            lambda_enc_div=1.5,           # FIX Bug1: 0.30→1.5
+            lambda_soft_H=2.0,            # FIX Bug2: 0.5→2.0
             net_tau_schedule=True, net_tau_min=0.70,
         )
 

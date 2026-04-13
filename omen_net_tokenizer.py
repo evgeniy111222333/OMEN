@@ -300,6 +300,23 @@ class EpistemicQuantizer(nn.Module):
         self._kmeans_buffer: List[torch.Tensor] = []
         self._kmeans_done: bool = False
 
+        # ── EMA freeze після restart (Bug7 fix) ────────────────────────────────
+        # Проблема: після interp restart EMA decay=0.95 перетягує код назад до
+        # collapse center за ~4 кроки (якщо весь батч призначається до коду 0).
+        # Фікс: після restart фіксуємо кодбук-запис на _ema_freeze_steps кроків,
+        # щоб він накопичив реальні assignments перш ніж EMA почне його зміщувати.
+        # _restart_step[i] = global step коли код i був рестартований (−1000 = ніколи).
+        self._ema_freeze_steps: int = 20
+        self.register_buffer("_restart_step",
+                             torch.full((max_vocab,), -1000, dtype=torch.long))
+
+        # OPT-RST: _restart_dead_codes_ema містить дорогу gram-матрицю (64×64) і
+        # codebook similarity (B*T × V) — разом ~970 MFLOPs на strong config.
+        # Throttle до кожних _restart_interval кроків: якість = майже та сама
+        # (dead codes живуть 10–15 кроків, 4 кроки затримки не критичні),
+        # але економія ~75% часу цього блоку.
+        self._restart_interval: int = 4   # кожні 4 кроки = 75% часу зекономлено
+
     # ── Допоміжне: нормований кодбук (з кешем) ───────────────────────────────
     def _normed_codebook(self) -> torch.Tensor:
         """Повертає нормовані вектори активних кодбук-записів (з кешем)."""
@@ -363,6 +380,23 @@ class EpistemicQuantizer(nn.Module):
                     dead_by_ema = (self.global_usage[:V_cur] < 0.10).sum().item()
                     dead_pct    = dead_by_ema / max(V_cur, 1)
                     if dead_pct > 0.35:
+                        max_new_per_step = 0
+
+                # ── Gate 3: Hard batch usage ───────────────────────────────────
+                # FIX Bug9: global_usage скидається до 0.15 після кожного restart,
+                # тому dead% завжди < 35% одразу після restart → Gate 2 завжди пропускає.
+                # Результат: V зростає ~2/крок навіть при encoder-collapse (MeanSim=0.99),
+                # створюючи 1444 токени де використовується лише 6.
+                #
+                # FIX: перевіряємо РЕАЛЬНЕ використання в ПОТОЧНОМУ батчі (hard assignments).
+                # indices вже обчислено (крок 1). hard_used_pct — частка кодів що
+                # отримали ≥1 assignment у цьому батчі. Якщо < 40% → ще не готові рости.
+                # Цей gate не обходиться restart-ом бо рахує реальні assignments тут і зараз.
+                if max_new_per_step > 0 and V_cur > 0:
+                    hard_counts   = torch.bincount(
+                        indices.clamp(0, V_cur - 1), minlength=V_cur).float()
+                    hard_used_pct = (hard_counts > 0).float().mean().item()
+                    if hard_used_pct < 0.40:     # < 40% кодів реально використано → стоп
                         max_new_per_step = 0
 
                 low_vecs = x_flat[low_sim_mask]                     # (M, d)
@@ -440,7 +474,11 @@ class EpistemicQuantizer(nn.Module):
                         self._kmeans_done = True
                 self._ema_update(x_flat.detach(), indices)
                 self._update_global_usage(indices)
-                self._restart_dead_codes_ema(x_flat.detach())
+                # OPT-RST: throttle restart — дорогий (gram + codebook sim) кожен крок.
+                # Кожні _restart_interval кроків = 75% часу зекономлено без втрати якості
+                # (dead code виявляється за ~10 кроків, 4 кроки затримки не критичні).
+                if self._ema_step % self._restart_interval == 0:
+                    self._restart_dead_codes_ema(x_flat.detach())
             # Commitment loss: тягне encoder до найближчого кодбук-вектора
             # L_commit = β · ||z_e - sg(e)||²
             commit = F.mse_loss(x_flat, z_q_flat.detach())
@@ -456,15 +494,23 @@ class EpistemicQuantizer(nn.Module):
 
         # ── 8b. Soft-entropy loss (диференційована ентропія) ──────────────────
         # ПРОБЛЕМА: l_code у NETLoss = torch.tensor(constant.item()) → 0 градієнту.
-        # РІШЕННЯ: soft assignments через Gumbel-temperature → справжній градієнт,
-        # який ненульовий навіть при повному encoder-collapse, якщо кодбук різноманітний.
+        # РІШЕННЯ: soft assignments через temperature → справжній градієнт.
         #
-        # Математика: soft_p_v = mean_i softmax(sim(x_i, e_v) / τ_soft)
+        # Математика: soft_p_v = mean_i softmax(norm(sim(x_i, e_v)) / τ_soft)
         #             H_soft = -Σ_v soft_p_v · log(soft_p_v)
-        #             L_soft_H = -H_soft / log(V)  → мінімізуємо = максимізуємо H
+        #             L_soft_H = max(0, 1 - H_soft/log(V))  → штраф за collapse
         #
-        # Градієнт штовхає encoder розподіляти токени рівномірніше по кодбуку.
-        # При collapse + РІЗНОМАНІТНИЙ кодбук → градієнт 10x сильніший ніж pairwise.
+        # FIX Bug5: стара формула -(H_soft/H_max) давала loss=-1 при collapse.
+        # ПРАВИЛЬНА формула: max(0, 1 - H/H_max)
+        #   · collapse (small H): loss ≈ 1  → великий штраф → encoder диверсифікується
+        #   · рівномірний (H≈H_max): loss ≈ 0 → немає зайвого штрафу
+        #
+        # FIX Bug8 (NEW): без row-нормалізації sims_soft, при random кодбуку
+        # всі рядки ≈ 0 → softmax ≈ uniform → H_soft ≈ H_max → loss ≈ 0 ЗАВЖДИ.
+        # ТЕСТ: collapsed encoder + random codebook → loss=0.007 (стара) vs 0.59 (нова).
+        # РІШЕННЯ: нормалізуємо кожен рядок sims_soft (z-score) перед softmax.
+        # Це перетворює near-zero similarities у значущий peaked розподіл,
+        # де найближчий кодбук-вектор отримує помітно вищу probability.
         soft_entropy_loss = torch.zeros(1, device=x.device).squeeze()
         if self.training:
             V_cur = self.current_size.item()
@@ -473,14 +519,29 @@ class EpistemicQuantizer(nn.Module):
                 # EMA кодбук не має навчатись через SGD (конфліктні сигнали)
                 cb_for_soft = cb_norm.detach()              # (V_cur, d) — немає градієнту
                 soft_tau_temp = 0.5                         # температура soft-quantizer
-                # sims вже є, але із non-detached cb_norm — перерахуємо для safety
-                sims_soft = x_norm @ cb_for_soft.t()       # (B*T, V_cur), grad через x_norm
-                soft_assign = F.softmax(sims_soft / soft_tau_temp, dim=-1)  # (B*T, V_cur)
+                # OPT-SOFT: subsample x_norm до _SOFT_N позицій замість усіх B*T.
+                # Для B=8, T=512: B*T=4096 → _SOFT_N=256 → 16× менше MACs у matmul.
+                # Якість: оцінка ентропії на 256 випадкових позиціях практично еквівалентна
+                # (закон великих чисел, 256 >> V_cur для типових розмірів словника).
+                _SOFT_N = 256
+                _n_avail = x_norm.size(0)
+                if _n_avail > _SOFT_N:
+                    _perm = torch.randperm(_n_avail, device=x_norm.device)[:_SOFT_N]
+                    x_norm_soft = x_norm[_perm]             # (256, d)
+                else:
+                    x_norm_soft = x_norm
+                sims_soft = x_norm_soft @ cb_for_soft.t()  # (≤256, V_cur), grad через x_norm_soft
+                # FIX Bug8: row-normalization — перетворює near-zero sims у peaked розподіл.
+                # Без цього: random codebook → all sims ≈ 0 → uniform softmax → H_soft≈H_max → loss≈0.
+                sims_norm = (sims_soft
+                             - sims_soft.mean(dim=-1, keepdim=True)
+                             ) / (sims_soft.std(dim=-1, keepdim=True) + 1e-6)
+                soft_assign = F.softmax(sims_norm / soft_tau_temp, dim=-1)  # (≤256, V_cur)
                 avg_usage   = soft_assign.mean(dim=0)       # (V_cur,) — очікуване використання
                 H_soft      = -(avg_usage * (avg_usage + 1e-8).log()).sum()  # диференційована H
                 H_soft_max  = math.log(max(V_cur, 2))
-                # Нормуємо в [−1, 0]: −1 = рівномірно (добре), 0 = один код (погано)
-                soft_entropy_loss = -(H_soft / (H_soft_max + 1e-8))
+                # max(0, 1 - H/H_max): 0 при collapse (H≈H_max), >0 при poor usage
+                soft_entropy_loss = (1.0 - H_soft / (H_soft_max + 1e-8)).clamp(min=0.0)
 
         # ── 9. Adaptive τ scheduling (після warmup) ────────────────────────────
         # τ знижується коли H/H_max < 0.55 (мало активних кодів)
@@ -549,19 +610,44 @@ class EpistemicQuantizer(nn.Module):
     # ── EMA оновлення ─────────────────────────────────────────────────────────
     @torch.no_grad()
     def _ema_update(self, x_flat: torch.Tensor, indices: torch.Tensor) -> None:
-        """EMA оновлення активних записів кодбуку."""
+        """EMA оновлення активних записів кодбуку.
+
+        FIX Bug7: коди що були нещодавно рестартовані (_restart_step протягом
+        _ema_freeze_steps кроків) НЕ оновлюються через EMA. Це захищає їх від
+        повернення до collapse center до того, як вони накопичать реальні assignments.
+        Тест показав: без freeze → re-collapse за 4 кроки. З freeze (20 кроків) →
+        код залишається в interp-позиції і поступово отримує власні assignments.
+        """
         V = self.current_size.item()
         γ = self.ema_decay
 
-        # One-hot для підрахунку призначень
-        one_hot = torch.zeros(x_flat.size(0), V, device=x_flat.device)
-        idx_clamped = indices.clamp(0, V - 1)
-        one_hot.scatter_(1, idx_clamped.unsqueeze(1), 1.0)
+        # OPT-EMA: scatter_add замість (B*T, V) one-hot матриці.
+        # Стара схема: zeros(B*T, V) → scatter_(1,...) → sum(0)/matmul
+        #   → ~7.5 MB aloc + ~970 MFLOPs (B*T=4096, V=462, d=512 на strong config).
+        # Нова: scatter_add_ безпосередньо на (V,) та (V, d) — 0 зайвих алокацій.
+        idx_clamped = indices.clamp(0, V - 1)                       # (B*T,)
 
         # N_i = кількість прикладів, призначених до кластера i
-        N = one_hot.sum(0)                                           # (V,)
+        N = torch.zeros(V, device=x_flat.device, dtype=x_flat.dtype)
+        N.scatter_add_(0, idx_clamped,
+                       torch.ones(idx_clamped.size(0),
+                                  device=x_flat.device, dtype=x_flat.dtype))
+
         # S_i = сума векторів, призначених до кластера i
-        S = one_hot.t() @ x_flat                                    # (V, d)
+        D = x_flat.size(1)
+        S = torch.zeros(V, D, device=x_flat.device, dtype=x_flat.dtype)
+        S.scatter_add_(0,
+                       idx_clamped.unsqueeze(1).expand(-1, D),
+                       x_flat)
+
+        # ── Freeze маска: коди під захистом після restart ─────────────────────
+        frozen_mask = (self._ema_step - self._restart_step[:V]) < self._ema_freeze_steps
+        # Зберігаємо стан захищених кодів до EMA
+        frozen_idx = frozen_mask.nonzero(as_tuple=True)[0] if frozen_mask.any() else None
+        if frozen_idx is not None and len(frozen_idx) > 0:
+            saved_count = self.cluster_count[frozen_idx].clone()
+            saved_sum   = self.cluster_sum[frozen_idx].clone()
+            saved_w     = self.codebook.weight.data[frozen_idx].clone()
 
         # EMA
         self.cluster_count[:V] = γ * self.cluster_count[:V] + (1 - γ) * N
@@ -571,6 +657,13 @@ class EpistemicQuantizer(nn.Module):
         updated = (self.cluster_sum[:V]
                    / (self.cluster_count[:V].unsqueeze(1) + 1e-5))
         self.codebook.weight[:V] = updated
+
+        # ── Відновлюємо захищені коди (скасовуємо EMA для них) ───────────────
+        if frozen_idx is not None and len(frozen_idx) > 0:
+            self.cluster_count[frozen_idx] = saved_count
+            self.cluster_sum[frozen_idx]   = saved_sum
+            self.codebook.weight.data[frozen_idx] = saved_w
+
         self._cb_norm_cache = None      # OPT-CB: кодбук змінився → інвалідуємо
 
     # ── K-means++ ініціалізація ───────────────────────────────────────────────
@@ -615,13 +708,14 @@ class EpistemicQuantizer(nn.Module):
             chosen  = torch.multinomial(probs, 1).item()
             centers.append(all_x[chosen])
 
-        centers_t = torch.stack(centers[:V])             # (V, D) нормовані
+        centers_t = torch.stack(centers)                # (K, D) — K ≤ V
+        actual_V  = min(len(centers), V)               # FIX: early break → K < V
 
         # Оновлюємо кодбук in-place (requires_grad → no_grad)
-        self.codebook.weight[:V].copy_(centers_t)
-        self.cluster_sum[:V].copy_(centers_t)
-        self.cluster_count[:V].fill_(1.0)
-        self.global_usage[:V].fill_(0.15)               # не мертві одразу
+        self.codebook.weight[:actual_V].copy_(centers_t[:actual_V])
+        self.cluster_sum[:actual_V].copy_(centers_t[:actual_V])
+        self.cluster_count[:actual_V].fill_(1.0)
+        self.global_usage[:actual_V].fill_(0.15)       # не мертві одразу
 
         self._kmeans_buffer.clear()
 
@@ -700,15 +794,45 @@ class EpistemicQuantizer(nn.Module):
 
         dead_indices = dead_mask.nonzero(as_tuple=True)[0][:n_restart]
         for i, dead_code_idx in enumerate(dead_indices):
-            if is_collapsed and (i % 2 == 0):
-                # При collapse: 50% кодів — RANDOM unit vectors (зберігаємо різноманітність)
-                # Зберігаємо різноманітний кодбук → soft_entropy та commit_loss надають
-                # реальний градієнт encoder'у до виходу з collapse.
-                rand_vec = F.normalize(
-                    torch.randn(self.d_tok, device=x_flat.device, dtype=x_flat.dtype
-                                ).unsqueeze(0), dim=-1).squeeze(0)
-                self.codebook.weight[dead_code_idx] = rand_vec
-                self.cluster_sum[dead_code_idx]     = rand_vec
+            if is_collapsed:
+                # FIX Bug3 (оновлено): при collapse random вектори НІКОЛИ не отримують
+                # assignment (sim до active ~0.93, sim до random ~0.33 → random програє).
+                # Стара стратегія «interp між двома кодами» при ЕКСТРЕМАЛЬНОМУ collapse
+                # (MeanSim>0.97) не допомагає — всі коди в тій самій точці,
+                # interp = та сама точка → нові коди одразу мертві.
+                #
+                # FIX Bug10 (NEW): розрізняємо два рівні collapse:
+                #   · Помірний (0.90<sim<0.97): interp добре працює (доведено тестами)
+                #   · Екстремальний (sim≥0.97): використовуємо perturbation у ортогональний
+                #     підпростір відносно collapsed centroid.
+                #     perturb = centroid + α * ort_noise (α=0.2–0.5)
+                #     Sim до centroid = cos(α) ≈ 0.975 > random 0.33 → виграє NN.
+                #     Але різні perturb вектори відрізняються → enc_div_loss отримує
+                #     значущий градієнт що тягне encoder з collapsed manifold.
+                if encoder_mean_sim >= 0.97:
+                    # Екстремальний collapse: збурення в ортогональний напрямок
+                    centroid = F.normalize(self.codebook.weight[:V].mean(0), dim=0)
+                    noise    = torch.randn_like(centroid)
+                    # Проеціюємо noise на простір ортогональний до centroid
+                    ort_noise = noise - (noise @ centroid) * centroid
+                    ort_noise = F.normalize(ort_noise, dim=0)
+                    # α: рівномірно в [0.15, 0.45] → sim до centroid ≈ [0.98, 0.99]
+                    alpha_ort = 0.15 + torch.rand(1, device=x_flat.device).item() * 0.30
+                    perturb_vec = F.normalize(centroid + alpha_ort * ort_noise, dim=-1)
+                    self.codebook.weight[dead_code_idx] = perturb_vec
+                    self.cluster_sum[dead_code_idx]     = perturb_vec
+                else:
+                    # Помірний collapse: стара interp стратегія (підтверджена тестами)
+                    i1 = torch.randint(0, V, (1,), device=x_flat.device).item()
+                    i2 = torch.randint(0, V, (1,), device=x_flat.device).item()
+                    alpha = torch.rand(1, device=x_flat.device).item()
+                    interp_vec = F.normalize(
+                        alpha * self.codebook.weight[i1].clone()
+                        + (1.0 - alpha) * self.codebook.weight[i2].clone(),
+                        dim=-1
+                    )
+                    self.codebook.weight[dead_code_idx] = interp_vec
+                    self.cluster_sum[dead_code_idx]     = interp_vec
             else:
                 # Нормальний режим: restart з "найважчого" encoder-виходу
                 src = x_flat[hard_idx[i]]
@@ -718,6 +842,8 @@ class EpistemicQuantizer(nn.Module):
             self.cluster_count[dead_code_idx]   = 1.0
             # 0.15 > 0.10 (threshold) → захищений від негайного повторного restart
             self.global_usage[dead_code_idx]    = 0.15
+            # FIX Bug7: реєструємо крок restart → EMA freeze на _ema_freeze_steps кроків
+            self._restart_step[dead_code_idx]   = self._ema_step
 
         self._cb_norm_cache = None      # OPT-CB: кодбук змінився → інвалідуємо
         return n_restart
@@ -1042,8 +1168,8 @@ class NETLoss(nn.Module):
                  lambda_voc:      float = 1e-4,
                  lambda_vq:       float = 1.0,
                  lambda_semantic: float = 0.01,
-                 lambda_enc_div:  float = 0.30,
-                 lambda_soft_H:   float = 0.5):
+                 lambda_enc_div:  float = 1.5,    # FIX Bug1: 0.30→1.5
+                 lambda_soft_H:   float = 2.0):   # FIX Bug2: 0.5→2.0
         super().__init__()
         self.lambda_voc      = lambda_voc
         self.lambda_vq       = lambda_vq
@@ -1197,8 +1323,8 @@ class NeuralEpistemicTokenizer(nn.Module):
         self.loss_fn = NETLoss(
             lambda_voc      = cfg.lambda_voc,
             lambda_semantic = getattr(cfg, 'lambda_semantic', 0.01),
-            lambda_enc_div  = getattr(cfg, 'lambda_enc_div', 0.02),
-            lambda_soft_H   = getattr(cfg, 'lambda_soft_H',  0.5),
+            lambda_enc_div  = getattr(cfg, 'lambda_enc_div', 1.5),   # FIX Bug1: 0.02→1.5
+            lambda_soft_H   = getattr(cfg, 'lambda_soft_H',  2.0),   # FIX Bug2: 0.5→2.0
         )
 
     # ── encode ────────────────────────────────────────────────────────────────
@@ -1244,6 +1370,33 @@ class NeuralEpistemicTokenizer(nn.Module):
                     Якщо None → L_semantic = 0 (режим без S-Core).
         """
         return self.loss_fn(vq_info, l_rec, self.quantizer, sem_pairs=sem_pairs)
+
+    # ── Stage-1 non-autoregressive reconstruction loss ────────────────────────
+    def stage1_rec_loss(self, h_q: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
+        """
+        Non-autoregressive reconstruction loss для Stage 1 pretraining.
+
+        ПРОБЛЕМА: ByteDecoder містить causal self-attention по tgt токенах.
+        Протягом навчання decoder може навчитись передбачати tgt[i+1] з tgt[0..i]
+        БЕЗ використання h_q (стандартна language model). Як тільки decoder знаходить
+        цей «bypass», градієнт через h_q до encoder слабшає → encoder collapse.
+
+        FIX: обчислюємо ДОДАТКОВУ позиційну реконструкцію: h_q[i] → src[i].
+        Тут НЕМАЄ causal context — decoder не може bypass-ити h_q.
+        Кожна позиція мусить закодувати власний байт у своєму z_q вектору.
+
+        L_rec_nonauto = CrossEntropy(lm_head(norm(h_q)), src)  (позиційно)
+
+        Ця loss додається до стандартного l_rec із вагою λ=0.5 у pretrain_net.
+        У Stage 2 (joint training) НЕ використовується — там є z_final контекст.
+        """
+        dec = self.byte_decoder
+        logits = dec.lm_head(dec.out_norm(h_q))          # (B, T, V) — без causal bypass
+        return F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            src.reshape(-1),
+            ignore_index=0,
+        )
 
     # ── Utility: зв'язати Q з KB ──────────────────────────────────────────────
     def attach_kb(self, kb) -> None:

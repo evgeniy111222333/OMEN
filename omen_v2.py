@@ -199,13 +199,23 @@ class WorldRNN(nn.Module):
           Раніше: T × (embed_lookup + GRUCell + Linear)
           Тепер:  1 × embed_lookup_batch  +  T × (GRUCell + Linear)
         На T=8, B=8: ~5% прискорення за рахунок зменшення диспетчеризації.
+
+        FIX Bug1 (world loss 17x drift):
+          Попередній код:  z0 if t == 0 else traj[-1]
+          Після кроку 0 GRU отримував власний попередній вихід traj[-1] замість
+          початкового концепту z0. За T=8 кроків похибка накопичувалася
+          (~+74% L_world), а не зменшувалась. Рішення — завжди подавати z0:
+          GRU-прихований стан h вже несе "пам'ять" про попередні кроки,
+          тому z0 як "anchor input" не заважає динаміці, але усуває дрейф.
         """
         B, T   = actions.shape
         a_all  = self.act_emb(actions)                     # (B, T, d_latent) — один виклик
         h      = self.h0.expand(B, -1).contiguous()
         traj   = []
         for t in range(T):
-            h = self.gru(torch.cat([z0 if t == 0 else traj[-1], a_all[:, t]], -1), h)
+            # FIXED: завжди z0 (а не traj[-1]) — GRU h несе динаміку,
+            # z0 — стабільний anchor. Усуває 17x дрейф world loss.
+            h = self.gru(torch.cat([z0, a_all[:, t]], -1), h)
             traj.append(self.out(h))
         return torch.stack(traj, dim=1)                    # (B, T, d_latent)
 
@@ -357,12 +367,14 @@ class EpistemicGapDetector(nn.Module):
           gap_norm : (B,)   — норма прогалини
           hot_dims : (B, d) — binary mask найгарячіших вимірів
         """
-        # Потрібен grad по z
-        z_req = z.detach().requires_grad_(True)
-        L_world = F.mse_loss(z_req, z_sim.detach(), reduction='none').sum(-1).mean()
-        grad_z  = torch.autograd.grad(L_world, z_req, create_graph=False)[0]
-
-        E        = grad_z.pow(2)                                   # (B, d)
+        # OPT-EGD: замість torch.autograd.grad() (окремий backward-пас ≈ +30–50% часу батчу)
+        # використовуємо замкнуту формулу градієнту MSE:
+        #   L = (1/B)·Σ_b ||z_b − z_sim_b||²   →   ∂L/∂z_b = (2/B)·(z_b − z_sim_b)
+        #   E = (∂L/∂z)² ∝ (z − z_sim)²
+        # Пропорційність: константа (4/B²) одинакова для всіх вимірів → hot_dims та
+        # gap_norm обчислюються коректно. Повний autograd.grad більше не потрібен.
+        diff     = z.detach() - z_sim.detach()                     # (B, d)
+        E        = diff.pow(2)                                      # (B, d)
         gap_norm = E.sum(-1).sqrt()                                # (B,)
 
         # Топ-25% найгарячіших вимірів

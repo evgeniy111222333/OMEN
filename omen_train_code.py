@@ -20,6 +20,20 @@ omen_train_code.py — Повний тренувальний цикл OMEN-Scale
   python omen_train_code.py --config demo       # CPU (швидко)
   python omen_train_code.py --config mid        # 1x A100
   python omen_train_code.py --real_text FILE    # реальний корпус (UTF-8)
+
+  # Рекомендований запуск на GPU (RTX 3080/4080):
+  python omen_train_code.py \\
+      --real_text codesearchnet_python.txt \\
+      --config strong --stage1_steps 1000 \\
+      --stage2_epochs 20 --batch_size 8 \\
+      --amp --grad_accum 2 \\
+      --checkpoint_dir ./checkpoints
+
+  Оптимізації Stage 2 (без втрати якості):
+    --amp            : FP16 autocast на GPU  → ~2x прискорення матричних операцій
+    --grad_accum N   : накопичення градієнтів → менше opt.step (рекомендовано: 2–4)
+    --num_workers N  : DataLoader workers для паралельного prefetch даних (2–4 на GPU)
+    --max_batches N  : ліміт батчів/епоху для коротших ітерацій
 """
 
 from __future__ import annotations
@@ -39,12 +53,78 @@ from torch.optim.lr_scheduler import (
     LinearLR,
     SequentialLR,
 )
+from torch.utils.data import DataLoader, Dataset
+
+import contextlib
+import pickle
 
 from omen_scale_config import OMENScaleConfig
 from omen_scale import OMENScale
 from omen_v2 import make_counting, make_python, make_rule_transfer, collate
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# AMP доступний тільки на CUDA (на CPU — no-op через enabled=False)
+_AMP_AVAILABLE = torch.cuda.is_available()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 0. STACKED DATASET  (zero-copy batching)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class StackedDataset(Dataset):
+    """
+    Перетворює List[Tuple[Tensor,Tensor]] у два великих тензори (N,T).
+    Це виконується ONE TIME, після чого кожен батч — просто slice (zero-copy).
+
+    Порівняно з поточним підходом (torch.stack кожен батч):
+      · Старий: N_batches × torch.stack(8 tensors) = N_batches × ~0.1ms = накопичується
+      · Новий:  stack один раз при ініціалізації, далі __getitem__ = O(1) indirection
+
+    На GPU з pin_memory=True DataLoader асинхронно переносить дані CPU→GPU
+    паралельно з тим, як GPU обраховує попередній батч (реальний overlap).
+    """
+    def __init__(self, data: List[Tuple[torch.Tensor, torch.Tensor]]):
+        t0 = time.perf_counter()
+        # Підтримуємо два формати (як collate):
+        #   List[Tuple[src, tgt]] — реальний текст (load_text_corpus)
+        #   List[Tensor]          — синтетичний (make_counting, make_python, …)
+        if isinstance(data[0], (tuple, list)):
+            self.src = torch.stack([x[0] for x in data])   # (N, T)
+            self.tgt = torch.stack([x[1] for x in data])   # (N, T)
+        else:
+            stacked  = torch.stack(data)                    # (N, T+1)
+            self.src = stacked[:, :-1]                      # (N, T)
+            self.tgt = stacked[:, 1:]                       # (N, T)
+        elapsed = (time.perf_counter() - t0) * 1000
+        print(f"  [StackedDataset] {len(self.src):,} зразків x T={self.src.shape[1]} "
+              f"стеккінг за {elapsed:.0f}ms  "
+              f"({self.src.numel()*2*4/1e6:.1f} MB RAM)")
+
+    def __len__(self) -> int:
+        return len(self.src)
+
+    def __getitem__(self, i: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.src[i], self.tgt[i]
+
+
+def build_loader(dataset_obj: StackedDataset,
+                 batch_size: int,
+                 num_workers: int = 0,
+                 shuffle: bool = True) -> DataLoader:
+    """
+    Будує DataLoader з pin_memory (якщо CUDA) і prefetch_factor.
+    num_workers=0 — безпечно з будь-яким GPU/CPU, >0 лише якщо CUDA і стабільно.
+    """
+    return DataLoader(
+        dataset_obj,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        pin_memory=(DEVICE.type == "cuda"),
+        num_workers=num_workers,
+        prefetch_factor=(2 if num_workers > 0 else None),
+        drop_last=True,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -133,8 +213,15 @@ def pretrain_net(model: OMENScale,
         h_q, _, vq_info = model.net.encode(src)
         z_dummy = torch.zeros(src.size(0), model.cfg.d_latent, device=DEVICE)
         _, l_rec = model.net.decode(tgt, z_dummy, h_q)
+
+        # Non-autoregressive reconstruction loss (позиційна, без causal bypass).
+        # Без цього decoder навчається передбачати tgt[i+1] з tgt[0..i]
+        # БЕЗ використання h_q → gradient через h_q до encoder слабшає → collapse.
+        # stage1_rec_loss форсує h_q[i] кодувати саме src[i].
+        l_nonauto = model.net.stage1_rec_loss(h_q, src)
+
         loss_dict = model.net.compute_loss(vq_info, l_rec)
-        loss = loss_dict["net_total"]
+        loss = loss_dict["net_total"] + 0.5 * l_nonauto
 
         if torch.isnan(loss) or torch.isinf(loss):
             continue
@@ -159,7 +246,7 @@ def pretrain_net(model: OMENScale,
                   f"L_vq={m['net_vq']:.4f}  "
                   f"H={m['net_entropy_bits']:.2f}bits  "
                   f"V={int(m['vocab'])}  "
-                  f"{elapsed:.0f}s")
+                  f"{elapsed:.0f}s", flush=True)
 
     # Розморожуємо всі параметри
     for p in model.parameters():
@@ -183,23 +270,53 @@ def joint_train(model: OMENScale,
                 lr: float = 1e-4,
                 weight_decay: float = 1e-2,
                 max_batches_per_epoch: Optional[int] = None,
-                checkpoint_dir: Optional[str] = None) -> List[Dict]:
+                checkpoint_dir: Optional[str] = None,
+                use_amp: bool = False,
+                grad_accum: int = 1,
+                num_workers: int = 0,
+                opt_state: Optional[dict] = None) -> List[Dict]:
     """
     Stage 2: спільне навчання OMEN-Scale.
     NET має менший LR (0.3x) щоб не зруйнувати Stage-1 кодбук.
 
+    Оптимізації (без втрати якості):
+      · StackedDataset + DataLoader → zero-copy batching + pin_memory async transfer
+      · AMP (autocast + GradScaler) → FP16 matmul на GPU (40–100% прискорення)
+      · grad_accum > 1 → менше optimizer.step() викликів (effective_batch = batch×accum)
+      · Throughput звіт: samples/sec, tokens/sec, ms/batch
+
     max_batches_per_epoch=None → весь датасет за кожну епоху.
     Задай числом щоб обмежити (наприклад 256 = 2048 зразків / епоха).
     """
+    use_amp = use_amp and _AMP_AVAILABLE  # AMP тільки на CUDA
+    _device_type = "cuda" if DEVICE.type == "cuda" else "cpu"
+
+    # torch.autocast — уніфікований API (PyTorch ≥ 2.0).
+    # enabled=False → nullcontext-like no-op, безпечно на CPU/GPU.
+    def _amp_ctx():
+        return torch.autocast(device_type=_device_type,
+                              dtype=torch.float16 if use_amp else torch.float32,
+                              enabled=use_amp)
+
     print("\n" + "═" * 68)
     print("  STAGE 2: Joint Training  (OMEN-Scale + NET)")
     print("═" * 68)
 
-    # Обчислюємо ефективний ліміт батчів (None = весь датасет)
-    n_total_batches = len(dataset) // batch_size
+    # ── StackedDataset + DataLoader ───────────────────────────────────────────
+    stacked = StackedDataset(dataset)
+    loader  = build_loader(stacked, batch_size, num_workers=num_workers, shuffle=True)
+
+    # Обчислюємо ефективний ліміт батчів
+    n_total_batches = len(loader)
     _max_bat = max_batches_per_epoch if max_batches_per_epoch is not None else n_total_batches
-    print(f"  batches/epoch : {min(_max_bat, n_total_batches)}"
-          f"  ({min(_max_bat, n_total_batches) * batch_size} samples)")
+    _max_bat = min(_max_bat, n_total_batches)
+
+    effective_batch = batch_size * grad_accum
+    print(f"  batches/epoch : {_max_bat}  ({_max_bat * batch_size} samples)")
+    print(f"  effective_batch: {effective_batch}  (batch_size={batch_size} × grad_accum={grad_accum})")
+    print(f"  AMP: {'✓ FP16' if use_amp else '✗ FP32'}  "
+          f"pin_memory: {'✓' if DEVICE.type=='cuda' else '✗'}  "
+          f"workers: {num_workers}")
 
     net_params   = [p for n, p in model.named_parameters() if "net." in n]
     other_params = [p for n, p in model.named_parameters() if "net." not in n]
@@ -208,10 +325,15 @@ def joint_train(model: OMENScale,
         {"params": net_params,   "lr": lr * 0.3, "weight_decay": 1e-5},
         {"params": other_params, "lr": lr,        "weight_decay": weight_decay},
     ])
+    # Bug fix: відновлюємо optimizer state (Adam m1/m2) після resume
+    if opt_state:
+        try:
+            opt.load_state_dict(opt_state)
+            print("  [resume] Optimizer state відновлено ✓")
+        except Exception as e:
+            print(f"  [resume] Optimizer state не вдалось відновити: {e} — продовжуємо з нуля")
 
     # FIX ❸: CosineAnnealingWarmRestarts(T_0=10) → LR-спайк на epoch 11 (PPL=1454).
-    # Замінюємо на: 2-епохний лінійний warmup + CosineAnnealingLR без рестартів.
-    # Результат: LR плавно зростає перші 2 епохи, потім монотонно спадає до lr*0.01.
     _warmup_ep = min(2, n_epochs)
     _decay_ep  = max(n_epochs - _warmup_ep, 1)
     warmup_sched = LinearLR(opt, start_factor=0.1, end_factor=1.0,
@@ -220,8 +342,11 @@ def joint_train(model: OMENScale,
     sched = SequentialLR(opt, schedulers=[warmup_sched, decay_sched],
                          milestones=[_warmup_ep])
 
+    # AMP GradScaler (no-op якщо use_amp=False)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
     hdr = (f"{'Ep':>4} {'CE':>7} {'World':>7} {'LScale':>7} "
-           f"{'NetL':>7} {'Voc':>4} {'KBf':>4} {'PPL':>8} {'ms':>6}")
+           f"{'NetL':>7} {'Voc':>4} {'KBf':>4} {'PPL':>8} {'ms/b':>6} {'tok/s':>7}")
     print(f"\n  {hdr}")
     print("  " + "─" * len(hdr))
 
@@ -229,49 +354,116 @@ def joint_train(model: OMENScale,
 
     for epoch in range(1, n_epochs + 1):
         model.train()
-        t0 = time.perf_counter()
+        t0_epoch = time.perf_counter()
         agg: Dict[str, float] = defaultdict(float)
         n_bat = 0
-        random.shuffle(dataset)
+        total_tokens = 0
 
-        for start in range(0, len(dataset) - batch_size, batch_size):
-            batch    = dataset[start: start + batch_size]
-            src, tgt = collate(batch)
-            src, tgt = src.to(DEVICE), tgt.to(DEVICE)
+        # timing buckets для throughput аналізу
+        t_data, t_fwd, t_bwd, t_opt = 0.0, 0.0, 0.0, 0.0
 
-            opt.zero_grad(set_to_none=True)
-            out = model(src, tgt)
+        opt.zero_grad(set_to_none=True)
+
+        t_iter_start = time.perf_counter()
+        for src, tgt in loader:
+            t_data += time.perf_counter() - t_iter_start  # data prefetch time
+
+            src = src.to(DEVICE, non_blocking=True)
+            tgt = tgt.to(DEVICE, non_blocking=True)
+
+            # ── Forward (з AMP якщо use_amp) ─────────────────────────────────
+            t1 = time.perf_counter()
+            with _amp_ctx():
+                out = model(src, tgt)
 
             if torch.isnan(out["total"]) or torch.isinf(out["total"]):
+                t_iter_start = time.perf_counter()
                 continue
+            t_fwd += time.perf_counter() - t1
 
-            out["total"].backward()
-            torch.nn.utils.clip_grad_norm_(net_params,   0.5)
-            torch.nn.utils.clip_grad_norm_(other_params, 1.0)
-            opt.step()
+            # ── Backward (масштабований для AMP) ─────────────────────────────
+            t2 = time.perf_counter()
+            # Ділимо loss на grad_accum щоб градієнти були «mid-batch» average
+            loss = out["total"] / grad_accum
+            scaler.scale(loss).backward()
+            t_bwd += time.perf_counter() - t2
 
-            # Flush memory AFTER optimizer step (no autograd graph)
-            model.memory.maybe_flush()
+            n_bat += 1
+            total_tokens += src.numel()
 
             for k, v in out.items():
                 if k not in ("logits", "z"):
                     agg[k] += float(v) if not isinstance(v, float) else v
-            n_bat += 1
+
+            # ── Optimizer step кожні grad_accum кроків ───────────────────────
+            if n_bat % grad_accum == 0:
+                t3 = time.perf_counter()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(net_params,   0.5)
+                torch.nn.utils.clip_grad_norm_(other_params, 1.0)
+                scaler.step(opt)
+                scaler.update()
+                opt.zero_grad(set_to_none=True)
+
+                # Flush memory AFTER optimizer step (no autograd graph)
+                model.memory.maybe_flush()
+                t_opt += time.perf_counter() - t3
+
+            # ── Прогрес-лічильник (оновлюється на місці через \r) ─────────────
+            elapsed_bat = time.perf_counter() - t0_epoch
+            ms_per_bat  = elapsed_bat / n_bat * 1000
+            eta_s       = ms_per_bat * (_max_bat - n_bat) / 1000
+            ce_cur      = agg.get("ce", 0.0) / n_bat
+            print(f"  \r  Ep {epoch:2d}  [{n_bat:4d}/{_max_bat}]  "
+                  f"{n_bat / _max_bat * 100:5.1f}%  "
+                  f"CE={ce_cur:.3f}  "
+                  f"{ms_per_bat:5.0f}ms/b  "
+                  f"ETA {eta_s:5.0f}s",
+                  end="", flush=True)
+
             if n_bat >= _max_bat:
                 break
+
+            t_iter_start = time.perf_counter()
+
+        # Final flush якщо залишились акумульовані градієнти
+        if n_bat % grad_accum != 0:
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(net_params,   0.5)
+            torch.nn.utils.clip_grad_norm_(other_params, 1.0)
+            scaler.step(opt)
+            scaler.update()
+            opt.zero_grad(set_to_none=True)
+            model.memory.maybe_flush()
 
         sched.step()
 
         if n_bat == 0:
             continue
 
+        epoch_time = time.perf_counter() - t0_epoch
         avg = {k: v / n_bat for k, v in agg.items()}
-        avg["ppl"] = math.exp(min(avg.get("ce", 10), 10))
-        avg["ms"]  = (time.perf_counter() - t0) * 1000
+        avg["ppl"]       = math.exp(min(avg.get("ce", 10), 10))
+        avg["ms"]        = (epoch_time / n_bat) * 1000    # ms per batch
+        avg["tok_s"]     = total_tokens / epoch_time       # tokens/sec
         avg["net_vocab"] = model.net.quantizer.current_size.item() if model.net_enabled else 0
         avg["kb_facts"]  = model.prover.kb.n_facts()
 
-        print(f"  {epoch:4d} "
+        # Throughput breakdown (тільки epoch 1 для діагностики)
+        if epoch == 1:
+            print(f"\n  ── Epoch 1 throughput breakdown ──")
+            print(f"     data prefetch : {t_data*1000/n_bat:5.1f} ms/batch")
+            print(f"     forward       : {t_fwd*1000/n_bat:5.1f} ms/batch")
+            print(f"     backward      : {t_bwd*1000/n_bat:5.1f} ms/batch")
+            print(f"     opt+step      : {t_opt*1000/n_bat:5.1f} ms/batch  "
+                  f"(кожні {grad_accum} batches)")
+            print(f"     total/batch   : {avg['ms']:5.1f} ms/batch")
+            print(f"     throughput    : {avg['tok_s']:,.0f} tok/s\n")
+            print(f"  {hdr}")
+            print("  " + "─" * len(hdr))
+
+        # \r → повертаємось на початок рядка, затираємо прогрес-лічильник
+        print(f"\r  {epoch:4d} "
               f"{avg.get('ce', 0):7.3f} "
               f"{min(avg.get('world', 0), 10.0):7.3f} "
               f"{avg.get('l_scale', 0):7.4f} "
@@ -279,10 +471,11 @@ def joint_train(model: OMENScale,
               f"{avg['net_vocab']:4d} "
               f"{avg['kb_facts']:4d} "
               f"{avg['ppl']:8.2f} "
-              f"{avg['ms']:6.0f}")
+              f"{avg['ms']:6.0f} "
+              f"{avg['tok_s']:7.0f}          ", flush=True)
         results.append(avg)
 
-        if checkpoint_dir and epoch % 2 == 0:
+        if checkpoint_dir and (epoch % 2 == 0 or epoch == n_epochs):
             _save_ckpt(model, opt, epoch, avg, checkpoint_dir)
 
     print("  " + "─" * len(hdr))
@@ -291,17 +484,69 @@ def joint_train(model: OMENScale,
     return results
 
 
+def _serialize_kb(kb) -> dict:
+    """Повна серіалізація TensorKnowledgeBase: факти, правила, records, лічильники."""
+    return {
+        "fact_buf":   kb._fact_buf[:kb._n_facts].cpu().clone(),   # (n_facts, 3) int64
+        "rules":      pickle.dumps(list(kb.rules)),               # bytes → safe for weights_only=True
+        "n_facts":    kb._n_facts,
+        "n_rules":    kb._n_rules,
+        "n_proposed": kb._n_proposed,
+        "n_verified": kb._n_verified,
+        "records":    pickle.dumps(dict(kb._records)),             # bytes → safe (RuleRecord містить HornClause)
+        "fact_set":   set(kb._fact_set),
+        "rule_hash_set": set(kb._rule_hash_set),
+    }
+
+
+def _restore_kb(model, kb_state: dict, device) -> None:
+    """Відновлює TensorKnowledgeBase з серіалізованого стану."""
+    kb = model.prover.kb
+    # Відновлюємо факти
+    n_f = kb_state["n_facts"]
+    if n_f > 0:
+        kb._fact_buf[:n_f] = kb_state["fact_buf"].to(device)
+    kb._n_facts       = n_f
+    kb._fact_set      = kb_state.get("fact_set", set())
+    # Відновлюємо правила
+    kb.rules          = pickle.loads(kb_state["rules"]) if isinstance(kb_state["rules"], bytes) else kb_state["rules"]
+    kb._n_rules       = kb_state["n_rules"]
+    kb._n_proposed    = kb_state["n_proposed"]
+    kb._n_verified    = kb_state["n_verified"]
+    kb._records       = (pickle.loads(kb_state["records"])
+                         if isinstance(kb_state["records"], bytes)
+                         else kb_state.get("records", {}))
+    kb._rule_hash_set = kb_state.get("rule_hash_set", {hash(r) for r in kb.rules})
+    # Інвалідуємо кеш фактів
+    kb._facts_cache   = None
+    kb._facts_cache_n = -1
+    print(f"    [restore] KB: {n_f} facts, {kb_state['n_rules']} rules")
+
+
 def _save_ckpt(model, optimizer, epoch, metrics, save_dir):
     Path(save_dir).mkdir(parents=True, exist_ok=True)
     path = str(Path(save_dir) / f"omen_epoch{epoch:04d}.pt")
+
+    # ── KB: повна серіалізація (Bug 1 fix) ─────────────────────────────────────
+    kb_state = _serialize_kb(model.prover.kb)
+
+    # ── Memory cache: episodic recall (Bug 3 fix) ───────────────────────────────
+    mem_cache = [(s.cpu().clone(), v.cpu().clone())
+                 for s, v in model.memory.cache]
+
     torch.save({
-        "epoch": epoch, "model": model.state_dict(),
+        "epoch":     epoch,
+        "model":     model.state_dict(),
         "optimizer": optimizer.state_dict() if optimizer else {},
-        "metrics": metrics,
+        "metrics":   metrics,
         "net_vocab": model.net.quantizer.current_size.item() if model.net_enabled else 0,
-        "kb_facts": model.prover.kb.n_facts(),
+        "net_tau":   float(model.net.quantizer.tau) if model.net_enabled else None,
+        "kb_facts":  kb_state["n_facts"],    # для швидкого перегляду
+        "kb_state":  kb_state,               # повний стан KB
+        "mem_cache": mem_cache,              # episodic recall cache
     }, path)
-    print(f"    [ckpt] {path}")
+    print(f"    [ckpt] {path}  (KB={kb_state['n_facts']}f/{kb_state['n_rules']}r"
+          f"  cache={len(mem_cache)})")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -311,7 +556,7 @@ def _save_ckpt(model, optimizer, epoch, metrics, save_dir):
 @torch.no_grad()
 def net_diagnostics(model: OMENScale,
                     dataset: List[Tuple[torch.Tensor, torch.Tensor]],
-                    n_samples: int = 4) -> None:
+                    n_samples: int = 32) -> None:
     if not model.net_enabled:
         return
     model.eval()
@@ -357,7 +602,8 @@ def smoke_test() -> None:
 
     # Stage 2
     results = joint_train(model, dataset, n_epochs=4, batch_size=4,
-                          lr=1e-4, max_batches_per_epoch=8)
+                          lr=1e-4, max_batches_per_epoch=8,
+                          use_amp=False, grad_accum=1)
 
     ppls = [r["ppl"] for r in results]
     best_ppl = min(ppls)
@@ -402,6 +648,18 @@ def parse_args():
     p.add_argument("--max_batches", type=int, default=None,
                    help="Ліміт батчів/епоху (None = весь датасет). "
                         "Рекомендовано: 256-500 для швидких ітерацій.")
+    # ── Оптимізація швидкості ──────────────────────────────────────────────
+    p.add_argument("--amp", action="store_true", default=False,
+                   help="Увімкнути AMP (FP16 autocast). "
+                        "Дає 40-100%% прискорення на CUDA GPU. "
+                        "Автоматично вимикається якщо немає CUDA.")
+    p.add_argument("--grad_accum", type=int, default=1,
+                   help="Gradient accumulation steps. "
+                        "effective_batch = batch_size × grad_accum. "
+                        "Рекомендовано: 2-4 (зменшує к-сть opt.step() викликів).")
+    p.add_argument("--num_workers", type=int, default=0,
+                   help="DataLoader workers (0 = main thread). "
+                        "На CUDA можна спробувати 2-4 для prefetch.")
     return p.parse_args()
 
 
@@ -417,6 +675,12 @@ def main():
 
     print(f"Config={args.config}  device={DEVICE}  NET={'on' if cfg.net_enabled else 'off'}")
 
+    # Підказка: GPU-оптимізація
+    if DEVICE.type == "cuda" and not args.amp:
+        print("\n  💡 ПІДКАЗКА: ви на GPU але --amp не задано.")
+        print("     Рекомендовано: --amp --grad_accum 2")
+        print("     Очікуване прискорення: ~2x forward/backward (FP16 tensor cores)\n")
+
     if args.real_text:
         dataset = load_text_corpus(args.real_text, cfg.seq_len)
     else:
@@ -426,19 +690,44 @@ def main():
     train_ds = dataset[:split]
 
     model = OMENScale(cfg).to(DEVICE)
+    _resume_opt_state = None
     if args.resume:
-        ckpt = torch.load(args.resume, map_location=DEVICE)
+        ckpt = torch.load(args.resume, map_location=DEVICE, weights_only=False)
         model.load_state_dict(ckpt["model"])
+        # Bug 4 fix: відновлюємо KB та memory cache
+        if "kb_state" in ckpt:
+            _restore_kb(model, ckpt["kb_state"], DEVICE)
+        if "mem_cache" in ckpt:
+            model.memory.cache.extend(
+                [(s.to(DEVICE), v.to(DEVICE)) for s, v in ckpt["mem_cache"]]
+            )
+        # Bug fix: відновлюємо net_tau (Python float — не входить у state_dict)
+        if "net_tau" in ckpt and ckpt["net_tau"] is not None and model.net_enabled:
+            model.net.quantizer.tau = float(ckpt["net_tau"])
+        # Bug fix: зберігаємо optimizer state для відновлення у joint_train
+        _resume_opt_state = ckpt.get("optimizer") or None
+        print(f"  [resume] Завантажено epoch={ckpt.get('epoch', '?')}  "
+              f"KB={ckpt.get('kb_facts', '?')} facts  "
+              f"cache={len(ckpt.get('mem_cache', []))}  "
+              f"tau={ckpt.get('net_tau', '?')}")
 
-    pretrain_net(model, train_ds, n_steps=args.stage1_steps,
-                 batch_size=args.batch_size)
+    # Stage 1: пропускаємо якщо resume (NET відновлено з checkpoint)
+    if args.resume:
+        print("  [resume] Stage 1 пропущено — NET відновлено з checkpoint")
+    else:
+        pretrain_net(model, train_ds, n_steps=args.stage1_steps,
+                     batch_size=args.batch_size)
     if cfg.net_enabled:
         net_diagnostics(model, train_ds)
 
     joint_train(model, train_ds, n_epochs=args.stage2_epochs,
                 batch_size=args.batch_size, lr=args.lr,
                 max_batches_per_epoch=args.max_batches,
-                checkpoint_dir=args.checkpoint_dir)
+                checkpoint_dir=args.checkpoint_dir,
+                use_amp=args.amp,
+                grad_accum=args.grad_accum,
+                num_workers=args.num_workers,
+                opt_state=_resume_opt_state)
     print(model.memory_report())
 
 
