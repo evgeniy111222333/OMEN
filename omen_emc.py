@@ -661,11 +661,13 @@ class EfficientMetaController(nn.Module):
                 gap_norm_cur = (gap_norm_cur * 0.9).clamp(0.0, 5.0)
 
             elif a == ACTION_FC:
-                all_facts_after = prover.kb.forward_chain(max_depth=1)
-                n_after  = len(all_facts_after)
-                r_int    = float(max(0, n_after - n_before)) / max(n_facts_init + 1, 1)
+                # FIX Bug-FC: forward_chain() повертає frozenset але НЕ додає факти в KB.
+                # forward_chain_step() виконує один крок І персистує нові факти через
+                # kb.add_fact() → state KB реально оновлюється для наступних кроків.
+                n_added_fc, _ = prover.forward_chain_step()
+                r_int    = float(n_added_fc) / max(n_facts_init + 1, 1)
                 # GapNorm може зменшитись якщо нові факти проясняють ситуацію
-                if n_after > n_before:
+                if n_added_fc > 0:
                     gap_norm_cur = (gap_norm_cur * 0.95).clamp(0.0, 5.0)
 
             elif a == ACTION_ABDUCE:
@@ -887,10 +889,10 @@ class EfficientMetaController(nn.Module):
                 gap_norm_cur = (gap_norm_cur * 0.9).clamp(0.0, 5.0)
 
             elif a == ACTION_FC:
-                all_facts_after = prover.kb.forward_chain(max_depth=1)
-                n_after  = len(all_facts_after)
-                r_int    = float(max(0, n_after - n_before)) / max(prover.kb.n_facts() + 1, 1)
-                if n_after > n_before:
+                # FIX Bug-FC: forward_chain() не змінює KB. forward_chain_step() персистує.
+                n_added_fc, _ = prover.forward_chain_step()
+                r_int    = float(n_added_fc) / max(prover.kb.n_facts() + 1, 1)
+                if n_added_fc > 0:
                     gap_norm_cur = (gap_norm_cur * 0.95).clamp(0.0, 5.0)
 
             elif a == ACTION_ABDUCE:

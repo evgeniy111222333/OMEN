@@ -752,14 +752,15 @@ class OMENScale(nn.Module):
 
         # Початкове символьне представлення: через EMC (якщо ввімкнено) або прямо
         if self.emc_enabled:
-            # Ініціальний Epistemic Gap для Bellman stopping
+            # Ініціальний Epistemic Gap для Bellman stopping.
+            # FIX Bug-EGD: раніше тут створювався новий EpistemicGapDetector(v2cfg)
+            # на кожен виклик generate() — нові (не навчені) ваги + зайва пам'ять.
+            # self.epistemic вже існує і compute() є pure-functional (закрита формула),
+            # тому використовуємо self.epistemic замість fresh instance.
             sim_tgt = prompt[:, -8:] if prompt.size(1) > 8 else prompt
-            v2cfg   = _make_v2_compat(self.cfg)
-            from omen_v2 import EpistemicGapDetector
-            _egdet  = EpistemicGapDetector(v2cfg).to(z.device)
             z_sim_traj = self.world_rnn.simulate_sequence(z.detach(), sim_tgt)
             z_sim0     = z_sim_traj[:, -1]
-            _, gap_norm0, _ = _egdet.compute(z, self.world_rnn, z_sim0)
+            _, gap_norm0, _ = self.epistemic.compute(z, self.world_rnn, z_sim0)
             z_sym, v_mem_emc = self.emc.run_episode_eval(
                 z, gap_norm0, self.prover, self.memory, device=z.device)
             if v_mem_emc.norm() > 1e-6:
@@ -785,10 +786,11 @@ class OMENScale(nn.Module):
                     # ── EMC адаптивне міркування під час inference ────────────
                     # π_meta* = argmax_π E[R_task − λ_time·T − λ_MDL·MDL(proof)]
                     # Bellman зупинка замість фіксованого max_depth.
+                    # FIX Bug-EGD: self.epistemic замість fresh EpistemicGapDetector
                     z_sim_step = self.world_rnn.simulate_sequence(
                         z_ctx.detach(), ctx[:, -8:] if ctx.size(1) > 8 else ctx
                     )[:, -1]
-                    _, gap_step, _ = _egdet.compute(z_ctx, self.world_rnn, z_sim_step)
+                    _, gap_step, _ = self.epistemic.compute(z_ctx, self.world_rnn, z_sim_step)
                     z_sym_step, v_mem_step = self.emc.run_episode_eval(
                         z_ctx, gap_step, self.prover, self.memory,
                         device=z_ctx.device)
@@ -928,6 +930,11 @@ def train_epoch_scale(model: OMENScale, dataset, optimizer,
         out["total"].backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        # FIX Bug-Flush: maybe_flush() ПІСЛЯ optimizer.step() — autograd graph вже знищено,
+        # safe для inplace оновлення memory buffer (уникаємо version mismatch).
+        # joint_train() правильно викликає maybe_flush() після кожного step;
+        # train_epoch_scale() раніше цього не робив → пам'ять оновлювалась лише в кінці епохи.
+        model.memory.maybe_flush()
 
         for k, v in out.items():
             if k not in ("logits", "z", "emc_stop"):
