@@ -50,6 +50,9 @@ from omen_net_tokenizer import NeuralEpistemicTokenizer
 # EMC: Efficient Meta-Controller (адаптивний контролер міркування)
 from omen_emc import EfficientMetaController
 
+# OSF: OMEN Synthesis Framework (ієрархічна нейро-символьна генерація)
+from omen_osf import OSFSynthesizer, OSFConfig
+
 # Запозичуємо стабільні компоненти v2
 from omen_v2 import (
     WorldRNN,
@@ -531,6 +534,46 @@ class OMENScale(nn.Module):
         # ─── Loss ─────────────────────────────────────────────────────────────
         self.loss_fn = OMENScaleLoss(cfg)
 
+        # ─── OSF: OMEN Synthesis Framework ────────────────────────────────────
+        # OSF замінює / доповнює TokenDecoder ієрархічною генерацією.
+        # osf_enabled=True → OSFSynthesizer використовується у forward().
+        # osf_enabled=False → класичний TokenDecoder (зворотна сумісність).
+        self.osf_enabled = getattr(cfg, 'osf_enabled', False)
+        if self.osf_enabled:
+            osf_cfg = OSFConfig(
+                osf_enabled     = True,
+                d_intent        = getattr(cfg, 'osf_d_intent', 64),
+                n_goals         = getattr(cfg, 'osf_n_goals', 32),
+                d_plan          = getattr(cfg, 'osf_d_plan', 64),
+                n_operators     = getattr(cfg, 'osf_n_operators', 32),
+                template_len    = getattr(cfg, 'osf_template_len', 8),
+                max_plan_depth  = getattr(cfg, 'osf_max_plan_depth', 4),
+                beam_width      = getattr(cfg, 'osf_beam_width', 2),
+                lambda_plan     = getattr(cfg, 'osf_lambda_plan', 0.10),
+                lambda_sim      = getattr(cfg, 'osf_lambda_sim', 0.05),
+                lambda_refl     = getattr(cfg, 'osf_lambda_refl', 0.05),
+                lambda_meta     = getattr(cfg, 'osf_lambda_meta', 0.05),
+                lambda_intent   = getattr(cfg, 'osf_lambda_intent', 0.01),
+                use_simulation  = getattr(cfg, 'osf_use_simulation', True),
+                use_reflection  = getattr(cfg, 'osf_use_reflection', True),
+                use_meta        = getattr(cfg, 'osf_use_meta', True),
+                meta_beta       = getattr(cfg, 'osf_meta_beta', 0.1),
+                gumbel_tau      = getattr(cfg, 'osf_gumbel_tau', 1.0),
+                dropout         = cfg.dropout,
+            )
+            self.osf = OSFSynthesizer(
+                cfg        = osf_cfg,
+                d_latent   = cfg.d_latent,
+                d_tok      = cfg.d_tok,
+                vocab_size = cfg.vocab_size,
+                n_heads    = getattr(cfg, 'n_heads_tok', 4),
+            )
+            self._osf_lambda_total = getattr(cfg, 'osf_lambda_total', 0.3)
+            # Running CE estimate: ковзне середнє CE попередніх батчів.
+            # EMA decay=0.9 → ~10-батчевий горизонт. Передається до OSFSynthesizer
+            # замість хардкоду 5.0, щоб мета-контролер отримував реальну якість.
+            self._osf_running_ce: float = 5.0
+
         # ─── torch.compile (опціонально) ──────────────────────────────────────
         if cfg.compile_model and not cfg.net_enabled:
             self.tok_encoder = torch.compile(self.tok_encoder)
@@ -640,6 +683,10 @@ class OMENScale(nn.Module):
         self.memory.schedule_write(z.detach(), z_sim.detach(), conf.detach())
 
         # ══ Рівень 1: Decode  ════════════════════════════════════════════════
+        # Ініціалізуємо osf_out заздалегідь — завжди визначена змінна незалежно
+        # від того, який шлях декодування обрано (NET / OSF / classic).
+        osf_out: Dict = {}
+
         if self.net_enabled:
             # NET декодер: реконструює оригінальні токени з h_tok + z_final
             logits, l_rec = self.net.decode(tgt, z_final, h_tok)      # (B,T,V), scalar
@@ -649,6 +696,22 @@ class OMENScale(nn.Module):
                 sem_pairs=sem_pairs_net if sem_pairs_net else None
             )
             net_loss = net_loss_dict["net_total"]
+        elif self.osf_enabled:
+            # ── OSF: ієрархічна генерація H1→H2→H3→H4 ─────────────────────────
+            # OSF замінює TokenDecoder через нейро-символьне планування.
+            # Повертає ті самі logits (B, T, V) + словник OSF losів.
+            logits, osf_out = self.osf(
+                h_tok      = h_tok,
+                z_final    = z_final,
+                tgt        = tgt,
+                world_rnn  = self.world_rnn,
+                gap_norm   = float(gap_norm.mean().item()),
+                ce_loss    = self._osf_running_ce,  # EMA CE попереднього батчу
+                n_rules    = len(self.prover),
+                n_writes   = self.memory.n_writes,
+            )
+            net_loss      = torch.tensor(0.0, device=src.device)
+            net_loss_dict = {}
         else:
             logits   = self.tok_decoder(tgt, z_final)                  # (B, T, V)
             net_loss = torch.tensor(0.0, device=src.device)
@@ -672,6 +735,33 @@ class OMENScale(nn.Module):
             meta_loss=meta_loss,
             traj_reward=traj_reward,
         )
+
+        # ── OSF: додаємо J_OSF до загального лосу ─────────────────────────────
+        # osf_out завжди визначений (ініціалізований вище як {}), тому
+        # перевірка 'osf_out' in dir() не потрібна — замінено на пряму перевірку ключа.
+        if self.osf_enabled and not self.net_enabled and "j_osf" in osf_out:
+            j_osf = osf_out["j_osf"]
+            if torch.is_tensor(j_osf):
+                out["total"] = out["total"] + self._osf_lambda_total * j_osf
+            # Додаємо OSF-статистику до out
+            for k, v in osf_out.items():
+                if k != "j_osf":
+                    out[k] = v
+
+        # ── OSF: оновлюємо running CE estimate (EMA decay=0.9) ────────────────
+        # Виконується ПІСЛЯ loss_fn, щоб CE поточного батчу врахувалась
+        # у мета-контролері наступного батчу.
+        if self.osf_enabled:
+            _ce_cur = out.get("ce", None)
+            if _ce_cur is not None:
+                try:
+                    _ce_f = float(_ce_cur)
+                    if not (math.isnan(_ce_f) or math.isinf(_ce_f)):
+                        self._osf_running_ce = (
+                            0.9 * self._osf_running_ce + 0.1 * _ce_f
+                        )
+                except (TypeError, ValueError):
+                    pass
 
         out["logits"]    = logits
         out["z"]         = z_final
@@ -810,11 +900,26 @@ class OMENScale(nn.Module):
             else:
                 if self.net_enabled:
                     h_for_decode, _, _ = self.net.encode(ctx)
+                elif self.osf_enabled:
+                    # OSF потребує h_tok так само як NET → кодуємо через tok_encoder
+                    h_for_decode = self.tok_encoder(ctx)   # (B, T, d_tok)
                 else:
                     h_for_decode = None   # tok_decoder не потребує h_tok
 
             if self.net_enabled:
                 logits, _ = self.net.decode(ctx, z_final, h_for_decode)
+            elif self.osf_enabled:
+                # ── OSF inference: ієрархічний декодер (без лосів) ───────────
+                # Кроки: z_final → IntentEncoder → SymbolicPlanner → HierarchicalDecoder
+                # Використовуємо eval-режим (self.training=False → Gumbel=sharpened softmax,
+                # planner=greedy argmax, meta_ctrl не активується).
+                _intent_state = self.osf.intent_encoder(z_final)
+                _plan         = self.osf.planner(_intent_state)
+                logits, _     = self.osf.hier_decoder(
+                    h_tok    = h_for_decode,
+                    z_intent = _intent_state.z_intent,
+                    plan     = _plan,
+                )
             else:
                 logits = self.tok_decoder(ctx, z_final)
 
@@ -874,6 +979,8 @@ class OMENScale(nn.Module):
             )
         if self.net_enabled:
             base += self.net.tokenizer_report()
+        if self.osf_enabled:
+            base += self.osf.memory_report()
         return base
 
 

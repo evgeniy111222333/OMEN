@@ -171,6 +171,33 @@ class OMENScaleConfig:
     world_rnn_hidden_v2: int = 512    # alias
 
     # ════════════════════════════════════════════════════════════════════════
+    # ─── OMEN Synthesis Framework (OSF) ──────────────────────────────────────
+    # OSF замінює TokenDecoder ієрархічною нейро-символьною генерацією.
+    # Чотири рівні: Intent → Plan → Expression → Tokens.
+    #
+    # J_OSF = λ_plan·L_plan + λ_sim·L_sim + λ_refl·L_refl + λ_meta·L_meta
+    # Повний функціонал: J_total = J_OMEN + λ_osf · J_OSF
+    #
+    osf_enabled:      bool  = True      # True → OSF замість TokenDecoder
+    osf_d_intent:     int   = 64        # розмір Intent-простору (H1)
+    osf_n_goals:      int   = 32        # кількість абстрактних цілей
+    osf_d_plan:       int   = 64        # розмір Plan-простору (H2)
+    osf_n_operators:  int   = 32        # бібліотека план-операторів
+    osf_template_len: int   = 8         # довжина шаблону оператора (H3)
+    osf_max_plan_depth: int = 4         # максимальна глибина плану
+    osf_beam_width:   int   = 2         # ширина beam search
+    osf_lambda_plan:  float = 0.10      # вага L_plan
+    osf_lambda_sim:   float = 0.05      # вага L_sim
+    osf_lambda_refl:  float = 0.05      # вага L_refl
+    osf_lambda_meta:  float = 0.05      # вага L_meta (стратегія)
+    osf_lambda_intent: float = 0.01     # anti-collapse intent
+    osf_lambda_total: float = 0.3       # λ_osf: вага J_OSF у J_total
+    osf_use_simulation: bool = True     # WorldSimulator
+    osf_use_reflection: bool = True     # ReflectionModule
+    osf_use_meta:     bool  = True      # SynthesisMetaController
+    osf_meta_beta:    float = 0.1       # баланс якість/вартість σ
+    osf_gumbel_tau:   float = 1.0       # Gumbel-Softmax temperature
+
     @classmethod
     def demo(cls) -> "OMENScaleConfig":
         """Конфіг для тестування на будь-якому залізі (CPU/GPU)"""
@@ -203,6 +230,13 @@ class OMENScaleConfig:
             # EMC розширення
             emc_use_gae=True,   emc_gae_lambda=0.95, emc_lambda_mdl=0.01,
             emc_use_action_hist=True,
+            # OSF: Synthesis Framework (малий для demo)
+            osf_enabled=True,   osf_d_intent=32,     osf_n_goals=16,
+            osf_d_plan=32,      osf_n_operators=16,  osf_template_len=4,
+            osf_max_plan_depth=3, osf_beam_width=2,
+            osf_lambda_plan=0.10, osf_lambda_sim=0.05, osf_lambda_refl=0.05,
+            osf_lambda_meta=0.05, osf_lambda_total=0.3,
+            osf_use_simulation=True, osf_use_reflection=True, osf_use_meta=True,
         )
 
     @classmethod
@@ -250,6 +284,12 @@ class OMENScaleConfig:
             # EMC розширення
             emc_use_gae=True,   emc_gae_lambda=0.95, emc_lambda_mdl=0.01,
             emc_use_action_hist=True,
+            # OSF
+            osf_enabled=True,   osf_d_intent=64,     osf_n_goals=32,
+            osf_d_plan=64,      osf_n_operators=32,  osf_template_len=8,
+            osf_max_plan_depth=4, osf_beam_width=2,
+            osf_lambda_plan=0.10, osf_lambda_sim=0.05, osf_lambda_refl=0.05,
+            osf_lambda_meta=0.05, osf_lambda_total=0.3,
         )
 
     @classmethod

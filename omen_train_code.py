@@ -487,7 +487,10 @@ def joint_train(model: OMENScale,
             diag_keys = ["ce", "world", "l_scale", "sym_ground", "ltm_pen",
                          "ltm_pen_raw", "net_loss", "meta_loss", "traj_reward",
                          "curiosity", "recall", "novelty", "vem_pen",
-                         "gnorm_net", "gnorm_other", "lr"]
+                         "gnorm_net", "gnorm_other", "lr",
+                         # OSF: компоненти J_OSF для діагностики стрибків
+                         "osf_l_plan", "osf_l_sim", "osf_l_refl", "osf_l_meta",
+                         "osf_l_intent", "osf_struct", "osf_plan_rl"]
             for dk in diag_keys:
                 v = avg.get(dk, 0.0)
                 flag = " ⚠️" if abs(v) > 5.0 else ""
@@ -532,6 +535,32 @@ def joint_train(model: OMENScale,
                   f"stop={a_stop:.0f}% recall={a_recall:.0f}% "
                   f"fc={a_fc:.0f}% abd={a_abd:.0f}% "
                   f"mdl={avg.get('emc_mdl',0):.2f}")
+
+        # ── OSF рядок (якщо ввімкнено) ────────────────────────────────────────
+        # Відображає всі компоненти J_OSF + стан мета-контролера стратегій.
+        # σ: 0=Fast, 1=Careful, 2=Exploratory — середнє за епоху.
+        if getattr(model.cfg, 'osf_enabled', False):
+            _osf_plan   = avg.get('osf_l_plan',    0.0)
+            _osf_sim    = avg.get('osf_l_sim',     0.0)
+            _osf_refl   = avg.get('osf_l_refl',    0.0)
+            _osf_meta   = avg.get('osf_l_meta',    0.0)
+            _osf_intent = avg.get('osf_l_intent',  0.0)
+            _osf_struct = avg.get('osf_struct',    0.0)
+            _osf_rl     = avg.get('osf_plan_rl',   0.0)
+            _osf_depth  = avg.get('osf_plan_depth',0.0)
+            _osf_entr   = avg.get('osf_goal_entropy', 0.0)
+            _osf_sigma  = avg.get('osf_strategy',  1.0)
+            _osf_rce    = getattr(model, '_osf_running_ce', 5.0)
+            _freq_fast  = avg.get('meta_freq_Fast',        0.0) * 100
+            _freq_care  = avg.get('meta_freq_Careful',     0.0) * 100
+            _freq_expl  = avg.get('meta_freq_Exploratory', 0.0) * 100
+            print(f"       [OSF] plan={_osf_plan:.3f} sim={_osf_sim:.3f} "
+                  f"refl={_osf_refl:.3f} meta={_osf_meta:.3f} "
+                  f"intent={_osf_intent:.3f} struct={_osf_struct:.3f} "
+                  f"rl={_osf_rl:.3f} | "
+                  f"depth={_osf_depth:.1f} H={_osf_entr:.2f} "
+                  f"σ={_osf_sigma:.1f} CE_ema={_osf_rce:.3f} | "
+                  f"Fast={_freq_fast:.0f}% Care={_freq_care:.0f}% Expl={_freq_expl:.0f}%")
 
         results.append(avg)
 
@@ -628,6 +657,9 @@ def _save_ckpt(model, optimizer, epoch, metrics, save_dir):
         "kb_state":  kb_state,               # повний стан KB
         "mem_cache": mem_cache,              # episodic recall cache
         "emc_meta":  emc_meta,              # EMC гіперпараметри + param counts (weights у model)
+        # OSF: зберігаємо running CE estimate, щоб мета-контролер відновлював
+        # реалістичну оцінку якості замість хардкоду 5.0 після завантаження.
+        "osf_running_ce": getattr(model, '_osf_running_ce', 5.0),
     }, path)
     emc_info = ""
     if emc_meta:
@@ -793,8 +825,11 @@ def main():
         # Bug fix: відновлюємо net_tau (Python float — не входить у state_dict)
         if "net_tau" in ckpt and ckpt["net_tau"] is not None and model.net_enabled:
             model.net.quantizer.tau = float(ckpt["net_tau"])
-        # Bug fix: зберігаємо optimizer state для відновлення у joint_train
+        # Bug fix: відновлюємо optimizer state для відновлення у joint_train
         _resume_opt_state = ckpt.get("optimizer") or None
+        # OSF: відновлюємо running CE estimate (не у state_dict)
+        if "osf_running_ce" in ckpt and getattr(model, 'osf_enabled', False):
+            model._osf_running_ce = float(ckpt["osf_running_ce"])
 
         # ── Перевірка EMC state відновлення ──────────────────────────────────
         # EfficientMetaController (Actor + Critic + StoppingUtility + StateEncoder)
