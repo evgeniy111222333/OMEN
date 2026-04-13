@@ -2144,6 +2144,21 @@ class DifferentiableProver(nn.Module):
         embs = self.term_emb(facts_list, device)              # (|facts|, d)
         return self.out_proj(embs.mean(0, keepdim=True))      # (1, d)
 
+    def forward_chain_step(self) -> Tuple[int, "FrozenSet[HornAtom]"]:
+        """
+        Один крок forward chaining з комітом нових фактів у KB.
+
+        Потрібно для EMC, інакше дія ForwardChainStep бачить приріст у
+        `forward_chain(max_depth=1)`, але стан KB фактично не змінюється.
+        """
+        before = self.kb.facts
+        after = self.kb.forward_chain(max_depth=1)
+        new_facts = frozenset(f for f in after if f not in before)
+        added = 0
+        for fact in new_facts:
+            added += int(self.kb.add_fact(fact))
+        return added, new_facts
+
     # ── Proof Search (REINFORCE + Cost(T)) ───────────────────────────────────
     def prove_with_policy(self,
                           goal: HornAtom,

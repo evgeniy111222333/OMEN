@@ -376,14 +376,20 @@ def joint_train(model: OMENScale,
             with _amp_ctx():
                 out = model(src, tgt)
 
+            # ── NaN/Inf guard з покомпонентною діагностикою ───────────────────
             if torch.isnan(out["total"]) or torch.isinf(out["total"]):
+                # Знаходимо проблемний компонент
+                bad = [k for k, v in out.items()
+                       if k not in ("logits", "z", "emc_stop")
+                       and isinstance(v, float) and (math.isnan(v) or math.isinf(v))]
+                print(f"\n  ⚠️  NaN/Inf у total (batch {n_bat+1}), пропускаємо. "
+                      f"Проблемні ключі: {bad if bad else 'невідомо'}")
                 t_iter_start = time.perf_counter()
                 continue
             t_fwd += time.perf_counter() - t1
 
             # ── Backward (масштабований для AMP) ─────────────────────────────
             t2 = time.perf_counter()
-            # Ділимо loss на grad_accum щоб градієнти були «mid-batch» average
             loss = out["total"] / grad_accum
             scaler.scale(loss).backward()
             t_bwd += time.perf_counter() - t2
@@ -392,24 +398,30 @@ def joint_train(model: OMENScale,
             total_tokens += src.numel()
 
             for k, v in out.items():
-                if k not in ("logits", "z"):
-                    agg[k] += float(v) if not isinstance(v, float) else v
+                if k not in ("logits", "z", "emc_stop"):
+                    try:
+                        fv = float(v) if not isinstance(v, float) else v
+                        if not (math.isnan(fv) or math.isinf(fv)):
+                            agg[k] += fv
+                    except (TypeError, ValueError):
+                        pass
 
             # ── Optimizer step кожні grad_accum кроків ───────────────────────
             if n_bat % grad_accum == 0:
                 t3 = time.perf_counter()
                 scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(net_params,   0.5)
-                torch.nn.utils.clip_grad_norm_(other_params, 1.0)
+                # Вимірюємо grad norm ДО кліпу для діагностики
+                gnorm_net   = torch.nn.utils.clip_grad_norm_(net_params,   0.5)
+                gnorm_other = torch.nn.utils.clip_grad_norm_(other_params, 1.0)
+                agg["gnorm_net"]   += float(gnorm_net)
+                agg["gnorm_other"] += float(gnorm_other)
                 scaler.step(opt)
                 scaler.update()
                 opt.zero_grad(set_to_none=True)
-
-                # Flush memory AFTER optimizer step (no autograd graph)
                 model.memory.maybe_flush()
                 t_opt += time.perf_counter() - t3
 
-            # ── Прогрес-лічильник (оновлюється на місці через \r) ─────────────
+            # ── Прогрес-лічильник ─────────────────────────────────────────────
             elapsed_bat = time.perf_counter() - t0_epoch
             ms_per_bat  = elapsed_bat / n_bat * 1000
             eta_s       = ms_per_bat * (_max_bat - n_bat) / 1000
@@ -442,14 +454,19 @@ def joint_train(model: OMENScale,
             continue
 
         epoch_time = time.perf_counter() - t0_epoch
+        n_opt_steps = max(n_bat // grad_accum, 1)
         avg = {k: v / n_bat for k, v in agg.items()}
+        # grad norms усереднені по кількості optimizer steps
+        avg["gnorm_net"]   = agg.get("gnorm_net",   0.0) / n_opt_steps
+        avg["gnorm_other"] = agg.get("gnorm_other", 0.0) / n_opt_steps
         avg["ppl"]       = math.exp(min(avg.get("ce", 10), 10))
-        avg["ms"]        = (epoch_time / n_bat) * 1000    # ms per batch
-        avg["tok_s"]     = total_tokens / epoch_time       # tokens/sec
+        avg["ms"]        = (epoch_time / n_bat) * 1000
+        avg["tok_s"]     = total_tokens / epoch_time
         avg["net_vocab"] = model.net.quantizer.current_size.item() if model.net_enabled else 0
         avg["kb_facts"]  = model.prover.kb.n_facts()
+        avg["lr"]        = opt.param_groups[-1]["lr"]  # LR основної групи
 
-        # Throughput breakdown (тільки epoch 1 для діагностики)
+        # Throughput breakdown (тільки epoch 1)
         if epoch == 1:
             print(f"\n  ── Epoch 1 throughput breakdown ──")
             print(f"     data prefetch : {t_data*1000/n_bat:5.1f} ms/batch")
@@ -462,7 +479,21 @@ def joint_train(model: OMENScale,
             print(f"  {hdr}")
             print("  " + "─" * len(hdr))
 
-        # \r → повертаємось на початок рядка, затираємо прогрес-лічильник
+        # ── PPL spike detector ────────────────────────────────────────────────
+        _prev_ppl = results[-1]["ppl"] if results else avg["ppl"]
+        _spike = avg["ppl"] > _prev_ppl * 3.0 and avg["ppl"] > 20.0
+        if _spike:
+            print(f"\n  🔴 PPL SPIKE: {_prev_ppl:.1f} → {avg['ppl']:.1f}  Компоненти лосу:")
+            diag_keys = ["ce", "world", "l_scale", "sym_ground", "ltm_pen",
+                         "ltm_pen_raw", "net_loss", "meta_loss", "traj_reward",
+                         "curiosity", "recall", "novelty", "vem_pen",
+                         "gnorm_net", "gnorm_other", "lr"]
+            for dk in diag_keys:
+                v = avg.get(dk, 0.0)
+                flag = " ⚠️" if abs(v) > 5.0 else ""
+                print(f"     {dk:<18}: {v:+10.5f}{flag}")
+
+        # ── Компактний рядок епохи ─────────────────────────────────────────────
         print(f"\r  {epoch:4d} "
               f"{avg.get('ce', 0):7.3f} "
               f"{min(avg.get('world', 0), 10.0):7.3f} "
@@ -473,6 +504,35 @@ def joint_train(model: OMENScale,
               f"{avg['ppl']:8.2f} "
               f"{avg['ms']:6.0f} "
               f"{avg['tok_s']:7.0f}          ", flush=True)
+
+        # ── Детальний рядок loss-компонентів ─────────────────────────────────
+        print(f"       "
+              f"sym={avg.get('sym_ground',0):.3f} "
+              f"ltm={avg.get('ltm_pen',0):.3f}({avg.get('ltm_pen_raw',0):.1f}) "
+              f"meta={avg.get('meta_loss',0):.3f} "
+              f"traj_r={avg.get('traj_reward',0):.3f} "
+              f"vem={avg.get('vem_pen',0):.4f} "
+              f"cur={avg.get('curiosity',0):.3f} "
+              f"|∇net|={avg.get('gnorm_net',0):.3f} "
+              f"|∇oth|={avg.get('gnorm_other',0):.3f} "
+              f"lr={avg.get('lr',0):.2e}")
+
+        # ── EMC рядок (якщо ввімкнено) ────────────────────────────────────────
+        if getattr(model.cfg, 'emc_enabled', False):
+            emc_steps  = avg.get('emc_steps', 0.0)
+            meta_loss  = avg.get('meta_loss', 0.0)
+            traj_r     = avg.get('emc_traj_r', 0.0)
+            pct_proved = avg.get('emc_proved', 0.0) * 100
+            a_stop     = avg.get('emc_a_stop', 0.0) * 100
+            a_recall   = avg.get('emc_a_recall', 0.0) * 100
+            a_fc       = avg.get('emc_a_fc', 0.0) * 100
+            a_abd      = avg.get('emc_a_abduce', 0.0) * 100
+            print(f"       [EMC] steps={emc_steps:.1f} "
+                  f"proved={pct_proved:.0f}% "
+                  f"stop={a_stop:.0f}% recall={a_recall:.0f}% "
+                  f"fc={a_fc:.0f}% abd={a_abd:.0f}% "
+                  f"mdl={avg.get('emc_mdl',0):.2f}")
+
         results.append(avg)
 
         if checkpoint_dir and (epoch % 2 == 0 or epoch == n_epochs):
@@ -534,6 +594,29 @@ def _save_ckpt(model, optimizer, epoch, metrics, save_dir):
     mem_cache = [(s.cpu().clone(), v.cpu().clone())
                  for s, v in model.memory.cache]
 
+    # ── EMC: мета-статистика (Actor/Critic/StoppingUtility weights — у model.state_dict())
+    # EfficientMetaController є nn.Module зареєстрованим як self.emc → його ваги
+    # (Actor, Critic, StoppingUtility.task_estimator, EMCStateEncoder) АВТОМАТИЧНО
+    # зберігаються через model.state_dict(). Зберігаємо також мета-статистику для
+    # діагностики та перевірки коректності відновлення.
+    emc_meta = {}
+    if getattr(model, 'emc_enabled', False) and hasattr(model, 'emc'):
+        emc = model.emc
+        emc_meta = {
+            "max_steps":    emc.max_steps,
+            "gamma":        emc.gamma,
+            "lambda_time":  emc.lambda_time,
+            "lambda_gap":   emc.lambda_gap,
+            "lambda_mdl":   emc.lambda_mdl,
+            "eta_int":      emc.eta_int,
+            "entropy_beta": emc.entropy_beta,
+            "use_gae":      emc.use_gae,
+            # Підтверджуємо що ваги зберігаються через model.state_dict()
+            "actor_param_count":  sum(p.numel() for p in emc.actor.parameters()),
+            "critic_param_count": sum(p.numel() for p in emc.critic.parameters()),
+            "stop_param_count":   sum(p.numel() for p in emc.stopping_utility.parameters()),
+        }
+
     torch.save({
         "epoch":     epoch,
         "model":     model.state_dict(),
@@ -544,9 +627,15 @@ def _save_ckpt(model, optimizer, epoch, metrics, save_dir):
         "kb_facts":  kb_state["n_facts"],    # для швидкого перегляду
         "kb_state":  kb_state,               # повний стан KB
         "mem_cache": mem_cache,              # episodic recall cache
+        "emc_meta":  emc_meta,              # EMC гіперпараметри + param counts (weights у model)
     }, path)
+    emc_info = ""
+    if emc_meta:
+        emc_info = (f"  EMC actor={emc_meta.get('actor_param_count',0)}p"
+                    f" critic={emc_meta.get('critic_param_count',0)}p"
+                    f" stoputil={emc_meta.get('stop_param_count',0)}p")
     print(f"    [ckpt] {path}  (KB={kb_state['n_facts']}f/{kb_state['n_rules']}r"
-          f"  cache={len(mem_cache)})")
+          f"  cache={len(mem_cache)}){emc_info}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -706,6 +795,21 @@ def main():
             model.net.quantizer.tau = float(ckpt["net_tau"])
         # Bug fix: зберігаємо optimizer state для відновлення у joint_train
         _resume_opt_state = ckpt.get("optimizer") or None
+
+        # ── Перевірка EMC state відновлення ──────────────────────────────────
+        # EfficientMetaController (Actor + Critic + StoppingUtility + StateEncoder)
+        # зберігається через model.state_dict() → відновлюється через load_state_dict().
+        # Тут перевіряємо що EMC param counts збігаються з очікуваними (meta-info).
+        emc_meta_ckpt = ckpt.get("emc_meta", {})
+        if emc_meta_ckpt and getattr(model, 'emc_enabled', False) and hasattr(model, 'emc'):
+            emc = model.emc
+            ok_actor  = sum(p.numel() for p in emc.actor.parameters()) == emc_meta_ckpt.get("actor_param_count", -1)
+            ok_critic = sum(p.numel() for p in emc.critic.parameters()) == emc_meta_ckpt.get("critic_param_count", -1)
+            ok_stop   = sum(p.numel() for p in emc.stopping_utility.parameters()) == emc_meta_ckpt.get("stop_param_count", -1)
+            status = "✓" if (ok_actor and ok_critic and ok_stop) else "⚠ mismatch"
+            print(f"  [resume] EMC weights restored {status} "
+                  f"(actor={ok_actor} critic={ok_critic} stoputil={ok_stop})")
+
         print(f"  [resume] Завантажено epoch={ckpt.get('epoch', '?')}  "
               f"KB={ckpt.get('kb_facts', '?')} facts  "
               f"cache={len(ckpt.get('mem_cache', []))}  "

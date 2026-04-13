@@ -120,6 +120,49 @@ class OMENScaleConfig:
                                      # FIX Bug2: 0.5→2.0 (при 0.5 soft_H grad ~4600x слабший за l_rec)
                                      # Soft assignments через temperature=0.5 → H градієнт ненульовий при collapse.
 
+    # ─── Efficient Meta-Controller (EMC) ─────────────────────────────────────
+    # EMC замінює фіксований max_proof_depth на адаптивну мета-політику π_meta.
+    #
+    # Рівняння Беллмана:
+    #   V*(s) = max{ U_stop(s), max_{a∈A} [-C(a) + γ·E V*(s')] }
+    #   U_stop(s) = R_task(s) + η_int·R_int(s) − λ_gap·GapNorm(s)
+    #
+    # Навчання Actor-Critic:
+    #   L_meta = L_actor + 0.5·L_critic   (додається до J_OMEN з вагою ω_meta)
+    #
+    # J_OMEN+EMC = J_OMEN
+    #            + ω_meta · E_τ[Σ_t (R_task + η_int·R_int − λ_gap·GapNorm − C(a))]
+    emc_enabled:       bool  = True    # True → EMC керує прологом; False → стара поведінка
+    emc_max_steps:     int   = 5       # максимальна кількість кроків EMC за forward
+    emc_gamma:         float = 0.95    # коефіцієнт дисконтування майбутньої нагороди
+    emc_entropy_beta:  float = 0.01    # β: вага ентропії (exploration bonus)
+    emc_lambda_time:   float = 0.05    # штраф за кожен зайвий крок міркування
+    emc_lambda_gap:    float = 0.05    # штраф за GapNorm (незнання)
+    emc_eta_int:       float = 0.10    # бонус за нові факти/правила (R_int)
+    emc_c_recall:      float = 0.01    # вартість дії RecallMCore
+    emc_c_fc:          float = 0.05    # вартість дії ForwardChainStep
+    emc_c_abduce:      float = 0.10    # вартість дії Abduce
+    omega_meta:        float = 0.05    # ω_meta: вага meta_loss у загальному J
+
+    # ─── EMC розширення: GAE + MDL(proof) + History ───────────────────────────
+    # GAE (Generalized Advantage Estimation):
+    #   A_GAE_t = Σ_{k≥0} (γλ)^k · δ_{t+k}
+    #   де δ_t = r_t + γ·V(s_{t+1}) − V(s_t)  (TD error)
+    #   При λ→0: чистий TD(0); при λ→1: Monte-Carlo. Компроміс bias/variance.
+    emc_use_gae:       bool  = True    # True → GAE замість Монте-Карло returns
+    emc_gae_lambda:    float = 0.95    # λ у GAE (0=TD, 1=MC)
+
+    # MDL(proof) компонент:
+    #   U_stop(s) -= λ_mdl · MDL(proof)
+    #   MDL(proof) = Σ_{R ∈ used_rules} Complexity(R) + depth·c_per_step
+    #   Заохочує стислі доведення (MDL-принцип розширений на reasoning)
+    emc_lambda_mdl:    float = 0.01    # штраф за складність доведення
+
+    # History encoding:
+    #   Стан розширено: s_t = (z, gap_norm, depth, n_facts, n_rules, action_hist)
+    #   action_hist — one-hot агрегат попередніх дій (допомагає уникнути cycles)
+    emc_use_action_hist: bool = True   # True → кодуємо історію дій у стані
+
     # ─── Сумісність з OMENv2 ──────────────────────────────────────────────────
     # (поля, що очікує OMENAGILoss/WorldRNN)
     n_heads:         int   = 16
@@ -152,6 +195,14 @@ class OMENScaleConfig:
             net_tau_schedule=True, net_tau_min=0.70,
             vem_tau=0.3,        delta_vem=1e-3,      eta_utility=0.1,
             lambda_semantic=0.01, rule_consolidate_every=50,
+            # EMC: адаптивний контролер міркування
+            emc_enabled=True,   emc_max_steps=3,     emc_gamma=0.95,
+            emc_entropy_beta=0.01, emc_lambda_time=0.05, emc_lambda_gap=0.05,
+            emc_eta_int=0.1,    emc_c_recall=0.01,   emc_c_fc=0.05,
+            emc_c_abduce=0.10,  omega_meta=0.05,
+            # EMC розширення
+            emc_use_gae=True,   emc_gae_lambda=0.95, emc_lambda_mdl=0.01,
+            emc_use_action_hist=True,
         )
 
     @classmethod
@@ -191,6 +242,14 @@ class OMENScaleConfig:
             vem_tau=0.3,         delta_vem=1e-3,      eta_utility=0.1,
             lambda_semantic=0.01, rule_consolidate_every=100,
             dropout=0.1, sparsity_lambda=5e-4,
+            # EMC
+            emc_enabled=True,   emc_max_steps=5,     emc_gamma=0.95,
+            emc_entropy_beta=0.01, emc_lambda_time=0.05, emc_lambda_gap=0.05,
+            emc_eta_int=0.1,    emc_c_recall=0.01,   emc_c_fc=0.05,
+            emc_c_abduce=0.10,  omega_meta=0.05,
+            # EMC розширення
+            emc_use_gae=True,   emc_gae_lambda=0.95, emc_lambda_mdl=0.01,
+            emc_use_action_hist=True,
         )
 
     @classmethod

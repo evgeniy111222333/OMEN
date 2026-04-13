@@ -47,6 +47,9 @@ from omen_prolog       import DifferentiableProver, HornAtom
 # NET: Neural Epistemic Tokenizer (замінює GPT-2 BPE)
 from omen_net_tokenizer import NeuralEpistemicTokenizer
 
+# EMC: Efficient Meta-Controller (адаптивний контролер міркування)
+from omen_emc import EfficientMetaController
+
 # Запозичуємо стабільні компоненти v2
 from omen_v2 import (
     WorldRNN,
@@ -315,6 +318,8 @@ class OMENScaleLoss(nn.Module):
                 world_rnn:    WorldRNN,
                 net_loss:     torch.Tensor,        # L_NET від NeuralEpistemicTokenizer
                 vem_penalty:  Optional[torch.Tensor] = None,  # δ·E[max(0,τ−U(R))]
+                meta_loss:    Optional[torch.Tensor] = None,  # ω_meta·L_AC (EMC)
+                traj_reward:  Optional[float]       = None,   # Σ_t r_t траєкторії
                 ) -> Dict:
         cfg = self.cfg
 
@@ -367,14 +372,36 @@ class OMENScaleLoss(nn.Module):
         L_sym   = sym_loss
 
         # ── 8. VeM Penalty: δ·E[max(0, τ − U(R))] ───────────────────────────
-        # Штрафує AbductionHead якщо він генерує кандидати, які VeM відхиляє.
-        # ltm_penalty вже включає utility_adjusted_penalty з prover.rule_regularizer()
         if vem_penalty is not None and torch.is_tensor(vem_penalty):
-            L_vem = vem_penalty
+            L_vem = vem_penalty.clamp(max=5.0)
         else:
             L_vem = torch.zeros(1, device=z.device).squeeze()
 
-        # ── Збираємо J(θ,Γ,M) ────────────────────────────────────────────────
+        # ── 9. EMC Meta-Loss: ω_meta·L_AC ────────────────────────────────────
+        if meta_loss is not None and torch.is_tensor(meta_loss):
+            L_meta = meta_loss.clamp(-5.0, 5.0)   # обрізаємо вибухи Actor-Critic
+        else:
+            L_meta = torch.zeros(1, device=z.device).squeeze()
+        omega_meta = getattr(cfg, 'omega_meta', 0.05)
+
+        # ── 10. J_OMEN+EMC: 7-ма компонента — траєкторна мета-винагорода ─────
+        if traj_reward is not None and traj_reward != 0.0:
+            L_traj = -torch.tensor(traj_reward, dtype=torch.float32, device=z.device).clamp(-5.0, 5.0)
+        else:
+            L_traj = torch.zeros(1, device=z.device).squeeze()
+
+        # ── ltm_penalty: клемпуємо щоб уникнути вибуху зі зростанням LTM ─────
+        # Без кліпу: при 1024 правилах × complexity≈5 → ltm_pen≈25 → домінує loss.
+        ltm_penalty_clamped = min(float(ltm_penalty), 2.0)
+
+        # ── Sym loss: обрізаємо нестабільний symbolic consistency ──────────────
+        L_sym_clamped = L_sym.clamp(max=5.0) if torch.is_tensor(L_sym) else torch.tensor(
+            min(float(L_sym), 5.0), device=z.device)
+
+        # ── Збираємо J(θ,Γ,M) + ω_meta·L_AC + ω_meta·L_traj ─────────────────
+        # Curiosity: обрізаємо щоб уникнути домінування при великих gap_norm
+        curiosity_clamped = curiosity_l.clamp(max=5.0) if torch.is_tensor(curiosity_l) \
+                            else min(float(curiosity_l), 5.0)
         total = (
             L_ce
           + cfg.gamma  * L_world
@@ -382,12 +409,18 @@ class OMENScaleLoss(nn.Module):
           + cfg.eta    * L_recall
           - cfg.alpha  * I_zm
           + L_scale
-          + cfg.beta   * L_sym
-          + ltm_penalty
-          + curiosity_l * 0.1
+          + cfg.beta   * L_sym_clamped
+          + ltm_penalty_clamped
+          + 0.1 * curiosity_clamped
           + cfg.eta_tok * net_loss          # ← L_NET (включає L_semantic)
           + getattr(cfg, 'delta_vem', 1e-3) * L_vem  # ← δ·VeM
+          + omega_meta  * L_meta            # ← ω_meta·L_AC (EMC Actor-Critic)
+          + omega_meta  * L_traj            # ← ω_meta·(-Σ_t r_t) (7-ма компонента)
         )
+
+        # Фінальна NaN-guard: якщо total=NaN → повертаємо тільки L_ce
+        if torch.isnan(total) or torch.isinf(total):
+            total = L_ce
 
         # net_loss може бути dict або scalar — нормалізуємо
         net_loss_scalar = (net_loss["net_total"].item()
@@ -403,11 +436,14 @@ class OMENScaleLoss(nn.Module):
             "recall":     L_recall.item(),
             "novelty":    I_zm.item(),
             "l_scale":    L_scale.item(),
-            "sym_ground": L_sym.item(),
-            "ltm_pen":    ltm_penalty,
+            "sym_ground": L_sym_clamped.item() if torch.is_tensor(L_sym_clamped) else float(L_sym_clamped),
+            "ltm_pen":    ltm_penalty_clamped,
+            "ltm_pen_raw": float(ltm_penalty),   # для діагностики нескліпованого значення
             "curiosity":  curiosity_l.item(),
             "net_loss":   net_loss_scalar,
             "vem_pen":    L_vem.item() if torch.is_tensor(L_vem) else float(L_vem),
+            "meta_loss":  L_meta.item() if torch.is_tensor(L_meta) else float(L_meta),
+            "traj_reward": traj_reward if traj_reward is not None else 0.0,
         }
 
 
@@ -484,6 +520,14 @@ class OMENScale(nn.Module):
         if cfg.net_enabled:
             self.net.attach_kb(self.prover.kb)
 
+        # ─── EMC: Efficient Meta-Controller ───────────────────────────────────
+        # π_meta(a|s) вирішує КОЛИ зупинитись і ЯКУ дію виконати.
+        # emc_enabled=True → повністю замінює fixed-depth prover.forward().
+        # emc_enabled=False → стара поведінка (prover.forward() напряму).
+        self.emc_enabled = getattr(cfg, 'emc_enabled', False)
+        if self.emc_enabled:
+            self.emc = EfficientMetaController(cfg)
+
         # ─── Loss ─────────────────────────────────────────────────────────────
         self.loss_fn = OMENScaleLoss(cfg)
 
@@ -543,9 +587,25 @@ class OMENScale(nn.Module):
         z_enr, cf_loss = self.curiosity(
             z, E, hot_dims, gap_norm, self.memory, self.world_rnn)
 
-        # ── Level 3: ∂-Prolog ─────────────────────────────────────────────────
+        # ── Level 3: ∂-Prolog (через EMC або напряму) ─────────────────────────
         world_err  = F.mse_loss(z_sim, z.detach()).detach()
-        z_sym, sym_loss = self.prover(z_enr, world_err)
+
+        if self.emc_enabled and self.training:
+            # ── EMC: Адаптивний контролер міркування ───────────────────────────
+            # π_meta визначає: Stop | RecallMCore | ForwardChainStep | Abduce
+            # Повертає (z_sym, sym_loss, v_mem_emc, meta_loss, traj_stats)
+            z_sym, sym_loss, v_mem_emc, meta_loss, traj_stats = self.emc.run_episode(
+                z_enr, gap_norm, self.prover, self.memory,
+                world_err, device=z_enr.device,
+            )
+            # Якщо EMC виконав RecallMCore → використовуємо збагачений v_mem
+            if v_mem_emc.norm() > 1e-6:
+                v_mem = v_mem_emc
+        else:
+            # ── Класичний шлях (eval або emc_enabled=False) ────────────────────
+            z_sym, sym_loss = self.prover(z_enr, world_err)
+            meta_loss = torch.zeros(1, device=z_enr.device).squeeze()
+            traj_stats = None
 
         # ── Semantic Feedback Pairs для NET (I(Z;Γ) апроксимація) ────────────
         # S-Core виявляє логічно пов'язані токени → NET наближає їх вектори.
@@ -595,11 +655,13 @@ class OMENScale(nn.Module):
             net_loss_dict = {}
             sem_pairs_net = []
 
-        # ── Loss J(θ,Γ,M) + η_tok·L_NET + δ·VeM ─────────────────────────────
+        # ── Loss J(θ,Γ,M) + η_tok·L_NET + δ·VeM + ω_meta·L_AC ──────────────
         ltm_pen = self.prover.rule_regularizer(
             self.cfg.lam_sym,
             eta_utility=getattr(self.cfg, 'eta_utility', 0.1)
         )
+        # 7-ма компонента J_OMEN+EMC: ω_meta·E_τ[Σ_t r_t]
+        traj_reward = traj_stats.trajectory_reward if traj_stats is not None else None
         out = self.loss_fn(
             logits, tgt, z_final,
             h_tok, latents,
@@ -607,6 +669,8 @@ class OMENScale(nn.Module):
             self.world_rnn,
             net_loss,
             vem_penalty=vem_pen,
+            meta_loss=meta_loss,
+            traj_reward=traj_reward,
         )
 
         out["logits"]    = logits
@@ -616,6 +680,23 @@ class OMENScale(nn.Module):
         out["n_writes"]  = self.memory.n_writes
         out["pend_writes"] = len(self.memory._buf_s)
         out["unknown_ex"]= self.curiosity.unknown_flag_count
+
+        # EMC-специфічна статистика (доступна лише при emc_enabled=True у training)
+        if traj_stats is not None:
+            out["emc_steps"]    = traj_stats.n_steps
+            out["emc_stop"]     = traj_stats.stop_reason
+            out["emc_proved"]   = int(traj_stats.goal_proved)
+            out["emc_traj_r"]   = traj_stats.trajectory_reward
+            out["emc_mdl"]      = traj_stats.proof_mdl
+            out["emc_gap_fin"]  = traj_stats.final_gap
+            # Частоти дій: [stop, recall, fc, abduce]
+            hist = traj_stats.action_histogram
+            if hist:
+                total_a = max(sum(hist), 1)
+                out["emc_a_stop"]   = hist[0] / total_a
+                out["emc_a_recall"] = hist[1] / total_a
+                out["emc_a_fc"]     = hist[2] / total_a
+                out["emc_a_abduce"] = hist[3] / total_a
 
         # NET-специфічна статистика
         if self.net_enabled:
@@ -668,8 +749,25 @@ class OMENScale(nn.Module):
             h_tok = self.tok_encoder(prompt)
         _, z  = self.perceiver(h_tok)
         v_mem = self.memory.read(z)
-        z_sym, _ = self.prover(z, torch.tensor(0.0, device=z.device))
-        z_final  = z + 0.1 * z_sym + 0.1 * v_mem
+
+        # Початкове символьне представлення: через EMC (якщо ввімкнено) або прямо
+        if self.emc_enabled:
+            # Ініціальний Epistemic Gap для Bellman stopping
+            sim_tgt = prompt[:, -8:] if prompt.size(1) > 8 else prompt
+            v2cfg   = _make_v2_compat(self.cfg)
+            from omen_v2 import EpistemicGapDetector
+            _egdet  = EpistemicGapDetector(v2cfg).to(z.device)
+            z_sim_traj = self.world_rnn.simulate_sequence(z.detach(), sim_tgt)
+            z_sim0     = z_sim_traj[:, -1]
+            _, gap_norm0, _ = _egdet.compute(z, self.world_rnn, z_sim0)
+            z_sym, v_mem_emc = self.emc.run_episode_eval(
+                z, gap_norm0, self.prover, self.memory, device=z.device)
+            if v_mem_emc.norm() > 1e-6:
+                v_mem = v_mem_emc
+        else:
+            z_sym, _ = self.prover(z, torch.tensor(0.0, device=z.device))
+
+        z_final = z + 0.1 * z_sym + 0.1 * v_mem
 
         generated = prompt.clone()
         for _ in range(max_new):
@@ -681,12 +779,32 @@ class OMENScale(nn.Module):
                     h_ctx, _, _ = self.net.encode(ctx)
                 else:
                     h_ctx = self.tok_encoder(ctx)
-                _, z_ctx      = self.perceiver(h_ctx)
-                z_sym_step, _ = self.prover(
-                    z_ctx, torch.tensor(0.0, device=z_ctx.device))
-                v_mem_step    = self.memory.read(z_ctx)
-                z_final       = z_ctx + 0.1 * z_sym_step + 0.1 * v_mem_step
-                h_for_decode  = h_ctx
+                _, z_ctx = self.perceiver(h_ctx)
+
+                if self.emc_enabled:
+                    # ── EMC адаптивне міркування під час inference ────────────
+                    # π_meta* = argmax_π E[R_task − λ_time·T − λ_MDL·MDL(proof)]
+                    # Bellman зупинка замість фіксованого max_depth.
+                    z_sim_step = self.world_rnn.simulate_sequence(
+                        z_ctx.detach(), ctx[:, -8:] if ctx.size(1) > 8 else ctx
+                    )[:, -1]
+                    _, gap_step, _ = _egdet.compute(z_ctx, self.world_rnn, z_sim_step)
+                    z_sym_step, v_mem_step = self.emc.run_episode_eval(
+                        z_ctx, gap_step, self.prover, self.memory,
+                        device=z_ctx.device)
+                else:
+                    # ── Класичний шлях: прямий prover ────────────────────────
+                    z_sym_step, _ = self.prover(
+                        z_ctx, torch.tensor(0.0, device=z_ctx.device))
+                    v_mem_step = self.memory.read(z_ctx)
+
+                if self.emc_enabled and v_mem_step.norm() > 1e-6:
+                    v_mem_use = v_mem_step
+                else:
+                    v_mem_use = self.memory.read(z_ctx)
+
+                z_final      = z_ctx + 0.1 * z_sym_step + 0.1 * v_mem_use
+                h_for_decode = h_ctx
             else:
                 if self.net_enabled:
                     h_for_decode, _, _ = self.net.encode(ctx)
@@ -740,10 +858,20 @@ class OMENScale(nn.Module):
             f"  Rules contrad.   : {n_cont}\n"
             f"  Avg Utility(R)   : {avg_util:.4f}\n"
             f"  VeM tau          : {getattr(self.cfg, 'vem_tau', 0.3)}\n"
-            f"  VeM buffer       : {len(self.prover.vem._train_embs)}"
+            f"  VeM buffer       : {len(self.prover.vem._train_embs)}\n"
+            f"  ── EMC Meta-Controller ──\n"
+            f"  EMC enabled      : {self.emc_enabled}\n"
         )
+        if self.emc_enabled:
+            base += (
+                f"  EMC max_steps    : {getattr(self.cfg, 'emc_max_steps', 5)}\n"
+                f"  EMC lambda_time  : {getattr(self.cfg, 'emc_lambda_time', 0.05)}\n"
+                f"  EMC lambda_mdl   : {getattr(self.cfg, 'emc_lambda_mdl', 0.01)}\n"
+                f"  EMC use_gae      : {getattr(self.cfg, 'emc_use_gae', True)}\n"
+                f"  omega_meta       : {getattr(self.cfg, 'omega_meta', 0.05)}\n"
+            )
         if self.net_enabled:
-            base += "\n" + self.net.tokenizer_report()
+            base += self.net.tokenizer_report()
         return base
 
 
@@ -802,8 +930,11 @@ def train_epoch_scale(model: OMENScale, dataset, optimizer,
         optimizer.step()
 
         for k, v in out.items():
-            if k not in ("logits", "z"):
-                agg[k] += float(v) if torch.is_tensor(v) else v
+            if k not in ("logits", "z", "emc_stop"):
+                try:
+                    agg[k] += float(v) if torch.is_tensor(v) else float(v)
+                except (TypeError, ValueError):
+                    pass  # пропускаємо нечислові значення (наприклад, рядки)
 
         tot_tok += tgt.numel()
         n_b += 1
@@ -888,7 +1019,8 @@ def run_tests_scale(cfg: OMENScaleConfig) -> None:
     conf_test = torch.ones(B, device=DEVICE) * 0.1   # низька впевненість → пишемо
     for _ in range(cfg.mem_update_steps + 1):
         model.memory.schedule_write(z_test, z_test, conf_test)
-    # Після schedule_write має спрацювати auto-flush
+    # Явний flush після schedule_write (в реальному тренуванні — після optimizer.step)
+    model.memory.flush()
     n_after = model.memory.n_writes
     print(f"  Writes before={n_before}  after={n_after}  (delta={n_after-n_before})")
     assert n_after > n_before, "FAIL: flush не спрацював"
