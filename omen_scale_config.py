@@ -40,6 +40,7 @@ class OMENScaleConfig:
     mem_cache_size:   int   = 2_048
     mem_write_tau:    float = 0.3
     mem_update_steps: int   = 8      # оновлення кожні N кроків (не на кожному)
+    mem_decay:        float = 0.995
 
     # ─── ∂-Prolog (Symbolic) ──────────────────────────────────────────────────
     sym_vocab:        int   = 128     # розмір символьного словника
@@ -53,7 +54,10 @@ class OMENScaleConfig:
 
     # ─── Epistemic / Curiosity ────────────────────────────────────────────────
     epistemic_tau:    float = 0.3
+    epistemic_exact_grad: bool = False
     n_counterfactual: int   = 2
+    symbolic_context_max_facts: int = 96
+    symbolic_ast_max_facts: int = 48
 
     # ─── MDL Loss Coefficients ─────────────────────────────────────────────────
     #   J(θ,Γ,M) = Perplexity + β·L_proof + γ·L_world - α·I(Z;M)
@@ -122,6 +126,18 @@ class OMENScaleConfig:
     lambda_soft_H:    float = 2.0    # Диференційована soft-entropy (anti-collapse ключовий сигнал)
                                      # FIX Bug2: 0.5→2.0 (при 0.5 soft_H grad ~4600x слабший за l_rec)
                                      # Soft assignments через temperature=0.5 → H градієнт ненульовий при collapse.
+
+    # --- Saliency Trace language mode -----------------------------------------
+    saliency_enabled: bool  = True
+    saliency_tau:     float = 0.20
+    saliency_top_k:   int   = 4
+    saliency_max_facts: int = 512
+    saliency_beta_struct: float = 0.05
+    saliency_gamma_role:  float = 0.05
+    saliency_delta_cons:  float = 0.05
+    saliency_eta_rule:    float = 1e-4
+    saliency_abduce_every: int  = 5
+    saliency_consistency_threshold: float = 0.55
 
     # ─── Efficient Meta-Controller (EMC) ─────────────────────────────────────
     # EMC замінює фіксований max_proof_depth на адаптивну мета-політику π_meta.

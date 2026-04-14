@@ -25,6 +25,7 @@ from __future__ import annotations
 import enum
 import math
 import random
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple, Union
 
@@ -312,6 +313,61 @@ class HornClause:
         if self.is_fact():
             return repr(self.head)
         return f"{self.head} :- {', '.join(repr(a) for a in self.body)}"
+
+
+SEQ_EDGE_PRED = 470
+SEQ_LAST_TOKEN_PRED = 471
+SEQ_PREDICT_NEXT_PRED = 472
+SEQ_ACTUAL_NEXT_PRED = 473
+SEQ_AST_SUPPORT_PRED = 474
+SEQ_SALIENCY_SUPPORT_PRED = 475
+SEQ_GAP_DIM_PRED = 476
+
+
+@dataclass
+class SymbolicTaskContext:
+    observed_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
+    goal: Optional[HornAtom] = None
+    target_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
+    provenance: str = "heuristic"
+    trigger_abduction: bool = False
+    hot_dims: Tuple[int, ...] = field(default_factory=tuple)
+    metadata: Dict[str, float] = field(default_factory=dict)
+
+
+def _const_int_term(term: Term) -> Optional[int]:
+    if isinstance(term, Const):
+        return int(term.val)
+    if isinstance(term, int):
+        return int(term)
+    return None
+
+
+def _term_const_values(term: Term) -> Tuple[int, ...]:
+    if isinstance(term, Const):
+        return (int(term.val),)
+    if isinstance(term, Compound):
+        values: List[int] = [int(term.func)]
+        for sub in term.subterms:
+            values.extend(_term_const_values(sub))
+        return tuple(values)
+    return ()
+
+
+def _atoms_conflict(a: HornAtom, b: HornAtom) -> bool:
+    """
+    Conservative contradiction check:
+    same predicate and same prefix arguments, but different final constant.
+    """
+    if a.pred != b.pred or a.arity() != b.arity() or a.arity() == 0:
+        return False
+    a_vals = [_const_int_term(arg) for arg in a.args]
+    b_vals = [_const_int_term(arg) for arg in b.args]
+    if any(v is None for v in a_vals) or any(v is None for v in b_vals):
+        return False
+    if a.arity() == 1:
+        return a_vals[0] != b_vals[0]
+    return a_vals[:-1] == b_vals[:-1] and a_vals[-1] != b_vals[-1]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -753,8 +809,12 @@ class KnowledgeBase:
         for h, rec in list(self._records.items()):
             if rec.status == EpistemicStatus.contradicted:
                 to_remove.add(h)
-            elif (rec.status == EpistemicStatus.proposed
-                  and rec.use_count < use_count_threshold):
+            elif (
+                rec.status == EpistemicStatus.proposed
+                and rec.use_count < use_count_threshold
+                and rec.utility() < 0.05
+                and rec.age_steps > 50
+            ):
                 to_remove.add(h)
 
         if not to_remove:
@@ -793,7 +853,12 @@ class KnowledgeBase:
                 fresh = freshen_vars(clause)
                 for sigma in find_all_substitutions(fresh.body, current):
                     derived = sigma.apply_atom(fresh.head)
-                    if derived.is_ground() and derived not in current:
+                    if not derived.is_ground():
+                        continue
+                    if any(_atoms_conflict(derived, known) for known in current):
+                        self.mark_rule_contradicted(clause)
+                        continue
+                    if derived not in current:
                         new_facts.add(derived)
                         clause.use_count += 1
                         clause.weight    *= 1.01
@@ -951,6 +1016,30 @@ class TensorKnowledgeBase:
         self._facts_cache: Optional[FrozenSet[HornAtom]] = None
         self._facts_cache_n: int = -1  # _n_facts при створенні кешу
 
+        # Ground-term interning: Const/Compound -> stable term ids in tensor buffers.
+        self._term_to_id: Dict[Term, int] = {}
+        self._id_to_term: Dict[int, Term] = {}
+        self._next_term_id: int = 1
+
+    @staticmethod
+    def _is_ground_term(term: Term) -> bool:
+        return len(term.vars()) == 0
+
+    def _intern_term(self, term: Union[Term, int]) -> int:
+        term_obj: Term = Const(int(term)) if isinstance(term, int) else term
+        if not self._is_ground_term(term_obj):
+            raise ValueError(f"TensorKnowledgeBase expects ground terms, got: {term_obj}")
+        term_id = self._term_to_id.get(term_obj)
+        if term_id is None:
+            term_id = self._next_term_id
+            self._next_term_id += 1
+            self._term_to_id[term_obj] = term_id
+            self._id_to_term[term_id] = term_obj
+        return term_id
+
+    def _decode_term(self, term_id: int) -> Term:
+        return self._id_to_term.get(term_id, Const(int(term_id)))
+
     # ── Кодування HornAtom → (pred, a0, a1) int tuple ────────────────────────
     def _atom_to_key(self, atom: HornAtom) -> Tuple[int, int, int]:
         """
@@ -961,12 +1050,16 @@ class TensorKnowledgeBase:
 
         def _enc(a: object, slot: int) -> int:
             if isinstance(a, Const):
-                return int(a.val)
+                return self._intern_term(a)
+            if isinstance(a, Compound) and self._is_ground_term(a):
+                return self._intern_term(a)
             if isinstance(a, Var):
                 return self.VAR_0 if slot == 0 else self.VAR_1
             if isinstance(a, int):
-                return a if a >= 0 else (self.VAR_0 if slot == 0 else self.VAR_1)
-            return 0  # Compound: спрощено до 0
+                return self._intern_term(Const(int(a))) if a >= 0 else (
+                    self.VAR_0 if slot == 0 else self.VAR_1
+                )
+            return 0  # unsupported non-ground compound -> fallback marker
 
         a0 = _enc(args[0], 0) if len(args) > 0 else self.NONE
         a1 = _enc(args[1], 1) if len(args) > 1 else self.NONE
@@ -990,6 +1083,19 @@ class TensorKnowledgeBase:
         head = clause.head
         body = clause.body[0]
 
+        def _tensor_term_ok(term: Term) -> bool:
+            if isinstance(term, (Const, Var)):
+                return True
+            if isinstance(term, Compound):
+                return self._is_ground_term(term)
+            return False
+
+        for atom in (head, body):
+            if len(atom.args) > 2:
+                return None
+            if not all(_tensor_term_ok(arg) for arg in atom.args):
+                return None
+
         # Будуємо мапу ім'я Var → VAR_0/VAR_1 (за порядком появи у body)
         var_map: Dict[str, int] = {}
         for a in body.args:
@@ -999,14 +1105,18 @@ class TensorKnowledgeBase:
 
         def _enc_head(a: object, pos: int) -> int:
             if isinstance(a, Const):
-                return int(a.val)
+                return self._intern_term(a)
+            if isinstance(a, Compound) and self._is_ground_term(a):
+                return self._intern_term(a)
             if isinstance(a, Var):
                 return var_map.get(a.name, self.VAR_0)  # default VAR_0
             return 0
 
         def _enc_body(a: object, pos: int) -> int:
             if isinstance(a, Const):
-                return int(a.val)
+                return self._intern_term(a)
+            if isinstance(a, Compound) and self._is_ground_term(a):
+                return self._intern_term(a)
             if isinstance(a, Var):
                 return var_map.get(a.name, self.VAR_0 if pos == 0 else self.VAR_1)
             return 0
@@ -1135,18 +1245,43 @@ class TensorKnowledgeBase:
         n_tensor_rules = self._rule_is_tensor[:self._n_rules].sum().item()
         if n_tensor_rules > 0:
             tensor_mask = self._rule_is_tensor[:self._n_rules]
+            tensor_rule_indices = tensor_mask.nonzero(as_tuple=True)[0]
             rules = self._rule_buf[:self._n_rules][tensor_mask]  # (R_t, 6)
             R = rules.shape[0]
 
-            # Multi-body rules (Python fallback)
+            # Multi-body rules:
+            #   1) flat fast path  — top-level Const/Var/ground Compound only
+            #   2) structured path — nested Compound patterns with bound vars
+            #   3) Python fallback — everything else
+            fast_multi_rules = [
+                r for i, r in enumerate(self.rules)
+                if i < self._n_rules and len(r.body) > 1 and self._can_fast_rule(r)
+            ]
+            structured_multi_rules = [
+                r for i, r in enumerate(self.rules)
+                if i < self._n_rules and len(r.body) > 1
+                and not self._can_fast_rule(r)
+                and self._can_structured_fast_rule(r)
+            ]
             multi_body_rules = [
                 r for i, r in enumerate(self.rules)
-                if i < self._n_rules and not self._rule_is_tensor[i].item()
+                if i < self._n_rules and len(r.body) > 1
+                and not self._can_fast_rule(r)
+                and not self._can_structured_fast_rule(r)
             ]
         else:
+            tensor_rule_indices = torch.zeros(0, dtype=torch.long, device=self._dev)
             rules = torch.zeros(0, 6, dtype=torch.long, device=self._dev)
             R = 0
-            multi_body_rules = [r for r in self.rules if len(r.body) > 1]
+            fast_multi_rules = [r for r in self.rules if len(r.body) > 1 and self._can_fast_rule(r)]
+            structured_multi_rules = [
+                r for r in self.rules
+                if len(r.body) > 1 and not self._can_fast_rule(r) and self._can_structured_fast_rule(r)
+            ]
+            multi_body_rules = [
+                r for r in self.rules
+                if len(r.body) > 1 and not self._can_fast_rule(r) and not self._can_structured_fast_rule(r)
+            ]
 
         for _depth in range(max_depth):
             n_new_total = 0
@@ -1170,7 +1305,11 @@ class TensorKnowledgeBase:
                 a1_var = (b_a1 < 0).unsqueeze(0)                  # (1, R)
                 a1_m   = a1_var | (facts[:, 2:3] == b_a1.unsqueeze(0))  # (N, R)
 
-                match = pred_m & a0_m & a1_m                       # (N, R)
+                same_var = ((b_a0 == self.VAR_0) & (b_a1 == self.VAR_0)) | \
+                           ((b_a0 == self.VAR_1) & (b_a1 == self.VAR_1))
+                same_var_m = (~same_var).unsqueeze(0) | (facts[:, 1:2] == facts[:, 2:3])
+
+                match = pred_m & a0_m & a1_m & same_var_m          # (N, R)
 
                 if match.any():
                     fi, ri = match.nonzero(as_tuple=True)           # (M,) кожен
@@ -1196,8 +1335,19 @@ class TensorKnowledgeBase:
 
                     # Дедуплікація: фільтруємо вже відомі факти
                     novel_rows: List[List[int]] = []
-                    for row in candidates.tolist():
+                    for cand_idx, row in enumerate(candidates.tolist()):
                         key = (row[0], row[1], row[2])
+                        candidate_atom = HornAtom(
+                            pred=int(row[0]),
+                            args=self._ints_to_args(int(row[1]), int(row[2])),
+                        )
+                        has_conflict = any(
+                            _atoms_conflict(candidate_atom, known) for known in self.facts
+                        )
+                        if has_conflict:
+                            rule_idx = int(tensor_rule_indices[ri[cand_idx]].item())
+                            self.mark_rule_contradicted(self.rules[rule_idx])
+                            continue
                         if key not in fact_set and row[0] >= 0:
                             fact_set.add(key)
                             novel_rows.append(row)
@@ -1212,6 +1362,112 @@ class TensorKnowledgeBase:
             # ── PYTHON FALLBACK: multi-body правила ───────────────────────────
             # Ці правила рідкісні (NeuralAbductionHead генерує 1-тільні),
             # тому Python-overhead тут незначний.
+            for clause in fast_multi_rules:
+                if not clause.body:
+                    continue
+                fresh = freshen_vars(clause)
+                body = fresh.body
+                head = fresh.head
+
+                C0 = self._candidate_rows(facts, body[0])
+                if C0.shape[0] == 0:
+                    continue
+
+                if len(body) == 2:
+                    C1 = self._candidate_rows(facts, body[1])
+                    if C1.shape[0] == 0:
+                        continue
+                    i0, i1 = self._equijoin_rows(C0, C1, body[0], body[1])
+                    if len(i0) == 0:
+                        continue
+                    joined = [C0[i0], C1[i1]]
+                else:
+                    C1 = self._candidate_rows(facts, body[1])
+                    C2 = self._candidate_rows(facts, body[2])
+                    if C1.shape[0] == 0 or C2.shape[0] == 0:
+                        continue
+                    i01, i11 = self._equijoin_rows(C0, C1, body[0], body[1])
+                    if len(i01) == 0:
+                        continue
+                    C01_0 = C0[i01]
+                    C01_1 = C1[i11]
+                    i_mid, i2 = self._equijoin_rows(C01_1, C2, body[1], body[2])
+                    if len(i_mid) == 0:
+                        continue
+                    joined = [C01_0[i_mid], C01_1[i_mid], C2[i2]]
+
+                head_rows = self._build_fast_head_rows(joined, body, head)
+                if head_rows is None or head_rows.shape[0] == 0:
+                    continue
+
+                for row_idx in range(head_rows.shape[0]):
+                    row = head_rows[row_idx]
+                    if int(row[0].item()) < 0 or int(row[1].item()) == self.NONE:
+                        continue
+                    derived = HornAtom(
+                        pred=int(row[0].item()),
+                        args=self._ints_to_args(int(row[1].item()), int(row[2].item())),
+                    )
+                    key = (int(row[0].item()), int(row[1].item()), int(row[2].item()))
+                    if any(_atoms_conflict(derived, known) for known in self.facts):
+                        self.mark_rule_contradicted(clause)
+                        continue
+                    if key in fact_set:
+                        continue
+                    fact_set.add(key)
+                    facts = torch.cat([facts, row.unsqueeze(0)], dim=0)
+                    N += 1
+                    n_new_total += 1
+                    clause.use_count += 1
+                    clause.weight *= 1.01
+                    self.mark_rule_verified(clause)
+
+            for clause in structured_multi_rules:
+                if not clause.body:
+                    continue
+                fresh = freshen_vars(clause)
+                matches0 = self._candidate_matches(facts, fresh.body[0])
+                if not matches0:
+                    continue
+                if len(fresh.body) == 2:
+                    matches1 = self._candidate_matches(facts, fresh.body[1])
+                    if not matches1:
+                        continue
+                    joined_matches = self._equijoin_matches(
+                        matches0, matches1, fresh.body[0], fresh.body[1]
+                    )
+                else:
+                    matches1 = self._candidate_matches(facts, fresh.body[1])
+                    matches2 = self._candidate_matches(facts, fresh.body[2])
+                    if not matches1 or not matches2:
+                        continue
+                    joined01 = self._equijoin_matches(
+                        matches0, matches1, fresh.body[0], fresh.body[1]
+                    )
+                    if not joined01:
+                        continue
+                    joined_matches = self._equijoin_matches(
+                        joined01, matches2, None, fresh.body[2]
+                    )
+
+                for rows, bindings in joined_matches:
+                    derived = self._build_structured_head_atom(fresh.head, bindings)
+                    if derived is None or not derived.is_ground():
+                        continue
+                    dk = self._atom_to_key(derived)
+                    if any(_atoms_conflict(derived, known) for known in self.facts):
+                        self.mark_rule_contradicted(clause)
+                        continue
+                    if dk not in fact_set and dk[0] >= 0:
+                        fact_set.add(dk)
+                        new_row = torch.tensor([dk], dtype=torch.long, device=self._dev)
+                        facts = torch.cat([facts, new_row], dim=0)
+                        N += 1
+                        n_new_total += 1
+                        clause.use_count += 1
+                        clause.weight *= 1.01
+                        self.mark_rule_verified(clause)
+
             if multi_body_rules:
                 current_frozenset = frozenset(
                     HornAtom(pred=int(row[0]),
@@ -1227,6 +1483,9 @@ class TensorKnowledgeBase:
                         derived = sigma.apply_atom(fresh.head)
                         if derived.is_ground():
                             dk = self._atom_to_key(derived)
+                            if any(_atoms_conflict(derived, known) for known in current_frozenset):
+                                self.mark_rule_contradicted(clause)
+                                continue
                             if dk not in fact_set and dk[0] >= 0:
                                 fact_set.add(dk)
                                 new_row = torch.tensor([dk], dtype=torch.long,
@@ -1252,11 +1511,318 @@ class TensorKnowledgeBase:
     def _ints_to_args(self, a0: int, a1: int) -> Tuple:
         """(a0, a1) int → Tuple[Term] для HornAtom."""
         if a1 == self.NONE:
-            return (Const(a0),) if a0 >= 0 else (Var("_v0"),)
+            return (self._decode_term(a0),) if a0 >= 0 else (Var("_v0"),)
         args: list = []
-        args.append(Const(a0) if a0 >= 0 else Var("_v0"))
-        args.append(Const(a1) if a1 >= 0 else Var("_v1"))
+        args.append(self._decode_term(a0) if a0 >= 0 else Var("_v0"))
+        args.append(self._decode_term(a1) if a1 >= 0 else Var("_v1"))
         return tuple(args)
+
+    @staticmethod
+    def _atom_var_positions(atom: HornAtom) -> Dict[str, List[int]]:
+        result: Dict[str, List[int]] = defaultdict(list)
+        for i, arg in enumerate(atom.args):
+            if isinstance(arg, Var) and not arg.name.startswith('_'):
+                result[arg.name].append(i)
+        return result
+
+    @staticmethod
+    def _atom_var_names(atom: HornAtom) -> FrozenSet[str]:
+        names: FrozenSet[str] = frozenset()
+        for arg in atom.args:
+            if isinstance(arg, (Const, Var, Compound)):
+                names = names | frozenset(
+                    name for name in arg.vars()
+                    if not name.startswith('_')
+                )
+        return names
+
+    def _fast_term_id(self, term: Term) -> Optional[int]:
+        if isinstance(term, Const):
+            return self._intern_term(term)
+        if isinstance(term, Compound) and self._is_ground_term(term):
+            return self._intern_term(term)
+        return None
+
+    def _can_fast_rule(self, clause: HornClause) -> bool:
+        if len(clause.body) == 0 or len(clause.body) > 3:
+            return False
+        atoms = [clause.head] + list(clause.body)
+        for atom in atoms:
+            if len(atom.args) > 2:
+                return False
+            for arg in atom.args:
+                if isinstance(arg, (Const, Var)):
+                    continue
+                if isinstance(arg, Compound) and self._is_ground_term(arg):
+                    continue
+                return False
+        return True
+
+    def _can_structured_fast_rule(self, clause: HornClause) -> bool:
+        if len(clause.body) == 0 or len(clause.body) > 3:
+            return False
+        atoms = [clause.head] + list(clause.body)
+        has_structured_compound = False
+        for atom in atoms:
+            if len(atom.args) > 2:
+                return False
+            for arg in atom.args:
+                if isinstance(arg, (Const, Var)):
+                    continue
+                if isinstance(arg, Compound):
+                    if not self._is_ground_term(arg):
+                        has_structured_compound = True
+                    continue
+                return False
+        return has_structured_compound
+
+    def _candidate_rows(self, facts: torch.Tensor, atom: HornAtom) -> torch.Tensor:
+        if facts.numel() == 0:
+            return facts
+        mask = facts[:, 0] == int(atom.pred)
+        for j, arg in enumerate(atom.args):
+            term_id = self._fast_term_id(arg)
+            if term_id is not None:
+                mask = mask & (facts[:, j + 1] == term_id)
+        for positions in self._atom_var_positions(atom).values():
+            if len(positions) < 2:
+                continue
+            base = positions[0]
+            for pos in positions[1:]:
+                mask = mask & (facts[:, base + 1] == facts[:, pos + 1])
+        return facts[mask]
+
+    def _match_term_bindings(
+        self,
+        pattern: Term,
+        value: Term,
+        bindings: Dict[str, Term],
+    ) -> Optional[Dict[str, Term]]:
+        if isinstance(pattern, Var):
+            if pattern.name.startswith('_'):
+                return bindings
+            bound = bindings.get(pattern.name)
+            if bound is None:
+                new_bindings = dict(bindings)
+                new_bindings[pattern.name] = value
+                return new_bindings
+            return bindings if bound == value else None
+        if isinstance(pattern, Const):
+            return bindings if isinstance(value, Const) and value.val == pattern.val else None
+        if isinstance(pattern, Compound):
+            if not isinstance(value, Compound):
+                return None
+            if pattern.func != value.func or len(pattern.subterms) != len(value.subterms):
+                return None
+            cur = bindings
+            for p_sub, v_sub in zip(pattern.subterms, value.subterms):
+                cur = self._match_term_bindings(p_sub, v_sub, cur)
+                if cur is None:
+                    return None
+            return cur
+        return None
+
+    def _row_bindings(self, atom: HornAtom, row: torch.Tensor) -> Optional[Dict[str, Term]]:
+        if len(atom.args) == 0:
+            return {}
+        bindings: Dict[str, Term] = {}
+        row_args = self._ints_to_args(int(row[1].item()), int(row[2].item()))
+        if len(row_args) != len(atom.args):
+            return None
+        for pattern, value in zip(atom.args, row_args):
+            bindings = self._match_term_bindings(pattern, value, bindings)
+            if bindings is None:
+                return None
+        return bindings
+
+    def _candidate_matches(
+        self,
+        facts: torch.Tensor,
+        atom: HornAtom,
+    ) -> List[Tuple[List[torch.Tensor], Dict[str, Term]]]:
+        candidates = self._candidate_rows(facts, atom)
+        matches: List[Tuple[List[torch.Tensor], Dict[str, Term]]] = []
+        for idx in range(candidates.shape[0]):
+            row = candidates[idx]
+            bindings = self._row_bindings(atom, row)
+            if bindings is not None:
+                matches.append(([row], bindings))
+        return matches
+
+    @staticmethod
+    def _merge_bindings(
+        left: Dict[str, Term],
+        right: Dict[str, Term],
+    ) -> Optional[Dict[str, Term]]:
+        if not left:
+            return dict(right)
+        if not right:
+            return dict(left)
+        merged = dict(left)
+        for name, term in right.items():
+            bound = merged.get(name)
+            if bound is None:
+                merged[name] = term
+            elif bound != term:
+                return None
+        return merged
+
+    @staticmethod
+    def _bindings_signature(
+        bindings: Dict[str, Term],
+        names: Tuple[str, ...],
+    ) -> Optional[Tuple[Term, ...]]:
+        if not names:
+            return tuple()
+        sig: List[Term] = []
+        for name in names:
+            if name not in bindings:
+                return None
+            sig.append(bindings[name])
+        return tuple(sig)
+
+    def _equijoin_matches(
+        self,
+        left_matches: List[Tuple[List[torch.Tensor], Dict[str, Term]]],
+        right_matches: List[Tuple[List[torch.Tensor], Dict[str, Term]]],
+        left_atom: Optional[HornAtom],
+        right_atom: Optional[HornAtom],
+    ) -> List[Tuple[List[torch.Tensor], Dict[str, Term]]]:
+        if not left_matches or not right_matches:
+            return []
+        if left_atom is not None and right_atom is not None:
+            shared_names = tuple(sorted(
+                self._atom_var_names(left_atom) & self._atom_var_names(right_atom)
+            ))
+        else:
+            shared_names = tuple(sorted(
+                set(left_matches[0][1].keys()) & set(right_matches[0][1].keys())
+            ))
+
+        joined: List[Tuple[List[torch.Tensor], Dict[str, Term]]] = []
+        if not shared_names:
+            for left_rows, left_bind in left_matches:
+                for right_rows, right_bind in right_matches:
+                    merged = self._merge_bindings(left_bind, right_bind)
+                    if merged is not None:
+                        joined.append((left_rows + right_rows, merged))
+            return joined
+
+        index: Dict[Tuple[Term, ...], List[Tuple[List[torch.Tensor], Dict[str, Term]]]] = defaultdict(list)
+        for right_rows, right_bind in right_matches:
+            sig = self._bindings_signature(right_bind, shared_names)
+            if sig is not None:
+                index[sig].append((right_rows, right_bind))
+
+        for left_rows, left_bind in left_matches:
+            sig = self._bindings_signature(left_bind, shared_names)
+            if sig is None:
+                continue
+            for right_rows, right_bind in index.get(sig, ()):
+                merged = self._merge_bindings(left_bind, right_bind)
+                if merged is not None:
+                    joined.append((left_rows + right_rows, merged))
+        return joined
+
+    def _equijoin_rows(
+        self,
+        left: torch.Tensor,
+        right: torch.Tensor,
+        left_atom: HornAtom,
+        right_atom: HornAtom,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if left.numel() == 0 or right.numel() == 0:
+            empty = torch.zeros(0, dtype=torch.long, device=self._dev)
+            return empty, empty
+        left_vars = self._atom_var_positions(left_atom)
+        right_vars = self._atom_var_positions(right_atom)
+        shared = set(left_vars.keys()) & set(right_vars.keys())
+        if not shared:
+            nl, nr = left.shape[0], right.shape[0]
+            return (
+                torch.arange(nl, device=self._dev).repeat_interleave(nr),
+                torch.arange(nr, device=self._dev).repeat(nl),
+            )
+        join_mask = torch.ones(left.shape[0], right.shape[0], dtype=torch.bool, device=self._dev)
+        for name in shared:
+            lp = left_vars[name][0]
+            rp = right_vars[name][0]
+            join_mask = join_mask & (
+                left[:, lp + 1].unsqueeze(1) == right[:, rp + 1].unsqueeze(0)
+            )
+        return join_mask.nonzero(as_tuple=True)
+
+    def _build_fast_head_rows(
+        self,
+        joined_rows: List[torch.Tensor],
+        body: Tuple[HornAtom, ...],
+        head: HornAtom,
+    ) -> Optional[torch.Tensor]:
+        if not joined_rows:
+            return None
+        m = joined_rows[0].shape[0]
+        if m == 0:
+            return None
+        head_rows = torch.full((m, 3), self.NONE, dtype=torch.long, device=self._dev)
+        head_rows[:, 0] = int(head.pred)
+        var_map: Dict[str, torch.Tensor] = {}
+        for atom, rows in zip(body, joined_rows):
+            for j, arg in enumerate(atom.args):
+                if isinstance(arg, Var) and not arg.name.startswith('_') and arg.name not in var_map:
+                    var_map[arg.name] = rows[:, j + 1]
+        for j, arg in enumerate(head.args[:2]):
+            term_id = self._fast_term_id(arg)
+            if term_id is not None:
+                head_rows[:, j + 1] = term_id
+            elif isinstance(arg, Var) and arg.name in var_map:
+                head_rows[:, j + 1] = var_map[arg.name]
+        return head_rows
+
+    def _instantiate_bound_term(
+        self,
+        term: Term,
+        bindings: Dict[str, Term],
+    ) -> Optional[Term]:
+        if isinstance(term, Const):
+            return term
+        if isinstance(term, Var):
+            if term.name.startswith('_'):
+                return None
+            return bindings.get(term.name)
+        if isinstance(term, Compound):
+            subterms: List[Term] = []
+            for sub in term.subterms:
+                bound = self._instantiate_bound_term(sub, bindings)
+                if bound is None:
+                    return None
+                subterms.append(bound)
+            return Compound(term.func, tuple(subterms))
+        return None
+
+    def _build_structured_head_atom(
+        self,
+        head: HornAtom,
+        bindings: Dict[str, Term],
+    ) -> Optional[HornAtom]:
+        args: List[Term] = []
+        for arg in head.args:
+            bound = self._instantiate_bound_term(arg, bindings)
+            if bound is None:
+                return None
+            args.append(bound)
+        return HornAtom(pred=head.pred, args=tuple(args))
+
+    def _sigma_from_rows(
+        self,
+        body: Tuple[HornAtom, ...],
+        rows: List[torch.Tensor],
+    ) -> Substitution:
+        bindings: Dict[str, Term] = {}
+        for atom, row in zip(body, rows):
+            for j, arg in enumerate(atom.args):
+                if isinstance(arg, Var) and not arg.name.startswith('_') and arg.name not in bindings:
+                    bindings[arg.name] = self._decode_term(int(row[j + 1].item()))
+        return Substitution(bindings)
 
     # ── facts property (frozenset[HornAtom] для сумісності) ──────────────────
     @property
@@ -1311,8 +1877,12 @@ class TensorKnowledgeBase:
         for h, rec in list(self._records.items()):
             if rec.status == EpistemicStatus.contradicted:
                 to_remove.add(h)
-            elif (rec.status == EpistemicStatus.proposed
-                  and rec.use_count < use_count_threshold):
+            elif (
+                rec.status == EpistemicStatus.proposed
+                and rec.use_count < use_count_threshold
+                and rec.utility() < 0.05
+                and rec.age_steps > 50
+            ):
                 to_remove.add(h)
         if not to_remove:
             return 0
@@ -1408,19 +1978,13 @@ class TensorKnowledgeBase:
         NET_CONTEXT_PRED = 101
         NET_MEANS_PRED = 102
 
-        def _const_int(term) -> Optional[int]:
-            if isinstance(term, Const):
-                return int(term.val)
-            if isinstance(term, int):
-                return int(term)
-            return None
-
         ctx_to_tokens: Dict[int, Set[int]] = {}
+        concept_to_tokens: Dict[int, Set[int]] = {}
         for fact in self.facts:
             if fact.pred != NET_CONTEXT_PRED or len(fact.args) < 2:
                 continue
-            tok = _const_int(fact.args[0])
-            ctx = _const_int(fact.args[1])
+            tok = _const_int_term(fact.args[0])
+            ctx = _const_int_term(fact.args[1])
             if tok is None or ctx is None:
                 continue
             ctx_to_tokens.setdefault(ctx, set()).add(tok)
@@ -1437,15 +2001,42 @@ class TensorKnowledgeBase:
         for rule in self.rules:
             if rule.head.pred != NET_MEANS_PRED or len(rule.head.args) < 2:
                 continue
-            tok = _const_int(rule.head.args[0])
-            concept = _const_int(rule.head.args[1])
+            tok = _const_int_term(rule.head.args[0])
+            concept = _const_int_term(rule.head.args[1])
             if tok is None or concept is None:
                 continue
+            concept_to_tokens.setdefault(concept, set()).add(tok)
             for other in ctx_to_tokens.get(concept, set()):
                 if other == tok:
                     continue
                 key = tuple(sorted((tok, other)))
                 scores[key] = max(scores.get(key, 0.0), 0.85)
+
+        for tokens in concept_to_tokens.values():
+            ordered = sorted(tokens)
+            for i in range(len(ordered)):
+                for j in range(i + 1, len(ordered)):
+                    key = (ordered[i], ordered[j])
+                    scores[key] = max(scores.get(key, 0.0), 1.25)
+
+        concept_items = list(concept_to_tokens.items())
+        for i in range(len(concept_items)):
+            concept_a, toks_a = concept_items[i]
+            ctx_a = ctx_to_tokens.get(concept_a, set())
+            for j in range(i + 1, len(concept_items)):
+                concept_b, toks_b = concept_items[j]
+                ctx_b = ctx_to_tokens.get(concept_b, set())
+                if not ctx_a or not ctx_b:
+                    continue
+                overlap = len(ctx_a & ctx_b) / max(len(ctx_a | ctx_b), 1)
+                if overlap < 0.5:
+                    continue
+                for tok_a in toks_a:
+                    for tok_b in toks_b:
+                        if tok_a == tok_b:
+                            continue
+                        key = tuple(sorted((tok_a, tok_b)))
+                        scores[key] = max(scores.get(key, 0.0), 0.7 + 0.2 * overlap)
 
         items = [(a, b, s) for (a, b), s in scores.items()]
         items.sort(key=lambda x: x[2], reverse=True)
@@ -1464,14 +2055,25 @@ class TensorKnowledgeBase:
         for ctx_idx in ctx:
             self.add_fact(HornAtom(pred=NET_CONTEXT_PRED,
                                    args=(Const(token_idx), Const(ctx_idx))))
-        if len(ctx) >= 2:
+            self.add_fact(HornAtom(pred=NET_MEANS_PRED,
+                                   args=(Const(token_idx), Const(ctx_idx))))
             self.add_rule(
                 HornClause(
                     head=HornAtom(pred=NET_MEANS_PRED,
-                                  args=(Const(token_idx), Const(ctx[0]))),
-                    body=(
-                        HornAtom(pred=NET_CONTEXT_PRED, args=(Const(token_idx), Const(ctx[0]))),
-                        HornAtom(pred=NET_CONTEXT_PRED, args=(Const(token_idx), Const(ctx[1]))),
+                                  args=(Const(token_idx), Const(ctx_idx))),
+                    body=(HornAtom(pred=NET_CONTEXT_PRED,
+                                   args=(Const(token_idx), Const(ctx_idx))),),
+                ),
+                status=EpistemicStatus.proposed,
+            )
+        if ctx:
+            self.add_rule(
+                HornClause(
+                    head=HornAtom(pred=NET_MEANS_PRED,
+                                  args=(Const(token_idx), Const(min(ctx)))),
+                    body=tuple(
+                        HornAtom(pred=NET_CONTEXT_PRED, args=(Const(token_idx), Const(ctx_idx)))
+                        for ctx_idx in ctx[: min(len(ctx), 3)]
                     ),
                 ),
                 status=EpistemicStatus.proposed,
@@ -2194,10 +2796,220 @@ class DifferentiableProver(nn.Module):
                                              lam=alpha)
 
         self._step = 0
+        self.task_context: Optional[SymbolicTaskContext] = None
+        self.last_goal: Optional[HornAtom] = None
+        self.last_context_facts: FrozenSet[HornAtom] = frozenset()
+        self.last_all_facts: FrozenSet[HornAtom] = frozenset()
+        self.last_forward_info: Dict[str, Union[int, float, str]] = {}
         # fc_cache видалено: TensorKnowledgeBase.forward_chain виконується
         # за ~0.1–0.5 ms/батч через GPU broadcast — кешування не потрібне.
 
     # ── Нейронний → символьний (perception) ──────────────────────────────────
+    def set_task_context(self, context: Optional[SymbolicTaskContext]) -> None:
+        self.task_context = context
+
+    def clear_task_context(self) -> None:
+        self.task_context = None
+
+    def _task_observed_facts(self) -> FrozenSet[HornAtom]:
+        if self.task_context is None:
+            return frozenset()
+        return self.task_context.observed_facts
+
+    def _task_target_facts(self) -> FrozenSet[HornAtom]:
+        if self.task_context is None:
+            return frozenset()
+        return self.task_context.target_facts
+
+    def current_goal(self, z: torch.Tensor) -> HornAtom:
+        if self.task_context is not None and self.task_context.goal is not None:
+            return self.task_context.goal
+        return self.perceive(z)
+
+    def current_working_facts(self) -> FrozenSet[HornAtom]:
+        observed = self._task_observed_facts()
+        if not observed:
+            return self.kb.facts
+        return frozenset(set(self.kb.facts) | set(observed))
+
+    def materialize_task_context_facts(self, limit: int = 32) -> int:
+        if self.task_context is None or not self.task_context.observed_facts:
+            return 0
+        added = 0
+        for fact in self.task_context.observed_facts:
+            if self.kb.add_fact(fact):
+                added += 1
+            if added >= limit:
+                break
+        return added
+
+    def _goal_embedding(self, goal: HornAtom, device: torch.device) -> torch.Tensor:
+        return self.ground(frozenset({goal}), device)
+
+    @staticmethod
+    def _goal_supported(goal: HornAtom, facts: FrozenSet[HornAtom]) -> bool:
+        for fact in facts:
+            if unify(goal, fact) is not None:
+                return True
+        return False
+
+    @staticmethod
+    def _shares_constant(*atoms: HornAtom) -> bool:
+        seen: Set[int] = set()
+        for atom in atoms:
+            for arg in atom.args:
+                for value in _term_const_values(arg):
+                    if value in seen:
+                        return True
+                    seen.add(value)
+        return False
+
+    def _generalize_example_rule(
+        self,
+        head: HornAtom,
+        body: Tuple[HornAtom, ...],
+    ) -> Optional[HornClause]:
+        const_to_var: Dict[int, Var] = {}
+        next_idx = 0
+
+        def map_term(term: Term) -> Optional[Term]:
+            nonlocal next_idx
+            if isinstance(term, Const):
+                key = int(term.val)
+                if key not in const_to_var:
+                    const_to_var[key] = Var(f"G{next_idx}")
+                    next_idx += 1
+                return const_to_var[key]
+            if isinstance(term, Var):
+                return term
+            if isinstance(term, Compound):
+                mapped_subterms: List[Term] = []
+                for sub in term.subterms:
+                    mapped = map_term(sub)
+                    if mapped is None:
+                        return None
+                    mapped_subterms.append(mapped)
+                return Compound(term.func, tuple(mapped_subterms))
+            return None
+
+        def map_atom(atom: HornAtom) -> Optional[HornAtom]:
+            args: List[Term] = []
+            for arg in atom.args:
+                mapped = map_term(arg)
+                if mapped is None:
+                    return None
+                args.append(mapped)
+            return HornAtom(atom.pred, tuple(args))
+
+        head_rule = map_atom(head)
+        if head_rule is None:
+            return None
+        body_rule: List[HornAtom] = []
+        for atom in body:
+            mapped = map_atom(atom)
+            if mapped is None:
+                return None
+            body_rule.append(mapped)
+
+        head_vars = {
+            var.name
+            for var in head_rule.args
+            if isinstance(var, Var)
+        }
+        body_vars = {
+            var.name
+            for atom in body_rule
+            for var in atom.args
+            if isinstance(var, Var)
+        }
+        if not head_vars or not head_vars.issubset(body_vars):
+            return None
+        return HornClause(head=head_rule, body=tuple(body_rule))
+
+    def _contextual_abduction_candidates(self, max_candidates: int = 12) -> List[HornClause]:
+        if self.task_context is None or self.task_context.goal is None:
+            return []
+        goal = self.task_context.goal
+        facts = list(self.task_context.observed_facts)
+        if not facts:
+            return []
+
+        ranked_bodies: List[Tuple[int, Tuple[HornAtom, ...]]] = []
+        fact_cap = min(len(facts), 16)
+        goal_consts = {
+            value
+            for arg in goal.args
+            for value in _term_const_values(arg)
+        }
+
+        for fact in facts[:fact_cap]:
+            if not self._shares_constant(goal, fact):
+                continue
+            atom_consts = {
+                value
+                for arg in fact.args
+                for value in _term_const_values(arg)
+            }
+            ranked_bodies.append((max(len(goal_consts & atom_consts), 1), (fact,)))
+
+        for i, fact_a in enumerate(facts[:fact_cap]):
+            for fact_b in facts[i + 1:fact_cap]:
+                if not self._shares_constant(goal, fact_a, fact_b):
+                    continue
+                overlap = 0
+                for atom in (fact_a, fact_b):
+                    atom_consts = {
+                        value
+                        for arg in atom.args
+                        for value in _term_const_values(arg)
+                    }
+                    overlap += len(goal_consts & atom_consts)
+                ranked_bodies.append((max(overlap, 1), (fact_a, fact_b)))
+
+        ranked_bodies.sort(key=lambda item: (item[0], -len(item[1])), reverse=True)
+        unique: Dict[int, HornClause] = {}
+        for _, body in ranked_bodies:
+            rule = self._generalize_example_rule(goal, body)
+            if rule is None:
+                continue
+            unique.setdefault(hash(rule), rule)
+            if len(unique) >= max_candidates:
+                break
+        return list(unique.values())
+
+    def forward_chain_step_local(
+        self,
+        current_facts: FrozenSet[HornAtom],
+    ) -> Tuple[int, FrozenSet[HornAtom], List[Tuple[HornClause, Optional[Substitution]]], FrozenSet[HornAtom]]:
+        current_set: Set[HornAtom] = set(current_facts)
+        new_facts: Set[HornAtom] = set()
+        derivations: List[Tuple[HornClause, Optional[Substitution]]] = []
+        added = 0
+
+        for clause in self.kb.rules:
+            if not clause.body:
+                continue
+            fresh = freshen_vars(clause)
+            current_snapshot = frozenset(current_set)
+            for sigma in find_all_substitutions(fresh.body, current_snapshot, max_solutions=128):
+                derived = sigma.apply_atom(fresh.head)
+                if not derived.is_ground():
+                    continue
+                if derived in current_set or derived in new_facts:
+                    continue
+                if any(_atoms_conflict(derived, known) for known in current_set):
+                    self.kb.mark_rule_contradicted(clause)
+                    continue
+                new_facts.add(derived)
+                current_set.add(derived)
+                derivations.append((clause, sigma))
+                clause.use_count += 1
+                clause.weight *= 1.01
+                self.kb.mark_rule_verified(clause)
+                added += 1
+
+        return added, frozenset(new_facts), derivations, frozenset(current_set)
+
     def perceive(self, z: torch.Tensor) -> HornAtom:
         """z: (B, d) → один HornAtom (усереднений по батчу)"""
         z_mean = z.mean(0, keepdim=True)                   # (1, d)
@@ -2222,7 +3034,9 @@ class DifferentiableProver(nn.Module):
         embs = self.term_emb(facts_list, device)              # (|facts|, d)
         return self.out_proj(embs.mean(0, keepdim=True))      # (1, d)
 
-    def forward_chain_step(self) -> Tuple[int, "FrozenSet[HornAtom]"]:
+    def forward_chain_step(
+        self,
+    ) -> Tuple[int, "FrozenSet[HornAtom]", List[Tuple[HornClause, Optional[Substitution]]]]:
         """
         Один крок forward chaining з комітом нових фактів у KB.
 
@@ -2230,18 +3044,40 @@ class DifferentiableProver(nn.Module):
         `forward_chain(max_depth=1)`, але стан KB фактично не змінюється.
         """
         before = self.kb.facts
-        after = self.kb.forward_chain(max_depth=1)
-        new_facts = frozenset(f for f in after if f not in before)
+        current = before
         added = 0
-        for fact in new_facts:
-            added += int(self.kb.add_fact(fact))
-        return added, new_facts
+        new_facts: Set[HornAtom] = set()
+        derivations: List[Tuple[HornClause, Optional[Substitution]]] = []
+
+        for clause in self.kb.rules:
+            if not clause.body:
+                continue
+            fresh = freshen_vars(clause)
+            for sigma in find_all_substitutions(fresh.body, current, max_solutions=128):
+                derived = sigma.apply_atom(fresh.head)
+                if not derived.is_ground():
+                    continue
+                if derived in current or derived in new_facts:
+                    continue
+                if any(_atoms_conflict(derived, known) for known in current):
+                    self.kb.mark_rule_contradicted(clause)
+                    continue
+                if self.kb.add_fact(derived):
+                    new_facts.add(derived)
+                    derivations.append((clause, sigma))
+                    clause.use_count += 1
+                    clause.weight *= 1.01
+                    self.kb.mark_rule_verified(clause)
+                    added += 1
+
+        return added, frozenset(new_facts), derivations
 
     # ── Proof Search (REINFORCE + Cost(T)) ───────────────────────────────────
     def prove_with_policy(self,
                           goal: HornAtom,
                           z_ctx: torch.Tensor,
-                          n_steps: Optional[int] = None) -> Tuple[bool, List[int], torch.Tensor]:
+                          n_steps: Optional[int] = None,
+                          starting_facts: Optional[FrozenSet[HornAtom]] = None) -> Tuple[bool, List[int], torch.Tensor]:
         """
         Шукає доведення goal, використовуючи PolicyNetwork для вибору правил.
 
@@ -2257,8 +3093,8 @@ class DifferentiableProver(nn.Module):
         n_rules = len(self.kb.rules)
         device  = z_ctx.device
 
-        z_goal = self.goal_proj(z_ctx)                     # (1, d)
-        current_facts = self.kb.facts                      # незмінний frozenset
+        z_goal = self.goal_proj(self._goal_embedding(goal, device))
+        current_facts = starting_facts if starting_facts is not None else self.kb.facts
 
         trajectory: List[int]         = []
         log_probs:  List[torch.Tensor]= []
@@ -2329,13 +3165,16 @@ class DifferentiableProver(nn.Module):
             return 0, zero, zero, 0.0
 
         # Генеруємо кандидатів через AbductionHead
-        raw_candidates, log_probs = self.abductor.sample_candidates(z[:1])
+        contextual_candidates = self._contextual_abduction_candidates(max_candidates=8)
+        neural_candidates, log_probs = self.abductor.sample_candidates(z[:1])
+        raw_candidates = contextual_candidates + neural_candidates
         utilities = self.vem.score_batch(raw_candidates, device) if raw_candidates else torch.zeros(0, device=device)
 
         # VeM фільтрація: тримаємо лише U(R) > vem_tau
         accepted, hinge_loss = self.vem.filter_candidates(raw_candidates, device)
-        if log_probs.numel() == utilities.numel() and log_probs.numel() > 0:
-            abductor_loss = -((utilities.detach() - self.vem_tau) * log_probs).mean()
+        neural_utilities = utilities[len(contextual_candidates):] if contextual_candidates else utilities
+        if log_probs.numel() == neural_utilities.numel() and log_probs.numel() > 0:
+            abductor_loss = -((neural_utilities.detach() - self.vem_tau) * log_probs).mean()
         else:
             abductor_loss = torch.zeros(1, device=device).squeeze()
 
@@ -2378,12 +3217,23 @@ class DifferentiableProver(nn.Module):
             # (можна логувати: n_removed правил видалено)
 
         # 1. Perception: z → факт → додаємо у KB
-        goal = self.perceive(z)
-        self.kb.add_fact(goal)
+        self.materialize_task_context_facts()
+        goal = self.current_goal(z)
+        working_facts = self.current_working_facts()
+        target_facts = self._task_target_facts()
+        provenance = self.task_context.provenance if self.task_context is not None else "latent"
 
         # 2. Forward Chaining: GPU-акселерований (TensorKnowledgeBase)
         # ~0.1–0.5 ms/батч — кешування не потрібне, викликаємо кожен крок.
-        all_facts = self.kb.forward_chain(self.max_depth)
+        all_facts = self.kb.forward_chain(self.max_depth, starting_facts=working_facts)
+        goal_supported = self._goal_supported(goal, all_facts)
+        target_hits = len(all_facts & target_facts)
+        target_total = len(target_facts)
+        target_coverage = (
+            float(target_hits) / float(target_total)
+            if target_total > 0 else (1.0 if goal_supported else 0.0)
+        )
+        unresolved_targets = max(target_total - target_hits, 0)
 
         # 3. Grounding: KB → z_sym
         # PERF FIX: при великому KB (>128 фактів) сэмплюємо підмножину,
@@ -2393,12 +3243,26 @@ class DifferentiableProver(nn.Module):
                          if len(all_facts) > _MAX_GROUND else all_facts)
         z_sym_1 = self.ground(ground_sample, device)            # (1, d)
         z_sym   = z_sym_1.expand(B, -1)                    # (B, d)
+        target_ground_facts = target_facts or frozenset({goal})
+        target_ground_sample = (
+            frozenset(random.sample(list(target_ground_facts), _MAX_GROUND))
+            if len(target_ground_facts) > _MAX_GROUND else target_ground_facts
+        )
+        z_target = self.ground(target_ground_sample, device).expand(B, -1)
 
         # 4. Proof search (тільки під час навчання)
         vem_hinge = torch.zeros(1, device=device).squeeze()
         abductor_aux = torch.zeros(1, device=device).squeeze()
+        proof_loss = torch.zeros(1, device=device).squeeze()
+        mean_utility = 0.0
+        abduced_rules = 0
         if self.training and len(self.kb.rules) > 0:
-            proved, traj, proof_loss = self.prove_with_policy(goal, z[:1])
+            proved, traj, proof_loss = self.prove_with_policy(
+                goal,
+                z[:1],
+                starting_facts=working_facts,
+            )
+            goal_supported = goal_supported or proved
 
             # Оновлюємо VeM targets на основі результату доведення
             if traj and self.kb.rules:
@@ -2431,14 +3295,41 @@ class DifferentiableProver(nn.Module):
                                   - 0.001 * gm_entropy
                                   + 0.01 * su_e
                                   - 0.001 * su_ent)
-        else:
-            proof_loss = torch.zeros(1, device=device).squeeze()
 
         # 5. Abduce з VeM фільтрацією (раз на 5 кроків)
-        if self._step % 5 == 0:
-            err_val = (world_error.item()
-                       if torch.is_tensor(world_error) else float(world_error))
-            _, vem_hinge, abductor_aux, _ = self.abduce_and_learn(z, err_val)
+        err_val = (world_error.item()
+                   if torch.is_tensor(world_error) else float(world_error))
+        mismatch_error = (1.0 - target_coverage) + (0.0 if goal_supported else 1.0)
+        trigger_abduction = (
+            self.task_context is not None and self.task_context.trigger_abduction
+        )
+        should_abduce = (
+            self.training
+            and (
+                trigger_abduction
+                or mismatch_error > 0.0
+                or (self._step % 5 == 0 and err_val > 0.5)
+            )
+        )
+        if should_abduce:
+            abduced_rules, vem_hinge, abductor_aux, mean_utility = self.abduce_and_learn(
+                z,
+                max(float(err_val), float(mismatch_error)),
+                force=trigger_abduction or mismatch_error > 0.0,
+            )
+            if abduced_rules > 0:
+                all_facts = self.kb.forward_chain(self.max_depth, starting_facts=working_facts)
+                goal_supported = self._goal_supported(goal, all_facts)
+                target_hits = len(all_facts & target_facts)
+                target_coverage = (
+                    float(target_hits) / float(target_total)
+                    if target_total > 0 else (1.0 if goal_supported else 0.0)
+                )
+                unresolved_targets = max(target_total - target_hits, 0)
+                ground_sample = (frozenset(random.sample(list(all_facts), _MAX_GROUND))
+                                 if len(all_facts) > _MAX_GROUND else all_facts)
+                z_sym_1 = self.ground(ground_sample, device)
+                z_sym = z_sym_1.expand(B, -1)
 
         # 6. VeM self-supervised loss (раз на 10 кроків)
         vem_self_loss = torch.zeros(1, device=device).squeeze()
@@ -2448,11 +3339,36 @@ class DifferentiableProver(nn.Module):
         # 7. Symbolic Consistency Loss: MSE між z та z_sym
         sym_consist = F.mse_loss(z, z_sym.detach()) + \
                       F.mse_loss(z_sym, z.detach())
+        symbolic_induction = (
+            F.mse_loss(z_sym, z_target.detach())
+            + F.mse_loss(z_target, z_sym.detach())
+        )
+        coverage_loss = torch.tensor(
+            (1.0 - target_coverage) + (0.0 if goal_supported else 1.0),
+            device=device,
+            dtype=z.dtype,
+        )
         sym_loss    = (sym_consist
+                       + 0.1  * symbolic_induction
+                       + 0.1  * coverage_loss
                        + 0.1  * proof_loss
                        + 0.01 * vem_hinge
                        + 0.05 * abductor_aux
                        + 0.01 * vem_self_loss)
+
+        self.last_goal = goal
+        self.last_context_facts = working_facts
+        self.last_all_facts = all_facts
+        self.last_forward_info = {
+            "goal_proved": 1.0 if goal_supported else 0.0,
+            "target_coverage": target_coverage,
+            "target_hits": float(target_hits),
+            "target_total": float(target_total),
+            "unresolved_targets": float(unresolved_targets),
+            "abduced_rules": float(abduced_rules),
+            "abduction_utility": mean_utility,
+            "provenance": provenance,
+        }
 
         return z_sym, sym_loss
 
@@ -2638,8 +3554,47 @@ def _run_prolog_tests() -> None:
     assert HornAtom(pred=1, args=(Const(2), Const(4))) in gp_facts, "gp(2,4) FAIL"
     print("  [PASS] — дедукція через транзитивність")
 
+    sep("T_GP_TENSOR · TensorKnowledgeBase — fast join + compound terms")
+    tkb = TensorKnowledgeBase(max_rules=64, max_facts=128, device=device)
+    comp_src = Compound(func=9, subterms=(Const(7), Const(8)))
+    comp_mid = Compound(func=10, subterms=(Const(9),))
+    tkb.add_fact(HornAtom(pred=10, args=(comp_src, comp_mid)))
+    tkb.add_fact(HornAtom(pred=11, args=(comp_mid, Const(99))))
+    XA, YB, ZC = Var("XA"), Var("YB"), Var("ZC")
+    tkb.add_rule(HornClause(
+        head=HornAtom(pred=12, args=(XA, ZC)),
+        body=(
+            HornAtom(pred=10, args=(XA, YB)),
+            HornAtom(pred=11, args=(YB, ZC)),
+        ),
+    ))
+    derived_tkb = tkb.forward_chain(max_depth=3)
+    assert HornAtom(pred=12, args=(comp_src, Const(99))) in derived_tkb, f"Tensor KB compound join FAIL: {derived_tkb}"
+    print("  [PASS] — tensor KB виводить compound-терми в multi-body правилі")
+
     # ══ T_ALL_SUB: find_all_substitutions ══════════════════════════════════════
     sep("T_ALL_SUB · find_all_substitutions (backtracking DFS)")
+    sep("T_GP_TENSOR_STRUCT В· TensorKnowledgeBase — structured compound join")
+    tkb_struct = TensorKnowledgeBase(max_rules=64, max_facts=128, device=device)
+    nested_fact = Compound(func=20, subterms=(Const(1), Const(5)))
+    tkb_struct.add_fact(HornAtom(pred=20, args=(nested_fact,)))
+    tkb_struct.add_fact(HornAtom(pred=21, args=(Const(5), Const(7))))
+    YS, ZS = Var("YS"), Var("ZS")
+    tkb_struct.add_rule(HornClause(
+        head=HornAtom(pred=22, args=(Compound(func=30, subterms=(YS, ZS)),)),
+        body=(
+            HornAtom(pred=20, args=(Compound(func=20, subterms=(Const(1), YS)),)),
+            HornAtom(pred=21, args=(YS, ZS)),
+        ),
+    ))
+    derived_struct = tkb_struct.forward_chain(max_depth=3)
+    expected_struct = HornAtom(
+        pred=22,
+        args=(Compound(func=30, subterms=(Const(5), Const(7))),),
+    )
+    assert expected_struct in derived_struct, f"Structured compound join FAIL: {derived_struct}"
+    print("  [PASS] вЂ” structured fast join РїС–РґС‚СЂРёРјСѓС” f(Const,Var) Сѓ body Р№ head")
+
     facts_u = frozenset([
         HornAtom(pred=0, args=(Const(1), Const(2))),
         HornAtom(pred=0, args=(Const(2), Const(3))),

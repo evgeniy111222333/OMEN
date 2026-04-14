@@ -110,7 +110,7 @@ class TaskStateEncoder(nn.Module):
         super().__init__()
         # Скалярні ознаки → d_state
         self.encoder = nn.Sequential(
-            nn.Linear(5, d_state),
+            nn.Linear(8, d_state),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(d_state, d_state),
@@ -124,6 +124,9 @@ class TaskStateEncoder(nn.Module):
         plan_depth: int,
         n_rules:   int,
         n_writes:  int,
+        goal_entropy: float = 0.0,
+        goal_confidence: float = 0.0,
+        latent_norm: float = 0.0,
     ) -> torch.Tensor:
         """Returns: (1, d_state)"""
         device = next(self.parameters()).device
@@ -131,9 +134,12 @@ class TaskStateEncoder(nn.Module):
             [gap_norm, ce_loss,
              float(plan_depth) / 10.0,
              float(n_rules) / 100.0,
-             float(n_writes) / 100.0],
+             float(n_writes) / 100.0,
+             goal_entropy,
+             goal_confidence,
+             latent_norm],
             dtype=torch.float32, device=device,
-        ).unsqueeze(0)  # (1, 5)
+        ).unsqueeze(0)  # (1, 8)
         return self.norm(self.encoder(feats))   # (1, d_state)
 
 
@@ -189,6 +195,9 @@ class SynthesisMetaController(nn.Module):
         plan_depth: int   = 0,
         n_rules:   int   = 0,
         n_writes:  int   = 0,
+        goal_entropy: float = 0.0,
+        goal_confidence: float = 0.0,
+        latent_norm: float = 0.0,
     ) -> Tuple[StrategyConfig, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Вибирає стратегію σ.
@@ -198,7 +207,16 @@ class SynthesisMetaController(nn.Module):
           log_prob : log π_meta(σ|s) — для REINFORCE backward
           value    : V_meta(s) — baseline
         """
-        s = self.state_enc(gap_norm, ce_loss, plan_depth, n_rules, n_writes)  # (1, d)
+        s = self.state_enc(
+            gap_norm,
+            ce_loss,
+            plan_depth,
+            n_rules,
+            n_writes,
+            goal_entropy=goal_entropy,
+            goal_confidence=goal_confidence,
+            latent_norm=latent_norm,
+        )  # (1, d)
 
         logits = self.actor(s)   # (1, N_strategies)
         value  = self.critic(s)  # (1, 1)
@@ -218,53 +236,6 @@ class SynthesisMetaController(nn.Module):
 
         cfg = STRATEGY_CONFIGS[sigma_id]
         return cfg, log_prob, value.squeeze(), entropy
-
-    def compute_meta_loss(
-        self,
-        log_prob:       torch.Tensor,  # log π(σ|s)
-        value:          torch.Tensor,  # V(s)
-        quality_reward: float,         # R(σ) — якість (1/CE-normalized)
-        strategy_id:    int,
-    ) -> MetaTrajectory:
-        """
-        Обчислює L_meta = L_actor + 0.5·L_critic.
-
-        quality_reward: ∈ [0, 1] — нормована якість (вища = краще).
-        """
-        device = log_prob.device
-
-        cost    = STRATEGY_COSTS[strategy_id].to(device)
-        R_net   = quality_reward - self.beta * cost.item()   # R(σ) − β·Cost(σ)
-
-        R_tensor = torch.tensor(R_net, dtype=torch.float32, device=device)
-
-        # Advantage: A(s,σ) = R_net − V(s)
-        advantage = (R_tensor - value.detach()).clamp(-5.0, 5.0)
-
-        # Actor loss: −log π(σ|s) · A(s,σ)
-        L_actor  = -(log_prob * advantage)
-
-        # Entropy bonus (exploration): -H(π)
-        # Обчислюємо через log_prob + Σπ·log π approximation
-        L_entropy = self.entropy_beta * log_prob  # soft approximation
-
-        # Critic loss: (R_net − V(s))²
-        L_critic = (R_tensor - value).pow(2) * 0.5
-
-        L_meta = (L_actor + L_entropy + L_critic).clamp(-10.0, 10.0)
-
-        # Статистика
-        self._total_reward  += R_net
-        self._n_episodes    += 1
-
-        return MetaTrajectory(
-            strategy_id    = strategy_id,
-            strategy_name  = STRATEGY_NAMES[strategy_id],
-            quality_reward = quality_reward,
-            cost_penalty   = cost.item() * self.beta,
-            net_reward     = R_net,
-            meta_loss      = L_meta,
-        )
 
     def compute_meta_loss(
         self,
@@ -308,3 +279,75 @@ class SynthesisMetaController(nn.Module):
         } | {
             "meta_avg_reward": self._total_reward / max(self._n_episodes, 1),
         }
+
+
+def run_tests_osf_meta() -> None:
+    torch.manual_seed(0)
+
+    meta = SynthesisMetaController(d_state=24, beta=0.2, entropy_beta=0.01, dropout=0.0)
+    meta.eval()
+
+    s_a = meta.state_enc(
+        gap_norm=0.4,
+        ce_loss=1.0,
+        plan_depth=2,
+        n_rules=5,
+        n_writes=3,
+        goal_entropy=0.1,
+        goal_confidence=0.9,
+        latent_norm=0.2,
+    )
+    s_b = meta.state_enc(
+        gap_norm=0.4,
+        ce_loss=1.0,
+        plan_depth=2,
+        n_rules=5,
+        n_writes=3,
+        goal_entropy=1.5,
+        goal_confidence=0.2,
+        latent_norm=1.1,
+    )
+    assert s_a.shape == (1, 24)
+    assert s_b.shape == (1, 24)
+    assert not torch.allclose(s_a, s_b), "TaskStateEncoder must react to intent-aware features"
+
+    cfg, log_prob, value, entropy = meta.select_strategy(
+        gap_norm=0.7,
+        ce_loss=0.8,
+        plan_depth=4,
+        n_rules=9,
+        n_writes=2,
+        goal_entropy=0.6,
+        goal_confidence=0.7,
+        latent_norm=0.5,
+    )
+    assert cfg.strategy_id in STRATEGY_CONFIGS
+    assert log_prob.ndim == 0 and value.ndim == 0 and entropy.ndim == 0
+
+    meta.train()
+    cfg_t, log_prob_t, value_t, entropy_t = meta.select_strategy(
+        gap_norm=0.5,
+        ce_loss=1.2,
+        plan_depth=3,
+        n_rules=4,
+        n_writes=1,
+        goal_entropy=0.3,
+        goal_confidence=0.8,
+        latent_norm=0.4,
+    )
+    traj = meta.compute_meta_loss(
+        log_prob_t,
+        value_t,
+        quality_reward=0.75,
+        strategy_id=cfg_t.strategy_id,
+        entropy=entropy_t,
+    )
+    assert torch.isfinite(traj.meta_loss)
+    stats = meta.strategy_stats()
+    assert "meta_avg_reward" in stats
+    assert any(key.startswith("meta_freq_") for key in stats)
+    print("OSF meta tests passed.")
+
+
+if __name__ == "__main__":
+    run_tests_osf_meta()

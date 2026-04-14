@@ -112,7 +112,7 @@ class ByteContextEncoder(nn.Module):
                 _seg_lut[_sb] = True
         self.register_buffer('_seg_lut', _seg_lut, persistent=False)
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor, return_attn: bool = False):
         """
         tokens : (B, T) ∈ [0, vocab_size)
         Returns: (B, T, d_tok)  — у byte-режимі розмір T збережено (без pooling)
@@ -125,15 +125,23 @@ class ByteContextEncoder(nn.Module):
         tokens = tokens.clamp(0, 255)
 
         x = self.drop(self.embed(tokens))              # (B, T, d_tok)
+        attn_maps: List[torch.Tensor] = []
         for norm_a, attn, norm_f, ffn in zip(
                 self.attn_norms, self.attns, self.ffn_norms, self.ffns):
-            x = x + attn(norm_a(x))
+            if return_attn:
+                attn_out, attn_weights = attn(norm_a(x), need_weights=True)
+                attn_maps.append(attn_weights)
+                x = x + attn_out
+            else:
+                x = x + attn(norm_a(x))
             x = x + ffn(norm_f(x))
         x = self.norm(x)
 
         if self.segment_pool:
             x = self._segment_pool(x, tokens)         # (B, T, d_tok) — pooled
 
+        if return_attn:
+            return x, torch.stack(attn_maps, dim=1)   # (B, T, d_tok), (B, L, H, T, T)
         return x                                       # (B, T, d_tok)
 
     def _segment_pool(self, h: torch.Tensor,
@@ -402,7 +410,7 @@ class EpistemicQuantizer(nn.Module):
                     new_norm = F.normalize(new_vec.unsqueeze(0), dim=-1)
                     idx = self.current_size.item()
                     with torch.no_grad():
-                        self.codebook.weight[idx] = new_vec
+                        self.codebook.weight.data[idx].copy_(new_vec)
                         self.cluster_sum[idx]     = new_vec
                         self.cluster_count[idx]   = 1.0
                         self.global_usage[idx]    = 0.1   # початкове значення — не "dead"
@@ -594,7 +602,7 @@ class EpistemicQuantizer(nn.Module):
         dead_indices = dead_mask.nonzero(as_tuple=True)[0][:n_restart]
         for i, dead_code_idx in enumerate(dead_indices):
             src = x_flat[hard_idx[i]]
-            self.codebook.weight[dead_code_idx] = src
+            self.codebook.weight.data[dead_code_idx].copy_(src)
             self.cluster_sum[dead_code_idx]     = src
             self.cluster_count[dead_code_idx]   = 1.0
 
@@ -649,13 +657,13 @@ class EpistemicQuantizer(nn.Module):
         # Оновлення кодбуку (Laplace smoothing у знаменнику)
         updated = (self.cluster_sum[:V]
                    / (self.cluster_count[:V].unsqueeze(1) + 1e-5))
-        self.codebook.weight[:V] = updated
+        self.codebook.weight.data[:V].copy_(updated)
 
         # ── Відновлюємо захищені коди (скасовуємо EMA для них) ───────────────
         if frozen_idx is not None and len(frozen_idx) > 0:
             self.cluster_count[frozen_idx] = saved_count
             self.cluster_sum[frozen_idx]   = saved_sum
-            self.codebook.weight.data[frozen_idx] = saved_w
+            self.codebook.weight.data[frozen_idx].copy_(saved_w)
 
         self._cb_norm_cache = None      # OPT-CB: кодбук змінився → інвалідуємо
 
@@ -705,7 +713,7 @@ class EpistemicQuantizer(nn.Module):
         actual_V  = min(len(centers), V)               # FIX: early break → K < V
 
         # Оновлюємо кодбук in-place (requires_grad → no_grad)
-        self.codebook.weight[:actual_V].copy_(centers_t[:actual_V])
+        self.codebook.weight.data[:actual_V].copy_(centers_t[:actual_V])
         self.cluster_sum[:actual_V].copy_(centers_t[:actual_V])
         self.cluster_count[:actual_V].fill_(1.0)
         self.global_usage[:actual_V].fill_(0.15)       # не мертві одразу
@@ -812,7 +820,7 @@ class EpistemicQuantizer(nn.Module):
                     # α: рівномірно в [0.15, 0.45] → sim до centroid ≈ [0.98, 0.99]
                     alpha_ort = 0.15 + torch.rand(1, device=x_flat.device).item() * 0.30
                     perturb_vec = F.normalize(centroid + alpha_ort * ort_noise, dim=-1)
-                    self.codebook.weight[dead_code_idx] = perturb_vec
+                    self.codebook.weight.data[dead_code_idx].copy_(perturb_vec)
                     self.cluster_sum[dead_code_idx]     = perturb_vec
                 else:
                     # Помірний collapse: стара interp стратегія (підтверджена тестами)
@@ -824,12 +832,12 @@ class EpistemicQuantizer(nn.Module):
                         + (1.0 - alpha) * self.codebook.weight[i2].clone(),
                         dim=-1
                     )
-                    self.codebook.weight[dead_code_idx] = interp_vec
+                    self.codebook.weight.data[dead_code_idx].copy_(interp_vec)
                     self.cluster_sum[dead_code_idx]     = interp_vec
             else:
                 # Нормальний режим: restart з "найважчого" encoder-виходу
                 src = x_flat[hard_idx[i]]
-                self.codebook.weight[dead_code_idx] = src
+                self.codebook.weight.data[dead_code_idx].copy_(src)
                 self.cluster_sum[dead_code_idx]     = src
 
             self.cluster_count[dead_code_idx]   = 1.0
@@ -1302,7 +1310,7 @@ class NeuralEpistemicTokenizer(nn.Module):
         )
 
     # ── encode ────────────────────────────────────────────────────────────────
-    def encode(self, src: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+    def encode(self, src: torch.Tensor, return_attn: bool = False) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         """
         src : (B, T) — вхідна послідовність
         Returns:
@@ -1311,9 +1319,16 @@ class NeuralEpistemicTokenizer(nn.Module):
           vq_info   : dict           — статистика квантування
         """
         # f_θ: контекстне кодування
-        h_ctx = self.byte_encoder(src)                             # (B, T, d_tok)
+        if return_attn:
+            h_ctx, attn_maps = self.byte_encoder(src, return_attn=True)   # (B, T, d_tok), (B, L, H, T, T)
+        else:
+            h_ctx = self.byte_encoder(src)                             # (B, T, d_tok)
+            attn_maps = None
         # Q: квантування
         h_q, vq_indices, vq_info = self.quantizer(h_ctx)          # STE
+        if attn_maps is not None:
+            vq_info["attention_maps"] = attn_maps
+            vq_info["h_ctx"] = h_ctx
         return h_q, vq_indices, vq_info
 
     # ── decode ────────────────────────────────────────────────────────────────
@@ -1530,13 +1545,16 @@ def run_net_tests() -> None:
     tgt2 = torch.randint(1, VOCAB, (B, T), device=DEVICE)
     zf   = torch.randn(B, D_LAT, device=DEVICE)
 
-    h_q, vq_idx, vq_info = net.encode(src)
+    h_q, vq_idx, vq_info = net.encode(src, return_attn=True)
     logits2, l_rec2       = net.decode(tgt2, zf, h_q)
     net_loss_dict         = net.compute_loss(vq_info, l_rec2)
 
     assert h_q.shape   == (B, T, D_TOK)
     assert vq_idx.shape == (B, T)
     assert logits2.shape == (B, T, VOCAB)
+    assert "attention_maps" in vq_info, "FAIL: attention maps не повернулись з encode(return_attn=True)"
+    assert "h_ctx" in vq_info, "FAIL: raw encoder hidden не повернувся з encode(return_attn=True)"
+    assert vq_info["attention_maps"].shape[:3] == (B, _FakeCfg.net_byte_layers, N_H)
     assert not net_loss_dict["net_total"].isnan()
 
     # Перевірка backward через весь NET
@@ -1550,6 +1568,7 @@ def run_net_tests() -> None:
 
     print(f"  h_q shape     : {tuple(h_q.shape)} ✓")
     print(f"  vq_idx shape  : {tuple(vq_idx.shape)} ✓")
+    print(f"  attn shape    : {tuple(vq_info['attention_maps'].shape)} ✓")
     print(f"  logits shape  : {tuple(logits2.shape)} ✓")
     print(f"  L_NET         : {net_loss_dict['net_total'].item():.4f}")
     print(f"  grad (enc)    : {grad_enc:.4f}")

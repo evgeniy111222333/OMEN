@@ -26,7 +26,7 @@ from __future__ import annotations
 import math, time, random, warnings
 from collections import defaultdict, deque
 from copy import deepcopy
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -42,10 +42,24 @@ from omen_scale_config import OMENScaleConfig
 from omen_perceiver    import (PerceiverResampler, LlamaDecoderBlock,
                                 RMSNorm, SwiGLUFFN, LlamaAttention,
                                 l_scale_penalty)
-from omen_prolog       import DifferentiableProver, HornAtom
+from omen_prolog       import (
+    Const,
+    DifferentiableProver,
+    HornAtom,
+    SymbolicTaskContext,
+    SEQ_ACTUAL_NEXT_PRED,
+    SEQ_AST_SUPPORT_PRED,
+    SEQ_EDGE_PRED,
+    SEQ_GAP_DIM_PRED,
+    SEQ_LAST_TOKEN_PRED,
+    SEQ_PREDICT_NEXT_PRED,
+    SEQ_SALIENCY_SUPPORT_PRED,
+)
+from omen_ast_multilang import MultiLangASTParser
 
 # NET: Neural Epistemic Tokenizer (замінює GPT-2 BPE)
 from omen_net_tokenizer import NeuralEpistemicTokenizer
+from omen_saliency import SaliencyTraceModule
 
 # EMC: Efficient Meta-Controller (адаптивний контролер міркування)
 from omen_emc import EfficientMetaController
@@ -91,6 +105,7 @@ class AsyncTensorProductMemory(nn.Module):
         self.out_proj = nn.Linear(d, d, bias=False)
         self.d, self.H = d, H
         self.write_tau    = cfg.mem_write_tau
+        self.decay        = float(getattr(cfg, "mem_decay", 1.0))
         self.update_steps = cfg.mem_update_steps
         self.cache:  deque = deque(maxlen=cfg.mem_cache_size)
         self.n_writes = 0
@@ -166,7 +181,8 @@ class AsyncTensorProductMemory(nn.Module):
             k = self.key_proj(z_s_m).view(-1, self.H, self.d)
             v = self.val_proj(z_v_m).view(-1, self.H, self.d)
             delta = torch.einsum('bhd,bhe,b->hde', k, v, lam_m)
-            new_mem = self.memory + delta / (mask.sum().float() + 1e-6)
+            base_mem = self.memory * self.decay
+            new_mem = base_mem + delta / (mask.sum().float() + 1e-6)
             self.memory.data.copy_(new_mem)
             for i in range(z_s_m.size(0)):
                 self.cache.append((z_s_m[i], z_v_m[i]))
@@ -225,12 +241,20 @@ class TokenEncoder(nn.Module):
         self.norm = RMSNorm(cfg.d_tok)
         self.drop = nn.Dropout(cfg.dropout)
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor, return_attn: bool = False):
         """tokens: (B, T) → hidden: (B, T, d_tok)"""
         x = self.drop(self.embed(tokens))
+        attn_maps: List[torch.Tensor] = []
         for blk in self.blocks:
-            x = blk(x)
-        return self.norm(x)                                        # (B, T, d_tok)
+            if return_attn:
+                x, attn_weights = blk(x, need_weights=True)
+                attn_maps.append(attn_weights)
+            else:
+                x = blk(x)
+        x = self.norm(x)
+        if return_attn:
+            return x, torch.stack(attn_maps, dim=1)
+        return x                                        # (B, T, d_tok)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -562,6 +586,9 @@ class OMENScale(nn.Module):
 
         # ─── Loss ─────────────────────────────────────────────────────────────
         self.loss_fn = OMENScaleLoss(cfg)
+        self.saliency_enabled = getattr(cfg, 'saliency_enabled', False)
+        if self.saliency_enabled:
+            self.saliency = SaliencyTraceModule(cfg.d_tok, cfg.d_latent, cfg)
 
         # ─── OSF: OMEN Synthesis Framework ────────────────────────────────────
         # OSF замінює / доповнює TokenDecoder ієрархічною генерацією.
@@ -614,6 +641,9 @@ class OMENScale(nn.Module):
         # Кешуємо результат; інвалідуємо тільки при зміні кількості правил.
         self._sem_pairs_cache: list = []
         self._sem_pairs_n_rules: int = -1
+        self._ctx_max_facts = int(getattr(cfg, "symbolic_context_max_facts", 96))
+        self._ctx_ast_max_facts = int(getattr(cfg, "symbolic_ast_max_facts", 48))
+        self.ast_parser = MultiLangASTParser()
         self.register_buffer("_train_step", torch.zeros((), dtype=torch.long), persistent=False)
 
     def _world_teacher_forcing_ratio(self) -> float:
@@ -622,6 +652,219 @@ class OMENScale(nn.Module):
         steps = max(int(getattr(self.cfg, 'world_teacher_forcing_steps', 2000)), 1)
         progress = min(float(self._train_step.item()) / steps, 1.0)
         return start + (end - start) * progress
+
+    def _retrieve_memory(self, z_query: torch.Tensor) -> torch.Tensor:
+        q_mem = self.mem_query_proj(z_query)
+        v_holo = self.memory.read(q_mem)
+        v_epi = self.memory.episodic_recall(q_mem)
+        sims = torch.stack([
+            F.cosine_similarity(q_mem, v_holo, dim=-1),
+            F.cosine_similarity(q_mem, v_epi, dim=-1),
+        ], dim=-1)
+        weights = F.softmax(sims, dim=-1)
+        return weights[:, :1] * v_holo + weights[:, 1:] * v_epi
+
+    def _world_rollout_from_hidden(
+        self,
+        h_tok: torch.Tensor,
+        actions: torch.Tensor,
+        teacher_forcing_ratio: float = 0.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        max_steps = max(int(getattr(self.cfg, 'world_rollout_steps', 8)), 1)
+        if h_tok.size(1) > 1 and actions.size(1) > 0:
+            steps = min(max_steps, h_tok.size(1) - 1, actions.size(1))
+            h_slice = h_tok[:, -(steps + 1):, :]
+            teacher_states = self.world_target_proj(h_slice[:, :-1]).detach()
+            world_targets = self.world_target_proj(h_slice[:, 1:]).detach()
+            action_seq = actions[:, -steps:]
+            z_sim_traj = self.world_rnn.simulate_sequence(
+                teacher_states[:, 0],
+                action_seq,
+                teacher_forcing_ratio=teacher_forcing_ratio,
+                teacher_states=teacher_states,
+            )
+            return z_sim_traj, world_targets
+
+        fallback_state = self.world_target_proj(h_tok[:, -1:, :]).detach()
+        fallback_actions = actions[:, -1:] if actions.size(1) > 0 else torch.zeros(
+            h_tok.size(0), 1, dtype=torch.long, device=h_tok.device
+        )
+        z_sim_traj = self.world_rnn.simulate_sequence(
+            fallback_state[:, 0],
+            fallback_actions,
+            teacher_forcing_ratio=teacher_forcing_ratio,
+        )
+        return z_sim_traj, z_sim_traj.detach()
+
+    def _combine_levels(
+        self,
+        z_neural: torch.Tensor,
+        z_symbolic: torch.Tensor,
+        v_mem: torch.Tensor,
+    ) -> torch.Tensor:
+        fusion_gate = self.mem_fusion_gate(torch.cat([z_neural, z_symbolic, v_mem], dim=-1))
+        return z_neural + 0.1 * z_symbolic + fusion_gate * v_mem
+
+    @staticmethod
+    def _dedupe_facts(facts: List[HornAtom], limit: int) -> List[HornAtom]:
+        unique: List[HornAtom] = []
+        seen: Set[HornAtom] = set()
+        for fact in facts:
+            if fact in seen:
+                continue
+            unique.append(fact)
+            seen.add(fact)
+            if len(unique) >= limit:
+                break
+        return unique
+
+    @staticmethod
+    def _first_const(atom: HornAtom) -> int:
+        for arg in atom.args:
+            if isinstance(arg, Const):
+                return int(arg.val)
+        return int(atom.pred)
+
+    def _ast_facts_from_bytes(self, src_row: torch.Tensor) -> List[HornAtom]:
+        try:
+            code = bytes(int(v) % 256 for v in src_row.tolist()).decode("utf-8", errors="ignore")
+        except Exception:
+            return []
+        if not code.strip():
+            return []
+        try:
+            facts = self.ast_parser.parse(code, lang="python", source_id=0)
+        except Exception:
+            return []
+        return self._dedupe_facts(list(facts), self._ctx_ast_max_facts)
+
+    def _build_counterfactual_actions(self, src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+        n_cf = max(int(getattr(self.cfg, "n_counterfactual", 0)), 0)
+        if n_cf <= 0:
+            return torch.zeros(src.size(0), 0, dtype=torch.long, device=src.device)
+        choices: List[torch.Tensor] = [tgt[:, -1], src[:, -1]]
+        if src.size(1) > 1:
+            choices.append(src[:, -2])
+        if tgt.size(1) > 1:
+            choices.append(tgt[:, -2])
+        cf = torch.stack(choices[:max(1, min(len(choices), n_cf))], dim=1)
+        if cf.size(1) < n_cf:
+            repeats = math.ceil(n_cf / max(cf.size(1), 1))
+            cf = cf.repeat(1, repeats)
+        return cf[:, :n_cf]
+
+    def _build_symbolic_task_context(
+        self,
+        src: torch.Tensor,
+        tgt: torch.Tensor,
+        gap_norm: torch.Tensor,
+        hot_dims: torch.Tensor,
+        saliency_out: Optional[object],
+    ) -> SymbolicTaskContext:
+        src_row = src[0].detach().cpu()
+        tgt_row = tgt[0].detach().cpu()
+        observed: List[HornAtom] = []
+
+        pair_cap = min(src_row.numel(), max(self._ctx_max_facts // 2, 8))
+        start_idx = max(src_row.numel() - pair_cap, 0)
+        for idx in range(start_idx, src_row.numel()):
+            observed.append(HornAtom(
+                SEQ_EDGE_PRED,
+                (int(src_row[idx].item()), int(tgt_row[idx].item())),
+            ))
+
+        last_src = int(src_row[-1].item())
+        last_tgt = int(tgt_row[-1].item())
+        observed.append(HornAtom(SEQ_LAST_TOKEN_PRED, (last_src, src_row.numel() - 1)))
+
+        hot_idx = hot_dims[0].nonzero(as_tuple=True)[0].tolist()[:8]
+        for dim_idx in hot_idx:
+            observed.append(HornAtom(SEQ_GAP_DIM_PRED, (int(dim_idx), 1)))
+
+        next_goal = HornAtom(SEQ_PREDICT_NEXT_PRED, (last_src, last_tgt))
+        actual_next = HornAtom(SEQ_ACTUAL_NEXT_PRED, (last_src, last_tgt))
+        goal = next_goal
+        provenance = "token"
+
+        ast_facts = self._ast_facts_from_bytes(src_row)
+        saliency_semantic = list(saliency_out.sal_semantic_facts[0]) if saliency_out is not None else []
+        saliency_expected = list(saliency_out.sal_expected_facts[0]) if saliency_out is not None else []
+
+        if len(ast_facts) >= 2:
+            goal = ast_facts[-1]
+            observed.extend(ast_facts[:-1])
+            observed.append(HornAtom(SEQ_AST_SUPPORT_PRED, (goal.pred, self._first_const(goal))))
+            provenance = "ast"
+        elif saliency_expected:
+            goal = saliency_expected[0]
+            observed.extend(saliency_expected[1:])
+            observed.append(HornAtom(SEQ_SALIENCY_SUPPORT_PRED, (goal.pred, self._first_const(goal))))
+            provenance = "saliency"
+
+        observed.extend(saliency_semantic)
+        if provenance != "ast":
+            observed.extend(ast_facts[:4])
+        observed = self._dedupe_facts(observed, self._ctx_max_facts)
+
+        target_facts = self._dedupe_facts([goal, next_goal, actual_next], limit=8)
+        gap_value = float(gap_norm.mean().item())
+        sal_consistency = (
+            float(getattr(saliency_out, "sal_consistency", 1.0))
+            if saliency_out is not None else 1.0
+        )
+        trigger_abduction = (
+            gap_value > float(getattr(self.cfg, "epistemic_tau", 0.3))
+            or sal_consistency < float(getattr(self.cfg, "saliency_consistency_threshold", 0.55))
+        )
+        return SymbolicTaskContext(
+            observed_facts=frozenset(observed),
+            goal=goal,
+            target_facts=frozenset(target_facts),
+            provenance=provenance,
+            trigger_abduction=trigger_abduction,
+            hot_dims=tuple(int(i) for i in hot_idx),
+            metadata={
+                "gap_norm": gap_value,
+                "saliency_consistency": sal_consistency,
+            },
+        )
+
+    def _build_generation_task_context(self, prompt: torch.Tensor) -> SymbolicTaskContext:
+        prompt_row = prompt[0].detach().cpu()
+        observed: List[HornAtom] = []
+        if prompt_row.numel() > 1:
+            pair_cap = min(prompt_row.numel() - 1, max(self._ctx_max_facts // 2, 8))
+            start_idx = max(prompt_row.numel() - pair_cap - 1, 0)
+            for idx in range(start_idx, prompt_row.numel() - 1):
+                observed.append(HornAtom(
+                    SEQ_EDGE_PRED,
+                    (int(prompt_row[idx].item()), int(prompt_row[idx + 1].item())),
+                ))
+
+        last_token = int(prompt_row[-1].item()) if prompt_row.numel() > 0 else 0
+        last_pos = max(int(prompt_row.numel()) - 1, 0)
+        observed.append(HornAtom(SEQ_LAST_TOKEN_PRED, (last_token, last_pos)))
+
+        ast_facts = self._ast_facts_from_bytes(prompt_row)
+        provenance = "token"
+        if ast_facts:
+            goal = ast_facts[-1]
+            observed.extend(ast_facts[:-1])
+            observed.append(HornAtom(SEQ_AST_SUPPORT_PRED, (goal.pred, self._first_const(goal))))
+            provenance = "ast"
+        else:
+            goal = HornAtom(SEQ_LAST_TOKEN_PRED, (last_token, last_pos))
+
+        observed = self._dedupe_facts(observed, self._ctx_max_facts)
+        return SymbolicTaskContext(
+            observed_facts=frozenset(observed),
+            goal=goal,
+            target_facts=frozenset({goal}),
+            provenance=provenance,
+            trigger_abduction=False,
+            hot_dims=tuple(),
+            metadata={"mode": "generate"},
+        )
 
 
     # ── Forward ──────────────────────────────────────────────────────────────
@@ -641,27 +884,34 @@ class OMENScale(nn.Module):
         # ══ Рівень 1: Token → Concept  ═══════════════════════════════════════
         net_info   = {}
         vq_indices = None
+        attn_maps = None
+        saliency_hidden = None
         if self.net_enabled:
             # ── NET шлях: контекстне кодування + семантичне квантування ────────
-            h_tok, vq_indices, net_info = self.net.encode(src)        # (B,T,d_tok)
+            h_tok, vq_indices, net_info = self.net.encode(
+                src, return_attn=self.saliency_enabled)        # (B,T,d_tok)
+            attn_maps = net_info.get("attention_maps")
+            saliency_hidden = net_info.get("h_ctx", h_tok)
         else:
             # ── Класичний шлях: просте Embedding + LlamaDecoderBlock ─────────
-            h_tok = self.tok_encoder(src)                               # (B,T,d_tok)
+            if self.saliency_enabled:
+                h_tok, attn_maps = self.tok_encoder(src, return_attn=True)
+            else:
+                h_tok = self.tok_encoder(src)                               # (B,T,d_tok)
+            saliency_hidden = h_tok
 
         latents, z = self.perceiver(h_tok)                             # (B,n,d_lat), (B,d_lat)
 
         # ── Level 2: M-Core читання ───────────────────────────────────────────
-        v_mem = self.memory.read(self.mem_query_proj(z))               # (B, d_lat)
+        v_mem = self._retrieve_memory(z)                               # (B, d_lat)
 
         # ── Level 2: WorldRNN симуляція ───────────────────────────────────────
         # FIX: z.detach() — WorldRNN отримує тільки «знімок» концепту z,
         # без backprop крізь z. Це ізолює WorldRNN-градієнт від решти граду:
         # градієнт L_world тече → z_sim → WorldRNN.params, а не → z → perceiver.
-        sim_tgt  = tgt[:, -8:] if tgt.size(1) > 8 else tgt
-        world_targets = self.world_target_proj(h_tok[:, -sim_tgt.size(1):, :]).detach()
         teacher_forcing_ratio = self._world_teacher_forcing_ratio() if self.training else 0.0
-        z_sim_traj = self.world_rnn.simulate_sequence(
-            z.detach(), sim_tgt, teacher_forcing_ratio=teacher_forcing_ratio
+        z_sim_traj, world_targets = self._world_rollout_from_hidden(
+            h_tok, src, teacher_forcing_ratio=teacher_forcing_ratio
         )
         z_sim    = z_sim_traj[:, -1]                                   # (B, d_lat)
 
@@ -670,8 +920,25 @@ class OMENScale(nn.Module):
             z, self.world_rnn, z_sim)
 
         # ── Curiosity (якщо gap великий) ──────────────────────────────────────
+        cf_actions = self._build_counterfactual_actions(src, tgt)
         z_enr, cf_loss = self.curiosity(
-            z, E, hot_dims, gap_norm, self.memory, self.world_rnn)
+            z, E, hot_dims, gap_norm, self.memory, self.world_rnn,
+            counterfactual_actions=cf_actions,
+        )
+
+        saliency_out = None
+        if self.saliency_enabled:
+            saliency_out = self.saliency(
+                attn_maps=attn_maps,
+                token_hidden=saliency_hidden,
+                z_neural=z,
+                prover=self.prover,
+                train_step=int(self._train_step.item()),
+            )
+        task_context = self._build_symbolic_task_context(
+            src, tgt, gap_norm, hot_dims, saliency_out,
+        )
+        self.prover.set_task_context(task_context)
 
         # ── Level 3: ∂-Prolog (через EMC або напряму) ─────────────────────────
         world_err  = F.mse_loss(z_sim_traj, world_targets).detach()
@@ -681,7 +948,7 @@ class OMENScale(nn.Module):
             # π_meta визначає: Stop | RecallMCore | ForwardChainStep | Abduce
             # Повертає (z_sym, sym_loss, v_mem_emc, meta_loss, traj_stats)
             z_sym, sym_loss, v_mem_emc, meta_loss, traj_stats = self.emc.run_episode(
-                z_enr, gap_norm, self.prover, self.memory,
+                z_enr, gap_norm, hot_dims, self.prover, self.memory,
                 world_err, device=z_enr.device,
             )
             # Якщо EMC виконав RecallMCore → використовуємо збагачений v_mem
@@ -692,6 +959,7 @@ class OMENScale(nn.Module):
             z_sym, sym_loss = self.prover(z_enr, world_err)
             meta_loss = torch.zeros(1, device=z_enr.device).squeeze()
             traj_stats = None
+        self.prover.clear_task_context()
 
         # ── Semantic Feedback Pairs для NET (I(Z;Γ) апроксимація) ────────────
         # S-Core виявляє логічно пов'язані токени → NET наближає їх вектори.
@@ -720,11 +988,14 @@ class OMENScale(nn.Module):
         )
 
         # ── Об'єднуємо рівні ─────────────────────────────────────────────────
-        fusion_gate = self.mem_fusion_gate(torch.cat([z_enr, z_sym, v_mem], dim=-1))
-        z_final = z_enr + 0.1 * z_sym + fusion_gate * v_mem          # (B, d_lat)
+        z_final = self._combine_levels(z_enr, z_sym, v_mem)          # (B, d_lat)
 
         # ── M-Core: буферизований запис ───────────────────────────────────────
-        conf = (1.0 - gap_norm.clamp(0, 1))
+        sym_stats = getattr(self.prover, "last_forward_info", {})
+        target_coverage = float(sym_stats.get("target_coverage", 1.0))
+        goal_proved = float(sym_stats.get("goal_proved", 1.0))
+        surprise = 0.5 * gap_norm.clamp(0, 1) + 0.5 * (1.0 - target_coverage * goal_proved)
+        conf = (1.0 - surprise).clamp(0.0, 1.0)
         self.memory.schedule_write(z.detach(), world_targets[:, -1].detach(), conf.detach())
 
         # ══ Рівень 1: Decode  ════════════════════════════════════════════════
@@ -734,13 +1005,29 @@ class OMENScale(nn.Module):
 
         if self.net_enabled:
             # NET декодер: реконструює оригінальні токени з h_tok + z_final
-            logits, l_rec = self.net.decode(tgt, z_final, h_tok)      # (B,T,V), scalar
+            net_logits, l_rec = self.net.decode(tgt, z_final, h_tok)  # (B,T,V), scalar
+            logits = net_logits
             # L_NET з семантичним feedback: -λ·I(Z;Γ) через sem_pairs_net
             net_loss_dict = self.net.compute_loss(
                 net_info, l_rec,
                 sem_pairs=sem_pairs_net if sem_pairs_net else None
             )
             net_loss = net_loss_dict["net_total"]
+            if self.osf_enabled:
+                osf_logits, osf_out = self.osf(
+                    h_tok      = h_tok,
+                    z_final    = z_final,
+                    tgt        = tgt,
+                    world_rnn  = self.world_rnn,
+                    gap_norm   = float(gap_norm.mean().item()),
+                    ce_loss    = self._osf_running_ce,
+                    n_rules    = len(self.prover),
+                    n_writes   = self.memory.n_writes,
+                    prover     = self.prover,
+                    symbolic_goal = getattr(self.prover, "last_goal", None) or task_context.goal,
+                    symbolic_facts = getattr(self.prover, "last_context_facts", frozenset()) or task_context.observed_facts,
+                )
+                logits = 0.8 * net_logits + 0.2 * osf_logits
         elif self.osf_enabled:
             # ── OSF: ієрархічна генерація H1→H2→H3→H4 ─────────────────────────
             # OSF замінює TokenDecoder через нейро-символьне планування.
@@ -754,6 +1041,9 @@ class OMENScale(nn.Module):
                 ce_loss    = self._osf_running_ce,  # EMA CE попереднього батчу
                 n_rules    = len(self.prover),
                 n_writes   = self.memory.n_writes,
+                prover     = self.prover,
+                symbolic_goal = getattr(self.prover, "last_goal", None) or task_context.goal,
+                symbolic_facts = getattr(self.prover, "last_context_facts", frozenset()) or task_context.observed_facts,
             )
             net_loss      = torch.tensor(0.0, device=src.device)
             net_loss_dict = {}
@@ -785,7 +1075,21 @@ class OMENScale(nn.Module):
         # ── OSF: додаємо J_OSF до загального лосу ─────────────────────────────
         # osf_out завжди визначений (ініціалізований вище як {}), тому
         # перевірка 'osf_out' in dir() не потрібна — замінено на пряму перевірку ключа.
-        if self.osf_enabled and not self.net_enabled and "j_osf" in osf_out:
+        if saliency_out is not None:
+            out["total"] = out["total"] + saliency_out.sal_total
+            out["sal_total"] = float(saliency_out.sal_total.item())
+            out["sal_role"] = float(saliency_out.sal_role.item())
+            out["sal_struct"] = float(saliency_out.sal_struct.item())
+            out["sal_cons_loss"] = float(saliency_out.sal_consistency_loss.item())
+            out["sal_rule_pen"] = float(saliency_out.sal_rule_penalty.item())
+            out["sal_consistency"] = saliency_out.sal_consistency
+            out["sal_tau"] = saliency_out.sal_tau
+            out["sal_observed"] = saliency_out.sal_observed
+            out["sal_expected"] = saliency_out.sal_expected
+            out["sal_edges"] = saliency_out.sal_edges
+            out["sal_abduced"] = saliency_out.sal_abduced
+
+        if self.osf_enabled and "j_osf" in osf_out:
             j_osf = osf_out["j_osf"]
             if torch.is_tensor(j_osf):
                 out["total"] = out["total"] + self._osf_lambda_total * j_osf
@@ -808,6 +1112,16 @@ class OMENScale(nn.Module):
                         )
                 except (TypeError, ValueError):
                     pass
+
+        sym_stats = getattr(self.prover, "last_forward_info", {})
+        out["sym_goal_proved"] = float(sym_stats.get("goal_proved", 0.0))
+        out["sym_target_coverage"] = float(sym_stats.get("target_coverage", 0.0))
+        out["sym_target_hits"] = float(sym_stats.get("target_hits", 0.0))
+        out["sym_target_total"] = float(sym_stats.get("target_total", 0.0))
+        out["sym_unresolved_targets"] = float(sym_stats.get("unresolved_targets", 0.0))
+        out["sym_abduced_rules"] = float(sym_stats.get("abduced_rules", 0.0))
+        out["sym_abduction_utility"] = float(sym_stats.get("abduction_utility", 0.0))
+        out["sym_provenance"] = sym_stats.get("provenance", task_context.provenance)
 
         out["logits"]    = logits
         out["z"]         = z_final
@@ -878,6 +1192,7 @@ class OMENScale(nn.Module):
           Швидший, але без динамічного «розуміння».
         """
         self.eval()
+        self.prover.set_task_context(self._build_generation_task_context(prompt))
 
         # ── Ініціальний стан (для dynamic=False або як база) ─────────────────
         if self.net_enabled:
@@ -885,7 +1200,7 @@ class OMENScale(nn.Module):
         else:
             h_tok = self.tok_encoder(prompt)
         _, z  = self.perceiver(h_tok)
-        v_mem = self.memory.read(self.mem_query_proj(z))
+        v_mem = self._retrieve_memory(z)
 
         # Початкове символьне представлення: через EMC (якщо ввімкнено) або прямо
         if self.emc_enabled:
@@ -894,23 +1209,23 @@ class OMENScale(nn.Module):
             # на кожен виклик generate() — нові (не навчені) ваги + зайва пам'ять.
             # self.epistemic вже існує і compute() є pure-functional (закрита формула),
             # тому використовуємо self.epistemic замість fresh instance.
-            sim_tgt = prompt[:, -8:] if prompt.size(1) > 8 else prompt
-            z_sim_traj = self.world_rnn.simulate_sequence(z.detach(), sim_tgt)
+            z_sim_traj, _ = self._world_rollout_from_hidden(h_tok, prompt, teacher_forcing_ratio=0.0)
             z_sim0     = z_sim_traj[:, -1]
             _, gap_norm0, _ = self.epistemic.compute(z, self.world_rnn, z_sim0)
             z_sym, v_mem_emc = self.emc.run_episode_eval(
-                z, gap_norm0, self.prover, self.memory, device=z.device)
+                z, gap_norm0, None, self.prover, self.memory, device=z.device)
             if v_mem_emc.norm() > 1e-6:
                 v_mem = v_mem_emc
         else:
             z_sym, _ = self.prover(z, torch.tensor(0.0, device=z.device))
 
-        fusion_gate = self.mem_fusion_gate(torch.cat([z, z_sym, v_mem], dim=-1))
-        z_final = z + 0.1 * z_sym + fusion_gate * v_mem
+        z_final = self._combine_levels(z, z_sym, v_mem)
 
         generated = prompt.clone()
         for _ in range(max_new):
             ctx = generated[:, -self.cfg.seq_len:]
+            step_context = self._build_generation_task_context(ctx)
+            self.prover.set_task_context(step_context)
 
             if dynamic_reasoning:
                 # ── reasoning_step: перекодуємо + оновлюємо ∂-Prolog / M-Core
@@ -925,26 +1240,25 @@ class OMENScale(nn.Module):
                     # π_meta* = argmax_π E[R_task − λ_time·T − λ_MDL·MDL(proof)]
                     # Bellman зупинка замість фіксованого max_depth.
                     # FIX Bug-EGD: self.epistemic замість fresh EpistemicGapDetector
-                    z_sim_step = self.world_rnn.simulate_sequence(
-                        z_ctx.detach(), ctx[:, -8:] if ctx.size(1) > 8 else ctx
-                    )[:, -1]
+                    z_sim_step = self._world_rollout_from_hidden(
+                        h_ctx, ctx, teacher_forcing_ratio=0.0
+                    )[0][:, -1]
                     _, gap_step, _ = self.epistemic.compute(z_ctx, self.world_rnn, z_sim_step)
                     z_sym_step, v_mem_step = self.emc.run_episode_eval(
-                        z_ctx, gap_step, self.prover, self.memory,
+                        z_ctx, gap_step, None, self.prover, self.memory,
                         device=z_ctx.device)
                 else:
                     # ── Класичний шлях: прямий prover ────────────────────────
                     z_sym_step, _ = self.prover(
                         z_ctx, torch.tensor(0.0, device=z_ctx.device))
-                    v_mem_step = self.memory.read(self.mem_query_proj(z_ctx))
+                    v_mem_step = self._retrieve_memory(z_ctx)
 
                 if self.emc_enabled and v_mem_step.norm() > 1e-6:
                     v_mem_use = v_mem_step
                 else:
-                    v_mem_use = self.memory.read(self.mem_query_proj(z_ctx))
+                    v_mem_use = self._retrieve_memory(z_ctx)
 
-                fusion_gate  = self.mem_fusion_gate(torch.cat([z_ctx, z_sym_step, v_mem_use], dim=-1))
-                z_final      = z_ctx + 0.1 * z_sym_step + fusion_gate * v_mem_use
+                z_final      = self._combine_levels(z_ctx, z_sym_step, v_mem_use)
                 h_for_decode = h_ctx
             else:
                 if self.net_enabled:
@@ -955,15 +1269,37 @@ class OMENScale(nn.Module):
                 else:
                     h_for_decode = None   # tok_decoder не потребує h_tok
 
+            symbolic_goal = getattr(self.prover, "last_goal", None) or step_context.goal
+            symbolic_facts = getattr(self.prover, "last_context_facts", frozenset()) or step_context.observed_facts
             if self.net_enabled:
-                logits, _ = self.net.decode(ctx, z_final, h_for_decode)
+                net_logits, _ = self.net.decode(ctx, z_final, h_for_decode)
+                logits = net_logits
+                if self.osf_enabled:
+                    _intent_state = self.osf.intent_encoder(z_final)
+                    _plan         = self.osf.planner(
+                        _intent_state,
+                        symbolic_goal=symbolic_goal,
+                        symbolic_facts=symbolic_facts,
+                        prover=self.prover,
+                    )
+                    osf_logits, _ = self.osf.hier_decoder(
+                        h_tok    = h_for_decode,
+                        z_intent = _intent_state.z_intent,
+                        plan     = _plan,
+                    )
+                    logits = 0.8 * net_logits + 0.2 * osf_logits
             elif self.osf_enabled:
                 # ── OSF inference: ієрархічний декодер (без лосів) ───────────
                 # Кроки: z_final → IntentEncoder → SymbolicPlanner → HierarchicalDecoder
                 # Використовуємо eval-режим (self.training=False → Gumbel=sharpened softmax,
                 # planner=greedy argmax, meta_ctrl не активується).
                 _intent_state = self.osf.intent_encoder(z_final)
-                _plan         = self.osf.planner(_intent_state)
+                _plan         = self.osf.planner(
+                    _intent_state,
+                    symbolic_goal=symbolic_goal,
+                    symbolic_facts=symbolic_facts,
+                    prover=self.prover,
+                )
                 logits, _     = self.osf.hier_decoder(
                     h_tok    = h_for_decode,
                     z_intent = _intent_state.z_intent,
@@ -975,6 +1311,7 @@ class OMENScale(nn.Module):
             probs     = F.softmax(logits[:, -1] / temperature, -1)
             generated = torch.cat([generated, torch.multinomial(probs, 1)], 1)
 
+        self.prover.clear_task_context()
         return generated
 
     def memory_report(self) -> str:
@@ -1053,6 +1390,7 @@ def _make_v2_compat(cfg: OMENScaleConfig) -> OMENv2Config:
         mem_cache_size    = cfg.mem_cache_size,
         mem_write_tau     = cfg.mem_write_tau,
         epistemic_tau     = cfg.epistemic_tau,
+        epistemic_exact_grad = getattr(cfg, "epistemic_exact_grad", False),
         n_counterfactual  = cfg.n_counterfactual,
         sym_vocab         = cfg.sym_vocab,
         sym_embed_dim     = cfg.sym_embed_dim,
@@ -1140,6 +1478,14 @@ def run_tests_scale(cfg: OMENScaleConfig) -> None:
     assert out["logits"].shape == (B, T, cfg.vocab_size), \
         f"logits {out['logits'].shape}"
     assert out["z"].shape == (B, cfg.d_latent), f"z {out['z'].shape}"
+    if cfg.osf_enabled:
+        for k in ("osf_l_plan", "osf_plan_depth"):
+            assert k in out, f"FAIL: відсутній OSF ключ {k}"
+    if cfg.net_enabled and cfg.osf_enabled:
+        assert "osf_l_refl" in out, "FAIL: NET+OSF не інтегровані у forward()"
+    if getattr(cfg, "saliency_enabled", False):
+        for k in ("sal_total", "sal_role", "sal_struct", "sal_consistency", "sal_edges"):
+            assert k in out, f"FAIL: відсутній Saliency ключ {k}"
     print(f"  Forward {ms:.0f} ms  CE={out['ce']:.3f}  L_scale={out['l_scale']:.5f}")
     print(f"  gap_norm={out['gap_norm']:.4f}  rules={out['n_rules']}  [PASS]")
 
@@ -1165,13 +1511,24 @@ def run_tests_scale(cfg: OMENScaleConfig) -> None:
                      if "prover" in n and p.grad is not None)
     wrnn_g     = sum(p.grad.norm().item() for n,p in model.named_parameters()
                      if "world_rnn" in n and p.grad is not None)
+    sal_g = 0.0
+    if getattr(cfg, "saliency_enabled", False):
+        sal_g = sum(
+            p.grad.norm().item()
+            for n, p in model.named_parameters()
+            if "saliency.role_classifier" in n and p.grad is not None
+        )
 
     print(f"  {enc_label} grad : {enc_g:.4f}")
     print(f"  Perceiver grad      : {perceiver_g:.4f}")
     print(f"  ∂-Prolog grad       : {prover_g:.4f}")
     print(f"  WorldRNN grad       : {wrnn_g:.4f}")
+    if getattr(cfg, "saliency_enabled", False):
+        print(f"  Saliency grad       : {sal_g:.4f}")
     assert enc_g       > 0, f"FAIL: {enc_label} без граду"
     assert perceiver_g > 0, "FAIL: Perceiver без граду"
+    if getattr(cfg, "saliency_enabled", False):
+        assert sal_g > 0, "FAIL: Saliency role classifier без граду"
     model.zero_grad()
     print("  [PASS]")
 

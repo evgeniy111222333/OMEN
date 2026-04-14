@@ -134,7 +134,8 @@ class LlamaAttention(nn.Module):
     def forward(self,
                 x: torch.Tensor,
                 context: Optional[torch.Tensor] = None,
-                attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                attn_mask: Optional[torch.Tensor] = None,
+                need_weights: bool = False):
         B, T, _ = x.shape
 
         q = self.q_proj(x).view(B, T, self.h, self.dh).transpose(1, 2)
@@ -147,6 +148,30 @@ class LlamaAttention(nn.Module):
         # RoPE тільки для self-attention
         if self.rope is not None:
             q, k = self.rope(q, k)
+
+        if need_weights:
+            scale = self.dh ** -0.5
+            scores = torch.matmul(q, k.transpose(-2, -1)) * scale   # (B, H, T, S)
+
+            if self.causal and not self.cross_attn:
+                causal = torch.triu(
+                    torch.ones(T, S, dtype=torch.bool, device=x.device),
+                    diagonal=1,
+                )
+                scores = scores.masked_fill(causal.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+            if attn_mask is not None:
+                mask = attn_mask
+                if mask.dtype == torch.bool:
+                    scores = scores.masked_fill(~mask, float("-inf"))
+                else:
+                    scores = scores + mask
+
+            weights = scores.softmax(dim=-1)
+            attn = F.dropout(weights, p=self.drop, training=self.training)
+            out = torch.matmul(attn, v)
+            out = self.o_proj(out.transpose(1, 2).contiguous().view(B, T, -1))
+            return out, weights
 
         # F.scaled_dot_product_attention: FlashAttention якщо доступна
         out = F.scaled_dot_product_attention(
@@ -176,7 +201,12 @@ class LlamaDecoderBlock(nn.Module):
         self.norm2 = RMSNorm(d)
         self.ffn   = SwiGLUFFN(d, dropout=dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, need_weights: bool = False):
+        if need_weights:
+            attn_out, attn_weights = self.attn(self.norm1(x), need_weights=True)
+            x = x + attn_out
+            x = x + self.ffn(self.norm2(x))
+            return x, attn_weights
         x = x + self.attn(self.norm1(x))
         x = x + self.ffn(self.norm2(x))
         return x

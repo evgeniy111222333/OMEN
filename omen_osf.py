@@ -41,10 +41,10 @@ import torch.nn.functional as F
 from omen_osf_intent    import IntentEncoder, IntentState
 from omen_osf_planner   import SymbolicPlanner, PlanSequence
 from omen_osf_decoder   import HierarchicalDecoder
-from omen_osf_simulator import WorldSimulator, ReflectionModule
+from omen_osf_simulator import SymbolicPlanVerifier, WorldSimulator, ReflectionModule
 from omen_osf_meta      import (
     SynthesisMetaController, StrategyConfig,
-    STRATEGY_FAST, STRATEGY_CAREFUL, STRATEGY_EXPLORATORY,
+    STRATEGY_CONFIGS, STRATEGY_FAST, STRATEGY_CAREFUL, STRATEGY_EXPLORATORY,
 )
 
 
@@ -179,6 +179,7 @@ class OSFSynthesizer(nn.Module):
                 n_action_vocab  = 256,
                 mismatch_tau    = cfg.mismatch_tau,
             )
+            self.symbolic_verifier = SymbolicPlanVerifier()
 
         if cfg.use_reflection:
             self.reflection = ReflectionModule(
@@ -211,6 +212,43 @@ class OSFSynthesizer(nn.Module):
         """Нормований reward з CE: 1 при CE=0, ~0 при CE=5."""
         return max(0.0, 1.0 - ce_loss / 5.0)
 
+    def _plan_with_strategy(
+        self,
+        intent_state: IntentState,
+        strategy_id: int,
+        plan_depth_use: int,
+        symbolic_goal=None,
+        symbolic_facts=None,
+        prover=None,
+    ) -> PlanSequence:
+        orig_depth = self.planner.max_depth
+        try:
+            if strategy_id == STRATEGY_FAST:
+                self.planner.max_depth = 1
+            else:
+                self.planner.max_depth = min(plan_depth_use, orig_depth)
+            return self.planner(
+                intent_state,
+                symbolic_goal=symbolic_goal,
+                symbolic_facts=symbolic_facts,
+                prover=prover,
+            )
+        finally:
+            self.planner.max_depth = orig_depth
+
+    @staticmethod
+    def _truncate_plan(plan: PlanSequence, sim_steps: int) -> PlanSequence:
+        if sim_steps <= 0 or plan.embeddings.size(0) <= sim_steps:
+            return plan
+        return PlanSequence(
+            operators=plan.operators[:sim_steps],
+            embeddings=plan.embeddings[:sim_steps],
+            goal_reached=plan.goal_reached,
+            goal_progress=plan.goal_progress,
+            goal_facts=plan.goal_facts,
+            plan_loss=plan.plan_loss,
+        )
+
     # ── Основний forward ────────────────────────────────────────────────────
     def forward(
         self,
@@ -222,6 +260,9 @@ class OSFSynthesizer(nn.Module):
         ce_loss:   float = 5.0,
         n_rules:   int   = 0,
         n_writes:  int   = 0,
+        prover=None,
+        symbolic_goal=None,
+        symbolic_facts=None,
     ) -> Tuple[torch.Tensor, Dict]:
         """
         Returns:
@@ -232,22 +273,32 @@ class OSFSynthesizer(nn.Module):
         B, T   = tgt.shape
 
         # ── Вибір стратегії σ ─────────────────────────────────────────────────
+        intent_state = self.intent_encoder(z_final)              # IntentState
+        goal_entropy = float(intent_state.goal_entropy.mean().item())
+        goal_confidence = float(intent_state.goal_probs.max(dim=-1).values.mean().item())
+        latent_norm = float(z_final.norm(dim=-1).mean().item() / math.sqrt(max(self.d_latent, 1)))
+
         cfg_used   = self.cfg
         log_prob_meta  = torch.tensor(0.0, device=device)
         value_meta     = torch.tensor(0.0, device=device)
         entropy_meta   = torch.tensor(0.0, device=device)
         strategy_id    = STRATEGY_CAREFUL
+        strategy_tau   = 0.5
 
-        if cfg_used.use_meta and self.training:
+        if cfg_used.use_meta:
             strat_cfg, log_prob_meta, value_meta, entropy_meta = self.meta_ctrl.select_strategy(
                 gap_norm=gap_norm, ce_loss=ce_loss,
                 plan_depth=cfg_used.max_plan_depth,
                 n_rules=n_rules, n_writes=n_writes,
+                goal_entropy=goal_entropy,
+                goal_confidence=goal_confidence,
+                latent_norm=latent_norm,
             )
             strategy_id    = strat_cfg.strategy_id
             plan_depth_use = strat_cfg.plan_depth
             n_reflections  = strat_cfg.n_reflections
             sim_steps      = strat_cfg.sim_steps
+            strategy_tau   = strat_cfg.confidence_tau
         else:
             # Inference або без meta: Careful за замовчуванням
             plan_depth_use = cfg_used.max_plan_depth
@@ -256,48 +307,116 @@ class OSFSynthesizer(nn.Module):
 
         # ── H1: Intent ────────────────────────────────────────────────────────
         intent_state = self.intent_encoder(z_final)              # IntentState
+        goal_entropy = float(intent_state.goal_entropy.mean().item())
+        goal_confidence = float(intent_state.goal_probs.max(dim=-1).values.mean().item())
+        latent_norm = float(z_final.norm(dim=-1).mean().item() / math.sqrt(max(self.d_latent, 1)))
 
-        # ── H2: Plan (якщо стратегія не Fast) ────────────────────────────────
-        if strategy_id == STRATEGY_FAST:
-            # Fast: мінімальний план (1 крок)
-            _orig_depth           = self.planner.max_depth
-            self.planner.max_depth = 1
-            plan = self.planner(intent_state)
-            self.planner.max_depth = _orig_depth
-        else:
-            # Careful / Exploratory
-            _orig_depth           = self.planner.max_depth
-            self.planner.max_depth = min(plan_depth_use, self.planner.max_depth)
-            plan = self.planner(intent_state)
-            self.planner.max_depth = _orig_depth
+        # ── H2: Plan ─────────────────────────────────────────────────────────
+        plan = self._plan_with_strategy(
+            intent_state, strategy_id, plan_depth_use,
+            symbolic_goal=symbolic_goal,
+            symbolic_facts=symbolic_facts,
+            prover=prover,
+        )
 
-        # ── Симуляція (якщо не Fast) ─────────────────────────────────────────
+        # ── Симуляція + symbolic verification ───────────────────────────────
         l_sim       = torch.tensor(0.0, device=device)
+        l_verify    = torch.tensor(0.0, device=device)
         z_reflected = z_final
+        l_refl      = torch.tensor(0.0, device=device)
+        refl_iters  = 0
+        mismatch_before = 0
+        mismatch_after  = 0
+        symbolic_mismatch_before = 0
+        symbolic_mismatch_after  = 0
+        symbolic_goal_progress   = float(plan.goal_progress)
+
+        sim_plan = self._truncate_plan(plan, sim_steps)
 
         if cfg_used.use_simulation and strategy_id != STRATEGY_FAST:
-            sim_result = self.simulator(z_final, plan, world_rnn)
-            l_sim      = sim_result.l_sim
+            sim_result = self.simulator(z_final, sim_plan, world_rnn)
+            verify_result = self.symbolic_verifier(sim_plan, batch_size=B, device=device)
+            sim_result = sim_result.__class__(
+                trace=sim_result.trace,
+                expected_trace=sim_result.expected_trace,
+                mismatch_mask=(sim_result.mismatch_mask | verify_result.mismatch_mask),
+                l_sim=sim_result.l_sim,
+            )
+            l_sim = sim_result.l_sim
+            l_verify = verify_result.l_verify
+            symbolic_goal_progress = float(verify_result.goal_progress.mean().item())
+            symbolic_mismatch_before = int(verify_result.mismatch_mask.sum().item())
+            symbolic_mismatch_after = symbolic_mismatch_before
+            mismatch_before = int(sim_result.mismatch_mask.sum().item())
+            mismatch_after = mismatch_before
 
-            # ── Рефлексія (якщо є невідповідності) ───────────────────────────
+            # ── Рефлексія з повторним simulation+verification ───────────────
             if cfg_used.use_reflection and sim_result.mismatch_mask.any():
+                best_sim = sim_result
+                best_verify = verify_result
+                best_z = z_reflected
+                best_plan = plan
+                best_sim_plan = sim_plan
                 for _ in range(min(n_reflections, 3)):
-                    patch      = self.reflection(z_reflected, sim_result)
-                    z_reflected = self.reflection.apply_patch(z_reflected, patch)
-                    l_refl_i   = patch.l_refl
-                    # Оновлюємо симуляцію з виправленим z
-                    if sim_result.mismatch_mask.any() and self.training:
-                        sim_result = self.simulator(z_reflected, plan, world_rnn)
-                l_refl = patch.l_refl if cfg_used.use_reflection else torch.tensor(0.0, device=device)
-            else:
-                l_refl = torch.tensor(0.0, device=device)
-        else:
-            l_refl = torch.tensor(0.0, device=device)
+                    patch = self.reflection(best_z, best_sim)
+                    candidate_z = self.reflection.apply_patch(best_z, patch)
+                    candidate_intent = self.intent_encoder(candidate_z)
+                    candidate_plan = self._plan_with_strategy(
+                        candidate_intent, strategy_id, plan_depth_use,
+                        symbolic_goal=symbolic_goal,
+                        symbolic_facts=symbolic_facts,
+                        prover=prover,
+                    )
+                    candidate_sim_plan = self._truncate_plan(candidate_plan, sim_steps)
+                    candidate_sim = self.simulator(candidate_z, candidate_sim_plan, world_rnn)
+                    candidate_verify = self.symbolic_verifier(candidate_sim_plan, batch_size=B, device=device)
+                    candidate_sim = candidate_sim.__class__(
+                        trace=candidate_sim.trace,
+                        expected_trace=candidate_sim.expected_trace,
+                        mismatch_mask=(candidate_sim.mismatch_mask | candidate_verify.mismatch_mask),
+                        l_sim=candidate_sim.l_sim,
+                    )
+                    refl_iters += 1
+                    l_refl = l_refl + patch.l_refl
+                    cand_mismatch = int(candidate_sim.mismatch_mask.sum().item())
+                    best_mismatch = int(best_sim.mismatch_mask.sum().item())
+                    cand_total = candidate_sim.l_sim.item() + candidate_verify.l_verify.item()
+                    best_total = best_sim.l_sim.item() + best_verify.l_verify.item()
+                    if cand_mismatch < best_mismatch or (
+                        cand_mismatch == best_mismatch and cand_total <= best_total
+                    ):
+                        best_z = candidate_z
+                        best_plan = candidate_plan
+                        best_sim_plan = candidate_sim_plan
+                        best_sim = candidate_sim
+                        best_verify = candidate_verify
+                        mismatch_after = cand_mismatch
+                        symbolic_mismatch_after = int(candidate_verify.mismatch_mask.sum().item())
+                        symbolic_goal_progress = float(candidate_verify.goal_progress.mean().item())
+                    if cand_mismatch == 0:
+                        break
+                z_reflected = best_z
+                plan = best_plan
+                sim_plan = best_sim_plan
+                sim_result = best_sim
+                verify_result = best_verify
+                l_sim = sim_result.l_sim
+                l_verify = verify_result.l_verify
 
         # ── H3+H4: Hierarchical Decoder ──────────────────────────────────────
+        decode_intent_state = (
+            self.intent_encoder(z_reflected)
+            if cfg_used.use_simulation and strategy_id != STRATEGY_FAST
+            else intent_state
+        )
+        decode_goal_confidence = float(
+            decode_intent_state.goal_probs.max(dim=-1).values.mean().item()
+        )
+
+
         logits, struct_loss = self.hier_decoder(
             h_tok      = h_tok,
-            z_intent   = intent_state.z_intent,
+            z_intent   = decode_intent_state.z_intent,
             plan       = plan,
             tgt_tokens = tgt,
         )
@@ -311,10 +430,13 @@ class OSFSynthesizer(nn.Module):
         # Summary коду (через h_tok): mean по часовій осі
         code_summary = self.code_summarizer(h_tok.mean(1))          # (B, d_latent)
 
-        l_plan = F.mse_loss(code_summary, plan_emb_lat.detach())    # scalar
+        goal_penalty = F.relu(
+            torch.tensor(strategy_tau - plan.goal_progress, device=device)
+        )
+        l_plan = F.mse_loss(code_summary, plan_emb_lat.detach()) + goal_penalty
 
         # ── Intent anti-collapse ──────────────────────────────────────────────
-        l_intent = self.intent_encoder.intent_loss(intent_state)
+        l_intent = self.intent_encoder.intent_loss(decode_intent_state)
 
         # ── L_meta: REINFORCE для стратегії ──────────────────────────────────
         l_meta = torch.tensor(0.0, device=device)
@@ -333,7 +455,7 @@ class OSFSynthesizer(nn.Module):
         j_osf = (
             plan_rl_loss                            # REINFORCE для планувальника
           + cfg_used.lambda_plan   * l_plan
-          + cfg_used.lambda_sim    * l_sim
+          + cfg_used.lambda_sim    * (l_sim + l_verify)
           + cfg_used.lambda_refl   * l_refl
           + cfg_used.lambda_meta   * l_meta
           + cfg_used.lambda_intent * l_intent
@@ -348,13 +470,24 @@ class OSFSynthesizer(nn.Module):
             "j_osf":           j_osf,
             "osf_l_plan":      l_plan.item(),
             "osf_l_sim":       l_sim.item()   if torch.is_tensor(l_sim)   else float(l_sim),
+            "osf_l_verify":    l_verify.item() if torch.is_tensor(l_verify) else float(l_verify),
             "osf_l_refl":      l_refl.item()  if torch.is_tensor(l_refl)  else float(l_refl),
             "osf_l_meta":      l_meta.item()  if torch.is_tensor(l_meta)  else float(l_meta),
             "osf_l_intent":    l_intent.item() if torch.is_tensor(l_intent) else float(l_intent),
             "osf_struct":      struct_loss.item(),
             "osf_strategy":    strategy_id,
+            "osf_confidence_tau": strategy_tau,
             "osf_plan_depth":  len(plan.operators),
-            "osf_goal_entropy": intent_state.goal_entropy.mean().item(),
+            "osf_sim_steps":   sim_plan.embeddings.size(0),
+            "osf_reflections": refl_iters,
+            "osf_mismatch_before": mismatch_before,
+            "osf_mismatch_after": mismatch_after,
+            "osf_symbolic_mismatch_before": symbolic_mismatch_before,
+            "osf_symbolic_mismatch_after": symbolic_mismatch_after,
+            "osf_goal_progress": plan.goal_progress,
+            "osf_symbolic_goal_progress": symbolic_goal_progress,
+            "osf_goal_entropy": decode_intent_state.goal_entropy.mean().item(),
+            "osf_goal_confidence": decode_goal_confidence,
             "osf_plan_rl":     plan_rl_loss.item() if self.training else 0.0,
             "osf_plan_loss":   plan.plan_loss.item(),
         }
@@ -383,3 +516,98 @@ class OSFSynthesizer(nn.Module):
             f"  use_meta            : {cfg.use_meta}\n"
             f"  λ_plan/sim/refl     : {cfg.lambda_plan}/{cfg.lambda_sim}/{cfg.lambda_refl}\n"
         )
+class _DummyWorldRNN(nn.Module):
+    def __init__(self, d_latent: int, vocab_size: int = 256):
+        super().__init__()
+        self.act_emb = nn.Embedding(vocab_size, d_latent)
+        nn.init.normal_(self.act_emb.weight, std=0.2)
+
+    def simulate_sequence(self, z0: torch.Tensor, action_seq: torch.Tensor) -> torch.Tensor:
+        act = self.act_emb(action_seq)
+        return z0.unsqueeze(1) + 0.1 * act.cumsum(dim=1)
+
+
+def run_tests_osf() -> None:
+    torch.manual_seed(0)
+
+    B, T = 2, 12
+    d_latent = 16
+    d_tok = 16
+    vocab_size = 64
+    h_tok = torch.randn(B, T, d_tok)
+    z_final = torch.randn(B, d_latent)
+    tgt = torch.randint(0, vocab_size, (B, T))
+    world_rnn = _DummyWorldRNN(d_latent, vocab_size=256)
+
+    cfg_plain = OSFConfig(
+        osf_enabled=True,
+        d_intent=16,
+        n_goals=8,
+        d_plan=16,
+        n_operators=8,
+        template_len=4,
+        max_plan_depth=5,
+        beam_width=2,
+        use_simulation=True,
+        use_reflection=True,
+        use_meta=False,
+        dropout=0.0,
+    )
+    osf_plain = OSFSynthesizer(cfg_plain, d_latent=d_latent, d_tok=d_tok, vocab_size=vocab_size, n_heads=2)
+    osf_plain.eval()
+    logits_plain, out_plain = osf_plain(
+        h_tok=h_tok,
+        z_final=z_final,
+        tgt=tgt,
+        world_rnn=world_rnn,
+        gap_norm=0.3,
+        ce_loss=1.1,
+        n_rules=4,
+        n_writes=2,
+    )
+    assert logits_plain.shape == (B, T, vocab_size)
+    assert torch.isfinite(out_plain["j_osf"])
+    assert out_plain["osf_sim_steps"] <= 4
+    assert out_plain["osf_mismatch_after"] <= out_plain["osf_mismatch_before"]
+    assert 0.0 <= out_plain["osf_goal_progress"] <= 1.0
+    assert out_plain["osf_l_verify"] >= 0.0
+    assert out_plain["osf_symbolic_mismatch_after"] <= out_plain["osf_symbolic_mismatch_before"]
+    assert 0.0 <= out_plain["osf_symbolic_goal_progress"] <= 1.0
+
+    cfg_meta = OSFConfig(
+        osf_enabled=True,
+        d_intent=16,
+        n_goals=8,
+        d_plan=16,
+        n_operators=8,
+        template_len=4,
+        max_plan_depth=6,
+        beam_width=2,
+        use_simulation=True,
+        use_reflection=True,
+        use_meta=True,
+        dropout=0.0,
+    )
+    osf_meta = OSFSynthesizer(cfg_meta, d_latent=d_latent, d_tok=d_tok, vocab_size=vocab_size, n_heads=2)
+    osf_meta.eval()
+    logits_meta, out_meta = osf_meta(
+        h_tok=h_tok,
+        z_final=z_final,
+        tgt=tgt,
+        world_rnn=world_rnn,
+        gap_norm=0.6,
+        ce_loss=0.9,
+        n_rules=7,
+        n_writes=5,
+    )
+    assert logits_meta.shape == (B, T, vocab_size)
+    assert out_meta["osf_strategy"] in (STRATEGY_FAST, STRATEGY_CAREFUL, STRATEGY_EXPLORATORY)
+    assert out_meta["osf_sim_steps"] <= STRATEGY_CONFIGS[out_meta["osf_strategy"]].sim_steps
+    assert 0.0 <= out_meta["osf_goal_confidence"] <= 1.0
+    assert out_meta["osf_l_verify"] >= 0.0
+    assert "meta_avg_reward" in out_meta
+    print("OSF tests passed.")
+
+
+if __name__ == "__main__":
+    run_tests_osf()

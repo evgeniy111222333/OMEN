@@ -25,7 +25,7 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -95,6 +95,8 @@ class PlanSequence:
     operators:    List[PlanOperator]
     embeddings:   torch.Tensor           # (K, d_plan)
     goal_reached: bool
+    goal_progress: float
+    goal_facts:    Tuple[PlanFact, ...]
     plan_loss:    torch.Tensor           # scalar
 
 
@@ -243,6 +245,149 @@ class SymbolicPlanner(nn.Module):
         ], dim=-1)  # (|WM|, d_plan)
         return emb.mean(0, keepdim=True)  # (1, d_plan)
 
+    def _goal_facts(self, intent_state: "IntentState") -> Tuple[int, Tuple[PlanFact, ...]]:
+        """Виводить компактну символічну ціль з intent distribution."""
+        goal_id = int(intent_state.goal_probs[:1].mean(0).argmax().item())
+        declared = PlanFact(301, goal_id)
+        composed = PlanFact(302, goal_id)
+        output = PlanFact(306, goal_id)
+        satisfied = PlanFact(303, goal_id)
+
+        mode = goal_id % 3
+        if mode == 0:
+            return goal_id, (declared, satisfied)
+        if mode == 1:
+            return goal_id, (composed, satisfied)
+        return goal_id, (output, satisfied)
+
+    @staticmethod
+    def _horn_atom_to_plan_facts(atom) -> Tuple[PlanFact, ...]:
+        facts: List[PlanFact] = []
+        for arg in getattr(atom, "args", ()):
+            val = getattr(arg, "val", None)
+            if val is None:
+                continue
+            facts.append(PlanFact(int(atom.pred) % 512, int(val) % 512))
+        if not facts:
+            facts.append(PlanFact(int(atom.pred) % 512, 0))
+        return tuple(dict.fromkeys(facts))
+
+    def _symbolic_seed(
+        self,
+        symbolic_goal,
+        symbolic_facts: Optional[FrozenSet],
+    ) -> Tuple[Optional[int], Tuple[PlanFact, ...], Set[PlanFact]]:
+        goal_facts = self._horn_atom_to_plan_facts(symbolic_goal) if symbolic_goal is not None else tuple()
+        wm_seed: Set[PlanFact] = set()
+        if symbolic_facts:
+            for atom in list(symbolic_facts)[:32]:
+                wm_seed.update(self._horn_atom_to_plan_facts(atom))
+        goal_id = goal_facts[0].arg if goal_facts else None
+        return goal_id, goal_facts, wm_seed
+
+    def _operator_library(
+        self,
+        z_intent: torch.Tensor,
+        goal_id: int,
+        device: torch.device,
+    ) -> List[PlanOperator]:
+        """
+        Будує бібліотеку операторів із реальною pre/add/del-семантикою для пошуку.
+        Нейромережа все ще задає embeddings та side effects, але core переходи вже не сліпі.
+        """
+        start = PlanFact(300, goal_id)
+        declared = PlanFact(301, goal_id)
+        composed = PlanFact(302, goal_id)
+        satisfied = PlanFact(303, goal_id)
+        control = PlanFact(305, goal_id)
+        output = PlanFact(306, goal_id)
+
+        lib: List[PlanOperator] = []
+        for op_id in range(self.n_operators):
+            op_idx = torch.tensor([op_id], device=device)
+            op_emb = self.op_embeddings(op_idx)
+            _, aux_add, aux_del = self._gen_op_effects(z_intent, op_emb)
+            op_type = self.OP_TYPES[op_id % len(self.OP_TYPES)]
+
+            if op_type == "define":
+                pre = (start,)
+                add = (declared,)
+            elif op_type in ("assign", "call"):
+                pre = (declared,)
+                add = (composed,)
+            elif op_type in ("branch", "loop"):
+                pre = (declared,)
+                add = (control,)
+            elif op_type == "yield":
+                pre = (control,)
+                add = (output,)
+            else:  # import / return
+                if op_type == "import":
+                    pre = (start,)
+                    add = (declared,)
+                elif goal_id % 3 == 0:
+                    pre = (declared,)
+                    add = (satisfied,)
+                elif goal_id % 3 == 1:
+                    pre = (composed,)
+                    add = (satisfied,)
+                else:
+                    pre = (output,)
+                    add = (satisfied,)
+
+            add_all = tuple(dict.fromkeys(add + aux_add[:2]))
+            del_all = tuple(dict.fromkeys(aux_del[:1]))
+            lib.append(PlanOperator(
+                op_id=op_id,
+                op_type=op_type,
+                preconditions=pre,
+                add_effects=add_all,
+                del_effects=del_all,
+                embedding=op_emb.squeeze(0),
+            ))
+        return lib
+
+    def _symbolic_operator_library(
+        self,
+        prover,
+        symbolic_facts: Optional[FrozenSet],
+        device: torch.device,
+    ) -> List[PlanOperator]:
+        if prover is None or not getattr(prover.kb, "rules", None):
+            return []
+        current_preds = {fact.pred for fact in (symbolic_facts or frozenset())}
+        lib: List[PlanOperator] = []
+        for idx, rule in enumerate(prover.kb.rules):
+            if not rule.body:
+                continue
+            if current_preds and not any(atom.pred in current_preds for atom in rule.body):
+                continue
+            pre: List[PlanFact] = []
+            for atom in rule.body[:4]:
+                pre.extend(self._horn_atom_to_plan_facts(atom)[:1])
+            add = list(self._horn_atom_to_plan_facts(rule.head))
+            if not pre or not add:
+                continue
+            emb = self.op_embeddings(torch.tensor([idx % self.n_operators], device=device)).squeeze(0)
+            lib.append(PlanOperator(
+                op_id=idx % self.n_operators,
+                op_type="ltm_rule",
+                preconditions=tuple(dict.fromkeys(pre)),
+                add_effects=tuple(dict.fromkeys(add)),
+                del_effects=tuple(),
+                embedding=emb,
+            ))
+            if len(lib) >= self.n_operators:
+                break
+        return lib
+
+    @staticmethod
+    def _goal_progress(wm: Set[PlanFact], goal_facts: Tuple[PlanFact, ...]) -> float:
+        if not goal_facts:
+            return 0.0
+        hit = sum(1 for fact in goal_facts if fact in wm)
+        return hit / float(len(goal_facts))
+
     # ── Генератор параметрів оператора ──────────────────────────────────────
     @torch.no_grad()
     def _gen_op_effects(
@@ -271,6 +416,9 @@ class SymbolicPlanner(nn.Module):
     def forward(
         self,
         intent_state: "IntentState",
+        symbolic_goal=None,
+        symbolic_facts: Optional[FrozenSet] = None,
+        prover=None,
     ) -> PlanSequence:
         """
         intent_state.z_intent: (B, d_intent)
@@ -279,85 +427,133 @@ class SymbolicPlanner(nn.Module):
         Для batch > 1: незалежні плани на кожен елемент батчу.
         Повертає план для першого елементу батчу (решта — для лосу).
         """
-        device   = intent_state.z_intent.device
-        B        = intent_state.z_intent.size(0)
-        z_intent = intent_state.z_intent[:1]           # (1, d_intent) — перший елемент
+        return self._forward_beam(
+            intent_state,
+            symbolic_goal=symbolic_goal,
+            symbolic_facts=symbolic_facts,
+            prover=prover,
+        )
 
-        z_ctx   = self.intent_proj(z_intent)           # (1, d_plan)
-        h_ctx   = self.ctx_h0.clone()                  # (1, d_plan)
+    def _forward_beam(
+        self,
+        intent_state: "IntentState",
+        symbolic_goal=None,
+        symbolic_facts: Optional[FrozenSet] = None,
+        prover=None,
+    ) -> PlanSequence:
+        """
+        Реальний search-based planner поверх Working Memory.
+        Beam search іде по символічних станах, а policy/value лише направляють розширення.
+        """
+        device = intent_state.z_intent.device
+        z_intent = intent_state.z_intent[:1]
+        z_ctx = self.intent_proj(z_intent)
+        sym_goal_id, symbolic_goal_facts, symbolic_wm = self._symbolic_seed(
+            symbolic_goal, symbolic_facts
+        )
+        goal_id, default_goal_facts = self._goal_facts(intent_state)
+        goal_facts = symbolic_goal_facts or default_goal_facts
+        goal_id = sym_goal_id if sym_goal_id is not None else goal_id
+        symbolic_ops = self._symbolic_operator_library(prover, symbolic_facts, device)
+        default_ops = self._operator_library(z_intent, goal_id, device)
+        operator_lib = symbolic_ops + default_ops[:max(self.n_operators - len(symbolic_ops), 0)]
+        start_fact = PlanFact(300, goal_id)
+        start_wm = symbolic_wm or {start_fact}
 
-        wm: Set[PlanFact] = set()
-        operators: List[PlanOperator] = []
-        op_embs:   List[torch.Tensor] = []
-        log_probs: List[torch.Tensor] = []
-        values:    List[torch.Tensor] = []
-
+        beam = [{
+            "wm": start_wm,
+            "operators": [],
+            "op_embs": [],
+            "log_probs": [],
+            "values": [],
+            "ctx": z_ctx,
+            "score": 0.0,
+            "goal_progress": 0.0,
+        }]
         plan_loss = torch.tensor(0.0, device=device)
 
         for step in range(self.max_depth):
-            # ── Стан ──────────────────────────────────────────────────────────
-            wm_emb    = self._wm_embed(wm, device)       # (1, d_plan)
-            logits    = self.policy.action_logits(
-                z_intent, z_ctx, wm_emb, step)           # (1, n_ops)
-            v_s       = self.policy.value(
-                z_intent, z_ctx, wm_emb, step)           # (1,)
+            expanded = []
+            for state in beam:
+                wm = state["wm"]
+                progress = self._goal_progress(wm, goal_facts)
+                if progress >= 1.0:
+                    expanded.append({**state, "score": state["score"] + 2.0})
+                    continue
 
-            # ── Sampling або Greedy ───────────────────────────────────────────
-            if self.training:
-                dist   = Categorical(logits=logits.squeeze(0))
-                op_idx = dist.sample()                   # scalar
-                lp     = dist.log_prob(op_idx)
-            else:
-                op_idx = logits.squeeze(0).argmax()
-                lp     = torch.tensor(0.0, device=device)
+                wm_emb = self._wm_embed(wm, device)
+                logits = self.policy.action_logits(z_intent, state["ctx"], wm_emb, step).squeeze(0)
+                value = self.policy.value(z_intent, state["ctx"], wm_emb, step).squeeze()
 
-            log_probs.append(lp)
-            values.append(v_s.squeeze())
+                applicable = [i for i, op in enumerate(operator_lib) if op.applicable(wm)]
+                if not applicable:
+                    expanded.append({**state, "score": state["score"] - 1.0})
+                    continue
 
-            # ── Отримуємо оператор ────────────────────────────────────────────
-            op_emb = self.op_embeddings(op_idx.unsqueeze(0))   # (1, d_plan)
-            pre, add, del_ = self._gen_op_effects(z_intent, op_emb)
+                masked_logits = logits[applicable]
+                probs = masked_logits.softmax(dim=-1)
+                dist = Categorical(probs=probs)
+                topk = min(self.beam_width, len(applicable))
+                _, top_idx = probs.topk(topk)
 
-            op_type = self.OP_TYPES[op_idx.item() % len(self.OP_TYPES)]
-            op = PlanOperator(
-                op_id        = int(op_idx.item()),
-                op_type      = op_type,
-                preconditions= pre,
-                add_effects  = add,
-                del_effects  = del_,
-                embedding    = op_emb.squeeze(0).detach(),
-            )
+                for local_idx in top_idx.tolist():
+                    op = operator_lib[applicable[local_idx]]
+                    op_emb = op.embedding.unsqueeze(0)
+                    new_wm = op.apply(wm)
+                    new_progress = self._goal_progress(new_wm, goal_facts)
+                    log_prob = dist.log_prob(torch.tensor(local_idx, device=device))
+                    new_ctx = self.ctx_gru(op_emb, state["ctx"])
+                    heuristic = (
+                        2.5 * new_progress
+                        + 0.2 * float(value.item())
+                        - self.alpha_plan * (len(state["operators"]) + 1)
+                    )
+                    expanded.append({
+                        "wm": new_wm,
+                        "operators": state["operators"] + [op],
+                        "op_embs": state["op_embs"] + [op_emb],
+                        "log_probs": state["log_probs"] + [log_prob],
+                        "values": state["values"] + [value],
+                        "ctx": new_ctx,
+                        "score": state["score"] + heuristic,
+                        "goal_progress": new_progress,
+                    })
 
-            # ── Застосовуємо оператор до WM ───────────────────────────────────
-            if op.applicable(wm) or step == 0:   # крок 0 — завжди застосовуємо
-                wm = op.apply(wm)
-                operators.append(op)
-                op_embs.append(op_emb)
+            if not expanded:
+                break
 
-            # ── Оновлюємо контекст через GRU ──────────────────────────────────
-            h_ctx = self.ctx_gru(op_emb, h_ctx)
-            z_ctx = h_ctx
+            expanded.sort(key=lambda s: (s["goal_progress"], s["score"]), reverse=True)
+            beam = expanded[:self.beam_width]
+            if beam[0]["goal_progress"] >= 1.0:
+                break
 
-        # ── Складаємо embedding-матрицю плану ─────────────────────────────────
+        best = max(beam, key=lambda s: (s["goal_progress"], s["score"]))
+        operators = best["operators"]
+        op_embs = best["op_embs"]
+        log_probs = best["log_probs"]
+        values = best["values"]
+        goal_progress = float(best["goal_progress"])
+        goal_reached = goal_progress >= 1.0
+
         if op_embs:
-            plan_embs = torch.cat(op_embs, dim=0)   # (K, d_plan)
+            plan_embs = torch.cat(op_embs, dim=0)
         else:
             plan_embs = torch.zeros(1, self.d_plan, device=device)
 
-        # ── REINFORCE-лос (L_plan) ────────────────────────────────────────────
-        # Нагорода: 1.0 завжди (навчаємо якість плану через L_plan_code в OSFLoss).
-        # Тут L_plan = E[-Σ log π(aₜ)] + α·Length — базовий policy gradient.
         if self.training and log_probs:
-            R = 1.0  # заглушка; справжня нагорода приходить з OSFLoss
+            reward = goal_progress + (0.25 if goal_reached else 0.0)
             baseline = sum(v.item() for v in values) / len(values)
             log_p_sum = torch.stack(log_probs).sum()
-            L_len     = self.alpha_plan * len(operators)
-            plan_loss = -(R - baseline) * log_p_sum + torch.tensor(
-                L_len, dtype=log_p_sum.dtype, device=device)
+            L_len = self.alpha_plan * len(operators)
+            plan_loss = -(reward - baseline) * log_p_sum + torch.tensor(
+                L_len, dtype=log_p_sum.dtype, device=device
+            )
 
         return PlanSequence(
-            operators    = operators,
-            embeddings   = plan_embs,
-            goal_reached = len(operators) >= 1,
-            plan_loss    = plan_loss,
+            operators=operators,
+            embeddings=plan_embs,
+            goal_reached=goal_reached,
+            goal_progress=goal_progress,
+            goal_facts=goal_facts,
+            plan_loss=plan_loss,
         )

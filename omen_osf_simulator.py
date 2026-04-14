@@ -24,13 +24,13 @@ ReflectionModule:
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from omen_osf_planner import PlanSequence
+from omen_osf_planner import PlanFact, PlanSequence
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -52,6 +52,15 @@ class PatchResult:
     patch_emb:  torch.Tensor   # (B, d_latent) — latent представлення патчу
     patch_score: torch.Tensor  # (B,) — ймовірність успіху патчу
     l_refl:     torch.Tensor   # scalar — Cost(Δ)
+
+
+@dataclass
+class SymbolicVerifyResult:
+    """Результат symbolic verification плану."""
+    mismatch_mask: torch.Tensor   # (B, T_plan) bool
+    goal_progress: torch.Tensor   # (B,)
+    progress_trace: torch.Tensor  # (B, T_plan)
+    l_verify:      torch.Tensor   # scalar
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -146,7 +155,7 @@ class WorldSimulator(nn.Module):
         action_seq       = action_ids.unsqueeze(0).expand(B, -1)    # (B, K)
 
         # simulate_sequence(z0, actions) → (B, K, d_latent)
-        simulated = world_rnn.simulate_sequence(z0.detach(), action_seq.detach())
+        simulated = world_rnn.simulate_sequence(z0, action_seq)
 
         # ── L_sim: Huber loss між traced та expected ──────────────────────────
         l_sim = F.huber_loss(simulated, expected.detach(), delta=1.0)
@@ -286,3 +295,74 @@ class ReflectionModule(nn.Module):
         accept = (patch.patch_score > self.verify_tau).float()  # (B,)
         z_patched = z + accept.unsqueeze(-1) * patch.patch_emb
         return z_patched
+
+
+class SymbolicPlanVerifier(nn.Module):
+    """
+    Lightweight symbolic verifier для PlanSequence.
+
+    Перевіряє, чи кожен оператор застосовний до поточного WM, і оцінює
+    реальний прогрес до goal_facts без участі WorldRNN.
+    """
+
+    def __init__(self, invalid_penalty: float = 1.0):
+        super().__init__()
+        self.invalid_penalty = invalid_penalty
+
+    @staticmethod
+    def _goal_progress(wm: Set[PlanFact], goal_facts: Tuple[PlanFact, ...]) -> float:
+        if not goal_facts:
+            return 0.0
+        hit = sum(1 for fact in goal_facts if fact in wm)
+        return hit / float(len(goal_facts))
+
+    @staticmethod
+    def _initial_wm(plan: PlanSequence) -> Set[PlanFact]:
+        goal_id = plan.goal_facts[0].arg if plan.goal_facts else 0
+        return {PlanFact(300, goal_id)}
+
+    def _verify_single(
+        self,
+        plan: PlanSequence,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        steps = max(len(plan.operators), 1)
+        mismatch = torch.zeros(steps, dtype=torch.bool, device=device)
+        progress = torch.zeros(steps, dtype=torch.float32, device=device)
+        wm = self._initial_wm(plan)
+
+        if not plan.operators:
+            progress[0] = self._goal_progress(wm, plan.goal_facts)
+            return mismatch, progress, progress[-1]
+
+        for idx, op in enumerate(plan.operators[:steps]):
+            applicable = op.applicable(wm)
+            mismatch[idx] = not applicable
+            if applicable:
+                wm = op.apply(wm)
+            progress[idx] = self._goal_progress(wm, plan.goal_facts)
+
+        if len(plan.operators) < steps:
+            progress[len(plan.operators):] = progress[len(plan.operators) - 1]
+
+        return mismatch, progress, progress[-1]
+
+    def forward(
+        self,
+        plan: PlanSequence,
+        batch_size: int,
+        device: torch.device,
+    ) -> SymbolicVerifyResult:
+        mismatch_1, progress_1, goal_progress_1 = self._verify_single(plan, device)
+        mismatch_mask = mismatch_1.unsqueeze(0).expand(batch_size, -1).contiguous()
+        progress_trace = progress_1.unsqueeze(0).expand(batch_size, -1).contiguous()
+        goal_progress = goal_progress_1.expand(batch_size)
+        invalid_rate = mismatch_mask.float().mean()
+        goal_gap = 1.0 - goal_progress.mean()
+        l_verify = self.invalid_penalty * invalid_rate + goal_gap
+        return SymbolicVerifyResult(
+            mismatch_mask=mismatch_mask,
+            goal_progress=goal_progress,
+            progress_trace=progress_trace,
+            l_verify=l_verify,
+        )

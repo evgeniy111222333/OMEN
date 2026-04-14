@@ -60,6 +60,7 @@ class OMENv2Config:
 
     # Curiosity
     epistemic_tau:    float = 0.3   # поріг ||E(z)|| для активації модуля
+    epistemic_exact_grad: bool = False
     n_counterfactual: int   = 2     # кількість контрфактичних роловтів
 
     # S-Core
@@ -192,7 +193,8 @@ class WorldRNN(nn.Module):
         h2 = self.gru(torch.cat([z, a], -1), h)
         return self.out(h2), h2
 
-    def simulate_sequence(self, z0, actions, teacher_forcing_ratio: float = 0.0):
+    def simulate_sequence(self, z0, actions, teacher_forcing_ratio: float = 0.0,
+                          teacher_states: Optional[torch.Tensor] = None):
         """
         OPT-2: Pre-embed всі дії одним викликом до входу в цикл.
         Embedding lookup виноситься за межі for-loop:
@@ -213,13 +215,21 @@ class WorldRNN(nn.Module):
         h      = self.h0.expand(B, -1).contiguous()
         traj   = []
         z_prev = z0
+        if teacher_states is not None and teacher_states.shape[:2] != (B, T):
+            raise ValueError("teacher_states must have shape (B, T, d_latent)")
         for t in range(T):
             # FIXED: завжди z0 (а не traj[-1]) — GRU h несе динаміку,
             # z0 — стабільний anchor. Усуває 17x дрейф world loss.
             z_in = z_prev
-            if t > 0 and teacher_forcing_ratio > 0.0 and self.training:
+            if teacher_states is not None:
+                z_teacher = teacher_states[:, t]
+            else:
+                z_teacher = z_prev if t > 0 else z0
+            if teacher_states is not None and t == 0:
+                z_in = z_teacher
+            elif t > 0 and teacher_forcing_ratio > 0.0 and self.training:
                 use_teacher = (torch.rand(B, 1, device=z0.device) < teacher_forcing_ratio).to(z0.dtype)
-                z_in = use_teacher * z0 + (1.0 - use_teacher) * z_prev
+                z_in = use_teacher * z_teacher + (1.0 - use_teacher) * z_prev
             h = self.gru(torch.cat([z_in, a_all[:, t]], -1), h)
             z_prev = self.out(h)
             traj.append(z_prev)
@@ -358,6 +368,7 @@ class EpistemicGapDetector(nn.Module):
     def __init__(self, cfg: OMENv2Config):
         super().__init__()
         self.tau = cfg.epistemic_tau
+        self.exact_grad = bool(getattr(cfg, "epistemic_exact_grad", False))
         # Вивчена проекція для агрегації епістемічного сигналу
         self.aggregator = nn.Linear(cfg.d_latent, cfg.d_latent)
         self.d = cfg.d_latent
@@ -379,9 +390,21 @@ class EpistemicGapDetector(nn.Module):
         #   E = (∂L/∂z)² ∝ (z − z_sim)²
         # Пропорційність: константа (4/B²) одинакова для всіх вимірів → hot_dims та
         # gap_norm обчислюються коректно. Повний autograd.grad більше не потрібен.
-        diff     = z.detach() - z_sim.detach()                     # (B, d)
-        E        = diff.pow(2)                                      # (B, d)
-        gap_norm = E.sum(-1).sqrt()                                # (B,)
+        if self.exact_grad and torch.is_grad_enabled() and z.requires_grad:
+            world_loss = F.mse_loss(z, z_sim)
+            grad_z = torch.autograd.grad(
+                world_loss,
+                z,
+                retain_graph=True,
+                create_graph=False,
+                allow_unused=False,
+            )[0]
+            E = grad_z.detach().pow(2)
+            gap_norm = E.sum(-1).sqrt()
+        else:
+            diff     = z.detach() - z_sim.detach()                 # (B, d)
+            E        = diff.pow(2)                                 # (B, d)
+            gap_norm = E.sum(-1).sqrt()                            # (B,)
 
         # Топ-25% найгарячіших вимірів
         threshold = E.quantile(0.75, dim=-1, keepdim=True)
@@ -412,7 +435,8 @@ class CuriosityModule(nn.Module):
                 hot_dims: torch.Tensor,
                 gap_norm: torch.Tensor,
                 memory: TensorProductMemory,
-                world_rnn: WorldRNN) -> Tuple[torch.Tensor, torch.Tensor]:
+                world_rnn: WorldRNN,
+                counterfactual_actions: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns: z_enriched (B, d), curiosity_loss scalar
         """
@@ -435,8 +459,17 @@ class CuriosityModule(nn.Module):
         # ── Counterfactual rollouts ───────────────────────────────────────────
         cf_loss = torch.tensor(0.0, device=z.device)
         if self.n_cf > 0 and self.training:
-            noise_actions = torch.randint(
-                0, 256, (B, self.n_cf), device=z.device)
+            if counterfactual_actions is not None and counterfactual_actions.numel() > 0:
+                noise_actions = counterfactual_actions.to(device=z.device, dtype=torch.long)
+                if noise_actions.dim() == 1:
+                    noise_actions = noise_actions.unsqueeze(0).expand(B, -1)
+                if noise_actions.size(1) < self.n_cf:
+                    repeats = math.ceil(self.n_cf / max(noise_actions.size(1), 1))
+                    noise_actions = noise_actions.repeat(1, repeats)
+                noise_actions = noise_actions[:, :self.n_cf]
+            else:
+                noise_actions = torch.randint(
+                    0, 256, (B, self.n_cf), device=z.device)
             z_cf_traj = world_rnn.simulate_sequence(
                 z.detach(), noise_actions)                         # (B, n_cf, d)
 

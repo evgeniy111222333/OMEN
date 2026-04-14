@@ -197,6 +197,23 @@ class HierarchicalDecoder(nn.Module):
 
         # Structural Agent
         self.struct_agent = StructuralAgent(d_plan, d_tok, dropout)
+        self.op_type_to_idx = {
+            "define": 0, "call": 1, "assign": 2, "return": 3,
+            "branch": 4, "loop": 5, "import": 6, "yield": 7,
+        }
+        self.n_productions = 4
+        self.production_selector = nn.Sequential(
+            nn.Linear(d_plan + d_intent + d_tok, d_tok * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_tok * 2, self.n_productions),
+        )
+        self.production_bank = nn.Parameter(
+            torch.randn(len(self.op_type_to_idx), self.n_productions, template_len, d_tok) * (d_tok ** -0.5)
+        )
+        self.order_bank = nn.Parameter(
+            torch.randn(StructuralAgent.N_ORDERS, template_len, d_tok) * (d_tok ** -0.5)
+        )
 
         # Cross-attention: h_tok ← templates
         self.cross_attn = nn.MultiheadAttention(
@@ -237,8 +254,32 @@ class HierarchicalDecoder(nn.Module):
         # Розширюємо на batch
         plan_embs_b = plan_embs.unsqueeze(0).expand(B, -1, -1)  # (B, K, d_plan)
 
-        # Templates: (B, K·T_len, d_tok)
-        templates = self.template_gen(plan_embs_b, z_intent)
+        # Templates: base continuous templates + grammar-aligned discrete productions.
+        base_templates = self.template_gen(plan_embs_b, z_intent).view(
+            B, K, self.template_len, self.d_tok
+        )
+        op_type_ids = torch.tensor(
+            [self.op_type_to_idx.get(op.op_type, 0) for op in plan.operators],
+            device=device,
+            dtype=torch.long,
+        )
+        if op_type_ids.numel() == 0:
+            op_type_ids = torch.zeros(K, device=device, dtype=torch.long)
+
+        ctx_mean = h_tok.mean(1)                                  # (B, d_tok)
+        ctx_exp = ctx_mean.unsqueeze(1).expand(-1, K, -1)
+        z_exp = z_intent.unsqueeze(1).expand(-1, K, -1)
+        prod_inp = torch.cat([plan_embs_b, z_exp, ctx_exp], dim=-1)   # (B,K,*)
+        prod_logits = self.production_selector(prod_inp.reshape(B * K, -1)).view(
+            B, K, self.n_productions
+        )
+        if self.training:
+            prod_w = F.gumbel_softmax(prod_logits, tau=1.0, hard=False, dim=-1)
+        else:
+            prod_w = F.softmax(prod_logits / 0.35, dim=-1)
+
+        bank = self.production_bank[op_type_ids].unsqueeze(0).expand(B, -1, -1, -1, -1)
+        discrete_templates = torch.einsum("bkp,bkptd->bktd", prod_w, bank)
 
         # ── Structural Agent ──────────────────────────────────────────────────
         # Ваги для зважування template позицій (soft expansion order).
@@ -247,13 +288,11 @@ class HierarchicalDecoder(nn.Module):
         # plan_proj(mean) → (B, d_tok), що давало Linear((d_tok+d_tok)=64, ...)
         # але очікувалось (d_plan+d_tok)=48 → RuntimeError.
         op_mean_raw = plan_embs_b.mean(1)                            # (B, d_plan) — raw
-        op_mean     = self.plan_proj(op_mean_raw)                    # (B, d_tok)  — for intent
-        ctx_mean    = h_tok.mean(1)                                  # (B, d_tok)
-        order_w     = self.struct_agent(op_mean_raw, ctx_mean)       # (B, N_ORDERS) ✓
-        # Застосовуємо order weights до template (soft permutation)
-        # Упрощена версія: scale templates за entropy-зваженим scalar
-        order_scale = order_w.mean(-1, keepdim=True).unsqueeze(-1)  # (B,1,1)
-        templates_w = templates * (1.0 + order_scale)               # (B, K·T_len, d_tok)
+        order_w     = self.struct_agent(op_mean_raw, ctx_mean)       # (B, N_ORDERS)
+        order_bias  = torch.einsum("bo,otd->btd", order_w, self.order_bank).unsqueeze(1)
+        templates_w = (base_templates + discrete_templates + order_bias).reshape(
+            B, K * self.template_len, self.d_tok
+        )
 
         # ── H4: Cross-attention: h_tok ← templates ───────────────────────────
         h_norm    = self.cross_norm(h_tok)
@@ -264,17 +303,19 @@ class HierarchicalDecoder(nn.Module):
         h_with_intent = h_tok + h_crossed + intent_ctx          # (B, T, d_tok)
 
         # Gating: combine original h with plan-informed h
-        h_fused = self.gate(
-            torch.cat([h_tok, h_with_intent], dim=-1))          # (B, T, d_tok)
+        gate = torch.sigmoid(self.gate(torch.cat([h_tok, h_with_intent], dim=-1)))
+        h_fused = gate * h_with_intent + (1.0 - gate) * h_tok
 
         # ── Structural Consistency Loss L_struct ──────────────────────────────
         # Мета: h_tok ≈ proj(template_mean) — декодер «розуміє» шаблони
         tmpl_mean  = templates_w.mean(1)                         # (B, d_tok)
         struct_pred = self.struct_proj(h_fused.mean(1))          # (B, d_tok)
         struct_pred = self.struct_norm(struct_pred)
-        struct_loss = F.mse_loss(
-            struct_pred,
-            tmpl_mean.detach())                                  # scalar
+        prod_entropy = -(prod_w * (prod_w.clamp_min(1e-8)).log()).sum(-1).mean()
+        struct_loss = (
+            F.mse_loss(struct_pred, tmpl_mean.detach())
+            + 0.05 * prod_entropy
+        )
 
         # ── LM Head → logits ─────────────────────────────────────────────────
         h_out  = self.out_norm(h_fused)

@@ -289,21 +289,43 @@ class TensorFactBase:
         # Множина для дедуплікації
         self._fact_set: Set[Tuple] = set()
 
+        # Ground-term interning: Const/Compound -> stable int ids.
+        self._term_to_id: Dict[Term, int] = {}
+        self._id_to_term: Dict[int, Term] = {}
+        self._next_term_id: int = 1
+
+    @staticmethod
+    def _is_ground_term(term: Term) -> bool:
+        return len(term.vars()) == 0
+
+    def _intern_term(self, term: Union[Term, int]) -> int:
+        term_obj: Term = Const(int(term)) if isinstance(term, int) else term
+        if not self._is_ground_term(term_obj):
+            raise ValueError(f"TensorFactBase expects ground terms, got: {term_obj}")
+        term_id = self._term_to_id.get(term_obj)
+        if term_id is None:
+            term_id = self._next_term_id
+            self._next_term_id += 1
+            self._term_to_id[term_obj] = term_id
+            self._id_to_term[term_id] = term_obj
+        return term_id
+
+    def _decode_term(self, term_id: int) -> Term:
+        return self._id_to_term.get(term_id, Const(int(term_id)))
+
     # ── Конверсія ─────────────────────────────────────────────────────────────
-    @classmethod
-    def atom_to_row(cls, atom: HornAtom, max_arity: int) -> Optional[Tuple[int, ...]]:
-        """HornAtom → кортеж int для тензора (тільки ground atoms)."""
+    def atom_to_row(self, atom: HornAtom) -> Optional[Tuple[int, ...]]:
+        """HornAtom → tensor row with ground Const/Compound args encoded via term ids."""
         if not atom.is_ground():
             return None
-        args = []
-        for a in atom.args[:max_arity]:
-            if isinstance(a, Const):
-                args.append(a.val)
+        args: List[int] = []
+        for a in atom.args[:self.max_arity]:
+            if isinstance(a, (Const, Compound)):
+                args.append(self._intern_term(a))
             else:
-                return None   # не ground
-        # Доповнюємо до max_arity
-        while len(args) < max_arity:
-            args.append(cls.PAD)
+                return None
+        while len(args) < self.max_arity:
+            args.append(self.PAD)
         return (atom.pred,) + tuple(args)
 
     def row_to_atom(self, row: torch.Tensor) -> Optional[HornAtom]:
@@ -314,13 +336,13 @@ class TensorFactBase:
             v = int(row[1 + j].item())
             if v == self.PAD:
                 break
-            args.append(Const(v))
+            args.append(self._decode_term(v))
         return HornAtom(pred=pred, args=tuple(args))
 
     # ── Додавання фактів ───────────────────────────────────────────────────────
     def add_atom(self, atom: HornAtom) -> bool:
         """Додає HornAtom як рядок у тензор. Повертає True якщо новий."""
-        row_tuple = self.atom_to_row(atom, self.max_arity)
+        row_tuple = self.atom_to_row(atom)
         if row_tuple is None:
             return False
         if row_tuple in self._fact_set:
@@ -494,8 +516,55 @@ class TensorUnifyEngine:
         return dict(result)
 
     @staticmethod
-    def _ground_filter(candidates: torch.Tensor,
-                       atom: HornAtom) -> torch.Tensor:
+    def _is_tensor_term(term: Term) -> bool:
+        if isinstance(term, (Const, Var)):
+            return True
+        if isinstance(term, Compound):
+            return len(term.vars()) == 0
+        return False
+
+    def _is_tensor_rule(self, clause: HornClause) -> bool:
+        if len(clause.body) == 0 or len(clause.body) > self.MAX_BODY:
+            return False
+        atoms = [clause.head] + list(clause.body)
+        for atom in atoms:
+            if len(atom.args) > self.max_arity:
+                return False
+            for arg in atom.args:
+                if not self._is_tensor_term(arg):
+                    return False
+        return True
+
+    def _is_structured_rule(self, clause: HornClause) -> bool:
+        if len(clause.body) == 0 or len(clause.body) > self.MAX_BODY:
+            return False
+        atoms = [clause.head] + list(clause.body)
+        has_structured_compound = False
+        for atom in atoms:
+            if len(atom.args) > self.max_arity:
+                return False
+            for arg in atom.args:
+                if isinstance(arg, (Const, Var)):
+                    continue
+                if isinstance(arg, Compound):
+                    if len(arg.vars()) > 0:
+                        has_structured_compound = True
+                    continue
+                return False
+        return has_structured_compound
+
+    @staticmethod
+    def _term_id(term: Term, fact_base: TensorFactBase) -> Optional[int]:
+        if isinstance(term, Const):
+            return fact_base._intern_term(term)
+        if isinstance(term, Compound) and len(term.vars()) == 0:
+            return fact_base._intern_term(term)
+        return None
+
+    def _ground_filter(self,
+                       candidates: torch.Tensor,
+                       atom: HornAtom,
+                       fact_base: TensorFactBase) -> torch.Tensor:
         """
         Фільтрує рядки кандидатів (N, 1+A) по ground args атому.
         Повертає булеву маску (N,).
@@ -506,9 +575,196 @@ class TensorUnifyEngine:
         N = candidates.shape[0]
         mask = torch.ones(N, dtype=torch.bool, device=candidates.device)
         for j, a in enumerate(atom.args):
-            if isinstance(a, Const):
-                mask = mask & (candidates[:, j + 1] == a.val)
+            term_id = self._term_id(a, fact_base)
+            if term_id is not None:
+                mask = mask & (candidates[:, j + 1] == term_id)
+        for positions in self._var_positions(atom).values():
+            if len(positions) < 2:
+                continue
+            anchor = positions[0]
+            for pos in positions[1:]:
+                mask = mask & (candidates[:, anchor + 1] == candidates[:, pos + 1])
         return mask
+
+    @staticmethod
+    def _atom_var_names(atom: HornAtom) -> FrozenSet[str]:
+        names: FrozenSet[str] = frozenset()
+        for arg in atom.args:
+            if isinstance(arg, (Const, Var, Compound)):
+                names = names | frozenset(
+                    name for name in arg.vars()
+                    if not name.startswith('_')
+                )
+        return names
+
+    def _match_term_bindings(
+        self,
+        pattern: Term,
+        value: Term,
+        bindings: Dict[str, Term],
+    ) -> Optional[Dict[str, Term]]:
+        if isinstance(pattern, Var):
+            if pattern.name.startswith('_'):
+                return bindings
+            bound = bindings.get(pattern.name)
+            if bound is None:
+                new_bindings = dict(bindings)
+                new_bindings[pattern.name] = value
+                return new_bindings
+            return bindings if bound == value else None
+        if isinstance(pattern, Const):
+            return bindings if isinstance(value, Const) and value.val == pattern.val else None
+        if isinstance(pattern, Compound):
+            if not isinstance(value, Compound):
+                return None
+            if pattern.func != value.func or len(pattern.subterms) != len(value.subterms):
+                return None
+            cur = bindings
+            for p_sub, v_sub in zip(pattern.subterms, value.subterms):
+                cur = self._match_term_bindings(p_sub, v_sub, cur)
+                if cur is None:
+                    return None
+            return cur
+        return None
+
+    def _row_bindings(
+        self,
+        atom: HornAtom,
+        row: torch.Tensor,
+        fact_base: TensorFactBase,
+    ) -> Optional[Dict[str, Term]]:
+        bindings: Dict[str, Term] = {}
+        values: List[Term] = []
+        for j in range(len(atom.args)):
+            term_id = int(row[j + 1].item())
+            if term_id == TensorFactBase.PAD:
+                return None
+            values.append(fact_base._decode_term(term_id))
+        for pattern, value in zip(atom.args, values):
+            bindings = self._match_term_bindings(pattern, value, bindings)
+            if bindings is None:
+                return None
+        return bindings
+
+    def _candidate_matches(
+        self,
+        candidates: torch.Tensor,
+        atom: HornAtom,
+        fact_base: TensorFactBase,
+    ) -> List[Tuple[List[torch.Tensor], Dict[str, Term]]]:
+        matches: List[Tuple[List[torch.Tensor], Dict[str, Term]]] = []
+        for idx in range(candidates.shape[0]):
+            row = candidates[idx]
+            bindings = self._row_bindings(atom, row, fact_base)
+            if bindings is not None:
+                matches.append(([row], bindings))
+        return matches
+
+    @staticmethod
+    def _merge_bindings(
+        left: Dict[str, Term],
+        right: Dict[str, Term],
+    ) -> Optional[Dict[str, Term]]:
+        merged = dict(left)
+        for name, term in right.items():
+            bound = merged.get(name)
+            if bound is None:
+                merged[name] = term
+            elif bound != term:
+                return None
+        return merged
+
+    @staticmethod
+    def _bindings_signature(
+        bindings: Dict[str, Term],
+        names: Tuple[str, ...],
+    ) -> Optional[Tuple[Term, ...]]:
+        sig: List[Term] = []
+        for name in names:
+            if name not in bindings:
+                return None
+            sig.append(bindings[name])
+        return tuple(sig)
+
+    def _signature_tensor(
+        self,
+        matches: List[Tuple[List[torch.Tensor], Dict[str, Term]]],
+        names: Tuple[str, ...],
+        fact_base: TensorFactBase,
+    ) -> Tuple[List[Tuple[List[torch.Tensor], Dict[str, Term]]], Optional[torch.Tensor]]:
+        if not names:
+            return matches, None
+        kept: List[Tuple[List[torch.Tensor], Dict[str, Term]]] = []
+        rows: List[List[int]] = []
+        for packed in matches:
+            _trace_rows, bindings = packed
+            sig: List[int] = []
+            ok = True
+            for name in names:
+                term = bindings.get(name)
+                if term is None or len(term.vars()) != 0:
+                    ok = False
+                    break
+                sig.append(fact_base._intern_term(term))
+            if ok:
+                kept.append(packed)
+                rows.append(sig)
+        if not rows:
+            return [], None
+        return kept, torch.tensor(rows, dtype=torch.long, device=self.device)
+
+    def _equijoin_matches(
+        self,
+        left_matches: List[Tuple[List[torch.Tensor], Dict[str, Term]]],
+        right_matches: List[Tuple[List[torch.Tensor], Dict[str, Term]]],
+        left_atom: Optional[HornAtom],
+        right_atom: Optional[HornAtom],
+        fact_base: TensorFactBase,
+    ) -> List[Tuple[List[torch.Tensor], Dict[str, Term]]]:
+        if not left_matches or not right_matches:
+            return []
+        if left_atom is not None and right_atom is not None:
+            shared_names = tuple(sorted(self._atom_var_names(left_atom) & self._atom_var_names(right_atom)))
+        else:
+            shared_names = tuple(sorted(set(left_matches[0][1].keys()) & set(right_matches[0][1].keys())))
+
+        joined: List[Tuple[List[torch.Tensor], Dict[str, Term]]] = []
+        if not shared_names:
+            for left_rows, left_bind in left_matches:
+                for right_rows, right_bind in right_matches:
+                    merged = self._merge_bindings(left_bind, right_bind)
+                    if merged is not None:
+                        joined.append((left_rows + right_rows, merged))
+            return joined
+
+        left_kept, left_sig = self._signature_tensor(left_matches, shared_names, fact_base)
+        right_kept, right_sig = self._signature_tensor(right_matches, shared_names, fact_base)
+        if left_sig is not None and right_sig is not None:
+            match_mask = (left_sig.unsqueeze(1) == right_sig.unsqueeze(0)).all(dim=-1)
+            i_left, i_right = match_mask.nonzero(as_tuple=True)
+            for li, ri in zip(i_left.tolist(), i_right.tolist()):
+                left_rows, left_bind = left_kept[li]
+                right_rows, right_bind = right_kept[ri]
+                merged = self._merge_bindings(left_bind, right_bind)
+                if merged is not None:
+                    joined.append((left_rows + right_rows, merged))
+            return joined
+
+        index: Dict[Tuple[Term, ...], List[Tuple[List[torch.Tensor], Dict[str, Term]]]] = defaultdict(list)
+        for right_rows, right_bind in right_matches:
+            sig = self._bindings_signature(right_bind, shared_names)
+            if sig is not None:
+                index[sig].append((right_rows, right_bind))
+
+        for left_rows, left_bind in left_matches:
+            sig = self._bindings_signature(left_bind, shared_names)
+            if sig is None:
+                continue
+            for right_rows, right_bind in index.get(sig, ()):
+                merged = self._merge_bindings(left_bind, right_bind)
+                if merged is not None:
+                    joined.append((left_rows + right_rows, merged))
+        return joined
 
     def _equijoin(
         self,
@@ -556,6 +812,7 @@ class TensorUnifyEngine:
         C_list: List[torch.Tensor],  # список (m, 1+A) для кожного body atom
         body:   Tuple[HornAtom, ...],
         head:   HornAtom,
+        fact_base: TensorFactBase,
     ) -> Optional[torch.Tensor]:
         """
         Будує рядки нових фактів для голови правила.
@@ -586,14 +843,55 @@ class TensorUnifyEngine:
         for j, a in enumerate(head.args):
             if j >= self.max_arity:
                 break
-            if isinstance(a, Const):
-                head_rows[:, j + 1] = a.val
+            term_id = self._term_id(a, fact_base)
+            if term_id is not None:
+                head_rows[:, j + 1] = term_id
             elif isinstance(a, Var):
                 if a.name in var_map:
                     head_rows[:, j + 1] = var_map[a.name]
                 # else: не вдалося визначити → залишаємо PAD
 
         return head_rows
+
+    def _instantiate_bound_term(
+        self,
+        term: Term,
+        bindings: Dict[str, Term],
+    ) -> Optional[Term]:
+        if isinstance(term, Const):
+            return term
+        if isinstance(term, Var):
+            if term.name.startswith('_'):
+                return None
+            return bindings.get(term.name)
+        if isinstance(term, Compound):
+            subterms: List[Term] = []
+            for sub in term.subterms:
+                bound = self._instantiate_bound_term(sub, bindings)
+                if bound is None:
+                    return None
+                subterms.append(bound)
+            return Compound(term.func, tuple(subterms))
+        return None
+
+    def _build_structured_head_atoms(
+        self,
+        head: HornAtom,
+        joined_matches: List[Tuple[List[torch.Tensor], Dict[str, Term]]],
+    ) -> List[HornAtom]:
+        atoms: List[HornAtom] = []
+        for _rows, bindings in joined_matches:
+            args: List[Term] = []
+            ok = True
+            for arg in head.args:
+                bound = self._instantiate_bound_term(arg, bindings)
+                if bound is None:
+                    ok = False
+                    break
+                args.append(bound)
+            if ok:
+                atoms.append(HornAtom(pred=head.pred, args=tuple(args)))
+        return atoms
 
     def _fast_isin(self, new_rows: torch.Tensor,
                    existing: Optional[torch.Tensor]) -> torch.Tensor:
@@ -664,11 +962,79 @@ class TensorUnifyEngine:
                         total_added += 1
                 continue
 
+            if self._is_structured_rule(fresh):
+                C0_raw = fact_base.get_by_pred(body[0].pred)
+                if C0_raw is None:
+                    continue
+                mask0 = self._ground_filter(C0_raw, body[0], fact_base)
+                C0 = C0_raw[mask0]
+                if C0.shape[0] == 0:
+                    continue
+                matches0 = self._candidate_matches(C0, body[0], fact_base)
+                if not matches0:
+                    continue
+
+                if len(body) == 1:
+                    joined_matches = matches0
+                elif len(body) == 2:
+                    C1_raw = fact_base.get_by_pred(body[1].pred)
+                    if C1_raw is None:
+                        continue
+                    mask1 = self._ground_filter(C1_raw, body[1], fact_base)
+                    C1 = C1_raw[mask1]
+                    if C1.shape[0] == 0:
+                        continue
+                    matches1 = self._candidate_matches(C1, body[1], fact_base)
+                    if not matches1:
+                        continue
+                    joined_matches = self._equijoin_matches(
+                        matches0, matches1, body[0], body[1], fact_base
+                    )
+                else:
+                    C1_raw = fact_base.get_by_pred(body[1].pred)
+                    C2_raw = fact_base.get_by_pred(body[2].pred)
+                    if C1_raw is None or C2_raw is None:
+                        continue
+                    mask1 = self._ground_filter(C1_raw, body[1], fact_base)
+                    mask2 = self._ground_filter(C2_raw, body[2], fact_base)
+                    C1, C2 = C1_raw[mask1], C2_raw[mask2]
+                    if C1.shape[0] == 0 or C2.shape[0] == 0:
+                        continue
+                    matches1 = self._candidate_matches(C1, body[1], fact_base)
+                    matches2 = self._candidate_matches(C2, body[2], fact_base)
+                    if not matches1 or not matches2:
+                        continue
+                    joined01 = self._equijoin_matches(
+                        matches0, matches1, body[0], body[1], fact_base
+                    )
+                    if not joined01:
+                        continue
+                    joined_matches = self._equijoin_matches(
+                        joined01, matches2, None, body[2], fact_base
+                    )
+
+                for derived in self._build_structured_head_atoms(head, joined_matches):
+                    if derived.is_ground() and fact_base.add_atom(derived):
+                        total_added += 1
+                continue
+
+            if not self._is_tensor_rule(fresh):
+                # Unsupported tensor rule — fallback до Python DFS
+                from omen_prolog import find_all_substitutions
+                subs = find_all_substitutions(
+                    body, fact_base.to_frozenset(), max_solutions=128)
+                for sigma in subs:
+                    derived = sigma.apply_atom(head)
+                    if derived.is_ground():
+                        fact_base.add_atom(derived)
+                        total_added += 1
+                continue
+
             # ── Отримуємо кандидатів для body[0] ──────────────────────────────
             C0_raw = fact_base.get_by_pred(body[0].pred)
             if C0_raw is None:
                 continue
-            mask0 = self._ground_filter(C0_raw, body[0])
+            mask0 = self._ground_filter(C0_raw, body[0], fact_base)
             C0    = C0_raw[mask0]                         # (k0, 1+A)
             if C0.shape[0] == 0:
                 continue
@@ -676,14 +1042,14 @@ class TensorUnifyEngine:
             if len(body) == 1:
                 # Одне тіло-атом → просто проеціюємо голову
                 C_joined = [C0]
-                head_rows = self._build_head_rows(C_joined, body, head)
+                head_rows = self._build_head_rows(C_joined, body, head, fact_base)
 
             elif len(body) == 2:
                 # Два body-атоми → один equijoin
                 C1_raw = fact_base.get_by_pred(body[1].pred)
                 if C1_raw is None:
                     continue
-                mask1 = self._ground_filter(C1_raw, body[1])
+                mask1 = self._ground_filter(C1_raw, body[1], fact_base)
                 C1    = C1_raw[mask1]
                 if C1.shape[0] == 0:
                     continue
@@ -692,7 +1058,7 @@ class TensorUnifyEngine:
                 if len(i0) == 0:
                     continue
                 C_joined = [C0[i0], C1[i1]]
-                head_rows = self._build_head_rows(C_joined, body, head)
+                head_rows = self._build_head_rows(C_joined, body, head, fact_base)
 
             else:
                 # body=3: two-phase join
@@ -700,8 +1066,8 @@ class TensorUnifyEngine:
                 C2_raw = fact_base.get_by_pred(body[2].pred)
                 if C1_raw is None or C2_raw is None:
                     continue
-                mask1 = self._ground_filter(C1_raw, body[1])
-                mask2 = self._ground_filter(C2_raw, body[2])
+                mask1 = self._ground_filter(C1_raw, body[1], fact_base)
+                mask2 = self._ground_filter(C2_raw, body[2], fact_base)
                 C1, C2 = C1_raw[mask1], C2_raw[mask2]
                 if C1.shape[0] == 0 or C2.shape[0] == 0:
                     continue
@@ -720,7 +1086,7 @@ class TensorUnifyEngine:
                 if len(i_mid) == 0:
                     continue
                 C_joined = [C01_0[i_mid], C01_1[i_mid], C2[i2]]
-                head_rows = self._build_head_rows(C_joined, body, head)
+                head_rows = self._build_head_rows(C_joined, body, head, fact_base)
 
             if head_rows is None or head_rows.shape[0] == 0:
                 continue
@@ -1072,6 +1438,12 @@ class ScalableKnowledgeBase:
             self.rete.register_rule(clause)
         return added
 
+    def _has_fast_compatible_rule(self, rules: List[HornClause]) -> bool:
+        for rule in rules:
+            if self.tensor_eng._is_tensor_rule(rule) or self.tensor_eng._is_structured_rule(rule):
+                return True
+        return False
+
     # ── Forward Chaining ───────────────────────────────────────────────────────
     def forward_chain(self, max_depth: int = 5,
                       verbose: bool = False) -> FrozenSet[HornAtom]:
@@ -1083,8 +1455,11 @@ class ScalableKnowledgeBase:
         rules = self.rete.all_rules()
         n     = len(self.tensor_fb)
 
-        if self.mode == "slow" or n < self.threshold:
+        if self.mode == "slow":
             # Чистий Python
+            return self.py_kb.forward_chain(max_depth)
+
+        if self.mode != "fast" and n < self.threshold and not self._has_fast_compatible_rule(rules):
             return self.py_kb.forward_chain(max_depth)
 
         # Fast tensor pass
@@ -1108,10 +1483,13 @@ class ScalableKnowledgeBase:
 
     # ── Статистика ─────────────────────────────────────────────────────────────
     def stats(self) -> Dict[str, int]:
+        rules = self.rete.all_rules()
         return {
             "n_facts":   len(self.tensor_fb),
             "n_rules":   len(self.rete),
             "pred_types": len(self.tensor_fb.pred_counts()),
+            "tensor_rules": sum(1 for r in rules if self.tensor_eng._is_tensor_rule(r)),
+            "structured_rules": sum(1 for r in rules if self.tensor_eng._is_structured_rule(r)),
         }
 
     def __len__(self) -> int:
@@ -1241,7 +1619,50 @@ def _run_tensor_tests() -> None:
     assert len(recovered) == 3
     print(f"  n_facts={len(fb)}  tensor_shape={tuple(by_pred.shape)}  [PASS]")
 
+    sep("T2b · TensorFactBase / TensorUnifyEngine — compound ground terms")
+    p_tree = PRED_VOCAB.get_id("tree_edge")
+    p_mark = PRED_VOCAB.get_id("inferred")
+    comp_left = Compound(func=7, subterms=(Const(1), Const(2)))
+    comp_right = Compound(func=8, subterms=(Const(3),))
+    fb_comp = TensorFactBase(max_arity=2, device=device)
+    fb_comp.add_atom(HornAtom(pred=p_tree, args=(comp_left, comp_right)))
+    recovered_comp = fb_comp.to_horn_atoms()
+    assert recovered_comp[0].args == (comp_left, comp_right), f"compound decode FAIL: {recovered_comp}"
+    rule_comp = HornClause(
+        head=HornAtom(pred=p_mark, args=(Var("A"),)),
+        body=(HornAtom(pred=p_tree, args=(Var("A"), comp_right)),),
+    )
+    added_comp = TensorUnifyEngine(max_arity=2, device=device).forward_chain_step(fb_comp, [rule_comp])
+    assert added_comp == 1, f"compound 1-body rule FAIL: {added_comp}"
+    marked = [a for a in fb_comp.to_horn_atoms() if a.pred == p_mark]
+    assert any(a.args == (comp_left,) for a in marked), f"compound derivation FAIL: {marked}"
+    print(f"  compound facts={len(fb_comp)}  derived={len(marked)}  [PASS]")
+
     # ══ T3: ReteIndex ═════════════════════════════════════════════════════════
+    sep("T3 · ReteIndex (O(1) тригер)")
+    sep("T2c · TensorUnifyEngine — structured compound join")
+    p_nested = PRED_VOCAB.get_id("nested_fact")
+    p_link = PRED_VOCAB.get_id("nested_link")
+    p_struct = PRED_VOCAB.get_id("structured_out")
+    fb_struct = TensorFactBase(max_arity=2, device=device)
+    nested_fact = Compound(func=20, subterms=(Const(1), Const(5)))
+    fb_struct.add_atom(HornAtom(pred=p_nested, args=(nested_fact,)))
+    fb_struct.add_atom(HornAtom(pred=p_link, args=(Const(5), Const(7))))
+    YS, ZS = Var("YS"), Var("ZS")
+    rule_struct = HornClause(
+        head=HornAtom(pred=p_struct, args=(Compound(func=30, subterms=(YS, ZS)),)),
+        body=(
+            HornAtom(pred=p_nested, args=(Compound(func=20, subterms=(Const(1), YS)),)),
+            HornAtom(pred=p_link, args=(YS, ZS)),
+        ),
+    )
+    added_struct = TensorUnifyEngine(max_arity=2, device=device).forward_chain_step(fb_struct, [rule_struct])
+    assert added_struct == 1, f"structured compound join FAIL: {added_struct}"
+    structured_atoms = [a for a in fb_struct.to_horn_atoms() if a.pred == p_struct]
+    expected_struct = Compound(func=30, subterms=(Const(5), Const(7)))
+    assert any(a.args == (expected_struct,) for a in structured_atoms), f"structured derivation FAIL: {structured_atoms}"
+    print(f"  structured facts={len(fb_struct)}  derived={len(structured_atoms)}  [PASS]")
+
     sep("T3 · ReteIndex (O(1) тригер)")
     rete = ReteIndex()
     p_gp   = PRED_VOCAB.get_id("ancestor")
@@ -1368,8 +1789,46 @@ class MathHelper:
     assert n_after >= n_before
 
     stats = skb.stats()
+    assert "tensor_rules" in stats and "structured_rules" in stats
     print(f"  facts_before={n_before}  facts_after={n_after}"
           f"  rules={stats['n_rules']}  preds={stats['pred_types']}  [PASS]")
+
+    sep("T7b · ScalableKnowledgeBase prefers structured fast-path below threshold")
+    skb_fast = ScalableKnowledgeBase(
+        max_arity=2,
+        device=device,
+        mode="hybrid",
+        tensor_threshold=10_000,
+    )
+    p_pair = pv.get_id("pair")
+    p_link = pv.get_id("link")
+    p_struct = pv.get_id("structured")
+    Y = Var("Y")
+    structured_rule = HornClause(
+        head=HornAtom(pred=p_struct, args=(Compound("node", (Y, Const(3))),)),
+        body=(
+            HornAtom(pred=p_pair, args=(Compound("node", (Const(1), Y)),)),
+            HornAtom(pred=p_link, args=(Y, Const(3))),
+        ),
+    )
+    skb_fast.add_rule(structured_rule)
+    skb_fast.add_fact(HornAtom(pred=p_pair, args=(Compound("node", (Const(1), Const(2))),)))
+    skb_fast.add_fact(HornAtom(pred=p_link, args=(Const(2), Const(3))))
+    fast_calls = {"n": 0}
+    orig_forward = skb_fast.tensor_eng.forward_chain
+
+    def _counting_forward(*args, **kwargs):
+        fast_calls["n"] += 1
+        return orig_forward(*args, **kwargs)
+
+    skb_fast.tensor_eng.forward_chain = _counting_forward
+    skb_fast.forward_chain(max_depth=2)
+    assert fast_calls["n"] == 1, f"Expected fast-path call, got {fast_calls['n']}"
+    assert any(
+        atom.pred == p_struct and atom.args == (Compound("node", (Const(2), Const(3))),)
+        for atom in skb_fast.tensor_fb.to_horn_atoms()
+    ), "Structured fast-path derivation missing"
+    print(f"  fast_calls={fast_calls['n']}  structured_rules={skb_fast.stats()['structured_rules']}  [PASS]")
 
     # ══ T8: End-to-end Python → facts → rules → inference ════════════════════
     sep("T8 · End-to-end pipeline (Python → KB → forward chain)")

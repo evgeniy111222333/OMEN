@@ -227,9 +227,11 @@ class EMCStateEncoder(nn.Module):
                  use_action_hist: bool = True):
         super().__init__()
         self.use_action_hist = use_action_hist
-        # z + 4 scalar features + (N_ACTIONS one-hot if action_hist)
-        d_in = d_latent + 4 + (N_ACTIONS if use_action_hist else 0)
+        # z + goal + WM summary + 6 scalar features + action histogram.
+        d_in = d_latent * 3 + 6 + (N_ACTIONS if use_action_hist else 0)
         self.z_proj = nn.Linear(d_latent, d_latent, bias=False)
+        self.goal_proj = nn.Linear(d_latent, d_latent, bias=False)
+        self.wm_proj = nn.Linear(d_latent, d_latent, bias=False)
         self.state_proj = nn.Sequential(
             nn.Linear(d_in, d_latent), nn.GELU(),
             nn.Dropout(dropout),
@@ -242,6 +244,10 @@ class EMCStateEncoder(nn.Module):
                 depth_norm:  torch.Tensor,
                 nfacts_norm: torch.Tensor,
                 nrules_norm: torch.Tensor,
+                goal_embed:  Optional[torch.Tensor] = None,
+                wm_embed:    Optional[torch.Tensor] = None,
+                trigger_flag: Optional[torch.Tensor] = None,
+                hot_ratio: Optional[torch.Tensor] = None,
                 action_hist: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         z           : (B, d_latent)
@@ -251,6 +257,8 @@ class EMCStateEncoder(nn.Module):
         """
         B = z.shape[0]
         z_enc = self.z_proj(z)
+        goal_enc = self.goal_proj(goal_embed if goal_embed is not None else torch.zeros_like(z))
+        wm_enc = self.wm_proj(wm_embed if wm_embed is not None else torch.zeros_like(z))
 
         def _as_col(t: torch.Tensor) -> torch.Tensor:
             """() або (B,) → (B, 1)"""
@@ -263,17 +271,19 @@ class EMCStateEncoder(nn.Module):
             _as_col(depth_norm),
             _as_col(nfacts_norm),
             _as_col(nrules_norm),
-        ], dim=-1)                                              # (B, 4)
+            _as_col(trigger_flag if trigger_flag is not None else torch.zeros((), device=z.device, dtype=z.dtype)),
+            _as_col(hot_ratio if hot_ratio is not None else torch.zeros((), device=z.device, dtype=z.dtype)),
+        ], dim=-1)                                              # (B, 6)
 
         if self.use_action_hist:
             if action_hist is not None:
-                feat = torch.cat([z_enc, scalars, action_hist], dim=-1)
+                feat = torch.cat([z_enc, goal_enc, wm_enc, scalars, action_hist], dim=-1)
             else:
                 # Заповнюємо нулями якщо action_hist не передано (перший крок)
                 zeros = torch.zeros(B, N_ACTIONS, device=z.device, dtype=z.dtype)
-                feat = torch.cat([z_enc, scalars, zeros], dim=-1)
+                feat = torch.cat([z_enc, goal_enc, wm_enc, scalars, zeros], dim=-1)
         else:
-            feat = torch.cat([z_enc, scalars], dim=-1)
+            feat = torch.cat([z_enc, goal_enc, wm_enc, scalars], dim=-1)
 
         return self.state_proj(feat)  # (B, d)
 
@@ -433,36 +443,19 @@ class EfficientMetaController(nn.Module):
             util += 1.0 / (1.0 + pred_counts.get(pred, 0))
         return util / max(len(facts), 1)
 
-    def _proof_mdl(self, prover, trajectory: List[int]) -> float:
-        """MDL(proof) ≈ довжина траєкторії + середня складність правил у KB.
-
-        Виправлення Bug:
-          Попередній код використовував action-ID (0..3) як індекс правила у KB:
-            prover.kb.rules[action_id % n_rules].complexity()
-          Це неправильно: {0=Stop, 1=Recall, 2=FC, 3=Abduce} — НЕ індекси правил.
-
-        Правильна семантика:
-          MDL(proof) = depth × (1 + α · avg_complexity_KB)
-          де avg_complexity_KB = середня складність всіх правил у базі знань.
-
-          Це пропорційно опису довжини доведення:
-            - більша глибина → більший MDL (кожен крок коштує)
-            - складніші правила у KB → вищий MDL (штраф за складні структури)
-
-          Математично відповідає:
-            MDL(proof) ≈ |trajectory| + Σ_{R ∈ used_rules} Complexity(R)
-          де Σ апроксимується через len(trajectory) × avg_complexity.
-        """
-        if not trajectory:
-            return 0.0
-        depth = float(len(trajectory))
-        rules = prover.kb.rules
-        if not rules:
-            # KB порожня → MDL = лише глибина траєкторії
-            return depth
-        avg_complexity = sum(r.complexity() for r in rules) / len(rules)
-        # Масштабуємо вплив складності на 0.1 щоб уникнути домінування при великих KB
-        return depth * (1.0 + 0.1 * avg_complexity)
+    def _proof_mdl(
+        self,
+        prover,
+        derivation_trace: List[Tuple[object, Optional[object]]],
+        action_count: int = 0,
+    ) -> float:
+        """MDL(proof) через реальну символічну вартість застосованих правил."""
+        if not derivation_trace:
+            return float(action_count)
+        total = 0.0
+        for clause, sigma in derivation_trace:
+            total += float(prover.cost_est.symbolic_cost(clause, sigma))
+        return total + 0.1 * float(action_count)
 
     def _action_mask(self,
                      device: torch.device,
@@ -478,6 +471,10 @@ class EfficientMetaController(nn.Module):
                       depth:       int,
                       n_facts:     int,
                       n_rules:     int,
+                      goal_embed:  Optional[torch.Tensor] = None,
+                      wm_embed:    Optional[torch.Tensor] = None,
+                      trigger_flag: float = 0.0,
+                      hot_ratio: float = 0.0,
                       action_counts: Optional[List[int]] = None) -> torch.Tensor:
         """
         Формує d-вимірний вектор стану.
@@ -511,14 +508,42 @@ class EfficientMetaController(nn.Module):
             _s(depth / max_d),
             _s(min(n_facts, max_f) / max_f),
             _s(min(n_rules, max_r) / max_r),
-            action_hist,
+            goal_embed=goal_embed,
+            wm_embed=wm_embed,
+            trigger_flag=_s(trigger_flag),
+            hot_ratio=_s(hot_ratio),
+            action_hist=action_hist,
         )
+
+    def _goal_embed(self, prover, goal, batch_size: int, device: torch.device) -> torch.Tensor:
+        return prover.ground(frozenset({goal}), device).expand(batch_size, -1)
+
+    def _wm_embed(self, prover, device: torch.device, batch_size: int,
+                  facts: Optional[frozenset] = None) -> torch.Tensor:
+        facts = prover.kb.facts if facts is None else facts
+        if not facts:
+            return torch.zeros(batch_size, prover.d, device=device)
+        sample_size = min(len(facts), 64)
+        if len(facts) > sample_size:
+            facts = frozenset(random.sample(list(facts), sample_size))
+        return prover.ground(facts, device).expand(batch_size, -1)
+
+    def _rule_trigger_flag(self, prover, facts: Optional[frozenset] = None) -> float:
+        fact_space = prover.kb.facts if facts is None else facts
+        fact_preds = {f.pred for f in fact_space}
+        if not fact_preds:
+            return 0.0
+        for rule in prover.kb.rules:
+            if any(atom.pred in fact_preds for atom in rule.body):
+                return 1.0
+        return 0.0
 
     # ── Головний цикл ─────────────────────────────────────────────────────────
 
     def run_episode(self,
                     z:         torch.Tensor,
                     gap_norm:  torch.Tensor,
+                    hot_dims:  Optional[torch.Tensor],
                     prover,                        # DifferentiableProver
                     memory,                        # AsyncTensorProductMemory
                     world_err: torch.Tensor,
@@ -558,10 +583,11 @@ class EfficientMetaController(nn.Module):
             prover.kb.consolidate(use_count_threshold=2)
 
         # ── 1. Perception: z → fact → KB ──────────────────────────────────────
-        goal = prover.perceive(z)
-        prover.kb.add_fact(goal)
+        prover.materialize_task_context_facts()
+        goal = prover.current_goal(z)
+        working_facts = prover.current_working_facts()
 
-        n_facts_init = prover.kb.n_facts()
+        n_facts_init = len(working_facts)
         n_rules_init = len(prover.kb)
         z_cur        = z.clone()
         v_mem_out    = torch.zeros_like(z)
@@ -582,16 +608,26 @@ class EfficientMetaController(nn.Module):
         goal_proved      = False
         # Підрахунок дій для кодування стану (action_hist)
         action_counts: List[int] = [0] * N_ACTIONS
-        # Акумульована складність траєкторії для MDL(proof)
-        proof_trajectory: List[int] = []
+        # Реальні (rule, substitution) кроки доведення для MDL(proof)
+        proof_derivations: List[Tuple[object, Optional[object]]] = []
+        goal_embed = self._goal_embed(prover, goal, B, device)
 
         for step in range(self.max_steps):
             # MDL(proof) поточного стану
-            proof_mdl_cur = self._proof_mdl(prover, proof_trajectory)
+            proof_mdl_cur = self._proof_mdl(
+                prover, proof_derivations, action_count=len(traj.actions)
+            )
+            wm_embed = self._wm_embed(prover, device, B, facts=working_facts)
+            trigger_flag = self._rule_trigger_flag(prover, facts=working_facts)
+            hot_ratio = float(hot_dims.float().mean().item()) if hot_dims is not None else 0.0
 
             state_vec = self._encode_state(
                 z_cur, gap_norm_cur, step,
-                prover.kb.n_facts(), len(prover.kb),
+                len(working_facts), len(prover.kb),
+                goal_embed=goal_embed,
+                wm_embed=wm_embed,
+                trigger_flag=trigger_flag,
+                hot_ratio=hot_ratio,
                 action_counts=action_counts)
 
             # ── Critic: V(s) ─────────────────────────────────────────────────
@@ -638,7 +674,6 @@ class EfficientMetaController(nn.Module):
             a = action.item()
             traj.actions.append(a)
             action_counts[a] = action_counts[a] + 1
-            proof_trajectory.append(a)
 
             # ── Явна дія STOP ─────────────────────────────────────────────────
             if a == ACTION_STOP:
@@ -648,13 +683,12 @@ class EfficientMetaController(nn.Module):
                 break
 
             # ── Виконуємо дію та обчислюємо R_int ────────────────────────────
-            n_before = prover.kb.n_facts()
             r_int    = 0.0
             cost_a   = self._action_cost(a)
 
             if a == ACTION_RECALL:
                 v_mem_step = memory.read(z_cur)
-                z_cur      = (z_cur + v_mem_step.detach()).clamp(-20.0, 20.0)
+                z_cur      = (z_cur + v_mem_step).clamp(-20.0, 20.0)
                 v_mem_out  = v_mem_step
                 r_int      = v_mem_step.norm(dim=-1).mean().item() / (z.shape[-1] ** 0.5 + 1e-6)
                 # GapNorm зменшується після recall (пам'ять закриває прогалину)
@@ -664,8 +698,14 @@ class EfficientMetaController(nn.Module):
                 # FIX Bug-FC: forward_chain() повертає frozenset але НЕ додає факти в KB.
                 # forward_chain_step() виконує один крок І персистує нові факти через
                 # kb.add_fact() → state KB реально оновлюється для наступних кроків.
-                n_added_fc, _ = prover.forward_chain_step()
-                r_int    = float(n_added_fc) / max(n_facts_init + 1, 1)
+                n_added_fc, new_fact_set, fc_trace, working_facts = prover.forward_chain_step_local(
+                    working_facts
+                )
+                new_facts = set(new_fact_set)
+                proof_derivations.extend(fc_trace)
+                r_int = self._fact_utility(prover, new_facts)
+                if n_added_fc > 0:
+                    r_int = max(r_int, float(n_added_fc) / max(n_facts_init + 1, 1))
                 # GapNorm може зменшитись якщо нові факти проясняють ситуацію
                 if n_added_fc > 0:
                     gap_norm_cur = (gap_norm_cur * 0.95).clamp(0.0, 5.0)
@@ -701,10 +741,12 @@ class EfficientMetaController(nn.Module):
         traj.n_steps = len(traj.actions)
         traj.action_histogram = list(action_counts)
         # MDL фінального доведення
-        traj.proof_mdl = self._proof_mdl(prover, proof_trajectory)
+        traj.proof_mdl = self._proof_mdl(
+            prover, proof_derivations, action_count=len(traj.actions)
+        )
 
         # ── 3. Фінальне Forward Chaining + Grounding ──────────────────────────
-        all_facts = prover.kb.forward_chain(prover.max_depth)
+        all_facts = prover.kb.forward_chain(prover.max_depth, starting_facts=working_facts)
 
         _MAX_GROUND = 128
         ground_sample = (frozenset(random.sample(list(all_facts), _MAX_GROUND))
@@ -718,7 +760,9 @@ class EfficientMetaController(nn.Module):
         vem_self_loss= torch.zeros(1, device=device).squeeze()
 
         if self.training and len(prover.kb.rules) > 0:
-            proved, traj_proof, proof_loss = prover.prove_with_policy(goal, z[:1])
+            proved, traj_proof, proof_loss = prover.prove_with_policy(
+                goal, z[:1], starting_facts=working_facts
+            )
             goal_proved = proved
             traj.goal_proved = proved
 
@@ -748,16 +792,69 @@ class EfficientMetaController(nn.Module):
             vem_self_loss = prover.vem.self_supervised_loss(device)
 
         abductor_aux = torch.zeros(1, device=device).squeeze()
-        if prover._step % 5 == 0:
-            err_val = (world_err.item() if torch.is_tensor(world_err) else float(world_err))
-            _, vem_hinge, abductor_aux, _ = prover.abduce_and_learn(
-                z_cur, err_val, force=True
+        abduced_rules = 0.0
+        target_facts = (
+            prover.task_context.target_facts
+            if getattr(prover, "task_context", None) is not None else frozenset()
+        )
+        target_hits = len(all_facts & target_facts)
+        target_total = len(target_facts)
+        target_coverage = (
+            float(target_hits) / float(target_total)
+            if target_total > 0 else (1.0 if goal_proved else 0.0)
+        )
+        err_val = (world_err.item() if torch.is_tensor(world_err) else float(world_err))
+        mismatch_error = (1.0 - target_coverage) + (0.0 if goal_proved else 1.0)
+        trigger_abduction = (
+            getattr(prover, "task_context", None) is not None
+            and prover.task_context.trigger_abduction
+        )
+        should_abduce = (
+            self.training
+            and (
+                trigger_abduction
+                or mismatch_error > 0.0
+                or (prover._step % 5 == 0 and err_val > 0.5)
             )
+        )
+        if should_abduce:
+            n_added_abd, vem_hinge, abductor_aux, mean_utility = prover.abduce_and_learn(
+                z_cur,
+                max(float(err_val), float(mismatch_error)),
+                force=trigger_abduction or mismatch_error > 0.0,
+            )
+            abduced_rules = float(n_added_abd)
+            if n_added_abd > 0:
+                all_facts = prover.kb.forward_chain(prover.max_depth, starting_facts=working_facts)
+                target_hits = len(all_facts & target_facts)
+                target_coverage = (
+                    float(target_hits) / float(target_total)
+                    if target_total > 0 else (1.0 if goal_proved else 0.0)
+                )
+                ground_sample = (frozenset(random.sample(list(all_facts), _MAX_GROUND))
+                                 if len(all_facts) > _MAX_GROUND else all_facts)
+                z_sym_1 = prover.ground(ground_sample, device)
+                z_sym = z_sym_1.expand(B, -1)
+                goal_proved = goal_proved or prover._goal_supported(goal, all_facts)
+                r_int_cumulative += mean_utility
+        target_ground = target_facts or frozenset({goal})
+        z_target = prover.ground(target_ground, device).expand(B, -1)
+        coverage_loss = torch.tensor(
+            (1.0 - target_coverage) + (0.0 if goal_proved else 1.0),
+            device=device,
+            dtype=z.dtype,
+        )
 
         # ── 5. Symbolic Consistency Loss ──────────────────────────────────────
         sym_consist = (F.mse_loss(z, z_sym.detach()) +
                        F.mse_loss(z_sym, z.detach()))
+        symbolic_induction = (
+            F.mse_loss(z_sym, z_target.detach())
+            + F.mse_loss(z_target, z_sym.detach())
+        )
         sym_loss = (sym_consist
+                    + 0.1  * symbolic_induction
+                    + 0.1  * coverage_loss
                     + 0.1  * proof_loss
                     + 0.01 * vem_hinge
                     + 0.05 * abductor_aux
@@ -800,13 +897,34 @@ class EfficientMetaController(nn.Module):
             task_sv = self._encode_state(
                 z_cur, gap_norm_cur,
                 len(traj.actions),
-                prover.kb.n_facts(), len(prover.kb),
+                len(working_facts), len(prover.kb),
+                goal_embed=goal_embed,
+                wm_embed=self._wm_embed(prover, device, B, facts=working_facts),
+                trigger_flag=self._rule_trigger_flag(prover, facts=working_facts),
+                hot_ratio=float(hot_dims.float().mean().item()) if hot_dims is not None else 0.0,
                 action_counts=action_counts,
             )
             r_pred    = self.stopping_utility.task_estimator(task_sv).squeeze(-1)  # (B,)
             bce_tgt   = torch.full_like(r_pred, float(goal_proved))
             l_task    = F.binary_cross_entropy(r_pred.clamp(1e-6, 1.0 - 1e-6), bce_tgt)
             meta_loss = meta_loss + 0.1 * l_task
+
+        prover.last_goal = goal
+        prover.last_context_facts = working_facts
+        prover.last_all_facts = all_facts
+        prover.last_forward_info = {
+            "goal_proved": 1.0 if goal_proved else 0.0,
+            "target_coverage": target_coverage,
+            "target_hits": float(target_hits),
+            "target_total": float(target_total),
+            "unresolved_targets": float(max(target_total - target_hits, 0)),
+            "abduced_rules": abduced_rules,
+            "abduction_utility": r_int_cumulative,
+            "provenance": (
+                prover.task_context.provenance
+                if getattr(prover, "task_context", None) is not None else "latent"
+            ),
+        }
 
         return z_sym, sym_loss, v_mem_out, meta_loss, traj
 
@@ -816,6 +934,7 @@ class EfficientMetaController(nn.Module):
     def run_episode_eval(self,
                          z:        torch.Tensor,
                          gap_norm: torch.Tensor,
+                         hot_dims: Optional[torch.Tensor],
                          prover,                       # DifferentiableProver
                          memory,                       # AsyncTensorProductMemory
                          device:   torch.device,
@@ -840,8 +959,9 @@ class EfficientMetaController(nn.Module):
         B = z.shape[0]
 
         # Perception: z → fact → KB (без модифікації prover._step)
-        goal = prover.perceive(z)
-        prover.kb.add_fact(goal)
+        prover.materialize_task_context_facts()
+        goal = prover.current_goal(z)
+        working_facts = prover.current_working_facts()
 
         z_cur        = z.clone()
         v_mem_out    = torch.zeros_like(z)
@@ -849,14 +969,22 @@ class EfficientMetaController(nn.Module):
         self.voc.reset()
 
         action_counts: List[int] = [0] * N_ACTIONS
-        proof_trajectory: List[int] = []
+        proof_derivations: List[Tuple[object, Optional[object]]] = []
         r_int_cumulative = 0.0
+        goal_embed = self._goal_embed(prover, goal, B, device)
 
         for step in range(self.max_steps):
-            proof_mdl_cur = self._proof_mdl(prover, proof_trajectory)
+            proof_mdl_cur = self._proof_mdl(
+                prover, proof_derivations, action_count=sum(action_counts)
+            )
+            wm_embed = self._wm_embed(prover, device, B, facts=working_facts)
             state_vec = self._encode_state(
                 z_cur, gap_norm_cur, step,
-                prover.kb.n_facts(), len(prover.kb),
+                len(working_facts), len(prover.kb),
+                goal_embed=goal_embed,
+                wm_embed=wm_embed,
+                trigger_flag=self._rule_trigger_flag(prover, facts=working_facts),
+                hot_ratio=float(hot_dims.float().mean().item()) if hot_dims is not None else 0.0,
                 action_counts=action_counts)
 
             val    = self.critic(state_vec).mean()
@@ -879,7 +1007,6 @@ class EfficientMetaController(nn.Module):
             a = mean_logits.argmax().item()
 
             action_counts[a] = action_counts[a] + 1
-            proof_trajectory.append(a)
 
             if a == ACTION_STOP:
                 break
@@ -895,8 +1022,11 @@ class EfficientMetaController(nn.Module):
 
             elif a == ACTION_FC:
                 # FIX Bug-FC: forward_chain() не змінює KB. forward_chain_step() персистує.
-                n_added_fc, _ = prover.forward_chain_step()
-                r_int    = float(n_added_fc) / max(prover.kb.n_facts() + 1, 1)
+                n_added_fc, _, fc_trace, working_facts = prover.forward_chain_step_local(
+                    working_facts
+                )
+                proof_derivations.extend(fc_trace)
+                r_int    = float(n_added_fc) / max(len(working_facts) + 1, 1)
                 if n_added_fc > 0:
                     gap_norm_cur = (gap_norm_cur * 0.95).clamp(0.0, 5.0)
 
@@ -914,12 +1044,40 @@ class EfficientMetaController(nn.Module):
             r_int_cumulative += r_int
 
         # Фінальний grounding: KB → z_sym
-        all_facts = prover.kb.forward_chain(prover.max_depth)
+        all_facts = prover.kb.forward_chain(prover.max_depth, starting_facts=working_facts)
         _MAX_GROUND = 128
         ground_sample = (frozenset(random.sample(list(all_facts), _MAX_GROUND))
                          if len(all_facts) > _MAX_GROUND else all_facts)
         z_sym_1 = prover.ground(ground_sample, device)    # (1, d)
         z_sym   = z_sym_1.expand(B, -1)                   # (B, d)
+
+        target_facts = (
+            prover.task_context.target_facts
+            if getattr(prover, "task_context", None) is not None else frozenset({goal})
+        )
+        target_hits = len(all_facts & target_facts)
+        target_total = len(target_facts)
+        goal_supported = prover._goal_supported(goal, all_facts)
+        target_coverage = (
+            float(target_hits) / float(target_total)
+            if target_total > 0 else (1.0 if goal_supported else 0.0)
+        )
+        prover.last_goal = goal
+        prover.last_context_facts = working_facts
+        prover.last_all_facts = all_facts
+        prover.last_forward_info = {
+            "goal_proved": 1.0 if goal_supported else 0.0,
+            "target_coverage": target_coverage,
+            "target_hits": float(target_hits),
+            "target_total": float(target_total),
+            "unresolved_targets": float(max(target_total - target_hits, 0)),
+            "abduced_rules": float(action_counts[ACTION_ABDUCE]),
+            "abduction_utility": r_int_cumulative,
+            "provenance": (
+                prover.task_context.provenance
+                if getattr(prover, "task_context", None) is not None else "latent"
+            ),
+        }
 
         return z_sym, v_mem_out
 
@@ -1299,6 +1457,11 @@ def _run_emc_tests() -> None:
     class MockProver:
         def __init__(self, n_rules=5):
             self.kb = MockKB(n_rules)
+            self.cost_est = type(
+                "MockCostEstimator",
+                (),
+                {"symbolic_cost": staticmethod(lambda clause, sigma: clause.complexity() + (0.5 if sigma is not None else 0.0))}
+            )()
 
     emc_t9 = EfficientMetaController(cfg).to(device)
     prover_mock = MockProver(n_rules=5)
@@ -1306,29 +1469,25 @@ def _run_emc_tests() -> None:
     # Порожня траєкторія → 0.0
     assert emc_t9._proof_mdl(prover_mock, []) == 0.0, "FAIL: empty trajectory"
 
-    # Траєкторія [Stop=0, Recall=1, FC=2, Abduce=3] — action IDs, НЕ rule indices
-    traj_test = [ACTION_STOP, ACTION_RECALL, ACTION_FC, ACTION_ABDUCE]
-    mdl = emc_t9._proof_mdl(prover_mock, traj_test)
-    # Очікуємо: depth=4, avg_complexity=6.0
-    # MDL = 4 × (1 + 0.1 × 6.0) = 4 × 1.6 = 6.4
-    expected = 4.0 * (1.0 + 0.1 * 6.0)
+    traj_test = [
+        (prover_mock.kb.rules[0], None),
+        (prover_mock.kb.rules[1], object()),
+    ]
+    mdl = emc_t9._proof_mdl(prover_mock, traj_test, action_count=2)
+    expected = prover_mock.kb.rules[0].complexity() + \
+               prover_mock.kb.rules[1].complexity() + 0.5 + 0.2
     assert abs(mdl - expected) < 1e-6, f"FAIL: MDL={mdl} ≠ {expected}"
     print(f"  MDL(traj={traj_test}): {mdl:.4f} (expected {expected:.4f})  [PASS]")
 
-    # Порожній KB → MDL = лише глибина
+    # Порожній trace → MDL = лише слабкий action-count term
     prover_empty = MockProver(n_rules=0)
-    mdl_empty = emc_t9._proof_mdl(prover_empty, [1, 2])
-    assert mdl_empty == 2.0, f"FAIL: empty KB MDL={mdl_empty} ≠ 2.0"
-    print(f"  MDL(empty KB, depth=2): {mdl_empty:.1f}  [PASS]")
+    mdl_empty = emc_t9._proof_mdl(prover_empty, [], action_count=2)
+    assert mdl_empty == 2.0, f"FAIL: empty trace MDL={mdl_empty} ≠ 2.0"
+    print(f"  MDL(empty trace, actions=2): {mdl_empty:.1f}  [PASS]")
 
-    # Переконуємось що action_id > n_rules більше не спричиняє IndexError
-    traj_large = [10, 20, 30]   # action IDs що раніше спричиняли некоректний доступ
-    try:
-        mdl_large = emc_t9._proof_mdl(prover_mock, traj_large)
-        print(f"  MDL(large action IDs): {mdl_large:.4f}  (no IndexError)  [PASS]")
-    except IndexError as e:
-        print(f"  FAIL: IndexError з великими action IDs: {e}")
-        raise
+    mdl_large = emc_t9._proof_mdl(prover_mock, [(prover_mock.kb.rules[0], None)], action_count=30)
+    assert mdl_large > 0.0
+    print(f"  MDL(with large action count): {mdl_large:.4f}  [PASS]")
 
     print(f"\n{'─'*60}")
     print("  ✅  Всі 9 EMC тестів пройдено (включно з Bug fixes)")
