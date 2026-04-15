@@ -25,14 +25,41 @@ from __future__ import annotations
 import enum
 import math
 import random
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, FrozenSet, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
+
+from omen_symbolic.abduction_search import (
+    bridge_variable_count as structural_bridge_variable_count,
+    rank_goal_directed_bodies,
+    rule_template_signature,
+)
+from omen_symbolic.controller import empty_induction_stats, run_latent_reasoning_controller
+from omen_symbolic.execution_trace import (
+    build_symbolic_trace_bundle,
+    SymbolicExecutionTraceBundle,
+    TRACE_ASSIGN_EVENT_PRED,
+    TRACE_BINOP_EVENT_PRED,
+    TRACE_COMPARE_EVENT_PRED,
+    TRACE_COUNTEREXAMPLE_PRED,
+    TRACE_ERROR_EVENT_PRED,
+    TRACE_PARAM_BIND_PRED,
+    TRACE_PRIMARY_PRED,
+    TRACE_RETURN_EVENT_PRED,
+    TRACE_SCOPE_PRED,
+    TRACE_STATE_TYPE_PRED,
+    TRACE_STATE_VALUE_PRED,
+)
+from omen_symbolic.executor import run_symbolic_executor
+from omen_symbolic.universal_bits import (
+    universal_int_bits,
+    universal_float_bits,
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -104,6 +131,29 @@ def _term_depth(t: Term) -> int:
 def _is_ground(t: Term) -> bool:
     """True, якщо терм не містить жодної змінної."""
     return not t.vars()
+
+
+def _term_code_symbols(t: Term) -> Tuple[str, ...]:
+    if isinstance(t, Const):
+        return (f"CONST:{int(t.val)}",)
+    if isinstance(t, Var):
+        return ("VAR",)
+    if isinstance(t, Compound):
+        symbols: List[str] = [f"FUNC:{t.func}/{len(t.subterms)}"]
+        for subterm in t.subterms:
+            symbols.extend(_term_code_symbols(subterm))
+        return tuple(symbols)
+    return ("TERM",)
+
+
+def _build_rule_codebook(rules: List["HornClause"]) -> Tuple[Counter, int, int]:
+    counts: Counter = Counter()
+    total = 0
+    for rule in rules:
+        symbols = rule.code_symbols()
+        counts.update(symbols)
+        total += len(symbols)
+    return counts, total, len(counts)
 
 def _to_term(x, pos: int = 0) -> Term:
     """
@@ -297,6 +347,68 @@ class HornClause:
         )
         return base + term_d
 
+    def code_symbols(self) -> Tuple[str, ...]:
+        symbols: List[str] = ["RULE_START", f"BODY_LEN:{len(self.body)}"]
+        for atom_idx, atom in enumerate((self.head,) + tuple(self.body)):
+            role = "HEAD" if atom_idx == 0 else "BODY"
+            symbols.append(f"{role}_PRED:{int(atom.pred)}/{atom.arity()}")
+            for arg in atom.args:
+                symbols.extend(_term_code_symbols(arg))
+            if atom_idx > 0:
+                symbols.append("BODY_SEP")
+        symbols.append("RULE_END")
+        return tuple(symbols)
+
+    def description_length_bits(
+        self,
+        codebook: Optional[Tuple[Counter, int, int]] = None,
+        pseudo_count: float = 0.5,
+        include_runtime_state: bool = False,
+    ) -> float:
+        """
+        Fixed-rule code length in bits under a universal grammar.
+
+        The estimate is intentionally independent from the current KB content:
+        rule cost should not shrink just because similar rules are already
+        present in the model. This makes the symbolic MDL term comparable
+        across batches and across alternative hypotheses.
+        """
+        del codebook, pseudo_count
+        var_ids: Dict[str, int] = {}
+
+        def term_bits(term: Term) -> float:
+            if isinstance(term, Const):
+                return 2.0 + universal_int_bits(int(term.val))
+            if isinstance(term, Var):
+                if term.name not in var_ids:
+                    var_ids[term.name] = len(var_ids)
+                return 2.0 + universal_int_bits(var_ids[term.name])
+            if isinstance(term, Compound):
+                total = 3.0
+                total += universal_int_bits(int(term.func))
+                total += universal_int_bits(len(term.subterms))
+                for subterm in term.subterms:
+                    total += term_bits(subterm)
+                return total
+            return 1.0
+
+        def atom_bits(atom: HornAtom) -> float:
+            total = 1.0
+            total += universal_int_bits(int(atom.pred))
+            total += universal_int_bits(atom.arity())
+            for arg in atom.args:
+                total += term_bits(arg)
+            return total
+
+        total_bits = universal_int_bits(len(self.body))
+        total_bits += atom_bits(self.head)
+        for atom in self.body:
+            total_bits += atom_bits(atom)
+        if include_runtime_state:
+            total_bits += universal_float_bits(self.weight, sigma=1.0)
+            total_bits += universal_int_bits(max(self.use_count, 0))
+        return float(total_bits)
+
     def all_vars(self) -> FrozenSet[str]:
         result: FrozenSet[str] = frozenset()
         for a in (self.head,) + tuple(self.body):
@@ -315,6 +427,15 @@ class HornClause:
         return f"{self.head} :- {', '.join(repr(a) for a in self.body)}"
 
 
+@dataclass
+class RelaxedHornClauseSpec:
+    clause: HornClause
+    head_pred_probs: torch.Tensor
+    body_pred_probs: Tuple[torch.Tensor, ...]
+    log_prob: Optional[torch.Tensor] = None
+    source: str = "neural"
+
+
 SEQ_EDGE_PRED = 470
 SEQ_LAST_TOKEN_PRED = 471
 SEQ_PREDICT_NEXT_PRED = 472
@@ -322,6 +443,9 @@ SEQ_ACTUAL_NEXT_PRED = 473
 SEQ_AST_SUPPORT_PRED = 474
 SEQ_SALIENCY_SUPPORT_PRED = 475
 SEQ_GAP_DIM_PRED = 476
+SEQ_DECODER_GUESS_PRED = 477
+SEQ_DECODER_MISS_PRED = 478
+SEQ_DECODER_SURPRISE_PRED = 479
 
 
 @dataclass
@@ -329,10 +453,11 @@ class SymbolicTaskContext:
     observed_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
     goal: Optional[HornAtom] = None
     target_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
+    execution_trace: Optional[SymbolicExecutionTraceBundle] = None
     provenance: str = "heuristic"
     trigger_abduction: bool = False
     hot_dims: Tuple[int, ...] = field(default_factory=tuple)
-    metadata: Dict[str, float] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 def _const_int_term(term: Term) -> Optional[int]:
@@ -563,7 +688,7 @@ class RuleRecord:
     Запис правила з епістемічними метаданими.
 
     Utility(R) = use_count / (1 + age_steps) — динамічна корисність.
-    Complexity(R) = rule.complexity()         — MDL статична складність.
+    Complexity(R) = rule.description_length_bits() — fixed symbolic code length.
 
     L_rule = Complexity(R) − η·Utility(R)   (формула розд. 3)
     """
@@ -588,7 +713,7 @@ class RuleRecord:
         Внесок правила в L_rule = Complexity(R) − η·Utility(R).
         Від'ємний лише якщо правило дуже корисне.
         """
-        return float(self.rule.complexity()) - eta * self.utility()
+        return float(self.rule.description_length_bits()) - eta * self.utility()
 
 
 class VerificationModule(nn.Module):
@@ -797,6 +922,20 @@ class KnowledgeBase:
         if h in self._records:
             self._records[h].status = EpistemicStatus.contradicted
 
+    def rule_status(self, clause: HornClause) -> EpistemicStatus:
+        rec = self._records.get(hash(clause))
+        if rec is None:
+            return EpistemicStatus.verified
+        return rec.status
+
+    def rule_is_usable(self, clause: HornClause, only_verified: bool = False) -> bool:
+        status = self.rule_status(clause)
+        if status == EpistemicStatus.contradicted:
+            return False
+        if only_verified and status != EpistemicStatus.verified:
+            return False
+        return True
+
     def consolidate(self, use_count_threshold: int = 2) -> int:
         """
         Rule Consolidation: видаляємо слабкі правила.
@@ -835,7 +974,8 @@ class KnowledgeBase:
 
     # ── Forward Chaining ───────────────────────────────────────────────────────
     def forward_chain(self, max_depth: int = 5,
-                      starting_facts: "Optional[FrozenSet]" = None) -> "FrozenSet[HornAtom]":
+                      starting_facts: "Optional[FrozenSet]" = None,
+                      only_verified: bool = False) -> "FrozenSet[HornAtom]":
         """
         Застосовує правила до fixpoint або max_depth ітерацій.
         Повертає всі виведені + існуючі факти.
@@ -848,6 +988,8 @@ class KnowledgeBase:
         for _ in range(max_depth):
             new_facts: Set[HornAtom] = set()
             for clause in self.rules:
+                if not self.rule_is_usable(clause, only_verified=only_verified):
+                    continue
                 if not clause.body:
                     continue
                 fresh = freshen_vars(clause)
@@ -871,8 +1013,8 @@ class KnowledgeBase:
 
     # ── MDL-складність (оновлена: враховує корисність) ─────────────────────────
     def complexity_penalty(self) -> float:
-        """Σ_R len(R) — довжина всіх правил у символах (базовий MDL)."""
-        return sum(r.complexity() for r in self.rules)
+        """Σ_R DL_bits(R) under a fixed universal grammar."""
+        return sum(r.description_length_bits() for r in self.rules)
 
     def utility_adjusted_penalty(self, eta: float = 0.1) -> float:
         """
@@ -885,12 +1027,12 @@ class KnowledgeBase:
         for r in self.rules:
             rec = self._records.get(hash(r))
             util = rec.utility() if rec is not None else 0.0
-            total += float(r.complexity()) - eta * util
+            total += float(r.description_length_bits()) - eta * util
         return total
 
     def weighted_complexity(self) -> float:
         """Σ_R use_count(R)·complexity(R)"""
-        return sum(r.use_count * r.complexity() for r in self.rules)
+        return sum(r.use_count * r.description_length_bits() for r in self.rules)
 
     def get_rule_pairs_for_semantic_feedback(
             self,
@@ -1020,6 +1162,7 @@ class TensorKnowledgeBase:
         self._term_to_id: Dict[Term, int] = {}
         self._id_to_term: Dict[int, Term] = {}
         self._next_term_id: int = 1
+        self._extra_facts: Set[HornAtom] = set()
 
     @staticmethod
     def _is_ground_term(term: Term) -> bool:
@@ -1072,8 +1215,8 @@ class TensorKnowledgeBase:
         Повертає None для multi-body (>1 literal) — вони обробляються Python-ом.
 
         Логіка кодування змінних:
-          · Збираємо унікальні Var-імена по порядку першої появи у body.
-          · Перша Var → VAR_0 (-1), Друга Var → VAR_1 (-2).
+          · Збираємо Var-імена за позицією їх першої появи у body.
+          · Перша по позиції body[0] Var → VAR_0 (-1), body[1] Var → VAR_1 (-2).
           · У head: якщо arg — та сама Var → VAR_0/VAR_1 (буде замінено фактом).
           · Якщо Var у head не з'являється у body → VAR_0 (безпечний default).
         """
@@ -1096,11 +1239,12 @@ class TensorKnowledgeBase:
             if not all(_tensor_term_ok(arg) for arg in atom.args):
                 return None
 
-        # Будуємо мапу ім'я Var → VAR_0/VAR_1 (за порядком появи у body)
+        # Будуємо мапу ім'я Var → VAR_0/VAR_1 за body-слотом першої появи.
+        # Це критично для правил на кшталт h(X,c) :- b(c,X), де X походить з body arg1.
         var_map: Dict[str, int] = {}
-        for a in body.args:
+        for pos, a in enumerate(body.args):
             if isinstance(a, Var) and a.name not in var_map:
-                slot = self.VAR_0 if len(var_map) == 0 else self.VAR_1
+                slot = self.VAR_0 if pos == 0 else self.VAR_1
                 var_map[a.name] = slot
 
         def _enc_head(a: object, pos: int) -> int:
@@ -1130,6 +1274,12 @@ class TensorKnowledgeBase:
 
     # ── add_fact ──────────────────────────────────────────────────────────────
     def add_fact(self, atom: HornAtom) -> bool:
+        if len(atom.args) > 2:
+            if atom in self._extra_facts:
+                return False
+            self._extra_facts.add(atom)
+            self._facts_cache = None
+            return True
         key = self._atom_to_key(atom)
         if key in self._fact_set:
             return False
@@ -1211,7 +1361,8 @@ class TensorKnowledgeBase:
 
     # ── forward_chain (GPU tensor) ────────────────────────────────────────────
     def forward_chain(self, max_depth: int = 4,
-                      starting_facts: Optional[FrozenSet] = None) -> FrozenSet[HornAtom]:
+                      starting_facts: Optional[FrozenSet] = None,
+                      only_verified: bool = False) -> FrozenSet[HornAtom]:
         """
         GPU-акселерований Forward Chaining.
 
@@ -1225,26 +1376,42 @@ class TensorKnowledgeBase:
         Складність: O(depth × N × R) — матричні операції на GPU.
         vs оригінал: O(depth × R × N) Python loops (~1000x повільніше).
         """
-        if self._n_facts == 0:
+        if self._n_facts == 0 and not self._extra_facts and not starting_facts:
             return frozenset()
 
         # Якщо передано starting_facts — конвертуємо у тензор
+        extra_facts: Set[HornAtom] = set(self._extra_facts)
         if starting_facts is not None:
-            keys = [self._atom_to_key(a) for a in starting_facts]
+            tensor_start = [a for a in starting_facts if len(a.args) <= 2]
+            extra_facts = {a for a in starting_facts if len(a.args) > 2}
+            keys = [self._atom_to_key(a) for a in tensor_start]
             if not keys:
-                return frozenset()
-            facts = torch.tensor(keys, dtype=torch.long, device=self._dev)
-            fact_set: Set[Tuple[int, int, int]] = set(keys)
+                facts = torch.zeros((0, 3), dtype=torch.long, device=self._dev)
+                fact_set = set()
+            else:
+                facts = torch.tensor(keys, dtype=torch.long, device=self._dev)
+                fact_set = set(keys)
         else:
             facts = self._fact_buf[:self._n_facts].clone()
             fact_set = set(self._fact_set)
 
         N = facts.shape[0]
+        allowed_indices = [
+            i for i, rule in enumerate(self.rules[:self._n_rules])
+            if self.rule_is_usable(rule, only_verified=only_verified)
+        ]
+        allowed_index_set = set(allowed_indices)
+        if allowed_indices:
+            allowed_idx_t = torch.tensor(allowed_indices, dtype=torch.long, device=self._dev)
+            allowed_mask = torch.zeros(self._n_rules, dtype=torch.bool, device=self._dev)
+            allowed_mask[allowed_idx_t] = True
+        else:
+            allowed_mask = torch.zeros(self._n_rules, dtype=torch.bool, device=self._dev)
 
         # Tensor-ready rules
-        n_tensor_rules = self._rule_is_tensor[:self._n_rules].sum().item()
+        n_tensor_rules = (self._rule_is_tensor[:self._n_rules] & allowed_mask).sum().item()
         if n_tensor_rules > 0:
-            tensor_mask = self._rule_is_tensor[:self._n_rules]
+            tensor_mask = self._rule_is_tensor[:self._n_rules] & allowed_mask
             tensor_rule_indices = tensor_mask.nonzero(as_tuple=True)[0]
             rules = self._rule_buf[:self._n_rules][tensor_mask]  # (R_t, 6)
             R = rules.shape[0]
@@ -1255,17 +1422,17 @@ class TensorKnowledgeBase:
             #   3) Python fallback — everything else
             fast_multi_rules = [
                 r for i, r in enumerate(self.rules)
-                if i < self._n_rules and len(r.body) > 1 and self._can_fast_rule(r)
+                if i < self._n_rules and i in allowed_index_set and len(r.body) > 1 and self._can_fast_rule(r)
             ]
             structured_multi_rules = [
                 r for i, r in enumerate(self.rules)
-                if i < self._n_rules and len(r.body) > 1
+                if i < self._n_rules and i in allowed_index_set and len(r.body) > 1
                 and not self._can_fast_rule(r)
                 and self._can_structured_fast_rule(r)
             ]
             multi_body_rules = [
                 r for i, r in enumerate(self.rules)
-                if i < self._n_rules and len(r.body) > 1
+                if i < self._n_rules and i in allowed_index_set and len(r.body) > 1
                 and not self._can_fast_rule(r)
                 and not self._can_structured_fast_rule(r)
             ]
@@ -1273,15 +1440,33 @@ class TensorKnowledgeBase:
             tensor_rule_indices = torch.zeros(0, dtype=torch.long, device=self._dev)
             rules = torch.zeros(0, 6, dtype=torch.long, device=self._dev)
             R = 0
-            fast_multi_rules = [r for r in self.rules if len(r.body) > 1 and self._can_fast_rule(r)]
+            fast_multi_rules = [
+                r for i, r in enumerate(self.rules[:self._n_rules])
+                if i in allowed_index_set and len(r.body) > 1 and self._can_fast_rule(r)
+            ]
             structured_multi_rules = [
-                r for r in self.rules
-                if len(r.body) > 1 and not self._can_fast_rule(r) and self._can_structured_fast_rule(r)
+                r for i, r in enumerate(self.rules[:self._n_rules])
+                if i in allowed_index_set and len(r.body) > 1 and not self._can_fast_rule(r)
+                and self._can_structured_fast_rule(r)
             ]
             multi_body_rules = [
-                r for r in self.rules
-                if len(r.body) > 1 and not self._can_fast_rule(r) and not self._can_structured_fast_rule(r)
+                r for i, r in enumerate(self.rules[:self._n_rules])
+                if i in allowed_index_set and len(r.body) > 1 and not self._can_fast_rule(r)
+                and not self._can_structured_fast_rule(r)
             ]
+
+        handled_rule_ids: Set[int] = set()
+        if n_tensor_rules > 0:
+            handled_rule_ids.update(
+                hash(self.rules[int(rule_idx.item())]) for rule_idx in tensor_rule_indices
+            )
+        handled_rule_ids.update(hash(rule) for rule in fast_multi_rules)
+        handled_rule_ids.update(hash(rule) for rule in structured_multi_rules)
+        handled_rule_ids.update(hash(rule) for rule in multi_body_rules)
+        python_fallback_rules = [
+            rule for rule in self.rules[:self._n_rules]
+            if hash(rule) not in handled_rule_ids and self.rule_is_usable(rule, only_verified=only_verified)
+        ]
 
         for _depth in range(max_depth):
             n_new_total = 0
@@ -1468,24 +1653,57 @@ class TensorKnowledgeBase:
                         clause.weight *= 1.01
                         self.mark_rule_verified(clause)
 
-            if multi_body_rules:
+            if python_fallback_rules:
                 current_frozenset = frozenset(
                     HornAtom(pred=int(row[0]),
                              args=self._ints_to_args(int(row[1]), int(row[2])))
                     for row in facts.tolist()
                     if row[0] >= 0
-                )
-                for clause in multi_body_rules:
-                    if not clause.body:
-                        continue
+                ) | frozenset(extra_facts)
+                for clause in python_fallback_rules:
                     fresh = freshen_vars(clause)
+                    if not fresh.body:
+                        if not fresh.head.is_ground():
+                            continue
+                        if any(_atoms_conflict(fresh.head, known) for known in current_frozenset):
+                            self.mark_rule_contradicted(clause)
+                            continue
+                        if len(fresh.head.args) > 2:
+                            if fresh.head not in extra_facts:
+                                extra_facts.add(fresh.head)
+                                current_frozenset = current_frozenset | {fresh.head}
+                                n_new_total += 1
+                                clause.use_count += 1
+                                clause.weight *= 1.01
+                                self.mark_rule_verified(clause)
+                            continue
+                        dk = self._atom_to_key(fresh.head)
+                        if dk not in fact_set and dk[0] >= 0:
+                            fact_set.add(dk)
+                            new_row = torch.tensor([dk], dtype=torch.long, device=self._dev)
+                            facts = torch.cat([facts, new_row], dim=0)
+                            N += 1
+                            n_new_total += 1
+                            clause.use_count += 1
+                            clause.weight *= 1.01
+                            self.mark_rule_verified(clause)
+                        continue
                     for sigma in find_all_substitutions(fresh.body, current_frozenset):
                         derived = sigma.apply_atom(fresh.head)
                         if derived.is_ground():
-                            dk = self._atom_to_key(derived)
                             if any(_atoms_conflict(derived, known) for known in current_frozenset):
                                 self.mark_rule_contradicted(clause)
                                 continue
+                            if len(derived.args) > 2:
+                                if derived not in extra_facts:
+                                    extra_facts.add(derived)
+                                    current_frozenset = current_frozenset | {derived}
+                                    n_new_total += 1
+                                    clause.use_count += 1
+                                    clause.weight *= 1.01
+                                    self.mark_rule_verified(clause)
+                                continue
+                            dk = self._atom_to_key(derived)
                             if dk not in fact_set and dk[0] >= 0:
                                 fact_set.add(dk)
                                 new_row = torch.tensor([dk], dtype=torch.long,
@@ -1501,12 +1719,13 @@ class TensorKnowledgeBase:
                 break  # fixpoint досягнуто
 
         # Конвертуємо тензор назад у frozenset[HornAtom]
-        return frozenset(
+        tensor_facts = frozenset(
             HornAtom(pred=int(row[0]),
                      args=self._ints_to_args(int(row[1]), int(row[2])))
             for row in facts.tolist()
             if row[0] >= 0
         )
+        return tensor_facts | frozenset(extra_facts)
 
     def _ints_to_args(self, a0: int, a1: int) -> Tuple:
         """(a0, a1) int → Tuple[Term] для HornAtom."""
@@ -1835,6 +2054,7 @@ class TensorKnowledgeBase:
             p, a0, a1 = row
             if p >= 0:
                 result.add(HornAtom(pred=p, args=self._ints_to_args(a0, a1)))
+        result.update(self._extra_facts)
         self._facts_cache = frozenset(result)
         self._facts_cache_n = self._n_facts
         return self._facts_cache
@@ -1870,6 +2090,20 @@ class TensorKnowledgeBase:
                 self._n_proposed -= 1
             elif old_status == EpistemicStatus.verified:
                 self._n_verified -= 1
+
+    def rule_status(self, clause: HornClause) -> EpistemicStatus:
+        rec = self._records.get(hash(clause))
+        if rec is None:
+            return EpistemicStatus.verified
+        return rec.status
+
+    def rule_is_usable(self, clause: HornClause, only_verified: bool = False) -> bool:
+        status = self.rule_status(clause)
+        if status == EpistemicStatus.contradicted:
+            return False
+        if only_verified and status != EpistemicStatus.verified:
+            return False
+        return True
 
     def consolidate(self, use_count_threshold: int = 2) -> int:
         """Видаляємо слабкі / contradicted правила."""
@@ -1936,18 +2170,18 @@ class TensorKnowledgeBase:
 
     # ── MDL / utility (ідентично KnowledgeBase) ───────────────────────────────
     def complexity_penalty(self) -> float:
-        return sum(r.complexity() for r in self.rules)
+        return sum(r.description_length_bits() for r in self.rules)
 
     def utility_adjusted_penalty(self, eta: float = 0.1) -> float:
         total = 0.0
         for r in self.rules:
             rec = self._records.get(hash(r))
             util = rec.utility() if rec is not None else 0.0
-            total += float(r.complexity()) - eta * util
+            total += float(r.description_length_bits()) - eta * util
         return total
 
     def weighted_complexity(self) -> float:
-        return sum(r.use_count * r.complexity() for r in self.rules)
+        return sum(r.use_count * r.description_length_bits() for r in self.rules)
 
     def get_rule_pairs_for_semantic_feedback(
             self, max_pairs: int = 32
@@ -2093,7 +2327,7 @@ class TensorKnowledgeBase:
         return len(self.rules)
 
     def n_facts(self) -> int:
-        return self._n_facts
+        return self._n_facts + len(self._extra_facts)
 
     def to(self, device: torch.device) -> "TensorKnowledgeBase":
         """Переносимо тензорні буфери на новий device."""
@@ -2376,7 +2610,11 @@ class GraphMatchingUnifier(nn.Module):
         device: torch.device,
         tau: float = 0.5,
         hard: bool = False,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]:
+        return_attention: bool = False,
+    ) -> Union[
+        Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor],
+        Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor, Dict[str, torch.Tensor]],
+    ]:
         """
         Диференційована уніфікація тіла правила з фактами.
 
@@ -2459,6 +2697,7 @@ class GraphMatchingUnifier(nn.Module):
         # ── Phase 3: Gumbel-Softmax assignments ───────────────────────────────
         # σ_soft(?Y) = Σ_c Gumbel(score(?Y,c))·V(c)  — диференційована підст.
         var_assign: Dict[str, torch.Tensor] = {}
+        var_attn: Dict[str, torch.Tensor] = {}
         total_entropy  = torch.tensor(0.0, device=device)
         total_energy   = torch.tensor(0.0, device=device)
 
@@ -2468,6 +2707,7 @@ class GraphMatchingUnifier(nn.Module):
             soft_w  = F.gumbel_softmax(scores, tau=tau, hard=hard)  # (|F|,)
             soft_v  = soft_w @ V                               # (d,) soft assignment
             var_assign[name] = soft_v
+            var_attn[name] = soft_w
 
             probs   = F.softmax(scores, dim=0)
             ent     = -(probs * (probs + 1e-9).log()).sum()
@@ -2499,7 +2739,10 @@ class GraphMatchingUnifier(nn.Module):
                 total_energy = total_energy + energy_j
 
         n_vars = max(len(var_names), 1)
-        return total_energy, var_assign, total_entropy / n_vars
+        mean_entropy = total_entropy / n_vars
+        if return_attention:
+            return total_energy, var_assign, mean_entropy, var_attn
+        return total_energy, var_assign, mean_entropy
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2553,10 +2796,13 @@ class ProofCostEstimator(nn.Module):
                       sigma: Optional['Substitution']) -> float:
         """
         Суто символьна вартість (без градієнту):
-          sym_cost = complexity(R) + λ·unif_complexity(σ)
+          sym_cost = bits(R) + λ·bits(σ)
         """
-        rule_len  = float(clause.complexity())
-        unif_cost = float(sigma.unif_complexity()) if sigma is not None else 0.0
+        rule_len = float(clause.description_length_bits())
+        unif_cost = (
+            universal_int_bits(int(sigma.unif_complexity()))
+            if sigma is not None else 0.0
+        )
         return rule_len + self.lam * unif_cost
 
     def forward(
@@ -2569,24 +2815,27 @@ class ProofCostEstimator(nn.Module):
         Returns    : scalar tensor Cost(T) = Σ [Length(R) + λ·UnifComplexity(σ)]
 
         Диференційована версія:
-          Cost = Σ_i [ 0.01·complexity(Ri) + nn_len(Ri) + λ·unif_c(σi) ]
+          Cost = Σ_i [ bits(Ri) + nn_len(Ri) + λ·bits(σi) ]
         """
         if not trajectory:
             return torch.tensor(0.0, device=device)
 
         total = torch.tensor(0.0, device=device)
         for rule, sigma in trajectory:
-            # MDL: Length(R) — символьна складність
-            sym_len = float(rule.complexity())
+            # Fixed symbolic code length in bits.
+            sym_len = float(rule.description_length_bits())
             # Нейронна оцінка (диференційована для backprop)
             r_emb   = self.clause_emb(rule, device)          # (d,)
             nn_len  = self.rule_enc(r_emb.unsqueeze(0)).squeeze()   # scalar ≥ 0
 
-            mdl_part = sym_len * 0.01 + nn_len
+            mdl_part = torch.tensor(sym_len, device=device, dtype=nn_len.dtype) + nn_len
 
-            # UnifComplexity(σ): Σ_{X∈dom(σ)} Depth(σ(X))
-            unif_c  = float(sigma.unif_complexity()) if sigma is not None else 0.0
-            total   = total + mdl_part + self.lam * unif_c
+            # Universal-code proxy for substitution complexity.
+            unif_bits = (
+                universal_int_bits(int(sigma.unif_complexity()))
+                if sigma is not None else 0.0
+            )
+            total = total + mdl_part + self.lam * float(unif_bits)
 
         return total
 
@@ -2664,7 +2913,83 @@ class NeuralAbductionHead(nn.Module):
         clauses, _ = self.sample_candidates(z)
         return clauses
 
-    def sample_candidates(self, z: torch.Tensor) -> Tuple[List[HornClause], torch.Tensor]:
+    def _variable_pattern(
+        self,
+        cand_i: int,
+    ) -> Tuple[Tuple[Var, ...], Tuple[Var, ...]]:
+        all_vars = [Var(f"X{i}") for i in range(self.max_arity + 1)]
+        mode = cand_i % 3
+        if mode == 0:
+            head_args = tuple(all_vars[:self.max_arity])
+            body_args = tuple(all_vars[:self.max_arity])
+        elif mode == 1:
+            xa, xb = all_vars[0], all_vars[1]
+            xc = all_vars[2] if self.max_arity >= 2 else all_vars[0]
+            head_args = (xa, xc)[:self.max_arity]
+            body_args = (xa, xb)[:self.max_arity]
+        else:
+            head_args = (all_vars[0],) * self.max_arity
+            body_args = (all_vars[0],) * self.max_arity
+        return tuple(head_args), tuple(body_args)
+
+    def sample_candidates_relaxed(
+        self,
+        z: torch.Tensor,
+        stochastic: bool = True,
+        tau: float = 0.7,
+    ) -> List[RelaxedHornClauseSpec]:
+        logits = self.rule_gen(z.squeeze(0)).view(self.slots, self.sv)
+        specs: List[RelaxedHornClauseSpec] = []
+        topk = min(self.n_cands, self.sv)
+        deterministic_choices: List[torch.Tensor] = []
+        if not stochastic:
+            for i in range(self.slots):
+                deterministic_choices.append(torch.topk(logits[i], k=topk, dim=-1).indices)
+
+        tau = max(float(tau), 1e-3)
+        body_pred_slot = 1 + self.max_arity
+        for cand_i in range(self.n_cands):
+            indices: List[int] = []
+            slot_probs: List[torch.Tensor] = []
+            lp_sum = torch.zeros(1, device=z.device).squeeze()
+            for i in range(self.slots):
+                slot_logits = logits[i]
+                if stochastic:
+                    noisy_logits = slot_logits + torch.randn_like(slot_logits) * 0.05
+                    probs = F.gumbel_softmax(noisy_logits, tau=tau, hard=False, dim=-1)
+                    idx = int(probs.argmax().item())
+                    log_soft = F.log_softmax(noisy_logits / tau, dim=-1)
+                else:
+                    chosen = deterministic_choices[i][cand_i % topk]
+                    idx = int(chosen.item())
+                    probs = F.softmax(slot_logits / tau, dim=-1)
+                    log_soft = F.log_softmax(slot_logits / tau, dim=-1)
+                indices.append(idx)
+                slot_probs.append(probs)
+                lp_sum = lp_sum + log_soft[idx]
+
+            head_args, body_args = self._variable_pattern(cand_i)
+            clause = HornClause(
+                head=HornAtom(pred=indices[0], args=head_args),
+                body=(HornAtom(pred=indices[body_pred_slot], args=body_args),),
+            )
+            specs.append(
+                RelaxedHornClauseSpec(
+                    clause=clause,
+                    head_pred_probs=slot_probs[0],
+                    body_pred_probs=(slot_probs[body_pred_slot],),
+                    log_prob=lp_sum,
+                    source="neural",
+                )
+            )
+        return specs
+
+    def sample_candidates(
+        self,
+        z: torch.Tensor,
+        stochastic: bool = True,
+        tau: float = 0.7,
+    ) -> Tuple[List[HornClause], torch.Tensor]:
         """
         z: (1, d_latent)
         Returns: список HornClause-кандидатів зі ЗМІННИМИ у args.
@@ -2681,51 +3006,13 @@ class NeuralAbductionHead(nn.Module):
         Gumbel-Softmax вибирає ПРЕДИКАТ (pred_id), а не аргументи,
         оскільки аргументи є змінними і обираються уніфікацією.
         """
-        logits = self.rule_gen(z.squeeze(0))               # (sv * n_slots,)
-        logits = logits.view(self.slots, self.sv)          # (slots, sv)
-
-        # Змінні: ?X0,...?X_{max_arity} — набір іменованих змінних
-        all_vars = [Var(f"X{i}") for i in range(self.max_arity + 1)]
-
-        clauses = []
-        log_probs: List[torch.Tensor] = []
-        for cand_i in range(self.n_cands):
-            indices: List[int] = []
-            lp_sum = torch.zeros(1, device=z.device).squeeze()
-            for i in range(self.slots):
-                noisy_logits = logits[i] + torch.randn_like(logits[i]) * 0.05
-                dist = Categorical(logits=noisy_logits / 0.7)
-                idx = dist.sample()
-                indices.append(int(idx.item()))
-                lp_sum = lp_sum + dist.log_prob(idx)
-            head_pred = indices[0]
-            body_pred = indices[1 + self.max_arity]
-
-            # Вибір паттерну змінних на основі кандидата
-            mode = cand_i % 3
-            if mode == 0:
-                # grandparent(?X,?Y) :- parent(?X,?Y) — спільні змінні
-                head_args = tuple(all_vars[:self.max_arity])
-                body_args = tuple(all_vars[:self.max_arity])
-            elif mode == 1:
-                # grandparent(?X,?Z) :- parent(?X,?Y) — ланцюговий зв'язок
-                # head: X, Z; body: X, Y
-                xa, xb = all_vars[0], all_vars[1]
-                xc     = all_vars[2] if self.max_arity >= 2 else all_vars[0]
-                head_args = (xa, xc)[:self.max_arity]
-                body_args = (xa, xb)[:self.max_arity]
-            else:
-                # mortal(?X) :- human(?X) — одна змінна
-                head_args = (all_vars[0],) * self.max_arity
-                body_args = (all_vars[0],) * self.max_arity
-
-            head      = HornAtom(pred=head_pred, args=head_args)
-            body_atom = HornAtom(pred=body_pred, args=body_args)
-
-            clause = HornClause(head=head, body=(body_atom,))
-            clauses.append(clause)
-            log_probs.append(lp_sum)
-
+        specs = self.sample_candidates_relaxed(
+            z,
+            stochastic=stochastic,
+            tau=tau,
+        )
+        clauses = [spec.clause for spec in specs]
+        log_probs = [spec.log_prob for spec in specs if spec.log_prob is not None]
         return clauses, torch.stack(log_probs) if log_probs else torch.zeros(0, device=z.device)
 
 
@@ -2797,19 +3084,498 @@ class DifferentiableProver(nn.Module):
 
         self._step = 0
         self.task_context: Optional[SymbolicTaskContext] = None
+        self._working_memory_facts: FrozenSet[HornAtom] = frozenset()
         self.last_goal: Optional[HornAtom] = None
         self.last_context_facts: FrozenSet[HornAtom] = frozenset()
         self.last_all_facts: FrozenSet[HornAtom] = frozenset()
         self.last_forward_info: Dict[str, Union[int, float, str]] = {}
+        self.last_abduced_rules: List[HornClause] = []
+        self.last_used_rules: List[HornClause] = []
+        self._last_used_rule_hashes: Set[int] = set()
+        self._rule_utility_history: Dict[int, List[float]] = defaultdict(list)
         # fc_cache видалено: TensorKnowledgeBase.forward_chain виконується
         # за ~0.1–0.5 ms/батч через GPU broadcast — кешування не потрібне.
+
+        # ── WorldRNN-інтеграція (Fix: Дедукція + Абдукція) ────────────────────
+        # WorldRNN ін'єктується з omen_scale після ініціалізації через set_world_rnn().
+        # Використовується в:
+        #   · _mental_simulate_rule()  → latent-space Prediction Error (Дедукція)
+        #   · _pred_error_for_rule()   → WorldRNN component у MDL PredError (Абдукція)
+        self._world_rnn: Optional[Any] = None          # WorldRNN | None
+        self._last_z: Optional[torch.Tensor] = None    # (B, d) — знімок з останнього forward()
+        self._world_rnn_vocab: int = 0                 # кешована vocab_size для clamp
+        self.hypothesis_token_head: Optional[nn.Module] = None
+        self.continuous_cycle_enabled: bool = True
+        self.continuous_cycle_max_contextual: int = 4
+        self.continuous_cycle_max_neural: int = 4
+        self.continuous_cycle_accept_threshold: float = 0.55
+        self.continuous_cycle_verify_threshold: float = 0.75
+        self.continuous_cycle_contradict_threshold: float = 0.15
+        self.continuous_cycle_symbolic_weight: float = 0.45
+        self.continuous_cycle_world_weight: float = 0.25
+        self.continuous_cycle_token_weight: float = 0.30
+        self.continuous_cycle_trace_weight: float = 0.20
+        self.continuous_cycle_counterexample_weight: float = 0.15
+        self.continuous_cycle_soft_symbolic_weight: float = 0.45
+        self.continuous_cycle_policy_weight: float = 0.25
+        self.continuous_cycle_policy_baseline_momentum: float = 0.90
+        self.continuous_cycle_candidate_tau: float = 0.70
+        self.continuous_cycle_repair_enabled: bool = True
+        self.continuous_cycle_repair_threshold: float = 0.35
+        self.continuous_cycle_max_repairs: int = 2
+        self.continuous_cycle_max_trace_candidates: int = 4
+        self._cycle_reward_baseline: float = 0.5
+        self.allow_latent_goal_fallback: bool = True
+        self.graph_reasoning_enabled: bool = True
+        self.graph_reasoning_top_k_facts: int = 12
+        self.graph_reasoning_max_fact_subset: int = 96
+        self.graph_reasoning_attention_threshold: float = 0.02
+        self.graph_reasoning_tau: float = 0.5
+        self.graph_reasoning_full_scan_cutoff: int = 64
+        self._graph_reasoning_stats: Dict[str, float] = {
+            "calls": 0.0,
+            "guided_calls": 0.0,
+            "fallbacks": 0.0,
+            "mean_subset": 0.0,
+            "mean_full_facts": 0.0,
+            "mean_solutions": 0.0,
+        }
 
     # ── Нейронний → символьний (perception) ──────────────────────────────────
     def set_task_context(self, context: Optional[SymbolicTaskContext]) -> None:
         self.task_context = context
+        self._working_memory_facts = frozenset()
+        self._reset_graph_reasoning_stats()
 
     def clear_task_context(self) -> None:
         self.task_context = None
+        self._working_memory_facts = frozenset()
+        self._reset_graph_reasoning_stats()
+
+    def set_allow_latent_goal_fallback(self, enabled: bool) -> None:
+        self.allow_latent_goal_fallback = bool(enabled)
+
+    def set_world_rnn(self, world_rnn: Any) -> None:
+        """
+        Ін'єктує WorldRNN у прувер для:
+          · ментальної симуляції правил (Дедукція, розділ 2 концепції)
+          · MDL PredError з latent-space відстанню (Абдукція, розділ 6)
+
+        Викликається з omen_scale.py після ініціалізації:
+          self.prover.set_world_rnn(self.world_rnn)
+        """
+        self._world_rnn = world_rnn
+        emb = getattr(world_rnn, "act_emb", None)
+        self._world_rnn_vocab = int(getattr(emb, "num_embeddings", 0))
+        if self._world_rnn_vocab > 0:
+            self.hypothesis_token_head = nn.Sequential(
+                nn.Linear(self.d * 2, self.d),
+                nn.GELU(),
+                nn.Linear(self.d, self._world_rnn_vocab),
+            ).to(next(self.parameters()).device)
+        else:
+            self.hypothesis_token_head = None
+
+    def configure_hypothesis_cycle(
+        self,
+        *,
+        enabled: bool = True,
+        max_contextual: int = 4,
+        max_neural: int = 4,
+        accept_threshold: float = 0.55,
+        verify_threshold: float = 0.75,
+        contradict_threshold: float = 0.15,
+        symbolic_weight: float = 0.45,
+        world_weight: float = 0.25,
+        token_weight: float = 0.30,
+        trace_weight: float = 0.20,
+        counterexample_weight: float = 0.15,
+        soft_symbolic_weight: float = 0.45,
+        policy_weight: float = 0.25,
+        policy_baseline_momentum: float = 0.90,
+        candidate_tau: float = 0.70,
+        repair_enabled: bool = True,
+        repair_threshold: float = 0.35,
+        max_repairs: int = 2,
+        max_trace_candidates: int = 4,
+    ) -> None:
+        self.continuous_cycle_enabled = bool(enabled)
+        self.continuous_cycle_max_contextual = max(int(max_contextual), 0)
+        self.continuous_cycle_max_neural = max(int(max_neural), 0)
+        self.continuous_cycle_accept_threshold = float(max(0.0, min(1.0, accept_threshold)))
+        self.continuous_cycle_verify_threshold = float(max(0.0, min(1.0, verify_threshold)))
+        self.continuous_cycle_contradict_threshold = float(max(0.0, min(1.0, contradict_threshold)))
+        total_weight = max(
+            float(symbolic_weight) + float(world_weight) + float(token_weight),
+            1e-6,
+        )
+        self.continuous_cycle_symbolic_weight = float(symbolic_weight) / total_weight
+        self.continuous_cycle_world_weight = float(world_weight) / total_weight
+        self.continuous_cycle_token_weight = float(token_weight) / total_weight
+        self.continuous_cycle_trace_weight = float(max(trace_weight, 0.0))
+        self.continuous_cycle_counterexample_weight = float(max(counterexample_weight, 0.0))
+        self.continuous_cycle_soft_symbolic_weight = float(max(0.0, min(1.0, soft_symbolic_weight)))
+        self.continuous_cycle_policy_weight = float(max(policy_weight, 0.0))
+        self.continuous_cycle_policy_baseline_momentum = float(
+            max(0.0, min(0.999, policy_baseline_momentum))
+        )
+        self.continuous_cycle_candidate_tau = float(max(candidate_tau, 1e-3))
+        self.continuous_cycle_repair_enabled = bool(repair_enabled)
+        self.continuous_cycle_repair_threshold = float(max(0.0, min(1.0, repair_threshold)))
+        self.continuous_cycle_max_repairs = max(int(max_repairs), 0)
+        self.continuous_cycle_max_trace_candidates = max(int(max_trace_candidates), 0)
+
+    def configure_graph_reasoning(
+        self,
+        *,
+        enabled: bool = True,
+        top_k_facts: int = 12,
+        max_fact_subset: int = 96,
+        attention_threshold: float = 0.02,
+        tau: float = 0.5,
+        full_scan_cutoff: int = 64,
+    ) -> None:
+        self.graph_reasoning_enabled = bool(enabled)
+        self.graph_reasoning_top_k_facts = max(int(top_k_facts), 1)
+        self.graph_reasoning_max_fact_subset = max(int(max_fact_subset), 8)
+        self.graph_reasoning_attention_threshold = float(max(attention_threshold, 0.0))
+        self.graph_reasoning_tau = float(max(tau, 1e-3))
+        self.graph_reasoning_full_scan_cutoff = max(int(full_scan_cutoff), 0)
+
+    def _reset_graph_reasoning_stats(self) -> None:
+        self._graph_reasoning_stats = {
+            "calls": 0.0,
+            "guided_calls": 0.0,
+            "fallbacks": 0.0,
+            "mean_subset": 0.0,
+            "mean_full_facts": 0.0,
+            "mean_solutions": 0.0,
+        }
+
+    def _record_graph_reasoning_call(
+        self,
+        n_full_facts: int,
+        n_subset_facts: int,
+        guided: bool,
+        fallback: bool,
+        n_solutions: int,
+    ) -> None:
+        stats = self._graph_reasoning_stats
+        calls = stats["calls"] + 1.0
+        stats["calls"] = calls
+        if guided:
+            stats["guided_calls"] += 1.0
+        if fallback:
+            stats["fallbacks"] += 1.0
+        stats["mean_full_facts"] += (float(n_full_facts) - stats["mean_full_facts"]) / calls
+        stats["mean_subset"] += (float(n_subset_facts) - stats["mean_subset"]) / calls
+        stats["mean_solutions"] += (float(n_solutions) - stats["mean_solutions"]) / calls
+
+    def _reasoning_device(
+        self,
+        reference: Optional[torch.Tensor] = None,
+    ) -> torch.device:
+        if reference is not None:
+            return reference.device
+        if self._last_z is not None:
+            return self._last_z.device
+        return next(self.parameters()).device
+
+    def _graph_guided_fact_subset(
+        self,
+        rule_body: Tuple[HornAtom, ...],
+        facts: FrozenSet[HornAtom],
+        device: Optional[torch.device] = None,
+    ) -> Tuple[FrozenSet[HornAtom], bool]:
+        if (
+            not self.graph_reasoning_enabled
+            or len(rule_body) < 2
+            or len(facts) <= self.graph_reasoning_full_scan_cutoff
+        ):
+            return facts, False
+
+        body_preds = {atom.pred for atom in rule_body}
+        facts_list = [fact for fact in facts if fact.pred in body_preds]
+        if not facts_list:
+            return facts, False
+
+        device = self._reasoning_device() if device is None else device
+        try:
+            with torch.no_grad():
+                _energy, _assign, _entropy, var_attn = self.graph_unif(
+                    rule_body,
+                    frozenset(facts_list),
+                    device,
+                    tau=self.graph_reasoning_tau,
+                    hard=False,
+                    return_attention=True,
+                )
+        except Exception:
+            return facts, False
+
+        selected_scores: Dict[int, float] = {}
+        for atom in rule_body:
+            atom_vars = [
+                term.name
+                for term in atom.args
+                if isinstance(term, Var) and not term.name.startswith("_")
+            ]
+            ranked: List[Tuple[float, int]] = []
+            for fact_idx, fact in enumerate(facts_list):
+                if unify(atom, fact) is None:
+                    continue
+                if atom_vars:
+                    var_scores = []
+                    for var_name in atom_vars:
+                        attn = var_attn.get(var_name)
+                        if attn is not None and fact_idx < int(attn.numel()):
+                            var_scores.append(float(attn[fact_idx].item()))
+                    score = sum(var_scores) / len(var_scores) if var_scores else 0.0
+                else:
+                    score = 1.0
+                ranked.append((score, fact_idx))
+            ranked.sort(key=lambda item: item[0], reverse=True)
+            kept = 0
+            for score, fact_idx in ranked:
+                if kept >= self.graph_reasoning_top_k_facts:
+                    break
+                if score < self.graph_reasoning_attention_threshold and kept > 0:
+                    continue
+                selected_scores[fact_idx] = max(selected_scores.get(fact_idx, 0.0), score)
+                kept += 1
+
+        for attn in var_attn.values():
+            if attn.numel() <= 0:
+                continue
+            top_k = min(self.graph_reasoning_top_k_facts, int(attn.numel()))
+            top_vals, top_idx = torch.topk(attn, k=top_k)
+            for score_t, idx_t in zip(top_vals.tolist(), top_idx.tolist()):
+                score = float(score_t)
+                if score < self.graph_reasoning_attention_threshold and len(selected_scores) >= top_k:
+                    continue
+                selected_scores[int(idx_t)] = max(selected_scores.get(int(idx_t), 0.0), score)
+
+        if not selected_scores:
+            return facts, False
+
+        ranked_indices = sorted(
+            selected_scores.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )[: self.graph_reasoning_max_fact_subset]
+        subset = frozenset(facts_list[idx] for idx, _ in ranked_indices)
+        if len(subset) < len(rule_body):
+            return facts, False
+        return subset, len(subset) < len(facts)
+
+    def _find_rule_substitutions(
+        self,
+        body: Tuple[HornAtom, ...],
+        facts: FrozenSet[HornAtom],
+        *,
+        max_solutions: int = 16,
+        device: Optional[torch.device] = None,
+    ) -> List[Substitution]:
+        if not body:
+            return []
+        device = self._reasoning_device() if device is None else device
+        fact_subset, guided = self._graph_guided_fact_subset(body, facts, device=device)
+        subset_size = len(fact_subset)
+        subs = find_all_substitutions(body, fact_subset, max_solutions=max_solutions)
+        fallback = False
+        if not subs and fact_subset != facts:
+            subs = find_all_substitutions(body, facts, max_solutions=max_solutions)
+            subset_size = len(facts)
+            fallback = True
+        self._record_graph_reasoning_call(
+            n_full_facts=len(facts),
+            n_subset_facts=subset_size,
+            guided=guided,
+            fallback=fallback,
+            n_solutions=len(subs),
+        )
+        return subs
+
+    def _guided_unify_body(
+        self,
+        body: Tuple[HornAtom, ...],
+        facts: FrozenSet[HornAtom],
+        device: Optional[torch.device] = None,
+    ) -> Optional[Substitution]:
+        solutions = self._find_rule_substitutions(
+            body,
+            facts,
+            max_solutions=1,
+            device=device,
+        )
+        return solutions[0] if solutions else None
+
+    def _executor_rule_is_usable(
+        self,
+        clause: HornClause,
+        *,
+        only_verified: bool = False,
+    ) -> bool:
+        status = self._rule_status(clause)
+        if status == EpistemicStatus.contradicted:
+            return False
+        if only_verified and status != EpistemicStatus.verified:
+            return False
+        if not only_verified and status == EpistemicStatus.proposed:
+            return False
+        return True
+
+    def forward_chain_reasoned(
+        self,
+        max_depth: Optional[int] = None,
+        starting_facts: Optional[FrozenSet[HornAtom]] = None,
+        only_verified: bool = False,
+        device: Optional[torch.device] = None,
+    ) -> FrozenSet[HornAtom]:
+        depth = self.max_depth if max_depth is None else max(int(max_depth), 0)
+        if depth <= 0:
+            return starting_facts if starting_facts is not None else self.current_working_facts()
+
+        current = starting_facts if starting_facts is not None else self.current_working_facts()
+        has_multi_body = any(
+            len(rule.body) > 1 and self._executor_rule_is_usable(rule, only_verified=only_verified)
+            for rule in self.kb.rules
+        )
+        if not self.graph_reasoning_enabled or not has_multi_body:
+            return self.kb.forward_chain(
+                depth,
+                starting_facts=current,
+                only_verified=only_verified,
+            )
+
+        device = self._reasoning_device() if device is None else device
+        for _ in range(depth):
+            added, _new_facts, _trace, current = self.forward_chain_step_local(
+                current,
+                only_verified=only_verified,
+                device=device,
+            )
+            if added <= 0:
+                break
+        return current
+
+    def _predicate_one_hot(
+        self,
+        pred: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        probs = torch.zeros(self.abductor.sv, device=device, dtype=dtype)
+        if probs.numel() == 0:
+            return probs
+        idx = max(0, min(int(pred), probs.numel() - 1))
+        probs[idx] = 1.0
+        return probs
+
+    def _relaxed_spec_for_clause(
+        self,
+        clause: HornClause,
+        device: torch.device,
+        dtype: torch.dtype,
+        *,
+        log_prob: Optional[torch.Tensor] = None,
+        source: str = "contextual",
+    ) -> RelaxedHornClauseSpec:
+        return RelaxedHornClauseSpec(
+            clause=clause,
+            head_pred_probs=self._predicate_one_hot(clause.head.pred, device, dtype),
+            body_pred_probs=tuple(
+                self._predicate_one_hot(atom.pred, device, dtype)
+                for atom in clause.body
+            ),
+            log_prob=log_prob,
+            source=source,
+        )
+
+    def _soft_predicate_embedding(
+        self,
+        pred_probs: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if pred_probs.numel() == 0:
+            return torch.zeros(self.d, device=device, dtype=next(self.parameters()).dtype)
+        weight = self.term_emb.const_emb.weight[:pred_probs.shape[-1]].to(
+            device=device,
+            dtype=pred_probs.dtype,
+        )
+        return pred_probs @ weight
+
+    def _soft_atom_embedding(
+        self,
+        atom: HornAtom,
+        pred_probs: torch.Tensor,
+        var_assign: Dict[str, torch.Tensor],
+        device: torch.device,
+    ) -> torch.Tensor:
+        pred_emb = self._soft_predicate_embedding(pred_probs, device)
+        if not atom.args:
+            return pred_emb
+        arg_embs: List[torch.Tensor] = []
+        for term in atom.args:
+            if isinstance(term, Var) and term.name in var_assign:
+                arg_embs.append(var_assign[term.name].to(device=device, dtype=pred_emb.dtype))
+            else:
+                arg_embs.append(self.term_emb.embed_term(term, device).to(dtype=pred_emb.dtype))
+        arg_mean = torch.stack(arg_embs).mean(0)
+        return 0.5 * (arg_mean + pred_emb)
+
+    def _smooth_embedding_match(
+        self,
+        query_vec: torch.Tensor,
+        anchors: torch.Tensor,
+        *,
+        tau: float = 0.1,
+        scale: float = 0.1,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if anchors.ndim == 1:
+            anchors = anchors.unsqueeze(0)
+        if anchors.numel() == 0:
+            zero = torch.zeros((), device=query_vec.device, dtype=query_vec.dtype)
+            return zero, zero
+        dists = (anchors - query_vec.unsqueeze(0)).pow(2).sum(-1)
+        tau = max(float(tau), 1e-3)
+        energy = -tau * torch.logsumexp(-dists / tau, dim=0)
+        score = torch.exp(-scale * energy).clamp(0.0, 1.0)
+        return score, energy
+
+    def _world_transition(
+        self,
+        z_state: torch.Tensor,
+        *,
+        action_token: Optional[int] = None,
+        action_probs: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self._world_rnn is None:
+            return z_state, None
+        if action_probs is not None and hasattr(self._world_rnn, "act_emb"):
+            try:
+                emb_layer = self._world_rnn.act_emb
+                weight = emb_layer.weight.to(device=z_state.device, dtype=z_state.dtype)
+                vocab = weight.size(0)
+                probs = action_probs.to(device=z_state.device, dtype=z_state.dtype)
+                if probs.numel() < vocab:
+                    probs = F.pad(probs, (0, vocab - probs.numel()))
+                elif probs.numel() > vocab:
+                    probs = probs[:vocab]
+                probs = probs / probs.sum().clamp_min(1e-6)
+                act = probs.unsqueeze(0) @ weight
+                if all(hasattr(self._world_rnn, attr) for attr in ("gru", "out", "h0")):
+                    h = self._world_rnn.h0.expand(z_state.size(0), -1)
+                    h2 = self._world_rnn.gru(torch.cat([z_state, act], dim=-1), h)
+                    return self._world_rnn.out(h2), h2
+                if hasattr(self._world_rnn, "proj"):
+                    return torch.tanh(self._world_rnn.proj(torch.cat([z_state, act], dim=-1))), None
+            except Exception:
+                pass
+        if action_token is None:
+            return z_state, None
+        action_t = torch.tensor([action_token], device=z_state.device, dtype=torch.long)
+        return self._world_rnn(z_state, action_t)
 
     def _task_observed_facts(self) -> FrozenSet[HornAtom]:
         if self.task_context is None:
@@ -2821,26 +3587,268 @@ class DifferentiableProver(nn.Module):
             return frozenset()
         return self.task_context.target_facts
 
-    def current_goal(self, z: torch.Tensor) -> HornAtom:
+    def _task_execution_trace(self) -> Optional[SymbolicExecutionTraceBundle]:
+        if self.task_context is None:
+            return None
+        return self.task_context.execution_trace
+
+    @staticmethod
+    def _trace_fact_priority(atom: HornAtom) -> int:
+        if atom.pred in (TRACE_RETURN_EVENT_PRED, TRACE_ERROR_EVENT_PRED):
+            return 5
+        if atom.pred in (TRACE_ASSIGN_EVENT_PRED, TRACE_BINOP_EVENT_PRED):
+            return 4
+        if atom.pred in (TRACE_COMPARE_EVENT_PRED, TRACE_PARAM_BIND_PRED):
+            return 3
+        if atom.pred in (TRACE_STATE_VALUE_PRED, TRACE_STATE_TYPE_PRED):
+            return 2
+        if atom.pred in (TRACE_SCOPE_PRED, TRACE_PRIMARY_PRED, TRACE_COUNTEREXAMPLE_PRED):
+            return 0
+        return 1
+
+    def _trace_focus_atoms(
+        self,
+        facts: FrozenSet[HornAtom],
+        max_atoms: int = 6,
+    ) -> List[HornAtom]:
+        if not facts:
+            return []
+        ranked = sorted(
+            list(facts),
+            key=lambda atom: (-self._trace_fact_priority(atom), atom.pred, len(atom.args)),
+        )
+        return ranked[:max_atoms]
+
+    def _trace_abduction_candidates(
+        self,
+        max_candidates: int = 8,
+        max_body_atoms: int = 3,
+    ) -> List[HornClause]:
+        bundle = self._task_execution_trace()
+        if bundle is None or not bundle.transitions:
+            return []
+
+        template_support: Counter = Counter()
+        best_by_template: Dict[Tuple, Tuple[float, float, HornClause]] = {}
+        for transition in bundle.transitions[: max(self.continuous_cycle_max_trace_candidates, 0) or len(bundle.transitions)]:
+            if not transition.before_facts and not transition.after_facts:
+                continue
+            after_targets = self._trace_focus_atoms(transition.after_facts, max_atoms=4)
+            local_best: Dict[Tuple, Tuple[float, float, HornClause]] = {}
+            for example_head in after_targets:
+                support_facts = list(
+                    self._trace_support_facts(
+                        transition.before_facts,
+                        transition.after_facts,
+                        head=example_head,
+                    )
+                )
+                if not support_facts:
+                    continue
+                ranked_bodies = rank_goal_directed_bodies(
+                    example_head,
+                    support_facts,
+                    term_const_values=_term_const_values,
+                    max_body_atoms=max_body_atoms,
+                )
+                for body_score, body in ranked_bodies:
+                    rule = self._generalize_example_rule(example_head, body)
+                    if rule is None:
+                        continue
+                    template_sig = rule_template_signature(rule.head, rule.body)
+                    base_score = self._contextual_template_score(
+                        rule,
+                        body_score=float(body_score),
+                        template_support=0,
+                    ) + 1.0
+                    current = local_best.get(template_sig)
+                    if current is None or base_score > current[0]:
+                        local_best[template_sig] = (base_score, float(body_score), rule)
+            for template_sig, (base_score, body_score, rule) in local_best.items():
+                template_support[template_sig] += 1
+                current = best_by_template.get(template_sig)
+                if current is None or base_score > current[0]:
+                    best_by_template[template_sig] = (base_score, body_score, rule)
+
+        ranked_rules: List[Tuple[float, float, HornClause]] = []
+        for template_sig, (_, body_score, rule) in best_by_template.items():
+            support = int(template_support.get(template_sig, 1))
+            score = self._contextual_template_score(
+                rule,
+                body_score=body_score,
+                template_support=support,
+            ) + 2.0 * float(support)
+            ranked_rules.append((score, float(rule.description_length_bits()), rule))
+        ranked_rules.sort(key=lambda item: (-item[0], item[1]))
+        return [rule for _, _, rule in ranked_rules[:max_candidates]]
+
+    def _trace_support_facts(
+        self,
+        before_facts: FrozenSet[HornAtom],
+        after_facts: FrozenSet[HornAtom],
+        head: Optional[HornAtom] = None,
+    ) -> FrozenSet[HornAtom]:
+        support = set(before_facts)
+        for fact in after_facts:
+            if head is not None and hash(fact) == hash(head):
+                continue
+            if self._trace_fact_priority(fact) >= 3:
+                support.add(fact)
+        return frozenset(support)
+
+    def _trace_transition_match_stats(
+        self,
+        clause: HornClause,
+        before_facts: FrozenSet[HornAtom],
+        after_facts: FrozenSet[HornAtom],
+        max_solutions: int = 12,
+    ) -> Tuple[float, float, bool]:
+        if not after_facts:
+            return 0.0, 0.0, False
+        support_facts = self._trace_support_facts(before_facts, after_facts, head=clause.head)
+        if not clause.body:
+            head_match = any(unify(clause.head, target) is not None for target in after_facts)
+            conflict = any(_atoms_conflict(clause.head, target) for target in after_facts)
+            return (1.0 if head_match else 0.0), (1.0 if head_match or conflict else 0.0), conflict
+
+        fresh = freshen_vars(clause)
+        subs = self._find_rule_substitutions(
+            fresh.body,
+            support_facts,
+            max_solutions=max_solutions,
+        )
+        if not subs:
+            return 0.0, 0.0, False
+
+        best_success = 0.0
+        support = 0.0
+        any_conflict = False
+        for sigma in subs:
+            support = 1.0
+            derived = sigma.apply_atom(fresh.head)
+            if not derived.is_ground():
+                continue
+            if any(unify(derived, target) is not None for target in after_facts):
+                best_success = 1.0
+                break
+            if any(_atoms_conflict(derived, target) for target in after_facts):
+                any_conflict = True
+        return best_success, support, any_conflict
+
+    def _trace_prediction_error_for_rule(
+        self,
+        clause: HornClause,
+        bundle: Optional[SymbolicExecutionTraceBundle],
+    ) -> float:
+        if bundle is None or not bundle.transitions:
+            return 1.0
+        matched = 0.0
+        total = 0.0
+        for transition in bundle.transitions[: max(self.continuous_cycle_max_trace_candidates, 1)]:
+            success, support, conflict = self._trace_transition_match_stats(
+                clause,
+                transition.before_facts,
+                transition.after_facts,
+            )
+            if support <= 0.0:
+                continue
+            total += 1.0
+            matched += max(0.0, success - (0.5 if conflict else 0.0))
+        if total <= 0.0:
+            return 1.0
+        return 1.0 - max(0.0, min(matched / total, 1.0))
+
+    def _counterexample_error_for_rule(
+        self,
+        clause: HornClause,
+        bundle: Optional[SymbolicExecutionTraceBundle],
+    ) -> float:
+        if bundle is None or not bundle.counterexamples:
+            return 0.0
+        failures = 0.0
+        triggered = 0.0
+        for transition in bundle.counterexamples[: self.continuous_cycle_max_repairs + 2]:
+            success, support, conflict = self._trace_transition_match_stats(
+                clause,
+                transition.before_facts,
+                transition.after_facts,
+            )
+            if support <= 0.0:
+                continue
+            triggered += 1.0
+            if success < 1.0 or conflict:
+                failures += 1.0
+        if triggered <= 0.0:
+            return 0.0
+        return failures / triggered
+
+    def _rule_record(self, clause: HornClause) -> Optional[RuleRecord]:
+        records = getattr(self.kb, "_records", None)
+        if records is None:
+            return None
+        return records.get(hash(clause))
+
+    def _rule_status(self, clause: HornClause) -> EpistemicStatus:
+        record = self._rule_record(clause)
+        if record is None:
+            return EpistemicStatus.verified
+        return record.status
+
+    def _rule_is_usable(
+        self,
+        clause: HornClause,
+        include_proposed: bool = False,
+    ) -> bool:
+        status = self._rule_status(clause)
+        if status == EpistemicStatus.contradicted:
+            return False
+        if status == EpistemicStatus.proposed and not include_proposed:
+            return False
+        return True
+
+    def current_goal(self, z: Optional[torch.Tensor] = None) -> HornAtom:
         if self.task_context is not None and self.task_context.goal is not None:
             return self.task_context.goal
-        return self.perceive(z)
+        if self.last_goal is not None:
+            return self.last_goal
+        if self.allow_latent_goal_fallback and z is not None:
+            return self.perceive(z)
+        return HornAtom(SEQ_PREDICT_NEXT_PRED, (Const(0), Var("NEXT")))
 
     def current_working_facts(self) -> FrozenSet[HornAtom]:
-        observed = self._task_observed_facts()
-        if not observed:
-            return self.kb.facts
-        return frozenset(set(self.kb.facts) | set(observed))
+        working: Set[HornAtom] = set(self.kb.facts)
+        working.update(self._task_observed_facts())
+        working.update(self._working_memory_facts)
+        return frozenset(working)
 
     def materialize_task_context_facts(self, limit: int = 32) -> int:
         if self.task_context is None or not self.task_context.observed_facts:
             return 0
+        return self.load_observed_facts(self.task_context.observed_facts, limit=limit)
+
+    def load_observed_facts(self, facts, limit: int = 96) -> int:
+        """
+        Ідеальна реалізація п.2: явне завантаження спостережуваних фактів
+        безпосередньо у KB до forward() pass.
+
+        Відрізняється від materialize_task_context_facts():
+          · Приймає facts напряму (не через task_context)
+          · Ліміт за замовчуванням 96 (більший, для символьного контексту)
+          · Може приймати будь-який iterable: frozenset, list, тощо
+
+        Повертає кількість доданих нових фактів.
+        """
+        if not facts:
+            return 0
+        working = set(self._working_memory_facts)
         added = 0
-        for fact in self.task_context.observed_facts:
-            if self.kb.add_fact(fact):
+        for fact in facts:
+            if fact not in working:
+                working.add(fact)
                 added += 1
             if added >= limit:
                 break
+        self._working_memory_facts = frozenset(working)
         return added
 
     def _goal_embedding(self, goal: HornAtom, device: torch.device) -> torch.Tensor:
@@ -2854,15 +3862,18 @@ class DifferentiableProver(nn.Module):
         return False
 
     @staticmethod
-    def _shares_constant(*atoms: HornAtom) -> bool:
-        seen: Set[int] = set()
-        for atom in atoms:
-            for arg in atom.args:
-                for value in _term_const_values(arg):
-                    if value in seen:
-                        return True
-                    seen.add(value)
-        return False
+    def _contextual_template_score(
+        rule: HornClause,
+        body_score: float,
+        template_support: int,
+    ) -> float:
+        bridge_bonus = float(structural_bridge_variable_count(rule.head, rule.body))
+        return (
+            10.0 * float(template_support)
+            + float(body_score)
+            + 3.0 * bridge_bonus
+            - 0.05 * float(rule.description_length_bits())
+        )
 
     def _generalize_example_rule(
         self,
@@ -2926,72 +3937,1076 @@ class DifferentiableProver(nn.Module):
             return None
         return HornClause(head=head_rule, body=tuple(body_rule))
 
-    def _contextual_abduction_candidates(self, max_candidates: int = 12) -> List[HornClause]:
+    def _contextual_abduction_candidates(
+        self,
+        max_candidates: int = 12,
+        max_body_atoms: int = 3,
+    ) -> List[HornClause]:
         if self.task_context is None or self.task_context.goal is None:
             return []
         goal = self.task_context.goal
-        facts = list(self.task_context.observed_facts)
+        facts = list(self.current_working_facts())
         if not facts:
             return []
 
-        ranked_bodies: List[Tuple[int, Tuple[HornAtom, ...]]] = []
-        fact_cap = min(len(facts), 16)
-        goal_consts = {
-            value
-            for arg in goal.args
-            for value in _term_const_values(arg)
+        example_heads: List[HornAtom] = [goal]
+        for target_fact in self.task_context.target_facts:
+            if hash(target_fact) == hash(goal):
+                continue
+            example_heads.append(target_fact)
+        template_support: Counter = Counter()
+        best_by_template: Dict[Tuple, Tuple[float, float, HornClause]] = {}
+        for example_head in example_heads:
+            ranked_bodies = rank_goal_directed_bodies(
+                example_head,
+                facts,
+                term_const_values=_term_const_values,
+                max_body_atoms=max_body_atoms,
+            )
+            local_best: Dict[Tuple, Tuple[float, float, HornClause]] = {}
+            for body_score, body in ranked_bodies:
+                rule = self._generalize_example_rule(example_head, body)
+                if rule is None:
+                    continue
+                template_sig = rule_template_signature(rule.head, rule.body)
+                base_score = self._contextual_template_score(
+                    rule,
+                    body_score=float(body_score),
+                    template_support=0,
+                )
+                current = local_best.get(template_sig)
+                if current is None or base_score > current[0]:
+                    local_best[template_sig] = (base_score, float(body_score), rule)
+            for template_sig, (base_score, body_score, rule) in local_best.items():
+                template_support[template_sig] += 1
+                current = best_by_template.get(template_sig)
+                if current is None or base_score > current[0]:
+                    best_by_template[template_sig] = (base_score, body_score, rule)
+        if not best_by_template:
+            return []
+        ranked_rules: List[Tuple[float, float, HornClause]] = []
+        for template_sig, (_, body_score, rule) in best_by_template.items():
+            support = int(template_support.get(template_sig, 1))
+            score = self._contextual_template_score(
+                rule,
+                body_score=body_score,
+                template_support=support,
+            )
+            mdl_bits = float(rule.description_length_bits())
+            ranked_rules.append((score, mdl_bits, rule))
+        ranked_rules.sort(key=lambda item: (-item[0], item[1]))
+        return [rule for _, _, rule in ranked_rules[:max_candidates]]
+
+    def _abduction_candidate_pool(
+        self,
+        z: torch.Tensor,
+        max_contextual: int = 12,
+        max_body_atoms: int = 3,
+        max_trace: int = 8,
+        max_neural_fallback: int = 2,
+    ) -> Tuple[List[HornClause], List[HornClause], List[HornClause], torch.Tensor]:
+        trace_candidates = self._trace_abduction_candidates(
+            max_candidates=max_trace,
+            max_body_atoms=max_body_atoms,
+        )
+        contextual_candidates = self._contextual_abduction_candidates(
+            max_candidates=max_contextual,
+            max_body_atoms=max_body_atoms,
+        )
+        neural_candidates: List[HornClause] = []
+        log_probs = torch.zeros(0, device=z.device)
+        if not contextual_candidates and not trace_candidates and max_neural_fallback > 0:
+            neural_candidates, log_probs = self.abductor.sample_candidates(
+                z[:1],
+                stochastic=False,
+            )
+            neural_candidates = neural_candidates[:max_neural_fallback]
+            if log_probs.numel() > 0:
+                log_probs = log_probs[:len(neural_candidates)]
+        return trace_candidates, contextual_candidates, neural_candidates, log_probs
+
+    def _note_used_rule(self, clause: Optional[HornClause]) -> None:
+        if clause is None:
+            return
+        rule_hash = hash(clause)
+        if rule_hash in self._last_used_rule_hashes:
+            return
+        self._last_used_rule_hashes.add(rule_hash)
+        self.last_used_rules.append(clause)
+
+    def _extend_recent_abduced_rules(self, rules: List[HornClause]) -> None:
+        seen = {hash(rule) for rule in self.last_abduced_rules}
+        for rule in rules:
+            rule_hash = hash(rule)
+            if rule_hash in seen:
+                continue
+            self.last_abduced_rules.append(rule)
+            seen.add(rule_hash)
+
+    def _record_rule_utility(self, clause: HornClause, utility: float) -> None:
+        history = self._rule_utility_history[hash(clause)]
+        history.append(float(max(0.0, min(1.0, utility))))
+        if len(history) > 32:
+            del history[0]
+
+    @staticmethod
+    def _rule_edit_distance(src: HornClause, dst: HornClause) -> float:
+        score = 0.0
+        score += 1.0 if src.head.pred != dst.head.pred else 0.0
+        score += 0.25 * abs(len(src.head.args) - len(dst.head.args))
+        score += float(abs(len(src.body) - len(dst.body)))
+        src_preds = [int(atom.pred) for atom in src.body]
+        dst_preds = [int(atom.pred) for atom in dst.body]
+        overlap = len(set(src_preds) & set(dst_preds))
+        score += float(max(len(src_preds), len(dst_preds)) - overlap)
+        return score
+
+    def _relaxed_symbolic_cycle_trace(
+        self,
+        clause: HornClause,
+        observed_facts: FrozenSet[HornAtom],
+        target_facts: FrozenSet[HornAtom],
+        z_query: torch.Tensor,
+        device: torch.device,
+        z_target: Optional[torch.Tensor] = None,
+        relaxed_spec: Optional[RelaxedHornClauseSpec] = None,
+    ) -> Dict[str, torch.Tensor]:
+        dtype = z_query.dtype
+        zero = torch.zeros((), device=device, dtype=dtype)
+        trace: Dict[str, torch.Tensor] = {
+            "soft_score_t": torch.tensor(0.5, device=device, dtype=dtype),
+            "graph_energy_t": zero,
+            "head_match_t": torch.tensor(0.5, device=device, dtype=dtype),
+            "body_success_t": torch.tensor(0.5, device=device, dtype=dtype),
+            "entropy_penalty_t": zero,
+            "head_emb": self.term_emb.embed_atom(clause.head, device).to(dtype=dtype),
         }
 
-        for fact in facts[:fact_cap]:
-            if not self._shares_constant(goal, fact):
-                continue
-            atom_consts = {
-                value
-                for arg in fact.args
-                for value in _term_const_values(arg)
-            }
-            ranked_bodies.append((max(len(goal_consts & atom_consts), 1), (fact,)))
+        fact_sample = observed_facts
+        if len(fact_sample) > 24:
+            fact_sample = frozenset(random.sample(list(fact_sample), 24))
+        facts_list = list(fact_sample)
+        fact_embs = (
+            self.term_emb(facts_list, device).to(dtype=dtype)
+            if facts_list else torch.zeros(0, self.d, device=device, dtype=dtype)
+        )
 
-        for i, fact_a in enumerate(facts[:fact_cap]):
-            for fact_b in facts[i + 1:fact_cap]:
-                if not self._shares_constant(goal, fact_a, fact_b):
+        body_pred_probs = (
+            relaxed_spec.body_pred_probs
+            if relaxed_spec is not None and relaxed_spec.body_pred_probs
+            else tuple(
+                self._predicate_one_hot(atom.pred, device, dtype)
+                for atom in clause.body
+            )
+        )
+        head_pred_probs = (
+            relaxed_spec.head_pred_probs
+            if relaxed_spec is not None
+            else self._predicate_one_hot(clause.head.pred, device, dtype)
+        )
+
+        default_var_assign = {
+            var.name: self.term_emb.embed_term(var, device).to(dtype=dtype)
+            for atom in (clause.head,) + tuple(clause.body)
+            for var in atom.args
+            if isinstance(var, Var)
+        }
+        var_assign = dict(default_var_assign)
+        graph_energy_t = zero
+        graph_entropy_t = zero
+        soft_energy_t = zero
+        soft_entropy_t = zero
+        if clause.body and fact_sample:
+            try:
+                graph_energy_t, _graph_assign, graph_entropy_t, graph_attn = self.graph_unif(
+                    clause.body,
+                    fact_sample,
+                    device,
+                    tau=max(self.continuous_cycle_candidate_tau, 1e-3),
+                    hard=False,
+                    return_attention=True,
+                )
+                for name, attn in graph_attn.items():
+                    var_assign[name] = (attn.to(dtype=dtype).unsqueeze(0) @ fact_embs).squeeze(0)
+                soft_energy_t, soft_entropy_t = self.soft_unif(
+                    clause.body,
+                    fact_sample,
+                    device,
+                )
+            except Exception:
+                pass
+
+        body_matches: List[torch.Tensor] = []
+        for idx, atom in enumerate(clause.body):
+            pred_probs = (
+                body_pred_probs[idx]
+                if idx < len(body_pred_probs)
+                else self._predicate_one_hot(atom.pred, device, dtype)
+            )
+            atom_emb = self._soft_atom_embedding(atom, pred_probs, var_assign, device)
+            if fact_embs.numel() > 0:
+                match_t, _ = self._smooth_embedding_match(
+                    atom_emb,
+                    fact_embs,
+                    tau=max(self.continuous_cycle_candidate_tau, 1e-3),
+                    scale=0.10,
+                )
+                body_matches.append(match_t)
+        body_success_t = (
+            torch.stack(body_matches).mean().clamp(0.0, 1.0)
+            if body_matches else torch.tensor(0.5, device=device, dtype=dtype)
+        )
+
+        head_emb = self._soft_atom_embedding(clause.head, head_pred_probs, var_assign, device)
+        if target_facts:
+            target_embs = self.term_emb(list(target_facts), device).to(dtype=dtype)
+            head_match_t, _ = self._smooth_embedding_match(
+                head_emb,
+                target_embs,
+                tau=max(self.continuous_cycle_candidate_tau, 1e-3),
+                scale=0.10,
+            )
+        else:
+            head_match_t = torch.tensor(0.5, device=device, dtype=dtype)
+
+        target_anchor = z_target if z_target is not None else z_query[:1].detach()
+        state_match_t = (
+            F.cosine_similarity(
+                self.out_proj(head_emb.unsqueeze(0)),
+                target_anchor,
+                dim=-1,
+            )
+            .clamp(-1.0, 1.0)
+            .add(1.0)
+            .mul(0.5)
+            .mean()
+        )
+        graph_success_t = torch.exp(-0.20 * graph_energy_t).clamp(0.0, 1.0)
+        soft_success_t = torch.exp(-0.10 * soft_energy_t).clamp(0.0, 1.0)
+        entropy_penalty_t = torch.tanh(
+            0.10 * (graph_entropy_t + soft_entropy_t)
+        ).clamp(0.0, 1.0)
+        soft_score_t = (
+            0.30 * body_success_t
+            + 0.25 * head_match_t
+            + 0.20 * graph_success_t
+            + 0.15 * soft_success_t
+            + 0.10 * state_match_t
+            - 0.10 * entropy_penalty_t
+        ).clamp(0.0, 1.0)
+        trace.update({
+            "soft_score_t": soft_score_t,
+            "graph_energy_t": graph_energy_t,
+            "head_match_t": head_match_t,
+            "body_success_t": body_success_t,
+            "entropy_penalty_t": entropy_penalty_t,
+            "head_emb": head_emb,
+        })
+        return trace
+
+    def _soft_symbolic_cycle_score(
+        self,
+        clause: HornClause,
+        observed_facts: FrozenSet[HornAtom],
+        target_facts: FrozenSet[HornAtom],
+        z_query: torch.Tensor,
+        device: torch.device,
+        z_target: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        trace = self._relaxed_symbolic_cycle_trace(
+            clause,
+            observed_facts,
+            target_facts,
+            z_query,
+            device,
+            z_target=z_target,
+        )
+        return trace["soft_score_t"], trace["graph_energy_t"]
+
+    def _repair_rule_candidate(
+        self,
+        clause: HornClause,
+        observed_facts: FrozenSet[HornAtom],
+        target_facts: FrozenSet[HornAtom],
+        max_body_atoms: int = 3,
+    ) -> Optional[HornClause]:
+        if not self.continuous_cycle_repair_enabled or not target_facts:
+            return None
+
+        facts = list(observed_facts)
+        if not facts:
+            return None
+
+        candidates: List[Tuple[float, HornClause]] = []
+        head_vars = {
+            var.name
+            for var in clause.head.args
+            if isinstance(var, Var)
+        }
+        body_vars = {
+            var.name
+            for atom in clause.body
+            for var in atom.args
+            if isinstance(var, Var)
+        }
+
+        for target in target_facts:
+            if len(target.args) == len(clause.head.args) and (
+                not head_vars or head_vars.issubset(body_vars)
+            ):
+                swapped_head = HornAtom(target.pred, clause.head.args)
+                swapped_rule = HornClause(swapped_head, clause.body)
+                if hash(swapped_rule) != hash(clause):
+                    candidates.append(
+                        (self._rule_edit_distance(clause, swapped_rule), swapped_rule)
+                    )
+
+            ranked_bodies = rank_goal_directed_bodies(
+                target,
+                facts,
+                term_const_values=_term_const_values,
+                max_body_atoms=max(1, int(max_body_atoms)),
+            )
+            for body_score, body in ranked_bodies[:4]:
+                repaired = self._generalize_example_rule(target, body)
+                if repaired is None or hash(repaired) == hash(clause):
                     continue
-                overlap = 0
-                for atom in (fact_a, fact_b):
-                    atom_consts = {
-                        value
-                        for arg in atom.args
-                        for value in _term_const_values(arg)
-                    }
-                    overlap += len(goal_consts & atom_consts)
-                ranked_bodies.append((max(overlap, 1), (fact_a, fact_b)))
+                bridge_bonus = float(
+                    structural_bridge_variable_count(repaired.head, repaired.body)
+                )
+                score = (
+                    self._rule_edit_distance(clause, repaired)
+                    - 0.05 * float(body_score)
+                    - 1.25 * bridge_bonus
+                )
+                candidates.append((score, repaired))
 
-        ranked_bodies.sort(key=lambda item: (item[0], -len(item[1])), reverse=True)
-        unique: Dict[int, HornClause] = {}
-        for _, body in ranked_bodies:
-            rule = self._generalize_example_rule(goal, body)
-            if rule is None:
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item[0])
+        lam_mdl = float(getattr(self, "_mdl_lambda", 0.5))
+        for _, repaired in candidates[:6]:
+            pred_error = self._pred_error_for_rule(repaired, observed_facts, lam=lam_mdl)
+            if pred_error < 0.95:
+                return repaired
+        return None
+
+    def _current_query_atom(self) -> Optional[HornAtom]:
+        if self.task_context is None:
+            return None
+        last_src = int(self.task_context.metadata.get("last_src", 0))
+        return HornAtom(SEQ_PREDICT_NEXT_PRED, (Const(last_src), Var("NEXT")))
+
+    def _current_target_token(self) -> Optional[int]:
+        if self.task_context is None:
+            return None
+        raw = self.task_context.metadata.get("last_tgt")
+        if raw is None:
+            raw = self.task_context.metadata.get("decoder_target")
+        if raw is None:
+            return None
+        try:
+            token = int(round(float(raw)))
+        except (TypeError, ValueError):
+            return None
+        if self._world_rnn_vocab <= 0:
+            return token
+        return max(0, min(token, self._world_rnn_vocab - 1))
+
+    def _rule_action_token(
+        self,
+        clause: HornClause,
+        predicted_facts: FrozenSet[HornAtom],
+    ) -> Optional[int]:
+        if self._world_rnn_vocab <= 0:
+            return None
+        preferred_preds = {
+            SEQ_PREDICT_NEXT_PRED,
+            SEQ_ACTUAL_NEXT_PRED,
+            SEQ_DECODER_GUESS_PRED,
+        }
+        for atom in predicted_facts:
+            if atom.pred in preferred_preds and atom.args:
+                token = _const_int_term(atom.args[-1])
+                if token is not None:
+                    return max(0, min(int(token), self._world_rnn_vocab - 1))
+        if clause.head.args:
+            token = _const_int_term(clause.head.args[-1])
+            if token is not None:
+                return max(0, min(int(token), self._world_rnn_vocab - 1))
+        return max(0, min(int(clause.head.pred), self._world_rnn_vocab - 1))
+
+    def _infer_used_rules_from_delta(
+        self,
+        before: FrozenSet[HornAtom],
+        after: FrozenSet[HornAtom],
+        max_rules: int = 96,
+        max_solutions: int = 32,
+    ) -> None:
+        new_facts = list(after - before)
+        if not new_facts:
+            return
+        fact_space = frozenset(after)
+        for clause in self.kb.rules[:max_rules]:
+            if not clause.body:
+                if clause.head in new_facts:
+                    self._note_used_rule(clause)
                 continue
-            unique.setdefault(hash(rule), rule)
-            if len(unique) >= max_candidates:
+            fresh = freshen_vars(clause)
+            for sigma in self._find_rule_substitutions(
+                fresh.body,
+                fact_space,
+                max_solutions=max_solutions,
+            ):
+                derived = sigma.apply_atom(fresh.head)
+                if any(unify(derived, new_fact) is not None for new_fact in new_facts):
+                    self._note_used_rule(clause)
+                    break
+
+    def _infer_supporting_rules_for_goal(
+        self,
+        goal: HornAtom,
+        fact_space: FrozenSet[HornAtom],
+        max_rules: int = 64,
+        max_solutions: int = 16,
+    ) -> None:
+        if not fact_space:
+            return
+        for clause in self.kb.rules[:max_rules]:
+            if not clause.body:
+                if unify(goal, clause.head) is not None:
+                    self._note_used_rule(clause)
+                continue
+            fresh = freshen_vars(clause)
+            for sigma in self._find_rule_substitutions(
+                fresh.body,
+                fact_space,
+                max_solutions=max_solutions,
+            ):
+                derived = sigma.apply_atom(fresh.head)
+                if unify(goal, derived) is not None:
+                    self._note_used_rule(clause)
+                    break
+
+    def continuous_hypothesis_cycle(
+        self,
+        z: torch.Tensor,
+        current_facts: FrozenSet[HornAtom],
+        target_facts: FrozenSet[HornAtom],
+        device: torch.device,
+    ) -> Dict[str, Any]:
+        zero = torch.zeros(1, device=device).squeeze()
+        empty_stats = dict(empty_induction_stats())
+        empty_stats.setdefault("repaired", 0.0)
+        result: Dict[str, Any] = {
+            "loss_tensor": zero,
+            "mean_utility": 0.0,
+            "accepted_rules": [],
+            "added_rules": 0,
+            "induction_stats": empty_stats,
+            "stats": {
+                "checked": 0.0,
+                "accepted": 0.0,
+                "added": 0.0,
+                "verified": 0.0,
+                "contradicted": 0.0,
+                "retained": 0.0,
+                "repaired": 0.0,
+                "mean_utility": 0.0,
+                "mean_error": 0.0,
+                "mean_symbolic_error": 0.0,
+                "mean_soft_symbolic_error": 0.0,
+                "mean_relaxed_body_error": 0.0,
+                "mean_relaxed_head_error": 0.0,
+                "mean_trace_error": 0.0,
+                "mean_counterexample_error": 0.0,
+                "mean_world_error": 0.0,
+                "mean_token_error": 0.0,
+                "mean_graph_energy": 0.0,
+                "policy_loss": 0.0,
+                "loss": 0.0,
+            },
+        }
+        if not self.training or not self.continuous_cycle_enabled:
+            return result
+
+        effective_targets = target_facts or self._task_target_facts()
+        if not effective_targets:
+            effective_targets = frozenset({self.current_goal(z)})
+        trace_bundle = self._task_execution_trace()
+        trace_candidates = (
+            self._trace_abduction_candidates(
+                max_candidates=self.continuous_cycle_max_trace_candidates,
+                max_body_atoms=3,
+            )
+            if self.continuous_cycle_max_trace_candidates > 0
+            else []
+        )
+        contextual_candidates = (
+            self._contextual_abduction_candidates(
+                max_candidates=self.continuous_cycle_max_contextual,
+                max_body_atoms=3,
+            )
+            if self.continuous_cycle_max_contextual > 0
+            else []
+        )
+        neural_specs: List[RelaxedHornClauseSpec] = []
+        if self.continuous_cycle_max_neural > 0:
+            neural_specs = self.abductor.sample_candidates_relaxed(
+                z[:1],
+                stochastic=self.training,
+                tau=max(self.continuous_cycle_candidate_tau, 1e-3),
+            )
+            neural_specs = neural_specs[:self.continuous_cycle_max_neural]
+
+        candidate_specs: Dict[int, Tuple[HornClause, Optional[torch.Tensor], str, Optional[RelaxedHornClauseSpec]]] = {}
+        for clause in trace_candidates:
+            relaxed = self._relaxed_spec_for_clause(
+                clause,
+                device,
+                z.dtype,
+                source="trace",
+            )
+            candidate_specs[hash(clause)] = (clause, None, "trace", relaxed)
+        for clause in contextual_candidates:
+            relaxed = self._relaxed_spec_for_clause(
+                clause,
+                device,
+                z.dtype,
+                source="contextual",
+            )
+            candidate_specs[hash(clause)] = (clause, None, "contextual", relaxed)
+        for spec in neural_specs:
+            clause = spec.clause
+            rule_hash = hash(clause)
+            if rule_hash in candidate_specs:
+                continue
+            candidate_specs[rule_hash] = (clause, spec.log_prob, "neural", spec)
+        if not candidate_specs:
+            return result
+
+        observed = current_facts or self.current_working_facts()
+        lam_mdl = float(getattr(self, "_mdl_lambda", 0.5))
+        ranked_candidates: List[Tuple[float, HornClause, Optional[torch.Tensor], str, Optional[RelaxedHornClauseSpec]]] = []
+        for clause, log_prob, source, relaxed_spec in candidate_specs.values():
+            mdl_score = float(clause.description_length_bits()) + lam_mdl * float(
+                self._pred_error_for_rule(clause, observed, lam=lam_mdl)
+            )
+            ranked_candidates.append((mdl_score, clause, log_prob, source, relaxed_spec))
+        ranked_candidates.sort(key=lambda item: item[0])
+        budget = max(
+            1,
+            self.continuous_cycle_max_trace_candidates
+            + self.continuous_cycle_max_contextual
+            + self.continuous_cycle_max_neural,
+        )
+        pending: List[Tuple[float, HornClause, Optional[torch.Tensor], str, Optional[RelaxedHornClauseSpec]]] = ranked_candidates[:budget]
+        seen_candidate_hashes = {hash(clause) for _, clause, _, _, _ in pending}
+        repair_budget = self.continuous_cycle_max_repairs
+
+        query_atom = self._current_query_atom()
+        query_emb = (
+            self.ground(frozenset({query_atom}), device)[:1]
+            if query_atom is not None and self.hypothesis_token_head is not None
+            else None
+        )
+        target_token = self._current_target_token()
+        target_token_t = (
+            torch.tensor([target_token], device=device, dtype=torch.long)
+            if target_token is not None and self.hypothesis_token_head is not None
+            else None
+        )
+        z_target = self.ground(effective_targets, device)[:1] if effective_targets else None
+        candidate_losses: List[torch.Tensor] = []
+        selection_logits: List[torch.Tensor] = []
+        policy_log_probs: List[torch.Tensor] = []
+        policy_rewards: List[torch.Tensor] = []
+        accepted_rules: List[HornClause] = []
+        utilities: List[float] = []
+        symbolic_errors: List[float] = []
+        soft_symbolic_errors: List[float] = []
+        relaxed_body_errors: List[float] = []
+        relaxed_head_errors: List[float] = []
+        trace_errors: List[float] = []
+        counterexample_errors: List[float] = []
+        world_errors: List[float] = []
+        token_errors: List[float] = []
+        graph_energies: List[float] = []
+        accepted = 0
+        added_rules = 0
+        verified = 0
+        contradicted = 0
+        retained = 0
+        repaired = 0
+        matched_predictions = 0
+        checked = 0
+
+        while pending and checked < (budget + self.continuous_cycle_max_repairs):
+            _mdl_score, clause, log_prob, _source, relaxed_spec = pending.pop(0)
+            checked += 1
+            pred_error, predicted_one = self._mental_simulate_rule(clause, observed, device)
+            predicted_facts = self._predict_rule_facts(clause, observed)
+            if predicted_one is not None:
+                predicted_facts = predicted_facts | frozenset({predicted_one})
+            if not predicted_facts and clause.head.is_ground():
+                predicted_facts = frozenset({clause.head})
+
+            target_hits = sum(
+                1
+                for target in effective_targets
+                if any(unify(pred, target) is not None for pred in predicted_facts)
+            )
+            observed_hits = sum(
+                1
+                for obs in observed
+                if any(unify(pred, obs) is not None for pred in predicted_facts)
+            )
+            conflict = any(
+                _atoms_conflict(pred, known)
+                for pred in predicted_facts
+                for known in observed
+            )
+            target_hit_frac = float(target_hits) / float(max(len(effective_targets), 1))
+            observed_hit_frac = (
+                float(observed_hits) / float(max(len(observed), 1))
+                if observed
+                else 0.0
+            )
+            symbolic_success = (
+                0.60 * target_hit_frac
+                + 0.25 * observed_hit_frac
+                + 0.15 * (1.0 - min(max(pred_error, 0.0), 1.0))
+            )
+            if not predicted_facts:
+                symbolic_success *= 0.5
+            symbolic_success = max(0.0, min(symbolic_success, 1.0))
+            hard_symbolic_t = torch.tensor(symbolic_success, device=device, dtype=z.dtype)
+            if relaxed_spec is None:
+                relaxed_spec = self._relaxed_spec_for_clause(
+                    clause,
+                    device,
+                    z.dtype,
+                    log_prob=log_prob,
+                    source=_source,
+                )
+            relaxed_trace = self._relaxed_symbolic_cycle_trace(
+                clause,
+                observed,
+                effective_targets,
+                z[:1],
+                device,
+                z_target=z_target,
+                relaxed_spec=relaxed_spec,
+            )
+            soft_symbolic_t = relaxed_trace["soft_score_t"]
+            graph_energy_t = relaxed_trace["graph_energy_t"]
+            relaxed_body_t = relaxed_trace["body_success_t"]
+            relaxed_head_t = relaxed_trace["head_match_t"]
+            entropy_penalty_t = relaxed_trace["entropy_penalty_t"]
+            symbolic_success_t = (
+                (1.0 - self.continuous_cycle_soft_symbolic_weight) * hard_symbolic_t
+                + self.continuous_cycle_soft_symbolic_weight * soft_symbolic_t
+            ).clamp(0.0, 1.0)
+            trace_error_t = torch.zeros((), device=device, dtype=z.dtype)
+            counterexample_error_t = torch.zeros((), device=device, dtype=z.dtype)
+            if trace_bundle is not None and trace_bundle.transitions:
+                trace_error_t = torch.tensor(
+                    self._trace_prediction_error_for_rule(clause, trace_bundle),
+                    device=device,
+                    dtype=z.dtype,
+                )
+                trace_success_t = 1.0 - trace_error_t
+                symbolic_success_t = (
+                    (1.0 - self.continuous_cycle_trace_weight) * symbolic_success_t
+                    + self.continuous_cycle_trace_weight * trace_success_t
+                ).clamp(0.0, 1.0)
+            if trace_bundle is not None and trace_bundle.counterexamples:
+                counterexample_error_t = torch.tensor(
+                    self._counterexample_error_for_rule(clause, trace_bundle),
+                    device=device,
+                    dtype=z.dtype,
+                )
+
+            world_success_t = torch.tensor(0.5, device=device, dtype=z.dtype)
+            world_error_t = torch.tensor(0.5, device=device, dtype=z.dtype)
+            z_next_world = z[:1]
+            action_token = self._rule_action_token(clause, predicted_facts)
+            action_probs = relaxed_spec.head_pred_probs if relaxed_spec is not None else None
+            if self._world_rnn is not None and z_target is not None and action_token is not None:
+                z_next_world, _ = self._world_transition(
+                    z[:1],
+                    action_token=action_token,
+                    action_probs=action_probs,
+                )
+                world_success_t = (
+                    F.cosine_similarity(z_next_world, z_target, dim=-1)
+                    .clamp(-1.0, 1.0)
+                    .add(1.0)
+                    .mul(0.5)
+                    .mean()
+                )
+                world_error_t = 1.0 - world_success_t
+
+            token_success_t = torch.tensor(0.5, device=device, dtype=z.dtype)
+            token_ce_t = zero
+            if (
+                self.hypothesis_token_head is not None
+                and query_emb is not None
+                and target_token_t is not None
+            ):
+                token_logits = self.hypothesis_token_head(
+                    torch.cat([z_next_world, query_emb], dim=-1)
+                )
+                token_probs = F.softmax(token_logits, dim=-1)
+                token_success_t = token_probs.gather(
+                    1, target_token_t.unsqueeze(1)
+                ).squeeze(1).mean()
+                token_ce_t = F.cross_entropy(token_logits, target_token_t)
+
+            utility_t = (
+                self.continuous_cycle_symbolic_weight * symbolic_success_t
+                + self.continuous_cycle_world_weight * world_success_t
+                + self.continuous_cycle_token_weight * token_success_t
+            ).clamp(0.0, 1.0)
+            if counterexample_error_t.numel() > 0:
+                utility_t = (
+                    utility_t
+                    - self.continuous_cycle_counterexample_weight * counterexample_error_t
+                ).clamp(0.0, 1.0)
+            if conflict:
+                utility_t = torch.minimum(
+                    utility_t,
+                    torch.tensor(0.05, device=device, dtype=z.dtype),
+                )
+            utility = float(utility_t.detach().item())
+            candidate_loss = (
+                (1.0 - utility_t)
+                + 0.25 * token_ce_t
+                + 0.10 * world_error_t
+                + 0.08 * (1.0 - soft_symbolic_t)
+                + 0.05 * (1.0 - relaxed_body_t)
+                + 0.05 * (1.0 - relaxed_head_t)
+                + 0.10 * trace_error_t
+                + 0.12 * counterexample_error_t
+                + 0.02 * entropy_penalty_t
+            )
+            candidate_losses.append(candidate_loss)
+            mdl_bias_t = torch.tensor(float(_mdl_score), device=device, dtype=z.dtype)
+            selection_logits.append((utility_t - 0.01 * mdl_bias_t).clamp(-5.0, 5.0))
+            if log_prob is not None:
+                policy_log_probs.append(log_prob)
+                policy_rewards.append(utility_t.detach())
+
+            self.vem.record_outcome(clause, utility_target=utility, device=device)
+            self._record_rule_utility(clause, utility)
+
+            utilities.append(utility)
+            symbolic_errors.append(1.0 - float(symbolic_success_t.detach().item()))
+            soft_symbolic_errors.append(1.0 - float(soft_symbolic_t.detach().item()))
+            relaxed_body_errors.append(1.0 - float(relaxed_body_t.detach().item()))
+            relaxed_head_errors.append(1.0 - float(relaxed_head_t.detach().item()))
+            trace_errors.append(float(trace_error_t.detach().item()))
+            counterexample_errors.append(float(counterexample_error_t.detach().item()))
+            world_errors.append(float(world_error_t.detach().item()))
+            token_errors.append(float((1.0 - token_success_t).detach().item()))
+            graph_energies.append(float(graph_energy_t.detach().item()))
+            matched_predictions += target_hits
+
+            repair_candidate = None
+            if (
+                self.continuous_cycle_repair_enabled
+                and repair_budget > 0
+                and utility <= self.continuous_cycle_repair_threshold
+            ):
+                repair_candidate = self._repair_rule_candidate(
+                    clause,
+                    observed,
+                    effective_targets,
+                    max_body_atoms=3,
+                )
+                if repair_candidate is not None and hash(repair_candidate) not in seen_candidate_hashes:
+                    pending.append((
+                        float(_mdl_score) - 0.25,
+                        repair_candidate,
+                        None,
+                        "repair",
+                        self._relaxed_spec_for_clause(
+                            repair_candidate,
+                            device,
+                            z.dtype,
+                            source="repair",
+                        ),
+                    ))
+                    seen_candidate_hashes.add(hash(repair_candidate))
+                    repair_budget -= 1
+                    repaired += 1
+                    if self._rule_record(clause) is not None:
+                        self.kb.mark_rule_contradicted(clause)
+                        contradicted += 1
+                    continue
+
+            if (
+                conflict
+                or utility <= self.continuous_cycle_contradict_threshold
+                or float(counterexample_error_t.detach().item()) >= 0.75
+            ):
+                record = self._rule_record(clause)
+                if record is not None:
+                    self.kb.mark_rule_contradicted(clause)
+                contradicted += 1
+                continue
+
+            should_accept = (
+                utility >= self.continuous_cycle_accept_threshold
+                or target_hit_frac > 0.0
+            )
+            if not should_accept:
+                retained += 1
+                continue
+
+            accepted += 1
+            accepted_rules.append(clause)
+            if self.kb.add_rule(clause, status=EpistemicStatus.proposed):
+                added_rules += 1
+            if utility >= self.continuous_cycle_verify_threshold and target_hit_frac > 0.0:
+                self.kb.mark_rule_verified(clause)
+                verified += 1
+            else:
+                retained += 1
+
+        policy_loss_t = zero
+        if candidate_losses:
+            loss_stack = torch.stack(candidate_losses)
+            select_stack = torch.stack(selection_logits) if selection_logits else None
+            if select_stack is not None:
+                weights = F.softmax(
+                    select_stack / max(self.continuous_cycle_candidate_tau, 1e-3),
+                    dim=0,
+                )
+                loss_tensor = (weights * loss_stack).sum()
+            else:
+                loss_tensor = loss_stack.mean()
+            if policy_log_probs:
+                reward_t = torch.stack(policy_rewards)
+                baseline = float(self._cycle_reward_baseline)
+                advantage_t = reward_t - baseline
+                if reward_t.numel() > 1:
+                    advantage_t = (
+                        advantage_t - advantage_t.mean()
+                    ) / (advantage_t.std(unbiased=False) + 1e-6)
+                policy_loss_t = -(advantage_t * torch.stack(policy_log_probs)).mean()
+                momentum = self.continuous_cycle_policy_baseline_momentum
+                self._cycle_reward_baseline = (
+                    momentum * baseline
+                    + (1.0 - momentum) * float(reward_t.mean().item())
+                )
+                loss_tensor = loss_tensor + self.continuous_cycle_policy_weight * policy_loss_t
+            result["loss_tensor"] = loss_tensor
+
+        if accepted_rules:
+            self._extend_recent_abduced_rules(accepted_rules)
+
+        mean_utility = float(sum(utilities) / len(utilities)) if utilities else 0.0
+        mean_error = (
+            float(sum(1.0 - utility for utility in utilities) / len(utilities))
+            if utilities else 0.0
+        )
+        mean_symbolic_error = (
+            float(sum(symbolic_errors) / len(symbolic_errors))
+            if symbolic_errors else 0.0
+        )
+        mean_soft_symbolic_error = (
+            float(sum(soft_symbolic_errors) / len(soft_symbolic_errors))
+            if soft_symbolic_errors else 0.0
+        )
+        mean_relaxed_body_error = (
+            float(sum(relaxed_body_errors) / len(relaxed_body_errors))
+            if relaxed_body_errors else 0.0
+        )
+        mean_relaxed_head_error = (
+            float(sum(relaxed_head_errors) / len(relaxed_head_errors))
+            if relaxed_head_errors else 0.0
+        )
+        mean_trace_error = (
+            float(sum(trace_errors) / len(trace_errors))
+            if trace_errors else 0.0
+        )
+        mean_counterexample_error = (
+            float(sum(counterexample_errors) / len(counterexample_errors))
+            if counterexample_errors else 0.0
+        )
+        mean_world_error = (
+            float(sum(world_errors) / len(world_errors))
+            if world_errors else 0.0
+        )
+        mean_token_error = (
+            float(sum(token_errors) / len(token_errors))
+            if token_errors else 0.0
+        )
+        mean_graph_energy = (
+            float(sum(graph_energies) / len(graph_energies))
+            if graph_energies else 0.0
+        )
+
+        result["mean_utility"] = mean_utility
+        result["accepted_rules"] = accepted_rules
+        result["added_rules"] = added_rules
+        result["induction_stats"] = {
+            "checked": float(checked),
+            "verified": float(verified),
+            "contradicted": float(contradicted),
+            "retained": float(retained),
+            "repaired": float(repaired),
+            "matched_predictions": float(matched_predictions),
+            "mean_score": mean_utility,
+        }
+        result["stats"] = {
+            "checked": float(checked),
+            "accepted": float(accepted),
+            "added": float(added_rules),
+            "verified": float(verified),
+            "contradicted": float(contradicted),
+            "retained": float(retained),
+            "repaired": float(repaired),
+            "mean_utility": mean_utility,
+            "mean_error": mean_error,
+            "mean_symbolic_error": mean_symbolic_error,
+            "mean_soft_symbolic_error": mean_soft_symbolic_error,
+            "mean_relaxed_body_error": mean_relaxed_body_error,
+            "mean_relaxed_head_error": mean_relaxed_head_error,
+            "mean_trace_error": mean_trace_error,
+            "mean_counterexample_error": mean_counterexample_error,
+            "mean_world_error": mean_world_error,
+            "mean_token_error": mean_token_error,
+            "mean_graph_energy": mean_graph_energy,
+            "policy_loss": float(policy_loss_t.detach().item()),
+            "loss": float(result["loss_tensor"].detach().item()),
+        }
+        return result
+
+    def answer_query(
+        self,
+        goal: HornAtom,
+        device: torch.device,
+        facts: Optional[FrozenSet[HornAtom]] = None,
+        max_matches: int = 16,
+    ) -> Tuple[torch.Tensor, Tuple[int, ...], torch.Tensor]:
+        base_facts = facts if facts is not None else self.current_working_facts()
+        if not base_facts:
+            zero = torch.zeros(1, self.d, device=device)
+            return zero, tuple(), torch.zeros((), device=device)
+        if (
+            facts is None
+            and self.last_all_facts
+            and self.last_context_facts
+            and base_facts == self.last_context_facts
+        ):
+            fact_space = self.last_all_facts
+        else:
+            fact_space = self.forward_chain_reasoned(
+                self.max_depth,
+                starting_facts=base_facts,
+                only_verified=True,
+                device=device,
+            )
+            if facts is None:
+                self.last_context_facts = base_facts
+                self.last_all_facts = fact_space
+            self._infer_used_rules_from_delta(base_facts, fact_space)
+
+        var_names = [
+            arg.name
+            for arg in goal.args
+            if isinstance(arg, Var) and not arg.name.startswith("_")
+        ]
+        matched_facts: List[HornAtom] = []
+        instantiated_queries: List[HornAtom] = []
+        answer_ids: List[int] = []
+
+        for fact in fact_space:
+            sigma = unify(goal, fact)
+            if sigma is None:
+                continue
+            matched_facts.append(fact)
+            instantiated_queries.append(sigma.apply_atom(goal))
+            for var_name in var_names:
+                term = sigma.bindings.get(var_name)
+                if term is None:
+                    continue
+                for value in _term_const_values(term):
+                    answer_ids.append(int(value))
+            if len(matched_facts) >= max_matches:
                 break
-        return list(unique.values())
+
+        if not matched_facts:
+            zero = torch.zeros(1, self.d, device=device)
+            return zero, tuple(), torch.zeros((), device=device)
+
+        self._infer_supporting_rules_for_goal(goal, fact_space)
+
+        seen_answers: Set[int] = set()
+        deduped_answers: List[int] = []
+        for token_id in answer_ids:
+            if token_id < 0 or token_id in seen_answers:
+                continue
+            seen_answers.add(token_id)
+            deduped_answers.append(token_id)
+            if len(deduped_answers) >= 8:
+                break
+
+        match_set = frozenset(matched_facts)
+        query_set = frozenset(instantiated_queries) if instantiated_queries else match_set
+        proof_state = 0.5 * (
+            self.ground(match_set, device) + self.ground(query_set, device)
+        )
+        support = torch.tensor(
+            1.0 - math.pow(0.5, min(len(matched_facts), 4)),
+            device=device,
+            dtype=proof_state.dtype,
+        )
+        proof_state = proof_state * support.view(1, 1)
+        return proof_state, tuple(deduped_answers), support
 
     def forward_chain_step_local(
         self,
         current_facts: FrozenSet[HornAtom],
+        only_verified: bool = False,
+        device: Optional[torch.device] = None,
     ) -> Tuple[int, FrozenSet[HornAtom], List[Tuple[HornClause, Optional[Substitution]]], FrozenSet[HornAtom]]:
         current_set: Set[HornAtom] = set(current_facts)
         new_facts: Set[HornAtom] = set()
         derivations: List[Tuple[HornClause, Optional[Substitution]]] = []
         added = 0
+        device = self._reasoning_device() if device is None else device
+        has_multi_body = any(
+            len(rule.body) > 1 and self._executor_rule_is_usable(rule, only_verified=only_verified)
+            for rule in self.kb.rules
+        )
+        if not has_multi_body:
+            after = self.kb.forward_chain(
+                max_depth=1,
+                starting_facts=current_facts,
+                only_verified=only_verified,
+            )
+            new_fact_set = frozenset(after - current_facts)
+            if new_fact_set:
+                self._infer_used_rules_from_delta(current_facts, after)
+            return len(new_fact_set), new_fact_set, [], after
 
         for clause in self.kb.rules:
+            if not self._executor_rule_is_usable(clause, only_verified=only_verified):
+                continue
             if not clause.body:
                 continue
             fresh = freshen_vars(clause)
             current_snapshot = frozenset(current_set)
-            for sigma in find_all_substitutions(fresh.body, current_snapshot, max_solutions=128):
+            for sigma in self._find_rule_substitutions(
+                fresh.body,
+                current_snapshot,
+                max_solutions=128,
+                device=device,
+            ):
                 derived = sigma.apply_atom(fresh.head)
                 if not derived.is_ground():
                     continue
@@ -3006,6 +5021,7 @@ class DifferentiableProver(nn.Module):
                 clause.use_count += 1
                 clause.weight *= 1.01
                 self.kb.mark_rule_verified(clause)
+                self._note_used_rule(clause)
                 added += 1
 
         return added, frozenset(new_facts), derivations, frozenset(current_set)
@@ -3036,6 +5052,9 @@ class DifferentiableProver(nn.Module):
 
     def forward_chain_step(
         self,
+        *,
+        only_verified: bool = False,
+        device: Optional[torch.device] = None,
     ) -> Tuple[int, "FrozenSet[HornAtom]", List[Tuple[HornClause, Optional[Substitution]]]]:
         """
         Один крок forward chaining з комітом нових фактів у KB.
@@ -3048,12 +5067,36 @@ class DifferentiableProver(nn.Module):
         added = 0
         new_facts: Set[HornAtom] = set()
         derivations: List[Tuple[HornClause, Optional[Substitution]]] = []
+        device = self._reasoning_device() if device is None else device
+        has_multi_body = any(
+            len(rule.body) > 1 and self._executor_rule_is_usable(rule, only_verified=only_verified)
+            for rule in self.kb.rules
+        )
+        if not has_multi_body:
+            after = self.kb.forward_chain(
+                max_depth=1,
+                starting_facts=current,
+                only_verified=only_verified,
+            )
+            new_fact_set = frozenset(after - current)
+            for atom in new_fact_set:
+                self.kb.add_fact(atom)
+            if new_fact_set:
+                self._infer_used_rules_from_delta(current, after)
+            return len(new_fact_set), new_fact_set, []
 
         for clause in self.kb.rules:
+            if not self._executor_rule_is_usable(clause, only_verified=only_verified):
+                continue
             if not clause.body:
                 continue
             fresh = freshen_vars(clause)
-            for sigma in find_all_substitutions(fresh.body, current, max_solutions=128):
+            for sigma in self._find_rule_substitutions(
+                fresh.body,
+                current,
+                max_solutions=128,
+                device=device,
+            ):
                 derived = sigma.apply_atom(fresh.head)
                 if not derived.is_ground():
                     continue
@@ -3068,26 +5111,258 @@ class DifferentiableProver(nn.Module):
                     clause.use_count += 1
                     clause.weight *= 1.01
                     self.kb.mark_rule_verified(clause)
+                    self._note_used_rule(clause)
                     added += 1
 
         return added, frozenset(new_facts), derivations
 
-    # ── Proof Search (REINFORCE + Cost(T)) ───────────────────────────────────
+    # ── Mental Simulation helpers (Deduction pre-check) ──────────────────────
+
+    def _mental_simulate_rule(
+        self,
+        rule: "HornClause",
+        current_facts: "FrozenSet[HornAtom]",
+        device: torch.device,
+    ) -> Tuple[float, Optional["HornAtom"]]:
+        """
+        Ментальна симуляція правила ДО його реального застосування.
+        Реалізує концептуальну Дедукцію (розділ 2 концепції):
+          «Уявляє, як правило працюватиме, обчислює Prediction Error
+           у латентному просторі ДО реального застосування»
+
+        Повертає: (prediction_error ∈ [0,1], derived_atom_or_None)
+          0.0 = правило консистентне з фактами
+          1.0 = правило конфліктує або не уніфікується
+        """
+        if not rule.body:
+            return 0.0, rule.head if rule.head.is_ground() else None
+
+        fresh = freshen_vars(rule)
+        sigma = self._guided_unify_body(fresh.body, current_facts, device=device)
+
+        if sigma is None:
+            # Тіло не уніфікується → prediction_error максимальна
+            return 1.0, None
+
+        derived = sigma.apply_atom(fresh.head)
+        if not derived.is_ground():
+            return 0.5, None
+
+        # Перевіряємо суперечності з відомими фактами
+        for known in current_facts:
+            if _atoms_conflict(derived, known):
+                return 1.0, None  # Суперечність → відхиляємо
+
+        # SoftUnifier-енергія як диференційована міра prediction error
+        _MENTAL_MAX_FACTS = 32
+        fact_sample = (
+            frozenset(random.sample(list(current_facts), _MENTAL_MAX_FACTS))
+            if len(current_facts) > _MENTAL_MAX_FACTS else current_facts
+        )
+        try:
+            su_energy, _ = self.soft_unif(rule.body, fact_sample, device)
+            pred_error = float(torch.tanh(su_energy.detach() * 0.1).item())
+        except Exception:
+            pred_error = 0.0
+
+        # ── WorldRNN latent-space Prediction Error (Дедукція, розділ 2) ─────
+        # Концепція: «WorldRNN отримує на вхід z та дію (правило) і передбачає
+        # наступний стан z_next.  Якщо z_next ≠ символьно-очікуваний стан →
+        # Prediction Error у латентному просторі ДО реального застосування.»
+        if (self._world_rnn is not None
+                and self._last_z is not None
+                and self._world_rnn_vocab > 0):
+            try:
+                with torch.no_grad():
+                    z_anchor = self._last_z[:1]                        # (1, d)
+                    act_id = min(int(rule.head.pred), self._world_rnn_vocab - 1)
+                    act_t  = torch.tensor([act_id], device=device, dtype=torch.long)
+                    z_next_world, _ = self._world_rnn(z_anchor, act_t)  # (1, d)
+                    # Символьно-очікуваний стан після виведення derived
+                    z_sym_exp = self.ground(frozenset({derived}), device)[:1]  # (1, d)
+                    cos = float(
+                        F.cosine_similarity(z_next_world, z_sym_exp, dim=-1).clamp(-1.0, 1.0).item()
+                    )
+                    world_pred_error = (1.0 - cos) / 2.0              # [0, 1]
+                    # 60% символьна уніфікація + 40% WorldRNN latent-consistency
+                    pred_error = 0.6 * pred_error + 0.4 * world_pred_error
+            except Exception:
+                pass  # WorldRNN недоступний → залишаємо символьний pred_error
+
+        return pred_error, derived
+
+    def _predict_rule_facts(
+        self,
+        rule: "HornClause",
+        current_facts: "FrozenSet[HornAtom]",
+        max_predictions: int = 8,
+    ) -> FrozenSet[HornAtom]:
+        if not rule.body:
+            return frozenset({rule.head}) if rule.head.is_ground() else frozenset()
+        fresh = freshen_vars(rule)
+        predicted: List[HornAtom] = []
+        for sigma in self._find_rule_substitutions(
+            fresh.body,
+            current_facts,
+            max_solutions=max_predictions,
+        ):
+            derived = sigma.apply_atom(fresh.head)
+            if not derived.is_ground():
+                continue
+            if any(_atoms_conflict(derived, known) for known in current_facts):
+                continue
+            predicted.append(derived)
+            if len(predicted) >= max_predictions:
+                break
+        return frozenset(predicted)
+
+    def _induce_proposed_rules_locally(
+        self,
+        current_facts: FrozenSet[HornAtom],
+        target_facts: FrozenSet[HornAtom],
+        device: torch.device,
+        max_rules: int = 24,
+    ) -> Dict[str, float]:
+        verified = 0
+        contradicted = 0
+        retained = 0
+        repaired = 0
+        matched_predictions = 0
+        checked = 0
+        induction_scores: List[float] = []
+        trace_bundle = self._task_execution_trace()
+
+        for clause in self.kb.rules[:max_rules]:
+            if self._rule_status(clause) != EpistemicStatus.proposed:
+                continue
+            checked += 1
+            pred_error, predicted_one = self._mental_simulate_rule(clause, current_facts, device)
+            trace_pred_error = self._trace_prediction_error_for_rule(clause, trace_bundle)
+            counterexample_error = self._counterexample_error_for_rule(clause, trace_bundle)
+            predicted_facts = self._predict_rule_facts(clause, current_facts)
+            if predicted_one is not None:
+                predicted_facts = predicted_facts | frozenset({predicted_one})
+
+            hit_target = any(
+                unify(pred, tgt) is not None
+                for pred in predicted_facts
+                for tgt in target_facts
+            )
+            hit_obs = any(
+                unify(pred, obs) is not None
+                for pred in predicted_facts
+                for obs in current_facts
+            )
+            conflict = any(
+                _atoms_conflict(pred, known)
+                for pred in predicted_facts
+                for known in current_facts
+            )
+            trace_supported = trace_bundle is not None and trace_bundle.transitions and trace_pred_error < 0.45
+            if hit_target or hit_obs or trace_supported:
+                utility = 0.95 if (hit_target or trace_supported) else 0.80
+                utility = max(utility - 0.25 * counterexample_error, 0.05)
+                self.kb.mark_rule_verified(clause)
+                self.vem.record_outcome(clause, utility_target=utility, device=device)
+                self._record_rule_utility(clause, utility)
+                verified += 1
+                matched_predictions += len(predicted_facts)
+                induction_scores.append(utility)
+            elif conflict or pred_error >= 0.85 or counterexample_error >= 0.75 or trace_pred_error >= 0.90:
+                repaired_rule = self._repair_rule_candidate(
+                    clause,
+                    current_facts,
+                    target_facts,
+                    max_body_atoms=3,
+                )
+                if repaired_rule is not None:
+                    self.kb.mark_rule_contradicted(clause)
+                    utility = max(0.35, 1.0 - pred_error)
+                    self.vem.record_outcome(repaired_rule, utility_target=utility, device=device)
+                    self._record_rule_utility(repaired_rule, utility)
+                    self.kb.add_rule(repaired_rule, status=EpistemicStatus.proposed)
+                    repaired += 1
+                    induction_scores.append(utility)
+                else:
+                    utility = 0.05
+                    self.kb.mark_rule_contradicted(clause)
+                    self.vem.record_outcome(clause, utility_target=utility, device=device)
+                    self._record_rule_utility(clause, utility)
+                    contradicted += 1
+                    induction_scores.append(utility)
+            else:
+                utility = max(0.2, 1.0 - max(pred_error, trace_pred_error))
+                utility = max(utility - 0.2 * counterexample_error, 0.05)
+                self.vem.record_outcome(clause, utility_target=utility, device=device)
+                self._record_rule_utility(clause, utility)
+                retained += 1
+                induction_scores.append(utility)
+
+        mean_score = (
+            float(sum(induction_scores) / len(induction_scores))
+            if induction_scores else 0.0
+        )
+        return {
+            "checked": float(checked),
+            "verified": float(verified),
+            "contradicted": float(contradicted),
+            "retained": float(retained),
+            "repaired": float(repaired),
+            "matched_predictions": float(matched_predictions),
+            "mean_score": mean_score,
+        }
+
+    def _compute_rule_compatibility_scores(
+        self,
+        n_rules: int,
+        current_facts: "FrozenSet[HornAtom]",
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Вектор сумісності правил з поточними фактами.
+        Скеровує вибір policy до правил, які реально можуть уніфікуватись.
+        """
+        scores = torch.zeros(n_rules, device=device)
+        for i, rule in enumerate(self.kb.rules[:n_rules]):
+            if not self._rule_is_usable(rule):
+                scores[i] = -1.0
+                continue
+            if not rule.body:
+                scores[i] = 0.5
+                continue
+            fresh = freshen_vars(rule)
+            can_unify = (
+                self._guided_unify_body(fresh.body, current_facts, device=device) is not None
+            )
+            if can_unify:
+                vem_s = self.vem.score(rule, device)
+                scores[i] = float(vem_s)
+            else:
+                scores[i] = -1.0  # Не може уніфікуватись → депріоритизуємо
+        return scores
+
+    # ── Proof Search (REINFORCE + Cost(T) + Mental Simulation) ───────────────
     def prove_with_policy(self,
                           goal: HornAtom,
                           z_ctx: torch.Tensor,
                           n_steps: Optional[int] = None,
                           starting_facts: Optional[FrozenSet[HornAtom]] = None) -> Tuple[bool, List[int], torch.Tensor]:
         """
-        Шукає доведення goal, використовуючи PolicyNetwork для вибору правил.
+        Шукає доведення goal із ментальною симуляцією перед застосуванням.
 
-        Реалізує REINFORCE з MDL-вартістю доведення (розділ 6):
-          L_proof = -E_{T~π_θ}[R(T) - α·Cost(T)]
-          Cost(T) = Σ_{(R,σ)∈T} [Length(R) + λ·UnifComplexity(σ)]
+        Реалізує концептуальну Дедукцію (розділ 2 концепції):
+          «Модель уявляє, як правило працюватиме → обчислює PredError →
+           лише тоді застосовує (або відкидає) правило»
 
-        goal  : ціль доведення
-        z_ctx : (1, d) — контекст з нейромережі
-        Returns: (proved, trajectory, proof_loss)
+        Алгоритм:
+          1. Policy вибирає правило (z_ctx + compat_scores)
+          2. _mental_simulate_rule() → pred_error:
+             < threshold → застосовуємо реально
+             ≥ threshold → відхиляємо (REINFORCE отримує штраф)
+          3. Cost(T) включає pred_error кожного кроку
+
+        L_proof = -E_{T~π_θ}[R(T) - α·Cost(T)]
+        Cost(T) = Σ_i [Length(Ri) + λ·UnifComplexity(σi) + μ·PredError(Ri)]
         """
         n_steps = n_steps or self.max_depth
         n_rules = len(self.kb.rules)
@@ -3096,36 +5371,66 @@ class DifferentiableProver(nn.Module):
         z_goal = self.goal_proj(self._goal_embedding(goal, device))
         current_facts = starting_facts if starting_facts is not None else self.kb.facts
 
-        trajectory: List[int]         = []
-        log_probs:  List[torch.Tensor]= []
-        # Повна траєкторія для Cost(T): (rule, sigma) пари
-        proof_steps: List[Tuple['HornClause', Optional[Substitution]]] = []
+        trajectory: List[int]          = []
+        log_probs:  List[torch.Tensor] = []
+        proof_steps: List[Tuple["HornClause", Optional[Substitution]]] = []
+        step_pred_errors: List[float]  = []
 
-        proved = goal in current_facts   # вже є у KB?
+        proved = self._goal_supported(goal, current_facts)
 
         for step in range(n_steps):
-            if proved or n_rules == 0:
+            usable_indices = [
+                i for i, rule in enumerate(self.kb.rules[:n_rules])
+                if self._rule_is_usable(rule)
+            ]
+            if proved or not usable_indices:
                 break
 
-            # Policy вибирає правило
-            log_p = self.policy(z_ctx, z_goal, max(n_rules, 1))  # (1, n_rules)
-            dist  = Categorical(logits=log_p.squeeze(0))
-            rule_idx = dist.sample()
-            trajectory.append(rule_idx.item())
-            log_probs.append(dist.log_prob(rule_idx))
+            # Символьна сумісність → скеровуємо policy до придатних правил
+            compat_scores = self._compute_rule_compatibility_scores(
+                n_rules, current_facts, device
+            )
 
-            # Застосовуємо обране правило
+            log_p = self.policy(z_ctx, z_goal, max(n_rules, 1))  # (1, n_rules)
+            usable_t = torch.tensor(usable_indices, device=device, dtype=torch.long)
+            combined_logits = (
+                log_p.squeeze(0).index_select(0, usable_t)
+                + 0.3 * compat_scores.index_select(0, usable_t)
+            )
+            dist = Categorical(logits=combined_logits)
+            local_idx = dist.sample()
+            rule_idx = usable_t[local_idx]
+            trajectory.append(int(rule_idx.item()))
+            log_probs.append(dist.log_prob(local_idx))
+
             if rule_idx.item() < len(self.kb.rules):
                 rule = self.kb.rules[rule_idx.item()]
+
+                # ── Ментальна симуляція ПЕРЕД застосуванням ───────────────────
+                pred_error, mentally_derived = self._mental_simulate_rule(
+                    rule, current_facts, device
+                )
+                step_pred_errors.append(pred_error)
+
+                mental_threshold = float(getattr(self, "_mental_sim_threshold", 0.8))
+                if pred_error >= mental_threshold:
+                    # Ментальна симуляція відхилила правило
+                    # → не застосовуємо, але REINFORCE отримає штраф через pred_error
+                    proof_steps.append((rule, None))
+                    continue
+
+                # Симуляція пройшла → застосовуємо реально
                 if rule.body:
-                    # Freshen vars щоб уникнути конфліктів із поточними фактами
                     fresh = freshen_vars(rule)
-                    sigma = unify_body(fresh.body, current_facts)
-                    # Записуємо крок для Cost(T)
+                    sigma = self._guided_unify_body(
+                        fresh.body,
+                        current_facts,
+                        device=device,
+                    )
                     proof_steps.append((rule, sigma))
                     if sigma is not None:
+                        self._note_used_rule(rule)
                         derived = sigma.apply_atom(fresh.head)
-                        # Додаємо лише ground-факти
                         if derived.is_ground():
                             current_facts = current_facts | {derived}
                             if unify(goal, derived) is not None:
@@ -3133,20 +5438,165 @@ class DifferentiableProver(nn.Module):
 
         # ── REINFORCE: L_proof = -E[R(T) - α·Cost(T)] ────────────────────────
         R = float(proved)
-        # Обчислюємо MDL-вартість доведення через ProofCostEstimator
         proof_cost_tensor = self.cost_est(proof_steps, device)
-        # R(T) - α·Cost(T): заохочує доведення, штрафує складні докази
-        effective_reward  = R - self.alpha * proof_cost_tensor
+        avg_pred_error = (
+            sum(step_pred_errors) / len(step_pred_errors)
+            if step_pred_errors else 0.0
+        )
+        effective_reward = R - self.alpha * proof_cost_tensor
 
         if log_probs:
-            # baseline = 0 (можна замінити на baseline мережу)
             proof_loss = -effective_reward * torch.stack(log_probs).sum()
+            # Штраф за кроки з великою prediction_error (дедукційний сигнал)
+            pred_err_penalty = torch.tensor(
+                avg_pred_error * self.alpha, device=device, dtype=proof_loss.dtype
+            )
+            proof_loss = proof_loss + pred_err_penalty
         else:
-            proof_loss = proof_cost_tensor * self.alpha   # лише MDL регуляризатор
+            proof_loss = proof_cost_tensor * self.alpha
 
         return proved, trajectory, proof_loss
 
-    # ── Abduce and Learn (повільний цикл) з VeM фільтрацією ──────────────────
+    # ── Abduce and Learn (повільний цикл) + MDL candidate ranking ────────────
+
+    def _pred_error_for_rule(
+        self,
+        clause: "HornClause",
+        observed_facts: "FrozenSet[HornAtom]",
+        lam: float = 0.5,
+    ) -> float:
+        """
+        PredError(R, Trace) — наскільки правило R не може пояснити спостереження.
+
+        Реалізує праву частину формули абдукції:
+          R* = argmin_R [Length(R) + λ·PredError(R, Trace)]
+
+        PredError = 1.0 − coverage, де coverage = частка observed_facts,
+        яка покривається виведеним множиною фактів при застосуванні R.
+
+        Для pure-fact-правил (body=[]) — перевіряємо, чи голова є у фактах.
+        Для правил з тілом — рахуємо кількість успішних уніфікацій тіла.
+        """
+        trace_bundle = self._task_execution_trace()
+        trace_targets: Set[HornAtom] = set()
+        if self.task_context is not None:
+            if self.task_context.goal is not None:
+                trace_targets.add(self.task_context.goal)
+            trace_targets.update(self.task_context.target_facts)
+        if trace_bundle is not None:
+            trace_targets.update(trace_bundle.target_facts)
+        if not observed_facts and not trace_targets:
+            return 1.0
+        if not clause.body:
+            # Pure facts are useful if they match either the trace or the current targets.
+            for fact in observed_facts:
+                if unify(clause.head, fact) is not None:
+                    return 0.0
+            for target in trace_targets:
+                if unify(clause.head, target) is not None:
+                    return 0.0
+            return 1.0
+
+        # Рахуємо, скільки фактів входять у «пояснену зону» правила
+        # (тобто беруть участь як підстановки у body)
+        total_facts = max(len(observed_facts), 1)
+        explained_atoms: Set[HornAtom] = set()
+        explained_targets: Set[HornAtom] = set()
+
+        fresh = freshen_vars(clause)
+        subs = self._find_rule_substitutions(
+            fresh.body,
+            observed_facts,
+            max_solutions=16,
+        )
+        for sigma in subs:
+            # Факти, що задовольнили тіло правила — «пояснені»
+            for b_atom in fresh.body:
+                grounded = sigma.apply_atom(b_atom)
+                for obs in observed_facts:
+                    if unify(grounded, obs) is not None:
+                        explained_atoms.add(obs)
+            # Виведений голова — якщо є у спостереженнях, теж пояснений
+            derived = sigma.apply_atom(fresh.head)
+            if derived.is_ground():
+                for obs in observed_facts:
+                    if unify(derived, obs) is not None:
+                        explained_atoms.add(obs)
+                for target in trace_targets:
+                    if unify(derived, target) is not None:
+                        explained_targets.add(target)
+
+        observed_coverage = len(explained_atoms) / float(total_facts)
+        if trace_targets:
+            target_coverage = len(explained_targets) / float(max(len(trace_targets), 1))
+            coverage = 0.65 * observed_coverage + 0.35 * target_coverage
+        else:
+            coverage = observed_coverage
+
+        trace_pred_error = self._trace_prediction_error_for_rule(clause, trace_bundle)
+        if trace_bundle is not None and trace_bundle.transitions:
+            coverage = 0.55 * coverage + 0.45 * (1.0 - trace_pred_error)
+
+        # ── WorldRNN latent-space component (Абдукція, розділ 6) ──────────────
+        # Концепція: PredError(R, Trace) має включати не лише символьне покриття,
+        # а й узгодженість з латентним передбаченням WorldRNN.
+        # Якщо WorldRNN не передбачає стан, характерний для виведеного факту →
+        # PredError зростає, правило отримує вищий MDL-score → менш ймовірне.
+        if (self._world_rnn is not None
+                and self._last_z is not None
+                and self._world_rnn_vocab > 0
+                and subs):
+            try:
+                device = self._last_z.device
+                with torch.no_grad():
+                    z_anchor = self._last_z[:1]
+                    act_id = min(int(clause.head.pred), self._world_rnn_vocab - 1)
+                    act_t  = torch.tensor([act_id], device=device, dtype=torch.long)
+                    z_next_world, _ = self._world_rnn(z_anchor, act_t)  # (1, d)
+                    # Беремо перший виведений факт як символьну ціль
+                    fresh2 = freshen_vars(clause)
+                    for sigma2 in subs[:1]:
+                        derived2 = sigma2.apply_atom(fresh2.head)
+                        if derived2.is_ground():
+                            z_sym = self.ground(frozenset({derived2}), device)[:1]
+                            cos = float(
+                                F.cosine_similarity(
+                                    z_next_world, z_sym, dim=-1
+                                ).clamp(-1.0, 1.0).item()
+                            )
+                            world_miss = (1.0 - cos) / 2.0      # [0, 1]
+                            # 70% символьне покриття + 30% WorldRNN узгодженість
+                            coverage = 0.7 * coverage + 0.3 * (1.0 - world_miss)
+                            break
+            except Exception:
+                pass  # WorldRNN недоступний → залишаємо символьне coverage
+
+        return 1.0 - min(max(coverage, 0.0), 1.0)
+
+    def _mdl_sort_candidates(
+        self,
+        candidates: "List[HornClause]",
+        observed_facts: "FrozenSet[HornAtom]",
+        lam: float = 0.5,
+    ) -> "List[Tuple[float, HornClause]]":
+        """
+        Сортує кандидатів за MDL-формулою:
+          score(R) = description_length_bits(R) + λ·PredError(R, Trace)
+
+        Повертає список (score, clause) відсортований за зростанням score.
+        Мінімальний score = найкраще правило (принцип Оккама).
+        """
+        if not candidates:
+            return []
+        scored: List[Tuple[float, HornClause]] = []
+        for clause in candidates:
+            length_bits = clause.description_length_bits()
+            pred_err = self._pred_error_for_rule(clause, observed_facts, lam)
+            mdl_score = length_bits + lam * pred_err
+            scored.append((mdl_score, clause))
+        scored.sort(key=lambda x: x[0])
+        return scored
+
     def abduce_and_learn(
         self,
         z: torch.Tensor,
@@ -3154,44 +5604,145 @@ class DifferentiableProver(nn.Module):
         force: bool = False,
     ) -> Tuple[int, torch.Tensor, torch.Tensor, float]:
         """
-        Якщо error > threshold — генеруємо нові правила через абдукцію.
-        VeM фільтрує кандидатів до додавання в LTM.
+        Цілеспрямований пошук мінімального правила (концепція, розділ 6):
+          R* = argmin_R [Length(R) + λ·PredError(R, Trace)]
 
-        Returns: (кількість доданих правил, hinge_loss для VeM)
+        Замість випадкової генерації → MDL-фільтрації:
+          1. Генерація кандидатів (контекстні + нейронні)
+          2. MDL-ранжування за description_length_bits + λ·PredError
+          3. VeM-фільтрація (U(R) > τ)
+          4. Додавання найкращих у LTM зі статусом proposed
+
+        Returns: (кількість доданих правил, hinge_loss, abductor_loss, mean_utility)
         """
         device = z.device
         if (error < 0.5) and not force:
             zero = torch.zeros(1, device=device).squeeze()
+            self.last_abduced_rules = []
             return 0, zero, zero, 0.0
 
-        # Генеруємо кандидатів через AbductionHead
-        contextual_candidates = self._contextual_abduction_candidates(max_candidates=8)
-        neural_candidates, log_probs = self.abductor.sample_candidates(z[:1])
-        raw_candidates = contextual_candidates + neural_candidates
-        utilities = self.vem.score_batch(raw_candidates, device) if raw_candidates else torch.zeros(0, device=device)
+        # 1. Генеруємо кандидатів
+        trace_candidates, contextual_candidates, neural_candidates, log_probs = self._abduction_candidate_pool(
+            z,
+            max_contextual=12,
+            max_body_atoms=3,
+            max_trace=max(4, self.continuous_cycle_max_trace_candidates),
+            max_neural_fallback=2,
+        )
+        raw_candidates = trace_candidates + contextual_candidates + neural_candidates
 
-        # VeM фільтрація: тримаємо лише U(R) > vem_tau
-        accepted, hinge_loss = self.vem.filter_candidates(raw_candidates, device)
-        neural_utilities = utilities[len(contextual_candidates):] if contextual_candidates else utilities
-        if log_probs.numel() == neural_utilities.numel() and log_probs.numel() > 0:
-            abductor_loss = -((neural_utilities.detach() - self.vem_tau) * log_probs).mean()
+        if not raw_candidates:
+            zero = torch.zeros(1, device=device).squeeze()
+            self.last_abduced_rules = []
+            return 0, zero, zero, 0.0
+
+        # 2. MDL-ранжування ПЕРЕД VeM-фільтрацією
+        # Це реалізує цілеспрямований пошук замість випадкової генерації:
+        #   R* = argmin_R [Length(R) + λ·PredError(R, Trace)]
+        observed = self.kb.facts
+        if self.task_context is not None and self.task_context.observed_facts:
+            observed = observed | self.task_context.observed_facts
+
+        lam_mdl = float(getattr(self, "_mdl_lambda", 0.5))
+        mdl_ranked = self._mdl_sort_candidates(raw_candidates, observed, lam=lam_mdl)
+
+        # Беремо лише топ-50% за MDL: відкидаємо явно погані кандидати
+        # ще до VeM, зменшуючи простір пошуку
+        cutoff = max(1, len(mdl_ranked) // 2)
+        mdl_filtered = [clause for _, clause in mdl_ranked[:cutoff]]
+
+        # Зберігаємо MDL-scores для REINFORCE (заохочуємо нейронну мережу
+        # генерувати MDL-мінімальні правила)
+        mdl_scores_map: Dict[int, float] = {
+            hash(clause): score for score, clause in mdl_ranked
+        }
+
+        # 3. VeM-фільтрація (U(R) > τ) на MDL-відібраних кандидатах
+        utilities = self.vem.score_batch(mdl_filtered, device)
+        accepted, hinge_loss = self.vem.filter_candidates(mdl_filtered, device)
+
+        # REINFORCE для нейронних кандидатів:
+        # Заохочуємо генерацію правил з малим MDL-score та high VeM-score
+        neural_mdl_filtered_lp: List[torch.Tensor] = []
+        neural_mdl_utilities: List[float] = []
+        if log_probs.numel() > 0:
+            for i, nc in enumerate(neural_candidates):
+                h = hash(nc)
+                if h in mdl_scores_map and i < log_probs.shape[0]:
+                    # Нормалізуємо MDL-score до [0,1]: менший score = більша utility
+                    max_possible_mdl = max(
+                        (s for s, _ in mdl_ranked), default=1.0
+                    )
+                    mdl_utility = 1.0 - min(
+                        mdl_scores_map[h] / max(max_possible_mdl, 1.0), 1.0
+                    )
+                    # Комбінуємо VeM utility + MDL utility
+                    vem_u = self.vem.score(nc, device)
+                    combined_utility = 0.6 * float(vem_u) + 0.4 * mdl_utility
+                    neural_mdl_filtered_lp.append(log_probs[i])
+                    neural_mdl_utilities.append(combined_utility)
+
+        if neural_mdl_filtered_lp and neural_mdl_utilities:
+            util_tensor = torch.tensor(
+                neural_mdl_utilities, dtype=torch.float32, device=device
+            )
+            lp_tensor = torch.stack(neural_mdl_filtered_lp)
+            abductor_loss = -((util_tensor.detach() - self.vem_tau) * lp_tensor).mean()
         else:
             abductor_loss = torch.zeros(1, device=device).squeeze()
 
-        # Додаємо прийнятих кандидатів з епістемічним статусом proposed
+        # 4. Додаємо прийнятих кандидатів у LTM
         added = 0
+        added_rules: List[HornClause] = []
         for c in accepted:
             if self.kb.add_rule(c, status=EpistemicStatus.proposed):
                 added += 1
+                added_rules.append(c)
+        self.last_abduced_rules = added_rules
 
-        # Якщо нікого не прийнято — все одно записуємо VeM-сигнал
-        for c in raw_candidates:
-            score = self.vem.score(c, device)
-            # Поки target невідомий → 0.5 (нейтральний prior)
-            self.vem.record_outcome(c, utility_target=0.5, device=device)
+        # Записуємо VeM-сигнал: MDL-кращі кандидати отримують вищий prior
+        for score, clause in mdl_ranked:
+            max_mdl = max((s for s, _ in mdl_ranked), default=1.0)
+            prior = 1.0 - min(score / max(max_mdl, 1.0), 1.0)
+            # Зберігаємо MDL-заснований prior (не фіксований 0.5)
+            self.vem.record_outcome(clause, utility_target=prior * 0.7, device=device)
 
         mean_utility = float(utilities.mean().item()) if utilities.numel() > 0 else 0.0
         return added, hinge_loss, abductor_loss, mean_utility
+
+    def reinforce_recent_rules(self, utility_target: float, device: torch.device) -> None:
+        if not self.last_abduced_rules:
+            return
+        utility = float(max(0.0, min(1.0, utility_target)))
+        for clause in self.last_abduced_rules:
+            self.vem.record_outcome(clause, utility_target=utility, device=device)
+            self._record_rule_utility(clause, utility)
+        self.last_abduced_rules = []
+
+    def reinforce_used_rules(self, utility_target: float, device: torch.device) -> None:
+        if not self.last_used_rules:
+            return
+        utility = float(max(0.0, min(1.0, utility_target)))
+        for clause in self.last_used_rules:
+            self.vem.record_outcome(clause, utility_target=utility, device=device)
+            self._record_rule_utility(clause, utility)
+        self.last_used_rules = []
+        self._last_used_rule_hashes.clear()
+
+    def vem_retrospective_update(self, ce_utility: float, device: torch.device) -> None:
+        blended_ce = float(max(0.0, min(1.0, ce_utility)))
+        for clause in self.kb.rules:
+            history = self._rule_utility_history.get(hash(clause), [])
+            if history:
+                hist_mean = sum(history) / float(len(history))
+                target = 0.7 * hist_mean + 0.3 * blended_ce
+            else:
+                record = self.kb._records.get(hash(clause))
+                if record is not None and record.status == EpistemicStatus.verified:
+                    target = max(0.6, blended_ce)
+                else:
+                    target = 0.5
+            self.vem.record_outcome(clause, utility_target=target, device=device)
 
     # ── Forward (інтеграція у тренувальний цикл) ──────────────────────────────
     def forward(self,
@@ -3209,6 +5760,12 @@ class DifferentiableProver(nn.Module):
         """
         B, device = z.shape[0], z.device
         self._step += 1
+        self.last_used_rules = []
+        self._last_used_rule_hashes.clear()
+
+        # Зберігаємо знімок z без градієнта для _mental_simulate_rule
+        # та _pred_error_for_rule (ментальна симуляція без backprop витоку)
+        self._last_z = z.detach()
 
         # 0. Оновлюємо вік правил і запускаємо консолідацію
         self.kb.tick()
@@ -3216,24 +5773,29 @@ class DifferentiableProver(nn.Module):
             n_removed = self.kb.consolidate(use_count_threshold=2)
             # (можна логувати: n_removed правил видалено)
 
-        # 1. Perception: z → факт → додаємо у KB
+        # 1. Materialize discrete task facts into working memory.
         self.materialize_task_context_facts()
-        goal = self.current_goal(z)
+        goal = self.current_goal()
         working_facts = self.current_working_facts()
         target_facts = self._task_target_facts()
         provenance = self.task_context.provenance if self.task_context is not None else "latent"
 
-        # 2. Forward Chaining: GPU-акселерований (TensorKnowledgeBase)
-        # ~0.1–0.5 ms/батч — кешування не потрібне, викликаємо кожен крок.
-        all_facts = self.kb.forward_chain(self.max_depth, starting_facts=working_facts)
-        goal_supported = self._goal_supported(goal, all_facts)
-        target_hits = len(all_facts & target_facts)
-        target_total = len(target_facts)
-        target_coverage = (
-            float(target_hits) / float(target_total)
-            if target_total > 0 else (1.0 if goal_supported else 0.0)
+        # 2. Pure symbolic executor: discrete facts/rules/goal only.
+        exec_result = run_symbolic_executor(
+            self.kb,
+            self.max_depth,
+            working_facts,
+            goal,
+            target_facts,
+            self._goal_supported,
         )
-        unresolved_targets = max(target_total - target_hits, 0)
+        all_facts = exec_result.all_facts
+        self._infer_used_rules_from_delta(working_facts, all_facts)
+        goal_supported = exec_result.goal_supported
+        target_hits = exec_result.target_hits
+        target_total = exec_result.target_total
+        target_coverage = exec_result.target_coverage
+        unresolved_targets = exec_result.unresolved_targets
 
         # 3. Grounding: KB → z_sym
         # PERF FIX: при великому KB (>128 фактів) сэмплюємо підмножину,
@@ -3251,90 +5813,27 @@ class DifferentiableProver(nn.Module):
         z_target = self.ground(target_ground_sample, device).expand(B, -1)
 
         # 4. Proof search (тільки під час навчання)
-        vem_hinge = torch.zeros(1, device=device).squeeze()
-        abductor_aux = torch.zeros(1, device=device).squeeze()
-        proof_loss = torch.zeros(1, device=device).squeeze()
-        mean_utility = 0.0
-        abduced_rules = 0
-        if self.training and len(self.kb.rules) > 0:
-            proved, traj, proof_loss = self.prove_with_policy(
-                goal,
-                z[:1],
-                starting_facts=working_facts,
-            )
-            goal_supported = goal_supported or proved
-
-            # Оновлюємо VeM targets на основі результату доведення
-            if traj and self.kb.rules:
-                used_rule = self.kb.rules[traj[-1] % len(self.kb.rules)]
-                self.vem.record_outcome(
-                    used_rule,
-                    utility_target=1.0 if proved else 0.0,
-                    device=device
-                )
-                # Якщо доведення успішне → mark_rule_verified
-                if proved:
-                    self.kb.mark_rule_verified(used_rule)
-
-            # GraphMatchingUnifier: консистентна soft-уніфікація (розділ 5.2)
-            if self.kb.rules:
-                r = random.choice(self.kb.rules)
-                if r.body:
-                    # PERF FIX: обмежуємо кількість фактів для soft-уніфікатора.
-                    # SoftUnifier будує (|body|, |F|) матрицю — при |F|=1986 це
-                    # 1986 embed_atom() викликів + великий тензор. 64 фактів достатньо.
-                    _MAX_UNIF = 64
-                    unif_facts = (frozenset(random.sample(list(all_facts), _MAX_UNIF))
-                                  if len(all_facts) > _MAX_UNIF else all_facts)
-                    gm_energy, var_assign, gm_entropy = self.graph_unif(
-                        r.body, unif_facts, device, tau=0.5
-                    )
-                    su_e, su_ent = self.soft_unif(r.body, unif_facts, device)
-                    proof_loss = (proof_loss
-                                  + 0.01 * gm_energy
-                                  - 0.001 * gm_entropy
-                                  + 0.01 * su_e
-                                  - 0.001 * su_ent)
-
-        # 5. Abduce з VeM фільтрацією (раз на 5 кроків)
-        err_val = (world_error.item()
-                   if torch.is_tensor(world_error) else float(world_error))
-        mismatch_error = (1.0 - target_coverage) + (0.0 if goal_supported else 1.0)
-        trigger_abduction = (
-            self.task_context is not None and self.task_context.trigger_abduction
+        controller_result = run_latent_reasoning_controller(
+            self,
+            z,
+            goal,
+            working_facts,
+            all_facts,
+            target_facts,
+            goal_supported,
+            target_coverage,
+            world_error,
+            device,
         )
-        should_abduce = (
-            self.training
-            and (
-                trigger_abduction
-                or mismatch_error > 0.0
-                or (self._step % 5 == 0 and err_val > 0.5)
-            )
-        )
-        if should_abduce:
-            abduced_rules, vem_hinge, abductor_aux, mean_utility = self.abduce_and_learn(
-                z,
-                max(float(err_val), float(mismatch_error)),
-                force=trigger_abduction or mismatch_error > 0.0,
-            )
-            if abduced_rules > 0:
-                all_facts = self.kb.forward_chain(self.max_depth, starting_facts=working_facts)
-                goal_supported = self._goal_supported(goal, all_facts)
-                target_hits = len(all_facts & target_facts)
-                target_coverage = (
-                    float(target_hits) / float(target_total)
-                    if target_total > 0 else (1.0 if goal_supported else 0.0)
-                )
-                unresolved_targets = max(target_total - target_hits, 0)
-                ground_sample = (frozenset(random.sample(list(all_facts), _MAX_GROUND))
-                                 if len(all_facts) > _MAX_GROUND else all_facts)
-                z_sym_1 = self.ground(ground_sample, device)
-                z_sym = z_sym_1.expand(B, -1)
-
-        # 6. VeM self-supervised loss (раз на 10 кроків)
-        vem_self_loss = torch.zeros(1, device=device).squeeze()
-        if self.training and self._step % 10 == 0:
-            vem_self_loss = self.vem.self_supervised_loss(device)
+        proof_loss = controller_result.proof_loss
+        vem_hinge = controller_result.vem_hinge
+        abductor_aux = controller_result.abductor_aux
+        vem_self_loss = controller_result.vem_self_loss
+        mean_utility = controller_result.mean_utility
+        abduced_rules = controller_result.abduced_rules
+        goal_supported = controller_result.goal_supported
+        induction_stats: Dict[str, float] = controller_result.induction_stats or empty_induction_stats()
+        cycle_stats: Dict[str, float] = controller_result.cycle_stats or {}
 
         # 7. Symbolic Consistency Loss: MSE між z та z_sym
         sym_consist = F.mse_loss(z, z_sym.detach()) + \
@@ -3367,6 +5866,41 @@ class DifferentiableProver(nn.Module):
             "unresolved_targets": float(unresolved_targets),
             "abduced_rules": float(abduced_rules),
             "abduction_utility": mean_utility,
+            "induction_checked": induction_stats["checked"],
+              "induction_verified": induction_stats["verified"],
+              "induction_contradicted": induction_stats["contradicted"],
+              "induction_retained": induction_stats["retained"],
+              "induction_repaired": induction_stats.get("repaired", 0.0),
+              "induction_matches": induction_stats["matched_predictions"],
+              "induction_score": induction_stats["mean_score"],
+              "cycle_checked": float(cycle_stats.get("checked", 0.0)),
+              "cycle_accepted": float(cycle_stats.get("accepted", 0.0)),
+              "cycle_added": float(cycle_stats.get("added", 0.0)),
+              "cycle_verified": float(cycle_stats.get("verified", 0.0)),
+              "cycle_contradicted": float(cycle_stats.get("contradicted", 0.0)),
+              "cycle_retained": float(cycle_stats.get("retained", 0.0)),
+              "cycle_repaired": float(cycle_stats.get("repaired", 0.0)),
+              "cycle_error": float(cycle_stats.get("mean_error", 0.0)),
+              "cycle_symbolic_error": float(cycle_stats.get("mean_symbolic_error", 0.0)),
+              "cycle_soft_symbolic_error": float(cycle_stats.get("mean_soft_symbolic_error", 0.0)),
+              "cycle_relaxed_body_error": float(cycle_stats.get("mean_relaxed_body_error", 0.0)),
+              "cycle_relaxed_head_error": float(cycle_stats.get("mean_relaxed_head_error", 0.0)),
+              "cycle_trace_error": float(cycle_stats.get("mean_trace_error", 0.0)),
+              "cycle_counterexample_error": float(cycle_stats.get("mean_counterexample_error", 0.0)),
+              "cycle_world_error": float(cycle_stats.get("mean_world_error", 0.0)),
+              "cycle_token_error": float(cycle_stats.get("mean_token_error", 0.0)),
+              "cycle_graph_energy": float(cycle_stats.get("mean_graph_energy", 0.0)),
+              "cycle_policy_loss": float(cycle_stats.get("policy_loss", 0.0)),
+              "cycle_loss": float(cycle_stats.get("loss", 0.0)),
+              "graph_reasoning_calls": float(self._graph_reasoning_stats.get("calls", 0.0)),
+              "graph_reasoning_guided_calls": float(self._graph_reasoning_stats.get("guided_calls", 0.0)),
+              "graph_reasoning_fallbacks": float(self._graph_reasoning_stats.get("fallbacks", 0.0)),
+              "graph_reasoning_mean_subset": float(self._graph_reasoning_stats.get("mean_subset", 0.0)),
+              "graph_reasoning_mean_full_facts": float(self._graph_reasoning_stats.get("mean_full_facts", 0.0)),
+              "graph_reasoning_mean_solutions": float(self._graph_reasoning_stats.get("mean_solutions", 0.0)),
+            "trace_steps": float(self.task_context.metadata.get("trace_steps", 0.0)) if self.task_context is not None else 0.0,
+            "trace_counterexamples": float(self.task_context.metadata.get("trace_counterexamples", 0.0)) if self.task_context is not None else 0.0,
+            "used_rules": float(len(self.last_used_rules)),
             "provenance": provenance,
         }
 
@@ -3395,12 +5929,23 @@ class DifferentiableProver(nn.Module):
         device = z.device
         if not self.training:
             return torch.zeros(1, device=device).squeeze()
-        raw_candidates, log_probs = self.abductor.sample_candidates(z[:1])
+        trace_candidates, contextual_candidates, neural_candidates, log_probs = self._abduction_candidate_pool(
+            z,
+            max_contextual=8,
+            max_body_atoms=3,
+            max_trace=max(2, self.continuous_cycle_max_trace_candidates),
+            max_neural_fallback=2,
+        )
+        raw_candidates = trace_candidates + contextual_candidates + neural_candidates
         if not raw_candidates:
             return torch.zeros(1, device=device).squeeze()
         utilities = self.vem.score_batch(raw_candidates, device)
         _, hinge = self.vem.filter_candidates(raw_candidates, device)
-        rl = -((utilities.detach() - self.vem_tau) * log_probs).mean()
+        if neural_candidates and log_probs.numel() > 0:
+            neural_utilities = self.vem.score_batch(neural_candidates, device)
+            rl = -((neural_utilities.detach() - self.vem_tau) * log_probs).mean()
+        else:
+            rl = torch.zeros(1, device=device).squeeze()
         return delta * (hinge + rl)
 
     def semantic_feedback_pairs(
@@ -3595,6 +6140,47 @@ def _run_prolog_tests() -> None:
     assert expected_struct in derived_struct, f"Structured compound join FAIL: {derived_struct}"
     print("  [PASS] вЂ” structured fast join РїС–РґС‚СЂРёРјСѓС” f(Const,Var) Сѓ body Р№ head")
 
+    sep("T_TENSOR_ARITY3 В· TensorKnowledgeBase — fallback для арності > 2")
+    sep("T_TENSOR_VARPOS")
+    tkb_varpos = TensorKnowledgeBase(max_rules=64, max_facts=128, device=device)
+    Xv = Var("Xv")
+    tkb_varpos.add_fact(HornAtom(pred=40, args=(Const(7), Const(5))))
+    tkb_varpos.add_rule(HornClause(
+        head=HornAtom(pred=41, args=(Xv, Const(7))),
+        body=(HornAtom(pred=40, args=(Const(7), Xv)),),
+    ))
+    derived_varpos = tkb_varpos.forward_chain(max_depth=3)
+    assert HornAtom(pred=41, args=(Const(5), Const(7))) in derived_varpos, (
+        f"Variable-to-head propagation FAIL: {derived_varpos}"
+    )
+    assert HornAtom(pred=41, args=(Const(7), Const(7))) not in derived_varpos, (
+        f"Spurious slot-0 propagation detected: {derived_varpos}"
+    )
+    print("  [PASS] - unary tensor rule respects body arg position")
+
+    tkb_arity = TensorKnowledgeBase(max_rules=64, max_facts=128, device=device)
+    tkb_arity.add_fact(HornAtom(pred=30, args=(Const(1), Const(2), Const(3))))
+    X3, Y3, Z3 = Var("X3"), Var("Y3"), Var("Z3")
+    tkb_arity.add_rule(HornClause(
+        head=HornAtom(pred=31, args=(X3, Z3)),
+        body=(HornAtom(pred=30, args=(X3, Y3, Z3)),),
+    ))
+    tkb_arity.add_rule(HornClause(
+        head=HornAtom(pred=32, args=(Const(4), Const(5), Const(6))),
+        body=(),
+    ))
+    derived_arity = tkb_arity.forward_chain(max_depth=3)
+    assert HornAtom(pred=30, args=(Const(1), Const(2), Const(3))) in derived_arity, (
+        f"Arity-3 fact lost in fallback path: {derived_arity}"
+    )
+    assert HornAtom(pred=31, args=(Const(1), Const(3))) in derived_arity, (
+        f"Arity-3 body fallback FAIL: {derived_arity}"
+    )
+    assert HornAtom(pred=32, args=(Const(4), Const(5), Const(6))) in derived_arity, (
+        f"Arity-3 fact-rule fallback FAIL: {derived_arity}"
+    )
+    print("  [PASS] — >2 аргументи не губляться і виводяться через Python fallback")
+
     facts_u = frozenset([
         HornAtom(pred=0, args=(Const(1), Const(2))),
         HornAtom(pred=0, args=(Const(2), Const(3))),
@@ -3613,6 +6199,26 @@ def _run_prolog_tests() -> None:
     pen = kb.complexity_penalty()
     assert pen > 0
     print(f"  complexity_penalty={pen:.1f}  rules={len(kb)}  [PASS]")
+
+    sep("T4b · Rule bits ignore runtime bookkeeping")
+    runtime_rule_a = HornClause(
+        head=HornAtom(pred=7, args=(Var("X"),)),
+        body=(HornAtom(pred=8, args=(Var("X"),)),),
+        weight=1.0,
+        use_count=0,
+    )
+    runtime_rule_b = HornClause(
+        head=HornAtom(pred=7, args=(Var("X"),)),
+        body=(HornAtom(pred=8, args=(Var("X"),)),),
+        weight=9.0,
+        use_count=123,
+    )
+    bits_a = runtime_rule_a.description_length_bits()
+    bits_b = runtime_rule_b.description_length_bits()
+    bits_runtime = runtime_rule_b.description_length_bits(include_runtime_state=True)
+    assert abs(bits_a - bits_b) < 1e-9, "FAIL: structural rule bits depend on runtime state"
+    assert bits_runtime > bits_b, "FAIL: runtime-state option should add extra bits"
+    print(f"  structural={bits_a:.2f}  with_runtime={bits_runtime:.2f}  [PASS]")
 
     # ══ T5: ProofPolicyNet ═══════════════════════════════════════════════════
     sep("T5 · ProofPolicyNet")
@@ -3698,12 +6304,20 @@ def _run_prolog_tests() -> None:
     prover.kb.add_rule(HornClause(
         head=HornAtom(pred=3, args=(Xp, Const(7))),
         body=(HornAtom(pred=2, args=(Const(7), Xp)),)
-    ))
+    ), status=EpistemicStatus.verified)
     goal = HornAtom(pred=3, args=(Const(5), Const(7)))
     z1   = torch.randn(1, 32, device=device)
     proved, traj, pl = prover.prove_with_policy(goal, z1, n_steps=3)
     assert pl.dim() == 0 or pl.numel() == 1, "FAIL: proof_loss не скалярний"
     print(f"  proved={proved}  steps={len(traj)}  proof_loss={pl.item():.4f}  [PASS]")
+
+    sep("T9b В· answer_query Р· query-specific proof state")
+    query_goal = HornAtom(pred=3, args=(Var("ANS"), Const(7)))
+    z_query, answer_ids, support = prover.answer_query(query_goal, device=device)
+    assert z_query.shape == (1, 32), f"FAIL: query state {z_query.shape}"
+    assert support.item() > 0.0, f"FAIL: query support={support.item():.4f}"
+    assert 5 in answer_ids, f"FAIL: expected answer 5 in {answer_ids}"
+    print(f"  support={support.item():.4f}  answers={answer_ids}  [PASS]")
 
     # ══ T10: Абдукція ═════════════════════════════════════════════════════════
     sep("T10 · abduce_and_learn")
@@ -3711,6 +6325,355 @@ def _run_prolog_tests() -> None:
     added, _, _, _ = prover.abduce_and_learn(z_in, error=2.0, force=True)
     n_after  = len(prover.kb)
     print(f"  rules before={n_before}  added={added}  after={n_after}  [PASS]")
+    sep("T10a В· contextual bridge-chain abduction")
+    bridge_prover = DifferentiableProver(
+        d_latent=32, sym_vocab=32, max_rules=32, max_depth=3, n_cands=4
+    ).to(device)
+    bridge_ctx = SymbolicTaskContext(
+        observed_facts=frozenset({
+            HornAtom(pred=5, args=(Const(1), Const(2))),
+            HornAtom(pred=6, args=(Const(2), Const(3))),
+            HornAtom(pred=8, args=(Const(3), Const(4))),
+        }),
+        goal=HornAtom(pred=7, args=(Const(1), Const(4))),
+        target_facts=frozenset({HornAtom(pred=7, args=(Const(1), Const(4)))}),
+        provenance="unit",
+        trigger_abduction=True,
+    )
+    bridge_prover.set_task_context(bridge_ctx)
+    bridge_rules = bridge_prover._contextual_abduction_candidates(
+        max_candidates=12,
+        max_body_atoms=3,
+    )
+    assert bridge_rules, "FAIL: no contextual bridge candidates"
+    assert any(len(rule.body) == 3 for rule in bridge_rules), "FAIL: no 3-body bridge rule"
+    print(
+        f"  bridge_candidates={len(bridge_rules)}  "
+        f"max_body={max(len(r.body) for r in bridge_rules)}  [PASS]"
+    )
+
+    sep("T10b · Working memory stays separate from KB")
+    sep("T10c · proactive hypothesis cycle")
+    class _DummyWorld(nn.Module):
+        def __init__(self, d_model: int, vocab_size: int):
+            super().__init__()
+            self.act_emb = nn.Embedding(vocab_size, d_model)
+            self.proj = nn.Linear(d_model * 2, d_model)
+
+        def forward(self, z_state, action, h=None):
+            del h
+            act = self.act_emb(action)
+            return torch.tanh(self.proj(torch.cat([z_state, act], dim=-1))), None
+
+    cycle_prover = DifferentiableProver(
+        d_latent=32, sym_vocab=32, max_rules=32, max_depth=3, n_cands=4
+    ).to(device)
+    cycle_prover.set_world_rnn(_DummyWorld(32, 32).to(device))
+    cycle_prover.configure_hypothesis_cycle(
+        enabled=True,
+        max_contextual=4,
+        max_neural=2,
+        accept_threshold=0.25,
+        verify_threshold=0.45,
+    )
+    cycle_ctx = SymbolicTaskContext(
+        observed_facts=bridge_ctx.observed_facts,
+        goal=bridge_ctx.goal,
+        target_facts=bridge_ctx.target_facts,
+        provenance="unit",
+        trigger_abduction=False,
+        metadata={"last_src": 1.0, "last_tgt": 4.0},
+    )
+    cycle_prover.set_task_context(cycle_ctx)
+    cycle_prover.train()
+    z_cycle = torch.randn(1, 32, device=device)
+    cycle_prover._last_z = z_cycle.detach()
+    cycle_out = cycle_prover.continuous_hypothesis_cycle(
+        z_cycle,
+        cycle_ctx.observed_facts,
+        cycle_ctx.target_facts,
+        device,
+    )
+    assert cycle_out["stats"]["checked"] >= 1.0, "Continuous cycle did not inspect any hypothesis"
+    assert not torch.isnan(cycle_out["loss_tensor"]), "Continuous cycle loss is NaN"
+    assert 0.0 <= cycle_out["stats"]["mean_token_error"] <= 1.0, "Bad token error"
+    print(
+        f"  checked={cycle_out['stats']['checked']:.0f}  "
+        f"added={cycle_out['stats']['added']:.0f}  "
+        f"loss={cycle_out['stats']['loss']:.4f}  [PASS]"
+    )
+
+    sep("T10d · hypothesis cycle repairs broken rule")
+    repair_prover = DifferentiableProver(
+        d_latent=32, sym_vocab=32, max_rules=32, max_depth=3, n_cands=2
+    ).to(device)
+    repair_prover.set_world_rnn(_DummyWorld(32, 32).to(device))
+    repair_prover.configure_hypothesis_cycle(
+        enabled=True,
+        max_contextual=1,
+        max_neural=0,
+        accept_threshold=0.25,
+        verify_threshold=0.45,
+        repair_enabled=True,
+        repair_threshold=0.80,
+        max_repairs=1,
+    )
+    repair_ctx = SymbolicTaskContext(
+        observed_facts=bridge_ctx.observed_facts,
+        goal=bridge_ctx.goal,
+        target_facts=bridge_ctx.target_facts,
+        provenance="unit",
+        trigger_abduction=False,
+        metadata={"last_src": 1.0, "last_tgt": 4.0},
+    )
+    repair_prover.set_task_context(repair_ctx)
+    repair_prover.train()
+    bad_rule = HornClause(
+        head=HornAtom(pred=6, args=(Var("X"), Var("Y"))),
+        body=(HornAtom(pred=9, args=(Var("X"), Var("Y"))),),
+    )
+    repair_prover.kb.add_rule(bad_rule, status=EpistemicStatus.proposed)
+    repair_prover._contextual_abduction_candidates = (
+        lambda max_candidates=4, max_body_atoms=3: [bad_rule]
+    )
+    z_repair = torch.randn(1, 32, device=device)
+    repair_prover._last_z = z_repair.detach()
+    repair_out = repair_prover.continuous_hypothesis_cycle(
+        z_repair,
+        repair_ctx.observed_facts,
+        repair_ctx.target_facts,
+        device,
+    )
+    repaired_rules = [
+        rule for rule in repair_prover.kb.rules
+        if rule.head.pred == 7 and len(rule.body) >= 2
+    ]
+    bridge_vars = max(
+        (
+            structural_bridge_variable_count(rule.head, rule.body)
+            for rule in repaired_rules
+        ),
+        default=0,
+    )
+    assert repair_out["stats"]["repaired"] >= 1.0, "Continuous cycle did not repair the rule"
+    assert repair_out["stats"]["checked"] >= 2.0, "Repair candidate was not re-evaluated"
+    assert repaired_rules, "Repaired bridge rule was not added to the KB"
+    assert bridge_vars >= 1, "Repair selected an unstructured rule instead of a bridge hypothesis"
+    print(
+        f"  repaired={repair_out['stats']['repaired']:.0f}  "
+        f"checked={repair_out['stats']['checked']:.0f}  "
+        f"bridge_body={len(repaired_rules[0].body)}  "
+        f"bridge_vars={bridge_vars:.0f}  [PASS]"
+    )
+
+    sep("T10e · relaxed hypothesis path backpropagates")
+    relaxed_prover = DifferentiableProver(
+        d_latent=32, sym_vocab=32, max_rules=32, max_depth=3, n_cands=4
+    ).to(device)
+    relaxed_prover.set_world_rnn(_DummyWorld(32, 32).to(device))
+    relaxed_prover.configure_hypothesis_cycle(
+        enabled=True,
+        max_contextual=0,
+        max_neural=2,
+        accept_threshold=0.25,
+        verify_threshold=0.45,
+    )
+    relaxed_ctx = SymbolicTaskContext(
+        observed_facts=bridge_ctx.observed_facts,
+        goal=bridge_ctx.goal,
+        target_facts=bridge_ctx.target_facts,
+        provenance="unit",
+        trigger_abduction=False,
+        metadata={"last_src": 1.0, "last_tgt": 4.0},
+    )
+    relaxed_prover.set_task_context(relaxed_ctx)
+    relaxed_prover.train()
+    relaxed_prover.zero_grad(set_to_none=True)
+    z_relaxed = torch.randn(1, 32, device=device, requires_grad=True)
+    relaxed_cycle = relaxed_prover.continuous_hypothesis_cycle(
+        z_relaxed,
+        relaxed_ctx.observed_facts,
+        relaxed_ctx.target_facts,
+        device,
+    )
+    relaxed_cycle["loss_tensor"].backward()
+    abductor_grad = sum(
+        p.grad.norm().item()
+        for n, p in relaxed_prover.named_parameters()
+        if "abductor" in n and p.grad is not None
+    )
+    graph_grad = sum(
+        p.grad.norm().item()
+        for n, p in relaxed_prover.named_parameters()
+        if "graph_unif" in n and p.grad is not None
+    )
+    z_grad = 0.0 if z_relaxed.grad is None else float(z_relaxed.grad.norm().item())
+    assert relaxed_cycle["stats"]["checked"] >= 1.0, "Relaxed cycle inspected no hypotheses"
+    assert abductor_grad > 0.0, "Relaxed cycle did not backprop into AbductionHead"
+    assert graph_grad > 0.0, "Relaxed cycle did not backprop into GraphMatchingUnifier"
+    assert z_grad > 0.0, "Relaxed cycle did not backprop into latent state z"
+    print(
+        f"  z_grad={z_grad:.4f}  "
+        f"abductor_grad={abductor_grad:.4f}  "
+        f"graph_grad={graph_grad:.4f}  [PASS]"
+    )
+
+    sep("T10f · trace-driven abduction and counterexample checks")
+    trace_bundle = build_symbolic_trace_bundle(
+        "def add(a, b):\n    return a + b\n",
+        max_steps=16,
+        max_counterexamples=2,
+    )
+    assert trace_bundle is not None, "FAIL: symbolic execution trace was not built"
+    trace_goal = next(
+        (fact for fact in trace_bundle.target_facts if fact.pred == TRACE_RETURN_EVENT_PRED),
+        next(iter(trace_bundle.target_facts)),
+    )
+    trace_prover = DifferentiableProver(
+        d_latent=32, sym_vocab=32, max_rules=32, max_depth=3, n_cands=2
+    ).to(device)
+    trace_ctx = SymbolicTaskContext(
+        observed_facts=trace_bundle.observed_facts,
+        goal=trace_goal,
+        target_facts=trace_bundle.target_facts,
+        execution_trace=trace_bundle,
+        provenance="trace",
+        trigger_abduction=True,
+    )
+    trace_prover.set_task_context(trace_ctx)
+    trace_rules = trace_prover._trace_abduction_candidates(max_candidates=8, max_body_atoms=2)
+    assert trace_rules, "FAIL: trace-guided abduction produced no rules"
+    trace_rule = next(
+        (
+            rule for rule in trace_rules
+            if rule.head.pred == TRACE_RETURN_EVENT_PRED
+            and any(atom.pred == TRACE_BINOP_EVENT_PRED for atom in rule.body)
+        ),
+        trace_rules[0],
+    )
+    bad_rule = HornClause(
+        head=HornAtom(
+            pred=TRACE_RETURN_EVENT_PRED,
+            args=(Var("S"), Var("SC"), Var("R")),
+        ),
+        body=(
+            HornAtom(
+                pred=TRACE_PARAM_BIND_PRED,
+                args=(Var("S"), Var("SC"), Var("P"), Var("R")),
+            ),
+        ),
+    )
+    good_trace_error = trace_prover._trace_prediction_error_for_rule(trace_rule, trace_bundle)
+    bad_trace_error = trace_prover._trace_prediction_error_for_rule(bad_rule, trace_bundle)
+    good_counterexample_error = trace_prover._counterexample_error_for_rule(trace_rule, trace_bundle)
+    bad_counterexample_error = trace_prover._counterexample_error_for_rule(bad_rule, trace_bundle)
+    assert len(trace_bundle.transitions) >= 1, "FAIL: no primary trace transitions"
+    assert len(trace_bundle.counterexamples) >= 1, "FAIL: no counterexample traces"
+    assert good_trace_error <= bad_trace_error, "FAIL: trace-guided rule does not explain the primary trace better"
+    assert bad_counterexample_error > 0.0, "FAIL: counterexample trace did not challenge the overgeneral rule"
+    print(
+        f"  trace_rules={len(trace_rules)}  "
+        f"good_trace_err={good_trace_error:.3f}  "
+        f"bad_trace_err={bad_trace_error:.3f}  "
+        f"good_counter_err={good_counterexample_error:.3f}  "
+        f"bad_counter_err={bad_counterexample_error:.3f}  [PASS]"
+    )
+
+    sep("T10g · extended symbolic execution trace coverage")
+    rich_trace = build_symbolic_trace_bundle(
+        (
+            "def total(xs):\n"
+            "    acc = 0\n"
+            "    for x in xs:\n"
+            "        acc = acc + x\n"
+            "    return acc\n\n"
+            "nums = [1, 2, 3]\n"
+            "first = nums[0]\n"
+            "lookup = {'a': 7}\n"
+            "value = lookup['a']\n"
+            "result = total(nums)\n"
+        ),
+        max_steps=32,
+        max_counterexamples=3,
+    )
+    assert rich_trace is not None, "FAIL: rich symbolic trace was not built"
+    rich_targets = list(rich_trace.target_facts)
+    assert any(fact.pred == TRACE_RETURN_EVENT_PRED for fact in rich_targets), "FAIL: missing return trace facts"
+    assert any(fact.pred == TRACE_BINOP_EVENT_PRED for fact in rich_targets), "FAIL: missing operator/subscript facts"
+    counter_after = set()
+    for transition in rich_trace.counterexamples:
+        counter_after.update(transition.after_facts)
+    assert any(fact.pred == TRACE_ERROR_EVENT_PRED for fact in counter_after), "FAIL: counterexample trace missed runtime error"
+    print(
+        f"  transitions={len(rich_trace.transitions)}  "
+        f"counterexamples={len(rich_trace.counterexamples)}  "
+        f"targets={len(rich_targets)}  [PASS]"
+    )
+
+    sep("T10h · graph-guided exact forward chaining")
+    guided_prover = DifferentiableProver(
+        d_latent=32, sym_vocab=64, max_rules=64, max_depth=4, n_cands=2
+    ).to(device)
+    guided_prover.configure_graph_reasoning(
+        enabled=True,
+        top_k_facts=3,
+        max_fact_subset=8,
+        attention_threshold=0.0,
+        tau=0.5,
+        full_scan_cutoff=0,
+    )
+    gp_rule = HornClause(
+        head=HornAtom(pred=77, args=(Var("X"), Var("Z"))),
+        body=(
+            HornAtom(pred=11, args=(Var("X"), Var("Y"))),
+            HornAtom(pred=11, args=(Var("Y"), Var("Z"))),
+        ),
+    )
+    guided_prover.kb.add_rule(gp_rule, status=EpistemicStatus.verified)
+    for a, b in [(1, 2), (2, 3)] + [(10 + i, 20 + i) for i in range(12)]:
+        guided_prover.kb.add_fact(HornAtom(pred=11, args=(Const(a), Const(b))))
+    guided_base = guided_prover.current_working_facts()
+    guided_out = guided_prover.forward_chain_reasoned(
+        max_depth=3,
+        starting_facts=guided_base,
+        only_verified=True,
+        device=device,
+    )
+    baseline_out = guided_prover.kb.forward_chain(
+        max_depth=3,
+        starting_facts=guided_base,
+        only_verified=True,
+    )
+    expected_gp = HornAtom(pred=77, args=(Const(1), Const(3)))
+    assert expected_gp in guided_out, "FAIL: graph-guided executor missed the exact derivation"
+    assert guided_out == baseline_out, "FAIL: graph-guided executor changed exact forward results"
+    assert guided_prover._graph_reasoning_stats["guided_calls"] > 0.0, "FAIL: graph guidance never activated"
+    assert guided_prover._graph_reasoning_stats["mean_subset"] < guided_prover._graph_reasoning_stats["mean_full_facts"], "FAIL: graph guidance did not prune fact search"
+    print(
+        f"  guided_calls={guided_prover._graph_reasoning_stats['guided_calls']:.0f}  "
+        f"subset={guided_prover._graph_reasoning_stats['mean_subset']:.1f}  "
+        f"full={guided_prover._graph_reasoning_stats['mean_full_facts']:.1f}  [PASS]"
+    )
+
+    wm_prover = DifferentiableProver(
+        d_latent=16, sym_vocab=16, max_rules=16, max_depth=2, n_cands=2
+    ).to(device)
+    kb_fact = HornAtom(pred=9, args=(Const(1), Const(1)))
+    wm_fact = HornAtom(pred=9, args=(Const(2), Const(2)))
+    wm_prover.kb.add_fact(kb_fact)
+    kb_before = wm_prover.kb.n_facts()
+    wm_added = wm_prover.load_observed_facts([wm_fact])
+    working_now = wm_prover.current_working_facts()
+    assert wm_added == 1, f"Expected 1 WM fact, got {wm_added}"
+    assert wm_fact in working_now, "WM fact missing from current working facts"
+    assert wm_prover.kb.n_facts() == kb_before, "Observed fact leaked into long-term KB"
+    wm_prover.clear_task_context()
+    assert wm_fact not in wm_prover.current_working_facts(), "WM fact survived context clear"
+    assert kb_fact in wm_prover.current_working_facts(), "KB fact should remain after WM clear"
+    print(
+        f"  kb_before={kb_before}  kb_after={wm_prover.kb.n_facts()}  "
+        f"working={len(working_now)}  [PASS]"
+    )
 
     # ══ T_GRAPH_UNIF: GraphMatchingUnifier ════════════════════════════════════
     sep("T_GRAPH_UNIF · GraphMatchingUnifier (консистентна уніфікація)")

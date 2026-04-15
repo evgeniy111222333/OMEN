@@ -1502,6 +1502,153 @@ class MultiLangASTParser:
             all_facts.extend(self.parse(code, lang, source_id=start_id + i))
         return all_facts
 
+    # ── Ідеальна реалізація: пункт 1 специфікації ─────────────────────────────
+
+    # Евристичні сигнатури мов — для автодетекту без tree-sitter
+    _LANG_SIGNATURES: Dict[str, List[str]] = {
+        "python":     ["def ", "import ", "class ", "elif ", "lambda "],
+        "javascript": ["function ", "const ", "let ", "var ", "=>", "require("],
+        "typescript": ["interface ", ": string", ": number", ": boolean", "as "],
+        "java":       ["public class", "private ", "void ", "System.out"],
+        "rust":       ["fn ", "let mut", "impl ", "use std", "pub fn"],
+        "go":         ["func ", "package ", "import (", ":=", "fmt."],
+        "c":          ["#include", "int main(", "printf(", "malloc("],
+        "cpp":        ["#include", "std::", "vector<", "cout <<"],
+        "bash":       ["#!/bin/", "echo ", "fi\n", "then\n", "done\n"],
+        "lua":        ["local ", "function ", "end\n", "require(", "io."],
+    }
+
+    def detect_lang(self, code: str) -> str:
+        """
+        Автодетект мови за евристичними сигнатурами.
+        Повертає найімовірнішу мову або 'python' за замовчуванням.
+
+        Відповідає пункту 1 «Ідеальної реалізації»:
+          Для каждого прикладу заздалегідь визначаємо мову,
+          щоб правильно витягнути символьні факти.
+        """
+        scores: Dict[str, int] = {}
+        for lang, sigs in self._LANG_SIGNATURES.items():
+            scores[lang] = sum(1 for s in sigs if s in code)
+        if not any(scores.values()):
+            return "python"
+        return max(scores, key=lambda l: scores[l])
+
+    def parse_autodetect(self, code: str, source_id: int = 0) -> List[HornAtom]:
+        """
+        Парсить код з автодетектом мови.
+        Пробує detect_lang() → parse(). Якщо парсер недоступний — fallback на Python.
+
+        Відповідає пункту 1 «Ідеальної реалізації»:
+          «Для коду використовується MultiLangASTParser (підтримка 10+ мов).»
+        """
+        lang = self.detect_lang(code)
+        facts = self.parse(code, lang, source_id)
+        # Якщо порожньо і lang != python — пробуємо python fallback
+        if not facts and lang != "python":
+            facts = self.parse(code, "python", source_id)
+        return facts
+
+    def extract_rule_templates(self,
+                               facts: List[HornAtom],
+                               max_rules: int = 32) -> List:
+        """
+        Витягує шаблони правил із Horn-фактів AST.
+
+        Відповідає пункту 6 «Ідеальної реалізації»:
+          «З AST можна витягувати не лише ground-факти, але й шаблони правил.
+           Наприклад, для def f(params): body →
+             call(f, args) ∧ type_match(args, params) → return_type(T).»
+
+        Стратегія:
+          · Для кожної пари (define_fact, call_fact) де вони пов'язані
+            через спільну константу func_id → генеруємо правило:
+            call(?F, ?X) :- define(?F, ?S), dep_data(?X, ?F)
+          · Для пар (param, return) → param(?F, ?T) → return(?F, ?T)
+          · Пари assign → dep_data:  assign(?X, ?Y) :- dep_data(?X, ?Y)
+
+        Returns:
+            List[HornClause] — шаблони правил для LTM (статус: verified)
+        """
+        from omen_prolog import HornClause, HornAtom, Var, Const
+
+        define_pred = PRED_VOCAB.get_id("define")
+        call_pred   = PRED_VOCAB.get_id("call")
+        param_pred  = PRED_VOCAB.get_id("param")
+        return_pred = PRED_VOCAB.get_id("return")
+        assign_pred = PRED_VOCAB.get_id("assign")
+        dep_pred    = PRED_VOCAB.get_id("dep_data")
+        type_pred   = PRED_VOCAB.get_id("type_of")
+
+        # Групуємо факти за предикатом
+        by_pred: Dict[int, List[HornAtom]] = defaultdict(list)
+        for f in facts:
+            by_pred[f.pred].append(f)
+
+        rules: List[HornClause] = []
+        X, Y, F, S = Var("X"), Var("Y"), Var("F"), Var("S")
+
+        # Правило 1: call(?F, ?X) :- define(?F, ?S)
+        # «якщо є визначення функції — її можна викликати»
+        if by_pred[define_pred] and by_pred[call_pred]:
+            head = HornAtom(pred=call_pred, args=(F, X))
+            body = (HornAtom(pred=define_pred, args=(F, S)),)
+            rules.append(HornClause(head=head, body=body))
+
+        # Правило 2: dep_data(?X, ?Y) :- assign(?X, ?Y)
+        # «присвоєння породжує залежність даних»
+        if by_pred[assign_pred]:
+            head = HornAtom(pred=dep_pred, args=(X, Y))
+            body = (HornAtom(pred=assign_pred, args=(X, Y)),)
+            rules.append(HornClause(head=head, body=body))
+
+        # Правило 3: return(?F, ?Y) :- dep_data(?X, ?Y), param(?F, ?X)
+        # «повернене значення залежить від параметра через data-flow»
+        if by_pred[dep_pred] and by_pred[param_pred]:
+            head = HornAtom(pred=return_pred, args=(F, Y))
+            body = (
+                HornAtom(pred=dep_pred,   args=(X, Y)),
+                HornAtom(pred=param_pred, args=(F, X)),
+            )
+            rules.append(HornClause(head=head, body=body))
+
+        # Правило 4: type_of(?X, ?T) :- param(?F, ?X), type_of(?F, ?T)
+        # «параметр успадковує тип функції»
+        if by_pred[type_pred] and by_pred[param_pred]:
+            T = Var("T")
+            head = HornAtom(pred=type_pred, args=(X, T))
+            body = (
+                HornAtom(pred=param_pred, args=(F, X)),
+                HornAtom(pred=type_pred,  args=(F, T)),
+            )
+            rules.append(HornClause(head=head, body=body))
+
+        # Конкретні правила на основі пар define-call зі спільними константами
+        define_funcs = {
+            int(f.args[0].val): f
+            for f in by_pred[define_pred]
+            if f.args and hasattr(f.args[0], 'val')
+        }
+        for call_fact in by_pred[call_pred][:max_rules]:
+            if not call_fact.args or not hasattr(call_fact.args[-1], 'val'):
+                continue
+            func_id = int(call_fact.args[-1].val)
+            if func_id in define_funcs:
+                def_fact = define_funcs[func_id]
+                # call(call_id, func_id) :- define(func_id, scope_id)
+                if (def_fact.args and call_fact.args and
+                        hasattr(def_fact.args[1], 'val')):
+                    head = HornAtom(pred=call_pred, args=(X, Const(func_id)))
+                    body = (HornAtom(pred=define_pred, args=(
+                        Const(func_id), Const(int(def_fact.args[1].val))
+                    )),)
+                    rules.append(HornClause(head=head, body=body))
+
+            if len(rules) >= max_rules:
+                break
+
+        return rules[:max_rules]
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 12.  INLINE ТЕСТИ

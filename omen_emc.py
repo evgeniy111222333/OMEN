@@ -48,6 +48,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 
+from omen_symbolic.controller import merge_induction_stats
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1.  КОНСТАНТИ ДІЙ
@@ -575,12 +577,25 @@ class EfficientMetaController(nn.Module):
         """
         B = z.shape[0]
         traj = TrajectoryStats()
+        induction_stats = {
+            "checked": 0.0,
+            "verified": 0.0,
+            "contradicted": 0.0,
+            "retained": 0.0,
+            "matched_predictions": 0.0,
+            "mean_score": 0.0,
+        }
 
         # ── 0. Housekeeping ───────────────────────────────────────────────────
         prover._step += 1
         prover.kb.tick()
         if prover._step % prover.consolidate_every == 0:
             prover.kb.consolidate(use_count_threshold=2)
+
+        # ── FIX: оновлюємо _last_z для _mental_simulate_rule() і _pred_error_for_rule()
+        # В EMC-режимі prover.forward() НЕ викликається, тому _last_z був би stale/None.
+        # WorldRNN latent-space компонента Дедукції та Абдукції потребує актуального z.
+        prover._last_z = z.detach()
 
         # ── 1. Perception: z → fact → KB ──────────────────────────────────────
         prover.materialize_task_context_facts()
@@ -715,6 +730,16 @@ class EfficientMetaController(nn.Module):
                 n_added, _, _, mean_utility = prover.abduce_and_learn(z_cur, err_val, force=True)
                 r_int   = max(float(n_added) / max(getattr(self.cfg, 'n_proof_cands', 8), 1),
                               mean_utility)
+                if n_added > 0:
+                    induction_stats = prover._induce_proposed_rules_locally(
+                        working_facts,
+                        (
+                            prover.task_context.target_facts
+                            if getattr(prover, "task_context", None) is not None
+                            else frozenset()
+                        ),
+                        device,
+                    )
                 # Абдукція може суттєво зменшити GapNorm
                 if n_added > 0:
                     gap_norm_cur = (gap_norm_cur * 0.85).clamp(0.0, 5.0)
@@ -746,7 +771,12 @@ class EfficientMetaController(nn.Module):
         )
 
         # ── 3. Фінальне Forward Chaining + Grounding ──────────────────────────
-        all_facts = prover.kb.forward_chain(prover.max_depth, starting_facts=working_facts)
+        all_facts = prover.forward_chain_reasoned(
+            prover.max_depth,
+            starting_facts=working_facts,
+            only_verified=True,
+            device=device,
+        )
 
         _MAX_GROUND = 128
         ground_sample = (frozenset(random.sample(list(all_facts), _MAX_GROUND))
@@ -797,6 +827,25 @@ class EfficientMetaController(nn.Module):
             prover.task_context.target_facts
             if getattr(prover, "task_context", None) is not None else frozenset()
         )
+        effective_targets = target_facts or frozenset({goal})
+        cycle_stats: Dict[str, float] = {}
+        cycle_recent_rules = []
+        if self.training and getattr(prover, "continuous_cycle_enabled", False):
+            cycle = prover.continuous_hypothesis_cycle(
+                z_cur,
+                working_facts,
+                effective_targets,
+                device,
+            )
+            abductor_aux = abductor_aux + cycle["loss_tensor"]
+            abduced_rules += float(cycle.get("added_rules", 0))
+            induction_stats = merge_induction_stats(
+                induction_stats,
+                cycle.get("induction_stats", {}),
+            )
+            cycle_stats = cycle.get("stats", {})
+            cycle_recent_rules = list(cycle.get("accepted_rules", []))
+            r_int_cumulative += float(cycle.get("mean_utility", 0.0))
         target_hits = len(all_facts & target_facts)
         target_total = len(target_facts)
         target_coverage = (
@@ -814,30 +863,28 @@ class EfficientMetaController(nn.Module):
             and (
                 trigger_abduction
                 or mismatch_error > 0.0
-                or (prover._step % 5 == 0 and err_val > 0.5)
             )
         )
         if should_abduce:
-            n_added_abd, vem_hinge, abductor_aux, mean_utility = prover.abduce_and_learn(
+            n_added_abd, reactive_vem_hinge, reactive_abductor_aux, mean_utility = prover.abduce_and_learn(
                 z_cur,
                 max(float(err_val), float(mismatch_error)),
                 force=trigger_abduction or mismatch_error > 0.0,
             )
-            abduced_rules = float(n_added_abd)
+            vem_hinge = vem_hinge + reactive_vem_hinge
+            abductor_aux = abductor_aux + reactive_abductor_aux
+            abduced_rules += float(n_added_abd)
             if n_added_abd > 0:
-                all_facts = prover.kb.forward_chain(prover.max_depth, starting_facts=working_facts)
-                target_hits = len(all_facts & target_facts)
-                target_coverage = (
-                    float(target_hits) / float(target_total)
-                    if target_total > 0 else (1.0 if goal_proved else 0.0)
+                reactive_induction = prover._induce_proposed_rules_locally(
+                    working_facts,
+                    effective_targets,
+                    device,
                 )
-                ground_sample = (frozenset(random.sample(list(all_facts), _MAX_GROUND))
-                                 if len(all_facts) > _MAX_GROUND else all_facts)
-                z_sym_1 = prover.ground(ground_sample, device)
-                z_sym = z_sym_1.expand(B, -1)
-                goal_proved = goal_proved or prover._goal_supported(goal, all_facts)
+                induction_stats = merge_induction_stats(induction_stats, reactive_induction)
                 r_int_cumulative += mean_utility
-        target_ground = target_facts or frozenset({goal})
+        if cycle_recent_rules:
+            prover._extend_recent_abduced_rules(cycle_recent_rules)
+        target_ground = effective_targets
         z_target = prover.ground(target_ground, device).expand(B, -1)
         coverage_loss = torch.tensor(
             (1.0 - target_coverage) + (0.0 if goal_proved else 1.0),
@@ -920,6 +967,30 @@ class EfficientMetaController(nn.Module):
             "unresolved_targets": float(max(target_total - target_hits, 0)),
             "abduced_rules": abduced_rules,
             "abduction_utility": r_int_cumulative,
+            "induction_checked": induction_stats["checked"],
+              "induction_verified": induction_stats["verified"],
+              "induction_contradicted": induction_stats["contradicted"],
+              "induction_retained": induction_stats["retained"],
+              "induction_repaired": induction_stats.get("repaired", 0.0),
+              "induction_matches": induction_stats["matched_predictions"],
+              "induction_score": induction_stats["mean_score"],
+              "cycle_checked": float(cycle_stats.get("checked", 0.0)),
+              "cycle_accepted": float(cycle_stats.get("accepted", 0.0)),
+              "cycle_added": float(cycle_stats.get("added", 0.0)),
+              "cycle_verified": float(cycle_stats.get("verified", 0.0)),
+              "cycle_contradicted": float(cycle_stats.get("contradicted", 0.0)),
+              "cycle_retained": float(cycle_stats.get("retained", 0.0)),
+              "cycle_repaired": float(cycle_stats.get("repaired", 0.0)),
+              "cycle_error": float(cycle_stats.get("mean_error", 0.0)),
+              "cycle_symbolic_error": float(cycle_stats.get("mean_symbolic_error", 0.0)),
+              "cycle_soft_symbolic_error": float(cycle_stats.get("mean_soft_symbolic_error", 0.0)),
+              "cycle_relaxed_body_error": float(cycle_stats.get("mean_relaxed_body_error", 0.0)),
+              "cycle_relaxed_head_error": float(cycle_stats.get("mean_relaxed_head_error", 0.0)),
+              "cycle_world_error": float(cycle_stats.get("mean_world_error", 0.0)),
+              "cycle_token_error": float(cycle_stats.get("mean_token_error", 0.0)),
+              "cycle_graph_energy": float(cycle_stats.get("mean_graph_energy", 0.0)),
+              "cycle_policy_loss": float(cycle_stats.get("policy_loss", 0.0)),
+              "cycle_loss": float(cycle_stats.get("loss", 0.0)),
             "provenance": (
                 prover.task_context.provenance
                 if getattr(prover, "task_context", None) is not None else "latent"
@@ -959,6 +1030,8 @@ class EfficientMetaController(nn.Module):
         B = z.shape[0]
 
         # Perception: z → fact → KB (без модифікації prover._step)
+        # FIX: оновлюємо _last_z щоб mental simulation під час eval бачила актуальний z
+        prover._last_z = z.detach()
         prover.materialize_task_context_facts()
         goal = prover.current_goal(z)
         working_facts = prover.current_working_facts()
@@ -971,6 +1044,14 @@ class EfficientMetaController(nn.Module):
         action_counts: List[int] = [0] * N_ACTIONS
         proof_derivations: List[Tuple[object, Optional[object]]] = []
         r_int_cumulative = 0.0
+        induction_stats = {
+            "checked": 0.0,
+            "verified": 0.0,
+            "contradicted": 0.0,
+            "retained": 0.0,
+            "matched_predictions": 0.0,
+            "mean_score": 0.0,
+        }
         goal_embed = self._goal_embed(prover, goal, B, device)
 
         for step in range(self.max_steps):
@@ -1039,12 +1120,26 @@ class EfficientMetaController(nn.Module):
                     mean_utility,
                 )
                 if n_added > 0:
+                    induction_stats = prover._induce_proposed_rules_locally(
+                        working_facts,
+                        (
+                            prover.task_context.target_facts
+                            if getattr(prover, "task_context", None) is not None
+                            else frozenset()
+                        ),
+                        device,
+                    )
                     gap_norm_cur = (gap_norm_cur * 0.85).clamp(0.0, 5.0)
 
             r_int_cumulative += r_int
 
         # Фінальний grounding: KB → z_sym
-        all_facts = prover.kb.forward_chain(prover.max_depth, starting_facts=working_facts)
+        all_facts = prover.forward_chain_reasoned(
+            prover.max_depth,
+            starting_facts=working_facts,
+            only_verified=True,
+            device=device,
+        )
         _MAX_GROUND = 128
         ground_sample = (frozenset(random.sample(list(all_facts), _MAX_GROUND))
                          if len(all_facts) > _MAX_GROUND else all_facts)
@@ -1073,6 +1168,13 @@ class EfficientMetaController(nn.Module):
             "unresolved_targets": float(max(target_total - target_hits, 0)),
             "abduced_rules": float(action_counts[ACTION_ABDUCE]),
             "abduction_utility": r_int_cumulative,
+            "induction_checked": induction_stats["checked"],
+              "induction_verified": induction_stats["verified"],
+              "induction_contradicted": induction_stats["contradicted"],
+              "induction_retained": induction_stats["retained"],
+              "induction_repaired": induction_stats.get("repaired", 0.0),
+              "induction_matches": induction_stats["matched_predictions"],
+              "induction_score": induction_stats["mean_score"],
             "provenance": (
                 prover.task_context.provenance
                 if getattr(prover, "task_context", None) is not None else "latent"

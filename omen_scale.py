@@ -26,7 +26,7 @@ from __future__ import annotations
 import math, time, random, warnings
 from collections import defaultdict, deque
 from copy import deepcopy
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -46,7 +46,10 @@ from omen_prolog       import (
     Const,
     DifferentiableProver,
     HornAtom,
+    HornClause,
     SymbolicTaskContext,
+    EpistemicStatus,
+    Var,
     SEQ_ACTUAL_NEXT_PRED,
     SEQ_AST_SUPPORT_PRED,
     SEQ_EDGE_PRED,
@@ -54,12 +57,31 @@ from omen_prolog       import (
     SEQ_LAST_TOKEN_PRED,
     SEQ_PREDICT_NEXT_PRED,
     SEQ_SALIENCY_SUPPORT_PRED,
+    SEQ_DECODER_GUESS_PRED,
+    SEQ_DECODER_MISS_PRED,
+    SEQ_DECODER_SURPRISE_PRED,
 )
 from omen_ast_multilang import MultiLangASTParser
 
 # NET: Neural Epistemic Tokenizer (замінює GPT-2 BPE)
 from omen_net_tokenizer import NeuralEpistemicTokenizer
 from omen_saliency import SaliencyTraceModule
+from omen_symbolic.integration import SymbolicStateIntegrator
+from omen_symbolic.memory_index import SymbolicMemoryIndex
+from omen_symbolic.execution_trace import (
+    TRACE_ASSIGN_EVENT_PRED,
+    TRACE_BINOP_EVENT_PRED,
+    TRACE_ERROR_EVENT_PRED,
+    TRACE_PARAM_BIND_PRED,
+    TRACE_RETURN_EVENT_PRED,
+    TRACE_STATE_VALUE_PRED,
+    build_symbolic_trace_bundle,
+)
+from omen_symbolic.universal_bits import (
+    gaussian_kl_bits,
+    gaussian_nll_bits,
+    gaussian_tensor_bits,
+)
 
 # EMC: Efficient Meta-Controller (адаптивний контролер міркування)
 from omen_emc import EfficientMetaController
@@ -108,6 +130,9 @@ class AsyncTensorProductMemory(nn.Module):
         self.decay        = float(getattr(cfg, "mem_decay", 1.0))
         self.update_steps = cfg.mem_update_steps
         self.cache:  deque = deque(maxlen=cfg.mem_cache_size)
+        self.symbolic_index = SymbolicMemoryIndex(
+            max_entries=int(getattr(cfg, "mem_symbolic_cache_size", cfg.mem_cache_size))
+        )
         self.n_writes = 0
         self._step    = 0
 
@@ -216,6 +241,41 @@ class AsyncTensorProductMemory(nn.Module):
 
     def memory_footprint_bytes(self) -> int:
         return self.memory.numel() * self.memory.element_size()
+
+    def write_symbolic_atoms(
+        self,
+        facts: List[object],
+        embeddings: torch.Tensor,
+    ) -> int:
+        if not facts or embeddings.numel() == 0:
+            return 0
+        embs = embeddings.detach()
+        if embs.dim() == 1:
+            embs = embs.unsqueeze(0)
+        # Exact symbolic recall and associative M-Core recall now share
+        # the same long-term write path instead of two unrelated stores.
+        added = self.symbolic_index.write(facts, embs)
+        write_conf = torch.zeros(embs.size(0), device=embs.device, dtype=embs.dtype)
+        self.schedule_write(embs, embs, write_conf)
+        return added
+
+    @torch.no_grad()
+    def recall_symbolic_atoms(
+        self,
+        z_query: torch.Tensor,
+        top_k: int = 8,
+        min_sim: float = 0.2,
+        predicate_hints: Optional[List[int]] = None,
+        anchor_values: Optional[List[int]] = None,
+    ) -> List[object]:
+        return self.symbolic_index.recall(
+            z_query,
+            top_k=top_k,
+            min_sim=min_sim,
+            predicate_hints=predicate_hints,
+            anchor_values=anchor_values,
+            structured_limit=max(2, top_k // 2),
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -331,23 +391,61 @@ class OMENScaleLoss(nn.Module):
         super().__init__()
         self.cfg = cfg
 
+    @staticmethod
+    def _gaussian_kl(
+        mu_q: torch.Tensor,
+        logvar_q: torch.Tensor,
+        mu_p: Optional[torch.Tensor] = None,
+        logvar_p: Optional[torch.Tensor] = None,
+        free_bits: float = 0.0,
+        reduction: str = "mean",
+    ) -> torch.Tensor:
+        return gaussian_kl_bits(
+            mu_q,
+            logvar_q,
+            mu_p=mu_p,
+            logvar_p=logvar_p,
+            free_bits=free_bits,
+            reduction=reduction,
+        )
+
+    @staticmethod
+    def _gaussian_nll(
+        x: torch.Tensor,
+        mu: torch.Tensor,
+        logvar: torch.Tensor,
+        to_bits: bool = False,
+        reduction: str = "mean",
+    ) -> torch.Tensor:
+        nll_bits = gaussian_nll_bits(x, mu, logvar, reduction=reduction)
+        if to_bits:
+            return nll_bits
+        return nll_bits * math.log(2.0)
+
     def forward(self,
                 logits:       torch.Tensor,
                 targets:      torch.Tensor,
                 z:            torch.Tensor,        # (B, d_latent)
+                mu:           torch.Tensor,        # (B, d_latent)
+                logvar:       torch.Tensor,        # (B, d_latent)
                 z_tok:        torch.Tensor,        # (B, T, d_tok)
                 z_latents:    torch.Tensor,        # (B, n, d_latent)
                 z_sim:        torch.Tensor,        # (B, d_latent)
                 z_world_targets: torch.Tensor,     # (B, T_w, d_latent)
                 v_mem:        torch.Tensor,        # (B, d_latent)
+                z_sym:        torch.Tensor,        # (B, d_latent)
                 sym_loss:     torch.Tensor,
                 ltm_penalty:  float,
                 curiosity_l:  torch.Tensor,
                 world_rnn:    WorldRNN,
                 net_loss:     torch.Tensor,        # L_NET від NeuralEpistemicTokenizer
+                priors:       Optional[Dict[str, torch.Tensor]] = None,
+                model_bits:   Optional[Dict[str, torch.Tensor]] = None,
                 vem_penalty:  Optional[torch.Tensor] = None,  # δ·E[max(0,τ−U(R))]
                 meta_loss:    Optional[torch.Tensor] = None,  # ω_meta·L_AC (EMC)
                 traj_reward:  Optional[float]       = None,   # Σ_t r_t траєкторії
+                reasoning_cost: Optional[float]    = None,   # Cost(Reasoning)
+                seen_tokens:  Optional[int]        = None,
                 train_step:   int                  = 0,
                 ) -> Dict:
         cfg = self.cfg
@@ -357,11 +455,14 @@ class OMENScaleLoss(nn.Module):
         # Попередня версія CE(logits, targets) порівнювала logits[t] з tgt[t]
         # (поточним), що давало артефактно низький PPL (~1.4) бо токен tgt[t]
         # вже присутній у контексті. Правильно: logits[:-1] → targets[1:].
-        L_ce = F.cross_entropy(
+        valid_tokens = max(int(targets[:, 1:].ne(0).sum().item()), 1)
+        token_nll_nats = F.cross_entropy(
             logits[:, :-1].reshape(-1, cfg.vocab_size),
             targets[:, 1:].reshape(-1),
             ignore_index=0,
         )
+        token_nll = token_nll_nats / math.log(2.0)
+        token_bits_total = token_nll * float(valid_tokens)
 
         # ── 2. WorldRNN Training: huber(z_sim, z.detach()) ────────────────────
         # FIX (критичне): попередній варіант
@@ -378,6 +479,18 @@ class OMENScaleLoss(nn.Module):
         world_pred = z_sim if z_sim.dim() == z_world_targets.dim() else z_sim.unsqueeze(1)
         L_world_raw  = F.huber_loss(world_pred, z_world_targets.detach(), delta=1.0)
         L_world      = torch.log1p(L_world_raw)
+        world_obs_logvar = (
+            priors["world_obs_logvar"]
+            if priors is not None and "world_obs_logvar" in priors
+            else torch.zeros(1, 1, 1, device=z.device, dtype=z.dtype)
+        )
+        world_nll = self._gaussian_nll(
+            z_world_targets.detach(),
+            world_pred,
+            world_obs_logvar,
+            to_bits=True,
+            reduction="sum",
+        )
 
         # ── 3. WorldRNN Complexity (скінченні різниці) ────────────────────────
         with torch.no_grad():
@@ -391,12 +504,82 @@ class OMENScaleLoss(nn.Module):
         # ── 4. Memory Recall ──────────────────────────────────────────────────
         v_norm    = v_mem.detach().norm(dim=-1, keepdim=True).clamp(min=1e-4)
         L_recall  = F.mse_loss(z, (v_mem / v_norm).detach())
+        free_bits = float(getattr(cfg, "vfe_free_bits", 0.0))
+        mem_prior_mu = (
+            priors["mem_mu"]
+            if priors is not None and "mem_mu" in priors
+            else v_mem.detach()
+        )
+        mem_prior_logvar = (
+            priors["mem_logvar"]
+            if priors is not None and "mem_logvar" in priors
+            else None
+        )
+        sym_prior_mu = (
+            priors["sym_mu"]
+            if priors is not None and "sym_mu" in priors
+            else z_sym.detach()
+        )
+        sym_prior_logvar = (
+            priors["sym_logvar"]
+            if priors is not None and "sym_logvar" in priors
+            else None
+        )
+        L_kl = self._gaussian_kl(mu, logvar, free_bits=free_bits, reduction="sum")
+        L_mem_kl = self._gaussian_kl(
+            mu,
+            logvar,
+            mu_p=mem_prior_mu,
+            logvar_p=mem_prior_logvar,
+            free_bits=free_bits,
+            reduction="sum",
+        )
+        L_sym_kl = self._gaussian_kl(
+            mu,
+            logvar,
+            mu_p=sym_prior_mu,
+            logvar_p=sym_prior_logvar,
+            free_bits=free_bits,
+            reduction="sum",
+        )
 
-        # ── 5. Novelty Bonus: -α·I(Z;M) ──────────────────────────────────────
-        I_zm = v_mem.norm(dim=-1).mean()
+        # Replace the old ||v_mem|| proxy with an explicit read-likelihood term:
+        #   -log P(Read(M, z) | z)
+        mem_read_mu = (
+            priors["mem_read_mu"]
+            if priors is not None and "mem_read_mu" in priors
+            else z.detach()
+        )
+        mem_read_logvar = (
+            priors["mem_read_logvar"]
+            if priors is not None and "mem_read_logvar" in priors
+            else torch.zeros_like(mem_read_mu)
+        )
+        memory_read_nll = self._gaussian_nll(
+            v_mem.detach(),
+            mem_read_mu,
+            mem_read_logvar,
+            to_bits=True,
+            reduction="sum",
+        )
 
-        # ── 6. L_scale: MDL для рівнів ────────────────────────────────────────
-        L_scale = l_scale_penalty(z_tok, z_latents, cfg.lambda_tok, cfg.lambda_conc)
+        # ── 6. L_scale: MDL для рівнів у єдиній валюті bits/token ─────────────
+        if model_bits is None:
+            neural_model_bits = torch.zeros((), device=z.device, dtype=z.dtype)
+            vocab_model_bits = torch.zeros((), device=z.device, dtype=z.dtype)
+        else:
+            neural_model_bits = model_bits.get(
+                "neural", torch.zeros((), device=z.device, dtype=z.dtype)
+            )
+            vocab_model_bits = model_bits.get(
+                "vocab", torch.zeros((), device=z.device, dtype=z.dtype)
+            )
+        L_scale = neural_model_bits + vocab_model_bits
+        rule_bits = torch.as_tensor(
+            float(ltm_penalty),
+            dtype=z.dtype,
+            device=z.device,
+        )
 
         # ── 7. Symbolic Generalization ────────────────────────────────────────
         L_sym   = sym_loss
@@ -413,53 +596,84 @@ class OMENScaleLoss(nn.Module):
         else:
             L_meta = torch.zeros(1, device=z.device).squeeze()
         omega_meta = getattr(cfg, 'omega_meta', 0.05)
-        aux_warmup = max(int(getattr(cfg, 'loss_aux_warmup', 500)), 1)
-        aux_phase = min(max(float(train_step) / aux_warmup, 0.0), 1.0)
-        world_w = cfg.gamma * (0.35 + 0.65 * aux_phase)
-        sym_w = cfg.beta * (0.25 + 0.75 * aux_phase)
-        recall_w = cfg.eta * (0.50 + 0.50 * aux_phase)
-        curiosity_w = 0.05 + 0.05 * aux_phase
-        net_w = cfg.eta_tok * (0.40 + 0.60 * aux_phase)
-        vem_w = getattr(cfg, 'delta_vem', 1e-3) * (0.35 + 0.65 * aux_phase)
-        meta_w = omega_meta * (0.25 + 0.75 * aux_phase)
+        use_aux_schedule = bool(getattr(cfg, "use_aux_loss_schedule", False))
+        aux_phase = 1.0
+        if use_aux_schedule:
+            aux_warmup = max(int(getattr(cfg, 'loss_aux_warmup', 500)), 1)
+            aux_phase = min(max(float(train_step) / aux_warmup, 0.0), 1.0)
+            world_w = cfg.gamma * (0.35 + 0.65 * aux_phase)
+            sym_w = cfg.beta * (0.25 + 0.75 * aux_phase)
+            recall_w = cfg.eta * (0.50 + 0.50 * aux_phase)
+            curiosity_w = 0.05 + 0.05 * aux_phase
+            net_w = cfg.eta_tok * (0.40 + 0.60 * aux_phase)
+            vem_w = getattr(cfg, 'delta_vem', 1e-3) * (0.35 + 0.65 * aux_phase)
+            meta_w = omega_meta * (0.25 + 0.75 * aux_phase)
+        else:
+            world_w = cfg.gamma
+            sym_w = cfg.beta
+            recall_w = cfg.eta
+            curiosity_w = 0.10
+            net_w = cfg.eta_tok
+            vem_w = getattr(cfg, 'delta_vem', 1e-3)
+            meta_w = omega_meta
 
         # ── 10. J_OMEN+EMC: 7-ма компонента — траєкторна мета-винагорода ─────
         if traj_reward is not None and traj_reward != 0.0:
             L_traj = -torch.tensor(traj_reward, dtype=torch.float32, device=z.device).clamp(-5.0, 5.0)
         else:
             L_traj = torch.zeros(1, device=z.device).squeeze()
+        L_reason = torch.as_tensor(
+            0.0 if reasoning_cost is None else reasoning_cost,
+            dtype=z.dtype,
+            device=z.device,
+        ).clamp(0.0, 10.0)
 
         # ── ltm_penalty: клемпуємо щоб уникнути вибуху зі зростанням LTM ─────
         # Без кліпу: при 1024 правилах × complexity≈5 → ltm_pen≈25 → домінує loss.
-        ltm_penalty_clamped = min(float(ltm_penalty), 2.0)
+        # Rule bits are already amortized above; no extra clipping needed here.
 
         # ── Sym loss: обрізаємо нестабільний symbolic consistency ──────────────
         L_sym_clamped = L_sym.clamp(max=5.0) if torch.is_tensor(L_sym) else torch.tensor(
             min(float(L_sym), 5.0), device=z.device)
 
-        # ── Збираємо J(θ,Γ,M) + ω_meta·L_AC + ω_meta·L_traj ─────────────────
-        # Curiosity: обрізаємо щоб уникнути домінування при великих gap_norm
+        # ── Assemble explicit MDL bits + auxiliary training signals ───────────
+        # Everything below `total_bits` is in the same currency: bits.
+        # Auxiliary terms stay outside MDL and are tracked separately.
         curiosity_clamped = curiosity_l.clamp(max=5.0) if torch.is_tensor(curiosity_l) \
                             else min(float(curiosity_l), 5.0)
-        total = (
-            L_ce
-          + world_w    * L_world
-          + cfg.delta  * L_complex
-          + recall_w   * L_recall
-          - cfg.alpha  * I_zm
-          + L_scale
-          + sym_w      * L_sym_clamped
-          + ltm_penalty_clamped
-          + curiosity_w * curiosity_clamped
-          + net_w      * net_loss           # ← L_NET (включає L_semantic)
-          + vem_w      * L_vem              # ← δ·VeM
-          + meta_w     * L_meta             # ← ω_meta·L_AC (EMC Actor-Critic)
-          + meta_w     * L_traj             # ← ω_meta·(-Σ_t r_t) (7-ма компонента)
+        observation_bits = token_bits_total + world_nll
+        local_complexity_bits = (
+            L_kl
+            + L_mem_kl
+            + L_sym_kl
+            + memory_read_nll
         )
+        mdl_seen_tokens = max(int(seen_tokens or valid_tokens), valid_tokens)
+        global_model_bits = L_scale + rule_bits
+        complexity_bits = local_complexity_bits + global_model_bits
+        total_bits = observation_bits + complexity_bits
+        bits_per_token = (
+            (observation_bits + local_complexity_bits) / float(valid_tokens)
+            + global_model_bits / float(mdl_seen_tokens)
+        )
+        auxiliary_energy = (
+            world_w * L_world
+            + sym_w * L_sym_clamped
+            + recall_w * L_recall
+            + cfg.delta * L_complex
+            + curiosity_w * curiosity_clamped
+            + net_w * net_loss
+            + vem_w * L_vem
+            + meta_w * L_meta
+            + meta_w * L_traj
+            + meta_w * L_reason
+        )
+        free_energy = bits_per_token
+        total = bits_per_token + auxiliary_energy
 
         # Фінальна NaN-guard: якщо total=NaN → повертаємо тільки L_ce
         if torch.isnan(total) or torch.isinf(total):
-            total = L_ce
+            total = token_nll
 
         # net_loss може бути dict або scalar — нормалізуємо
         net_loss_scalar = (net_loss["net_total"].item()
@@ -469,26 +683,500 @@ class OMENScaleLoss(nn.Module):
 
         return {
             "total":      total,
-            "ce":         L_ce.item(),
+            "ce":         token_nll_nats.item(),
+            "ce_bits":    token_nll.item(),
+            "token_bits": token_bits_total.item(),
             "world":      L_world.item(),
+            "world_nll":  (world_nll / float(valid_tokens)).item(),
+            "world_bits": world_nll.item(),
             "complex":    L_complex.item(),
+            "kl":         (L_kl / float(valid_tokens)).item(),
+            "mem_kl":     (L_mem_kl / float(valid_tokens)).item(),
+            "sym_kl":     (L_sym_kl / float(valid_tokens)).item(),
             "recall":     L_recall.item(),
-            "novelty":    I_zm.item(),
-            "l_scale":    L_scale.item(),
+            "novelty":    (memory_read_nll / float(valid_tokens)).item(),
+            "memory_read_nll": (memory_read_nll / float(valid_tokens)).item(),
+            "memory_bits": memory_read_nll.item(),
+            "l_scale":    (L_scale / float(mdl_seen_tokens)).item(),
+            "model_bits": neural_model_bits.item(),
+            "model_bits_bpt": (neural_model_bits / float(mdl_seen_tokens)).item(),
+            "vocab_bits": vocab_model_bits.item(),
+            "vocab_bits_bpt": (vocab_model_bits / float(mdl_seen_tokens)).item(),
+            "rule_bits":  rule_bits.item(),
+            "rule_bits_bpt": (rule_bits / float(mdl_seen_tokens)).item(),
+            "mdl_token_budget": float(valid_tokens),
+            "mdl_seen_tokens": float(mdl_seen_tokens),
             "sym_ground": L_sym_clamped.item() if torch.is_tensor(L_sym_clamped) else float(L_sym_clamped),
-            "ltm_pen":    ltm_penalty_clamped,
+            "free_energy": free_energy.item(),
+            "total_bits": total_bits.item(),
+            "bits_per_token": bits_per_token.item(),
+            "fe_obs":     (observation_bits / float(valid_tokens)).item(),
+            "fe_complex": (
+                (local_complexity_bits / float(valid_tokens))
+                + (global_model_bits / float(mdl_seen_tokens))
+            ).item(),
+            "fe_aux":     auxiliary_energy.item(),
+            "fe_reasoning": L_reason.item(),
+            "ltm_pen":    (rule_bits / float(mdl_seen_tokens)).item(),
             "ltm_pen_raw": float(ltm_penalty),   # для діагностики нескліпованого значення
             "curiosity":  curiosity_l.item(),
             "net_loss":   net_loss_scalar,
             "vem_pen":    L_vem.item() if torch.is_tensor(L_vem) else float(L_vem),
             "meta_loss":  L_meta.item() if torch.is_tensor(L_meta) else float(L_meta),
             "traj_reward": traj_reward if traj_reward is not None else 0.0,
+            "reasoning_cost": L_reason.item(),
             "aux_phase":  aux_phase,
             "world_w":    world_w,
             "sym_w":      sym_w,
             "net_w":      net_w,
             "meta_w":     meta_w,
         }
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4b.  SYMBOLIC FACT CACHE  (офлайн-кеш символьних фактів)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SymbolicFactCache:
+    """
+    LRU-кеш для попередньо витягнутих символьних фактів.
+
+    Відповідає пункту 1 «Ідеальної реалізації»:
+      «Парсинг виконується один раз при підготовці даних, не замедляє навчання.»
+
+    Ключ: SHA-1 хеш від байтів вхідної послідовності.
+    Значення: Tuple[List[HornAtom], List[HornClause], object]
+      (facts + rule templates + optional execution-trace bundle)
+
+    Розмір кешу обмежений max_entries (LRU eviction через OrderedDict).
+    Thread-safe для читання (запис відбувається лише в одному потоці під GIL).
+    """
+
+    def __init__(self, max_entries: int = 4096):
+        import collections
+        self._cache: "collections.OrderedDict" = collections.OrderedDict()
+        self._max = max_entries
+        self._hits = 0
+        self._misses = 0
+
+    def _key(self, src_row: torch.Tensor) -> str:
+        import hashlib
+        raw = bytes(int(v) % 256 for v in src_row.tolist())
+        return hashlib.sha1(raw).hexdigest()
+
+    @staticmethod
+    def _normalize_entry(entry):
+        if entry is None:
+            return None
+        if len(entry) == 2:
+            facts, rules = entry
+            return facts, rules, None
+        return entry
+
+    def get(self, src_row: torch.Tensor):
+        """Повертає (facts, rules, trace_bundle) або None при cache miss."""
+        k = self._key(src_row)
+        if k in self._cache:
+            self._cache.move_to_end(k)
+            self._hits += 1
+            return self._normalize_entry(self._cache[k])
+        self._misses += 1
+        return None
+
+    def put(self, src_row: torch.Tensor, facts, rules, trace_bundle=None) -> None:
+        k = self._key(src_row)
+        self._cache[k] = (facts, rules, trace_bundle)
+        self._cache.move_to_end(k)
+        if len(self._cache) > self._max:
+            self._cache.popitem(last=False)
+
+    @property
+    def hit_rate(self) -> float:
+        total = self._hits + self._misses
+        return self._hits / total if total > 0 else 0.0
+
+    def stats(self) -> Dict:
+        return {
+            "size": len(self._cache),
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": round(self.hit_rate, 3),
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4c.  SYMBOLIC QUERY GENERATOR  (пункт 3 ідеальної реалізації)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SymbolicQueryGenerator(nn.Module):
+    """
+    Генератор логічних запитів до S-Core з прихованого стану декодера.
+
+    Відповідає пункту 3 «Ідеальної реалізації»:
+      «Декодер формує логічний запит до S-Core.
+       S-Core пробує довести ціль; результат доведення модифікує
+       логіти декодера — підвищує ймовірності відповідних токенів.»
+
+    Архітектура:
+      h_decoder (B, T, d_tok)
+        ↓  [last token hidden]
+      h_last (B, d_tok)
+        ↓  query_proj → (B, d_latent)  [нейронне кодування запиту]
+        ↓  pred_head  → (B, sym_vocab) [розподіл по предикатах]
+        ↓  arg_head   → (B, 2)         [два аргументи]
+      HornAtom(pred=argmax(pred_logits), args=(arg0, arg1))
+        ↓  prover.prove(goal) → z_proof (B, d_latent)
+        ↓  logit_bias_proj → (B, vocab_size) [зміщення логітів]
+      logits_final = logits + α_sym · logit_bias
+
+    Навчання:
+      · Якщо доведення успішне → reward через VeM.reinforce_recent_rules
+      · Якщо ні → абдукція при великому world_error
+    """
+
+    def __init__(self, d_tok: int, d_latent: int, sym_vocab: int,
+                 vocab_size: int, alpha_sym: float = 0.1,
+                 gumbel_tau: float = 0.85,
+                 entropy_beta: float = 1e-3,
+                 hard_mask_threshold: float = 0.75):
+        super().__init__()
+        self.d_latent  = d_latent
+        self.sym_vocab = sym_vocab
+        self.alpha_sym = alpha_sym
+        self.gumbel_tau = gumbel_tau
+        self.entropy_beta = entropy_beta
+        self.hard_mask_threshold = hard_mask_threshold
+
+        pred_candidates: List[int] = []
+        seen_preds: Set[int] = set()
+        for pred_id in (
+            SEQ_PREDICT_NEXT_PRED,
+            SEQ_ACTUAL_NEXT_PRED,
+            SEQ_EDGE_PRED,
+            SEQ_LAST_TOKEN_PRED,
+            SEQ_AST_SUPPORT_PRED,
+            SEQ_SALIENCY_SUPPORT_PRED,
+            SEQ_GAP_DIM_PRED,
+            *range(sym_vocab),
+        ):
+            pred_int = int(pred_id)
+            if pred_int in seen_preds:
+                continue
+            seen_preds.add(pred_int)
+            pred_candidates.append(pred_int)
+        self.pred_candidates: Tuple[int, ...] = tuple(pred_candidates)
+        self.pred_to_index: Dict[int, int] = {
+            pred_id: idx for idx, pred_id in enumerate(self.pred_candidates)
+        }
+        self.default_query_preds: Tuple[int, ...] = tuple(
+            pred_id for pred_id in (
+                SEQ_PREDICT_NEXT_PRED,
+                SEQ_ACTUAL_NEXT_PRED,
+                SEQ_EDGE_PRED,
+                SEQ_DECODER_GUESS_PRED,
+                SEQ_DECODER_MISS_PRED,
+                SEQ_AST_SUPPORT_PRED,
+                SEQ_SALIENCY_SUPPORT_PRED,
+            )
+            if pred_id in self.pred_to_index
+        )
+
+        # h_decoder → нейронний запит
+        self.query_proj = nn.Sequential(
+            nn.Linear(d_tok, d_latent),
+            nn.GELU(),
+            nn.Linear(d_latent, d_latent),
+        )
+        self.context_proj = nn.Sequential(
+            nn.Linear(d_latent, d_latent),
+            nn.GELU(),
+            nn.Linear(d_latent, d_latent),
+        )
+        # Вибір предиката
+        self.pred_head = nn.Linear(d_latent, len(self.pred_candidates))
+        # Вибір аргументів (2 слоти)
+        self.arg_head  = nn.Linear(d_latent, 2 * sym_vocab)
+        self.sym_query_emb = nn.Embedding(len(self.pred_candidates), d_latent)
+        self.arg_query_emb = nn.Embedding(sym_vocab, d_latent)
+
+        # z_proof → зміщення логітів декодера
+        self.logit_bias_proj = nn.Sequential(
+            nn.Linear(d_latent, d_latent),
+            nn.GELU(),
+            nn.Linear(d_latent, vocab_size),
+        )
+        self.query_bias_proj = nn.Sequential(
+            nn.Linear(d_latent * 2, d_latent),
+            nn.GELU(),
+            nn.Linear(d_latent, vocab_size),
+        )
+        # Ворота: скільки довіряти символьному результату
+        self.proof_gate = nn.Sequential(
+            nn.Linear(d_latent * 2, 1),
+            nn.Sigmoid(),
+        )
+        self.last_query_info: Dict[str, object] = {}
+
+    def _build_query_state(
+        self,
+        h_last: Optional[torch.Tensor],
+        symbolic_state: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        parts: List[torch.Tensor] = []
+        if h_last is not None:
+            parts.append(self.query_proj(h_last))
+        if symbolic_state is not None:
+            if symbolic_state.dim() == 1:
+                symbolic_state = symbolic_state.unsqueeze(0)
+            parts.append(self.context_proj(symbolic_state))
+        if not parts:
+            raise ValueError("SymbolicQueryGenerator needs h_last or symbolic_state")
+        total = parts[0]
+        for part in parts[1:]:
+            total = total + part
+        return total / float(len(parts))
+
+    def _mask_candidate_preds(
+        self,
+        pred_logits: torch.Tensor,
+        candidate_preds: Optional[Tuple[int, ...]],
+    ) -> torch.Tensor:
+        candidate_preds = self._normalize_candidate_preds(candidate_preds)
+        if not candidate_preds:
+            return pred_logits
+        allowed = {
+            self.pred_to_index[int(pred)]
+            for pred in candidate_preds
+            if int(pred) in self.pred_to_index
+        }
+        if not allowed:
+            return pred_logits
+        masked = torch.full_like(pred_logits, -1e4)
+        for idx in allowed:
+            masked[:, idx] = pred_logits[:, idx]
+        return masked
+
+    def _normalize_candidate_preds(
+        self,
+        candidate_preds: Optional[Tuple[int, ...]],
+    ) -> Tuple[int, ...]:
+        if candidate_preds:
+            normalized = tuple(
+                int(pred) for pred in candidate_preds
+                if int(pred) in self.pred_to_index
+            )
+            if normalized:
+                return normalized
+        return self.default_query_preds or self.pred_candidates
+
+    def generate_query(self,
+                       h_last: Optional[torch.Tensor],
+                       sym_vocab: int,
+                       context_anchor: Optional[int] = None,
+                       symbolic_state: Optional[torch.Tensor] = None,
+                       candidate_preds: Optional[Tuple[int, ...]] = None) -> "HornAtom":
+        """
+        h_last: (1, d_tok) — прихований стан останнього токена
+        Повертає HornAtom — логічний запит до S-Core.
+
+        Пункт 6 ідеальної реалізації:
+          «generate_query повинен бути обучаємим і вариативним.
+           Він повинен повертати Horn-атом з предикатом, вибраним з sym_vocab,
+           а не фіксований SEQ_PREDICT_NEXT_PRED.»
+
+        Використовуємо нейронні передбачення pred_id, arg0 замість хардкоду.
+        arg1 залишається Var("NEXT") — ми завжди запитуємо «що наступне?»
+        """
+        z_q = self._build_query_state(h_last, symbolic_state)
+        pred_logits = self._mask_candidate_preds(
+            self.pred_head(z_q),
+            candidate_preds,
+        )
+        pred_idx = int(pred_logits.argmax(-1).item()) % max(len(self.pred_candidates), 1)
+        pred_id = self.pred_candidates[pred_idx]
+
+        arg_logits = self.arg_head(z_q).view(1, 2, sym_vocab)  # (1,2,sv)
+        arg0 = (
+            int(context_anchor)
+            if context_anchor is not None
+            else int(arg_logits[:, 0].argmax(-1).item()) % max(sym_vocab, 1)
+        )
+        # arg1 завжди Var("NEXT"): ми шукаємо значення наступного токена
+        # pred_id вибирається нейронно — це є ключова відмінність від v1
+        return HornAtom(pred_id, (arg0, Var("NEXT")))
+
+    def forward(self,
+                logits:   torch.Tensor,
+                h_tok:    torch.Tensor,
+                z_sym:    torch.Tensor,
+                prover:   "DifferentiableProver") -> torch.Tensor:
+        """
+        Модифікує логіти декодера символьним результатом доведення.
+
+        logits  : (B, T, vocab_size) — оригінальні логіти
+        h_tok   : (B, T, d_tok)      — приховані стани декодера
+        z_sym   : (B, d_latent)      — символьний вектор від prover
+        prover  : DifferentiableProver
+
+        Returns: logits + α_sym · gate · logit_bias  (той самий shape)
+        """
+        B, T, V = logits.shape
+        # Беремо прихований стан останнього токена
+        h_last = h_tok[:, -1, :]                     # (B, d_tok)
+        task_context = getattr(prover, "task_context", None)
+        context_anchor = None
+        gold_next = None
+        candidate_preds: Tuple[int, ...] = self.default_query_preds
+        context_state: Optional[torch.Tensor] = z_sym
+        if task_context is not None:
+            context_anchor = int(task_context.metadata.get("last_src", 0))
+            gold_next = int(task_context.metadata.get("last_tgt", -1))
+            observed_facts = tuple(task_context.observed_facts)
+            if observed_facts:
+                pred_hints = {int(fact.pred) for fact in observed_facts if fact.arity() >= 2}
+                if task_context.goal is not None and task_context.goal.arity() >= 2:
+                    pred_hints.add(int(task_context.goal.pred))
+                pred_hints.add(SEQ_PREDICT_NEXT_PRED)
+                candidate_preds = tuple(sorted(pred_hints))
+                context_state = prover.ground(
+                    task_context.observed_facts,
+                    logits.device,
+                ).expand(B, -1)
+        elif getattr(prover, "last_goal", None) is not None and getattr(prover.last_goal, "args", ()):
+            anchor_term = prover.last_goal.args[0]
+            if isinstance(anchor_term, Const):
+                context_anchor = int(anchor_term.val)
+            elif isinstance(anchor_term, int):
+                context_anchor = int(anchor_term)
+        z_q = self._build_query_state(h_last, context_state)
+        raw_pred_logits = self.pred_head(z_q)
+        pred_logits = self._mask_candidate_preds(
+            raw_pred_logits,
+            candidate_preds,
+        )
+        arg_logits = self.arg_head(z_q).view(B, 2, self.sym_vocab)
+        if self.training:
+            pred_probs = F.gumbel_softmax(
+                pred_logits, tau=self.gumbel_tau, hard=False, dim=-1
+            )
+            arg_probs = F.gumbel_softmax(
+                arg_logits, tau=self.gumbel_tau, hard=False, dim=-1
+            )
+        else:
+            pred_probs = F.one_hot(
+                pred_logits.argmax(dim=-1),
+                num_classes=len(self.pred_candidates),
+            ).to(dtype=logits.dtype)
+            arg_probs = F.one_hot(
+                arg_logits.argmax(dim=-1),
+                num_classes=self.sym_vocab,
+            ).to(dtype=logits.dtype)
+        pred_ctx = pred_probs @ self.sym_query_emb.weight
+        arg0_ctx = arg_probs[:, 0, :] @ self.arg_query_emb.weight
+        arg1_ctx = arg_probs[:, 1, :] @ self.arg_query_emb.weight
+        query_ctx = pred_ctx + 0.5 * (arg0_ctx + arg1_ctx)
+
+        # Обчислюємо зміщення логітів на основі z_sym
+        query_goal = self.generate_query(
+            h_last[:1],
+            self.sym_vocab,
+            context_anchor=context_anchor,
+            symbolic_state=None if context_state is None else context_state[:1],
+            candidate_preds=candidate_preds,
+        )
+        z_query_proof, answer_ids, proof_support = prover.answer_query(
+            query_goal,
+            logits.device,
+        )
+        used_fallback = False
+        if proof_support.item() <= 0.0 and context_anchor is not None:
+            fallback_goal = HornAtom(SEQ_PREDICT_NEXT_PRED, (context_anchor, Var("NEXT")))
+            fallback_state, fallback_answers, fallback_support = prover.answer_query(
+                fallback_goal,
+                logits.device,
+            )
+            if fallback_support.item() > proof_support.item():
+                query_goal = fallback_goal
+                z_query_proof = fallback_state
+                answer_ids = fallback_answers
+                proof_support = fallback_support
+                used_fallback = True
+        z_query_proof = z_query_proof.expand(B, -1)
+        proof_support_exp = proof_support.to(logits.dtype).view(1, 1).expand(B, 1)
+        valid_answer_ids = [token_id for token_id in answer_ids if 0 <= token_id < V]
+
+        pred_entropy = -(
+            pred_probs[:1] * torch.log(pred_probs[:1].clamp_min(1e-8))
+        ).sum(dim=-1).mean()
+        query_hit = 1.0 if gold_next is not None and gold_next in valid_answer_ids else 0.0
+        query_reward = 0.5 * float(proof_support.item()) + 0.5 * query_hit
+        answer_bias = torch.zeros(B, V, device=logits.device, dtype=logits.dtype)
+        if valid_answer_ids and (not self.training or query_hit > 0.0):
+            answer_boost = (0.5 + 0.5 * float(proof_support.item())) / max(self.alpha_sym, 1e-3)
+            bias_step = answer_boost / float(len(valid_answer_ids))
+            for token_id in valid_answer_ids:
+                answer_bias[:, token_id] += bias_step
+
+        logit_bias = (
+            self.logit_bias_proj(z_sym + z_query_proof)
+            + self.query_bias_proj(torch.cat([z_q, query_ctx + z_query_proof], dim=-1))
+            + answer_bias
+        )      # (B, V)
+
+        # Адаптивна ворота: наскільки довіряємо символьному результату
+        gate = self.proof_gate(
+            torch.cat([z_q + query_ctx, z_sym + z_query_proof], dim=-1)   # (B, 2*d_lat)
+        ) * (0.25 + 0.75 * proof_support_exp)                              # (B, 1)
+
+        query_aux_loss = torch.zeros((), device=logits.device, dtype=logits.dtype)
+        target_pred_idx = self.pred_to_index.get(int(query_goal.pred))
+        if target_pred_idx is not None:
+            target_pred = torch.tensor([target_pred_idx], device=logits.device)
+            reward_scale = 0.25 + 0.75 * query_reward
+            target_allowed = (
+                not candidate_preds
+                or int(query_goal.pred) in set(candidate_preds)
+            )
+            pred_supervision_logits = pred_logits[:1] if target_allowed else raw_pred_logits[:1]
+            query_aux_loss = reward_scale * F.cross_entropy(pred_supervision_logits, target_pred)
+            if context_anchor is not None and 0 <= context_anchor < self.sym_vocab:
+                arg_target = torch.tensor([int(context_anchor)], device=logits.device)
+                query_aux_loss = query_aux_loss + 0.25 * reward_scale * F.cross_entropy(
+                    arg_logits[:1, 0, :],
+                    arg_target,
+                )
+            query_aux_loss = query_aux_loss - self.entropy_beta * pred_entropy
+
+        self.last_query_info = {
+            "pred": int(query_goal.pred),
+            "candidate_count": float(len(candidate_preds)),
+            "support": float(proof_support.item()),
+            "n_answers": float(len(valid_answer_ids)),
+            "answer_ids": tuple(int(token_id) for token_id in valid_answer_ids[:4]),
+            "fallback": 1.0 if used_fallback else 0.0,
+            "hit": query_hit,
+            "reward": query_reward,
+            "entropy": float(pred_entropy.detach().item()),
+            "aux_loss": float(query_aux_loss.detach().item()),
+            "aux_loss_tensor": query_aux_loss,
+        }
+
+        # This query reasons about the current next-token step only.
+        logits_out = logits.clone()
+        logits_out[:, -1, :] = logits_out[:, -1, :] + self.alpha_sym * gate * logit_bias
+        if (
+            valid_answer_ids
+            and float(proof_support.item()) >= float(self.hard_mask_threshold)
+            and (not self.training or query_hit > 0.0)
+        ):
+            veto_mask = torch.full_like(logits_out[:, -1, :], -1e4)
+            veto_mask[:, valid_answer_ids] = 0.0
+            logits_out[:, -1, :] = logits_out[:, -1, :] + veto_mask
+            self.last_query_info["hard_mask"] = 1.0
+        else:
+            self.last_query_info["hard_mask"] = 0.0
+        return logits_out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -537,6 +1225,38 @@ class OMENScale(nn.Module):
             n_latents=cfg.n_latents, n_heads=cfg.n_heads_lat,
             n_layers=cfg.n_layers_lat, dropout=cfg.dropout,
         )
+        self.posterior_mu = nn.Linear(cfg.d_latent, cfg.d_latent)
+        self.posterior_logvar = nn.Linear(cfg.d_latent, cfg.d_latent)
+        nn.init.zeros_(self.posterior_mu.weight)
+        nn.init.zeros_(self.posterior_mu.bias)
+        nn.init.zeros_(self.posterior_logvar.weight)
+        nn.init.constant_(self.posterior_logvar.bias, -4.0)
+        self.memory_prior_mu = nn.Linear(cfg.d_latent, cfg.d_latent)
+        self.memory_prior_logvar = nn.Linear(cfg.d_latent, cfg.d_latent)
+        self.memory_read_mu = nn.Linear(cfg.d_latent, cfg.d_latent)
+        self.memory_read_logvar = nn.Linear(cfg.d_latent, cfg.d_latent)
+        self.symbolic_prior_mu = nn.Linear(cfg.d_latent, cfg.d_latent)
+        self.symbolic_prior_logvar = nn.Linear(cfg.d_latent, cfg.d_latent)
+        for layer in (
+            self.memory_prior_mu,
+            self.memory_prior_logvar,
+            self.memory_read_mu,
+            self.memory_read_logvar,
+            self.symbolic_prior_mu,
+            self.symbolic_prior_logvar,
+        ):
+            nn.init.zeros_(layer.weight)
+        nn.init.zeros_(self.memory_prior_mu.bias)
+        nn.init.constant_(self.memory_prior_logvar.bias, -2.0)
+        nn.init.zeros_(self.memory_read_mu.bias)
+        nn.init.zeros_(self.memory_read_logvar.bias)
+        nn.init.zeros_(self.symbolic_prior_mu.bias)
+        nn.init.constant_(self.symbolic_prior_logvar.bias, -2.0)
+        self.token_code_mu = nn.Parameter(torch.zeros(cfg.d_tok))
+        self.token_code_logvar = nn.Parameter(torch.zeros(cfg.d_tok))
+        self.concept_code_mu = nn.Parameter(torch.zeros(cfg.d_latent))
+        self.concept_code_logvar = nn.Parameter(torch.zeros(cfg.d_latent))
+        self.world_obs_logvar = nn.Parameter(torch.zeros(()))
 
         # ─── Рівень 2: Concept ────────────────────────────────────────────────
         v2cfg = _make_v2_compat(cfg)
@@ -551,11 +1271,19 @@ class OMENScale(nn.Module):
             nn.Linear(cfg.d_latent, cfg.d_latent),
         )
         self.mem_query_proj = nn.Linear(cfg.d_latent, cfg.d_latent, bias=False)
-        self.mem_fusion_gate = nn.Sequential(
-            nn.Linear(cfg.d_latent * 3, cfg.d_latent),
+        self.state_integrator = SymbolicStateIntegrator(cfg.d_latent)
+        self.symbolic_token_head = nn.Sequential(
+            nn.Linear(cfg.d_latent * 2, cfg.d_latent),
             nn.GELU(),
-            nn.Linear(cfg.d_latent, cfg.d_latent),
-            nn.Sigmoid(),
+            nn.Linear(cfg.d_latent, cfg.vocab_size),
+        )
+        self.decoder_surprise_head = nn.Sequential(
+            nn.Linear(cfg.d_tok + cfg.d_latent, cfg.d_tok),
+            nn.GELU(),
+            nn.Linear(cfg.d_tok, cfg.vocab_size),
+        )
+        self._decoder_surprise_enabled = bool(
+            getattr(cfg, "sym_decoder_surprise_enabled", True)
         )
 
         # ─── Рівень 3: Symbolic (∂-Prolog) ────────────────────────────────────
@@ -569,6 +1297,44 @@ class OMENScale(nn.Module):
             vem_tau    = getattr(cfg, 'vem_tau', 0.3),
             eta_utility = getattr(cfg, 'eta_utility', 0.1),
             consolidate_every = getattr(cfg, 'rule_consolidate_every', 100),
+        )
+        self._install_symbolic_bootstrap_rules()
+
+        # ─── КРИТИЧНО: WorldRNN → ∂-Prolog ін'єкція ──────────────────────────
+        # set_world_rnn() увімкнює:
+        #   · Дедукція: _mental_simulate_rule() використовує WorldRNN для
+        #     латентного Prediction Error ДО реального застосування правила
+        #   · Абдукція: _pred_error_for_rule() отримує WorldRNN-компоненту
+        #     в MDL PredError(R, Trace) — 30% ваги latent-space consistency
+        # БЕЗ цього виклику self._world_rnn = None у всіх методах прувера
+        # → Дедукція та Абдукція працювали суто символьно, без latent сигналу.
+        self.prover.set_world_rnn(self.world_rnn)
+        self.prover.set_allow_latent_goal_fallback(False)
+        self.prover.configure_hypothesis_cycle(
+            enabled=getattr(cfg, "continuous_cycle_enabled", True),
+            max_contextual=getattr(cfg, "continuous_cycle_contextual", 4),
+            max_neural=getattr(cfg, "continuous_cycle_neural", 4),
+            accept_threshold=getattr(cfg, "continuous_cycle_accept_threshold", 0.55),
+            verify_threshold=getattr(cfg, "continuous_cycle_verify_threshold", 0.75),
+            contradict_threshold=getattr(cfg, "continuous_cycle_contradict_threshold", 0.15),
+            symbolic_weight=getattr(cfg, "continuous_cycle_symbolic_weight", 0.45),
+            world_weight=getattr(cfg, "continuous_cycle_world_weight", 0.25),
+            token_weight=getattr(cfg, "continuous_cycle_token_weight", 0.30),
+            soft_symbolic_weight=getattr(cfg, "continuous_cycle_soft_symbolic_weight", 0.45),
+            policy_weight=getattr(cfg, "continuous_cycle_policy_weight", 0.25),
+            policy_baseline_momentum=getattr(cfg, "continuous_cycle_policy_baseline_momentum", 0.90),
+            candidate_tau=getattr(cfg, "continuous_cycle_candidate_tau", 0.70),
+            repair_enabled=getattr(cfg, "continuous_cycle_repair_enabled", True),
+            repair_threshold=getattr(cfg, "continuous_cycle_repair_threshold", 0.35),
+            max_repairs=getattr(cfg, "continuous_cycle_max_repairs", 2),
+        )
+        self.prover.configure_graph_reasoning(
+            enabled=getattr(cfg, "sym_graph_reasoning_enabled", True),
+            top_k_facts=getattr(cfg, "sym_graph_reasoning_top_k_facts", 12),
+            max_fact_subset=getattr(cfg, "sym_graph_reasoning_max_fact_subset", 96),
+            attention_threshold=getattr(cfg, "sym_graph_reasoning_attention_threshold", 0.02),
+            tau=getattr(cfg, "sym_graph_reasoning_tau", 0.5),
+            full_scan_cutoff=getattr(cfg, "sym_graph_reasoning_full_scan_cutoff", 64),
         )
 
         # ─── KB ↔ NET інтеграція: NET реєструє концепти прямо в Prolog-KB ──────
@@ -645,6 +1411,247 @@ class OMENScale(nn.Module):
         self._ctx_ast_max_facts = int(getattr(cfg, "symbolic_ast_max_facts", 48))
         self.ast_parser = MultiLangASTParser()
         self.register_buffer("_train_step", torch.zeros((), dtype=torch.long), persistent=False)
+        self.register_buffer("_seen_tokens", torch.zeros((), dtype=torch.long), persistent=False)
+
+        # ── Ідеальна реалізація: пункти 1 та 3 ───────────────────────────────
+        # SymbolicFactCache: офлайн-кеш фактів щоб уникнути повторного AST-парсингу
+        self._fact_cache = SymbolicFactCache(
+            max_entries=int(getattr(cfg, "fact_cache_size", 4096))
+        )
+        # SymbolicQueryGenerator: генерує Horn-цілі з прихованого стану декодера
+        # і коригує логіти декодера відповідно до результату доведення (пункт 3)
+        sym_qg_enabled = getattr(cfg, "sym_query_gen_enabled", True)
+        if sym_qg_enabled:
+            self.sym_query_gen = SymbolicQueryGenerator(
+                d_tok      = cfg.d_tok,
+                d_latent   = cfg.d_latent,
+                sym_vocab  = cfg.sym_vocab,
+                vocab_size = cfg.vocab_size,
+                alpha_sym  = float(getattr(cfg, "sym_query_alpha", 0.05)),
+                gumbel_tau = float(getattr(cfg, "sym_query_gumbel_tau", 0.85)),
+                entropy_beta = float(getattr(cfg, "sym_query_entropy_beta", 1e-3)),
+                hard_mask_threshold = float(getattr(cfg, "sym_query_hard_mask_threshold", 0.75)),
+            )
+        else:
+            self.sym_query_gen = None
+        self._sym_qg_enabled = sym_qg_enabled
+        self._last_ce_utility: float = 0.0
+        self.ce_reinforce_enabled: bool = bool(getattr(cfg, "ce_reinforce_enabled", False))
+        self.ce_reinforce_fallback_only: bool = bool(getattr(cfg, "ce_reinforce_fallback_only", True))
+        self.ce_reinforce_retro_every: int = int(getattr(cfg, "ce_reinforce_retro_every", 0))
+        # Running CE EMA для reward feedback у S-Core (пункт 1/5 ідеальної реалізації)
+        # _prev_ce: EMA попереднього CE — використовується для визначення
+        #   чи правила, що були абдуковані, допомогли покращити мовну модель.
+        self._prev_ce: float = float("inf")
+        self._ce_ema: float = float("inf")   # окремий smooth EMA для VeM retro
+
+    # ── CE-Driven Abduce→Deduce→Induce: замикання зворотного зв'язку ─────────
+    def _install_symbolic_bootstrap_rules(self) -> None:
+        x_var = Var("BOOT_X")
+        y_var = Var("BOOT_Y")
+        bootstrap_rules = [
+            HornClause(
+                head=HornAtom(SEQ_PREDICT_NEXT_PRED, (x_var, y_var)),
+                body=(HornAtom(SEQ_EDGE_PRED, (x_var, y_var)),),
+            ),
+            HornClause(
+                head=HornAtom(SEQ_ACTUAL_NEXT_PRED, (x_var, y_var)),
+                body=(HornAtom(SEQ_EDGE_PRED, (x_var, y_var)),),
+            ),
+        ]
+        for rule in bootstrap_rules:
+            try:
+                self.prover.kb.add_rule(rule, status=EpistemicStatus.verified)
+            except Exception:
+                continue
+
+    def _per_rule_induction(
+        self,
+        rules: list,
+        target_facts,
+        all_facts,
+        global_ce_utility: float,
+        device: torch.device,
+    ) -> None:
+        """
+        Локальна (per-rule) Індукція (концепція, розділ 3):
+          «Перевіряємо конкретне правило на конкретному прикладі:
+           якщо передбачення не збіглося → правило відкидається або модифікується»
+
+        Замість глобального CE-сигналу для всіх правил → перевіряємо кожне
+        правило окремо: чи факти, виведені ЦИМ правилом, потрапили у target_facts.
+
+        Алгоритм:
+          1. Для кожного правила → forward_chain_step_local → derived_facts
+          2. hits = |derived_facts ∩ target_facts|
+          3. rule_utility = (0.7 * hits_score + 0.3 * global_ce_utility)
+             де hits_score = 1.0 якщо hits > 0, інакше 0.0
+          4. Якщо rule_utility < 0.2 → mark_contradicted
+
+        Це відрізняється від глобального _ce_reinforce:
+          СТАРО: utility(ALL rules) = f(CE_global)
+          НОВО:  utility(R_i) = f(CE_global, hits(R_i, target_facts))
+        """
+        if not rules or not target_facts:
+            return
+
+        from omen_prolog import (
+            freshen_vars, find_all_substitutions, unify, _atoms_conflict
+        )
+
+        for rule in rules:
+            if not rule.body:
+                # Правило-факт: перевіряємо голову проти target_facts
+                hits = sum(
+                    1 for tf in target_facts
+                    if unify(rule.head, tf) is not None
+                )
+                hits_score = 1.0 if hits > 0 else 0.0
+                rule_utility = 0.7 * hits_score + 0.3 * global_ce_utility
+            else:
+                # Правило з тілом: перевіряємо виведені факти проти target_facts
+                try:
+                    fresh = freshen_vars(rule)
+                    base_facts = all_facts or self.prover.kb.facts
+                    derived_by_rule = set()
+                    for sigma in find_all_substitutions(
+                        fresh.body, base_facts, max_solutions=8
+                    ):
+                        derived = sigma.apply_atom(fresh.head)
+                        if derived.is_ground():
+                            derived_by_rule.add(derived)
+
+                    # Скільки виведених фактів потрапили у target_facts
+                    hits = sum(
+                        1 for df in derived_by_rule
+                        for tf in target_facts
+                        if unify(df, tf) is not None
+                    )
+                    hits_score = min(1.0, float(hits) / max(len(derived_by_rule), 1))
+                    # Якщо правило нічого не вивело взагалі — нейтральний сигнал
+                    if not derived_by_rule:
+                        hits_score = 0.3  # не корисне, але не шкідливе
+                    rule_utility = 0.7 * hits_score + 0.3 * global_ce_utility
+                except Exception:
+                    rule_utility = global_ce_utility
+
+            # Оновлюємо VeM та статус правила на основі ЛОКАЛЬНОЇ перевірки
+            self.prover.vem.record_outcome(
+                rule, utility_target=rule_utility, device=device
+            )
+            if hasattr(self.prover, "_record_rule_utility"):
+                self.prover._record_rule_utility(rule, rule_utility)
+
+            # Епістемічний статус: верифікується тільки якщо правило РЕАЛЬНО
+            # допомогло (висока локальна utility), а не через глобальний CE
+            if rule_utility >= 0.85:
+                self.prover.kb.mark_rule_verified(rule)
+            elif rule_utility <= 0.15:
+                self.prover.kb.mark_rule_contradicted(rule)
+
+    def _ce_reinforce(self, cur_ce: float, device: torch.device) -> None:
+        """
+        Замикає Abduce→Deduce→Induce цикл.
+
+        Інтегрує два рівні зворотного зв'язку:
+          1. ГЛОБАЛЬНИЙ (через CE delta) — для загального напрямку навчання
+          2. ЛОКАЛЬНИЙ (через per-rule target_facts verification) — для точної
+             верифікації кожного правила окремо (Fix 3: реальна Індукція)
+
+        Концепція, розділ 3:
+          «Локальна перевірка конкретного правила на конкретному прикладі:
+           якщо передбачення не збіглося → правило відкидається, а не підганяється»
+        """
+        if math.isnan(cur_ce) or math.isinf(cur_ce):
+            return
+        if not self.ce_reinforce_enabled:
+            self._last_ce_utility = 0.0
+            if self._prev_ce < float("inf"):
+                self._prev_ce = 0.9 * self._prev_ce + 0.1 * cur_ce
+                self._ce_ema = 0.95 * self._ce_ema + 0.05 * cur_ce
+            else:
+                self._prev_ce = cur_ce
+                self._ce_ema = cur_ce
+            return
+
+        # ── Глобальний сигнал (CE delta) ──────────────────────────────────
+        if self._prev_ce < float("inf"):
+            ce_delta = self._prev_ce - cur_ce   # > 0 = покращення
+            global_utility = float(torch.sigmoid(torch.tensor(ce_delta * 3.0)).item())
+            if ce_delta > 0.05:
+                global_utility = max(global_utility, 0.9)
+            elif ce_delta < -0.05:
+                global_utility = min(global_utility, 0.1)
+        else:
+            global_utility = 0.5
+
+        self._last_ce_utility = global_utility
+
+        # ── Локальна per-rule Індукція (FIX 3) ────────────────────────────
+        # Перевіряємо кожне нещодавно абдуковане та використане правило ЛОКАЛЬНО
+        # проти target_facts прувера (не через глобальний CE)
+        target_facts = self.prover._task_target_facts()
+        all_facts = self.prover.last_all_facts
+
+        recent_rules = list(self.prover.last_abduced_rules)
+        used_rules   = list(self.prover.last_used_rules)
+        if not target_facts and self.ce_reinforce_fallback_only:
+            recent_rules = []
+            used_rules = []
+            self.prover.last_abduced_rules = []
+            if hasattr(self.prover, "last_used_rules"):
+                self.prover.last_used_rules = []
+            if hasattr(self.prover, "_last_used_rule_hashes"):
+                self.prover._last_used_rule_hashes.clear()
+
+        if target_facts:
+            # Є конкретні target_facts → per-rule verification
+            if recent_rules:
+                self._per_rule_induction(
+                    recent_rules, target_facts, all_facts, global_utility, device
+                )
+            if used_rules:
+                self._per_rule_induction(
+                    used_rules, target_facts, all_facts, global_utility, device
+                )
+            # Очищаємо після per-rule перевірки
+            self.prover.last_abduced_rules = []
+            if hasattr(self.prover, "last_used_rules"):
+                self.prover.last_used_rules = []
+            if hasattr(self.prover, "_last_used_rule_hashes"):
+                self.prover._last_used_rule_hashes.clear()
+        else:
+            # Немає конкретних target_facts → fallback до глобального CE сигналу
+            # (зберігаємо стару поведінку для backward compatibility)
+            self.prover.reinforce_recent_rules(
+                utility_target=global_utility, device=device
+            )
+            if hasattr(self.prover, "reinforce_used_rules"):
+                self.prover.reinforce_used_rules(
+                    utility_target=global_utility, device=device
+                )
+
+        # ── VeM CE-based retrospective (рідко) ────────────────────────────
+        step = int(self._train_step.item())
+        if (
+            self.ce_reinforce_retro_every > 0
+            and step > 0
+            and step % self.ce_reinforce_retro_every == 0
+            and self._ce_ema < float("inf")
+        ):
+            self.prover.vem_retrospective_update(
+                ce_utility=global_utility,
+                device=device,
+            )
+
+        # ── Оновлюємо EMA CE ───────────────────────────────────────────────
+        alpha = 0.1
+        if self._prev_ce < float("inf"):
+            self._prev_ce = (1.0 - alpha) * self._prev_ce + alpha * cur_ce
+            self._ce_ema  = (1.0 - 0.05) * self._ce_ema  + 0.05  * cur_ce
+        else:
+            self._prev_ce = cur_ce
+            self._ce_ema  = cur_ce
 
     def _world_teacher_forcing_ratio(self) -> float:
         start = float(getattr(self.cfg, 'world_teacher_forcing_start', 0.35))
@@ -702,8 +1709,147 @@ class OMENScale(nn.Module):
         z_symbolic: torch.Tensor,
         v_mem: torch.Tensor,
     ) -> torch.Tensor:
-        fusion_gate = self.mem_fusion_gate(torch.cat([z_neural, z_symbolic, v_mem], dim=-1))
-        return z_neural + 0.1 * z_symbolic + fusion_gate * v_mem
+        return self.state_integrator.post_symbolic(z_neural, z_symbolic, v_mem)
+
+    def _pre_symbolic_state(
+        self,
+        z_neural: torch.Tensor,
+        v_mem: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.state_integrator.pre_symbolic(z_neural, v_mem)
+
+    def _model_description_bits(self) -> Dict[str, torch.Tensor]:
+        sigma = float(getattr(self.cfg, "mdl_param_sigma", 0.05))
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+        neural_bits = torch.zeros((), device=device, dtype=dtype)
+        vocab_bits = torch.zeros((), device=device, dtype=dtype)
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "codebook.weight" in name:
+                continue
+            neural_bits = neural_bits + gaussian_tensor_bits(param, sigma=sigma)
+        if self.net_enabled and hasattr(self, "net") and hasattr(self.net, "quantizer"):
+            vocab_bits = self.net.quantizer.vocab_description_bits().to(
+                device=device,
+                dtype=dtype,
+            )
+        return {
+            "neural": neural_bits,
+            "vocab": vocab_bits,
+        }
+
+    def _recall_symbolic_memory_facts(
+        self,
+        z_query: torch.Tensor,
+        hint_facts: Optional[List[HornAtom]] = None,
+        goal: Optional[HornAtom] = None,
+    ) -> List[HornAtom]:
+        top_k = int(getattr(self.cfg, "mem_symbolic_recall_topk", 8))
+        min_sim = float(getattr(self.cfg, "mem_symbolic_min_sim", 0.2))
+        predicate_hints: Set[int] = set()
+        anchor_values: Set[int] = set()
+        for fact in hint_facts or []:
+            predicate_hints.add(int(fact.pred))
+            anchor_values.update(self._const_values_from_atom(fact))
+        if goal is not None:
+            predicate_hints.add(int(goal.pred))
+            anchor_values.update(self._const_values_from_atom(goal))
+        recalled = self.memory.recall_symbolic_atoms(
+            z_query[:1],
+            top_k=top_k,
+            min_sim=min_sim,
+            predicate_hints=sorted(predicate_hints),
+            anchor_values=sorted(anchor_values),
+        )
+        return [fact for fact in recalled if isinstance(fact, HornAtom)]
+
+    def _write_symbolic_memory_facts(
+        self,
+        facts: FrozenSet[HornAtom],
+        confidence: float,
+    ) -> int:
+        if not facts or confidence <= float(getattr(self.cfg, "mem_write_tau", 0.3)):
+            return 0
+        fact_list = list(facts)[: int(getattr(self.cfg, "sym_max_facts", 64))]
+        fact_embs = self.prover.term_emb(fact_list, next(self.parameters()).device)
+        return self.memory.write_symbolic_atoms(fact_list, fact_embs)
+
+    def _sample_variational_latent(
+        self,
+        z_det: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build q(z|o) with a conservative residual posterior."""
+        if not bool(getattr(self.cfg, "vfe_enabled", True)):
+            zeros = torch.zeros_like(z_det)
+            return z_det, z_det, zeros
+        mu = z_det + self.posterior_mu(z_det)
+        logvar = self.posterior_logvar(z_det).clamp(-6.0, 2.0)
+        if self.training:
+            eps = torch.randn_like(mu)
+            z_post = mu + eps * (0.5 * logvar).exp()
+        else:
+            z_post = mu
+        return z_post, mu, logvar
+
+    @staticmethod
+    def _conditional_gaussian_prior(
+        anchor: torch.Tensor,
+        mu_layer: nn.Linear,
+        logvar_layer: nn.Linear,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        base = anchor.detach()
+        mu = base + mu_layer(base)
+        logvar = logvar_layer(base).clamp(-6.0, 2.0)
+        return mu, logvar
+
+    @staticmethod
+    def _decoder_query_from_context(task_context: SymbolicTaskContext) -> HornAtom:
+        last_src = int(task_context.metadata.get("last_src", 0))
+        return HornAtom(SEQ_PREDICT_NEXT_PRED, (last_src, Var("NEXT")))
+
+    def _symbolic_token_logits(
+        self,
+        z_symbolic: torch.Tensor,
+        task_context: SymbolicTaskContext,
+    ) -> torch.Tensor:
+        query = self._decoder_query_from_context(task_context)
+        query_emb = self.prover.ground(frozenset({query}), z_symbolic.device).expand(z_symbolic.size(0), -1)
+        return self.symbolic_token_head(torch.cat([z_symbolic, query_emb], dim=-1))
+
+    def _decoder_surprise_signal(
+        self,
+        h_tok: Optional[torch.Tensor],
+        z_enriched: torch.Tensor,
+        tgt: torch.Tensor,
+    ) -> Optional[Dict[str, object]]:
+        """Estimate a local next-token miss signal before symbolic reasoning."""
+        if (
+            not self._decoder_surprise_enabled
+            or h_tok is None
+            or h_tok.numel() == 0
+            or tgt.numel() == 0
+        ):
+            return None
+        probe_input = torch.cat([h_tok[:, -1, :], z_enriched], dim=-1)
+        probe_logits = self.decoder_surprise_head(probe_input)
+        targets = tgt[:, -1].long()
+        probe_ce = F.cross_entropy(probe_logits, targets, reduction="none")
+        probe_probs = F.softmax(probe_logits, dim=-1)
+        pred_tokens = probe_logits.argmax(dim=-1)
+        gold_probs = probe_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        misses = pred_tokens.ne(targets).to(probe_logits.dtype)
+        surprise = 0.5 * misses + 0.5 * (1.0 - gold_probs)
+        return {
+            "pred_tokens": pred_tokens.detach(),
+            "targets": targets.detach(),
+            "misses": misses.detach(),
+            "surprise": surprise.detach(),
+            "probe_ce": probe_ce.detach(),
+            "loss_tensor": probe_ce.mean(),
+            "loss": float(probe_ce.mean().detach().item()),
+        }
 
     @staticmethod
     def _dedupe_facts(facts: List[HornAtom], limit: int) -> List[HornAtom]:
@@ -719,13 +1865,111 @@ class OMENScale(nn.Module):
         return unique
 
     @staticmethod
+    def _prioritize_trace_targets(
+        facts: FrozenSet[HornAtom],
+        limit: int,
+    ) -> List[HornAtom]:
+        priority = {
+            TRACE_RETURN_EVENT_PRED: 6,
+            TRACE_ERROR_EVENT_PRED: 6,
+            TRACE_BINOP_EVENT_PRED: 5,
+            TRACE_ASSIGN_EVENT_PRED: 4,
+            TRACE_PARAM_BIND_PRED: 3,
+            TRACE_STATE_VALUE_PRED: 2,
+        }
+
+        def fact_key(atom: HornAtom) -> Tuple[int, int, Tuple[int, ...]]:
+            values = OMENScale._const_values_from_atom(atom)
+            return (
+                -priority.get(int(atom.pred), 0),
+                int(atom.pred),
+                tuple(values),
+            )
+
+        ranked = sorted(list(facts), key=fact_key)
+        return ranked[: max(int(limit), 0)]
+
+    @staticmethod
     def _first_const(atom: HornAtom) -> int:
         for arg in atom.args:
             if isinstance(arg, Const):
                 return int(arg.val)
         return int(atom.pred)
 
+    @staticmethod
+    def _const_values_from_atom(atom: HornAtom) -> List[int]:
+        values: List[int] = [int(atom.pred)]
+
+        def visit(term) -> None:
+            if isinstance(term, Const):
+                values.append(int(term.val))
+                return
+            func = getattr(term, "func", None)
+            if func is not None:
+                values.append(int(func))
+            for subterm in getattr(term, "subterms", ()) or ():
+                visit(subterm)
+
+        for arg in atom.args:
+            visit(arg)
+        return values
+
+    @staticmethod
+    def _queryable_candidate_preds(
+        facts: List[HornAtom],
+        goal: Optional[HornAtom] = None,
+    ) -> Tuple[int, ...]:
+        preds: Set[int] = {SEQ_PREDICT_NEXT_PRED}
+        for fact in facts:
+            if fact.arity() >= 2:
+                preds.add(int(fact.pred))
+        if goal is not None and goal.arity() >= 2:
+            preds.add(int(goal.pred))
+        return tuple(sorted(preds))
+
+    def _seed_symbolic_memory_facts(
+        self,
+        tokens: torch.Tensor,
+        decoder_signal: Optional[Dict[str, object]] = None,
+    ) -> List[HornAtom]:
+        row = tokens[0].detach().cpu()
+        if row.numel() == 0:
+            return []
+        seed: List[HornAtom] = []
+        edge_cap = min(max(int(row.numel()) - 1, 0), 6)
+        start_idx = max(int(row.numel()) - edge_cap - 1, 0)
+        for idx in range(start_idx, max(int(row.numel()) - 1, 0)):
+            seed.append(HornAtom(
+                SEQ_EDGE_PRED,
+                (int(row[idx].item()), int(row[idx + 1].item())),
+            ))
+        last_token = int(row[-1].item())
+        seed.append(HornAtom(SEQ_LAST_TOKEN_PRED, (last_token, max(int(row.numel()) - 1, 0))))
+        if decoder_signal is not None and torch.is_tensor(decoder_signal.get("pred_tokens")):
+            pred_tokens = decoder_signal["pred_tokens"]
+            if pred_tokens.numel() > 0:
+                decoder_pred = int(pred_tokens[0].item())
+                seed.append(HornAtom(SEQ_DECODER_GUESS_PRED, (last_token, decoder_pred)))
+        seed.extend(self._ast_facts_from_bytes(row)[:8])
+        return self._dedupe_facts(seed, limit=24)
+
     def _ast_facts_from_bytes(self, src_row: torch.Tensor) -> List[HornAtom]:
+        """
+        Витягує Horn-факти з байтового рядка через MultiLangASTParser.
+
+        Ідеальна реалізація (пункт 1):
+          · Перевіряємо SymbolicFactCache — якщо hit, повертаємо без парсингу.
+          · Автодетект мови (detect_lang) замість фіксованого 'python'.
+          · Зберігаємо результат у кеш для наступних батчів.
+
+        Returns:
+            List[HornAtom] — знайдені факти (ліміт _ctx_ast_max_facts)
+        """
+        cached = self._fact_cache.get(src_row)
+        if cached is not None:
+            facts, _rules, _trace = cached
+            return facts
+
         try:
             code = bytes(int(v) % 256 for v in src_row.tolist()).decode("utf-8", errors="ignore")
         except Exception:
@@ -733,10 +1977,57 @@ class OMENScale(nn.Module):
         if not code.strip():
             return []
         try:
-            facts = self.ast_parser.parse(code, lang="python", source_id=0)
+            # Автодетект мови замість фіксованого 'python'
+            facts = self.ast_parser.parse_autodetect(code, source_id=0)
         except Exception:
             return []
-        return self._dedupe_facts(list(facts), self._ctx_ast_max_facts)
+        try:
+            trace_bundle = build_symbolic_trace_bundle(
+                code,
+                lang_hint="python",
+                max_steps=int(getattr(self.cfg, "sym_trace_max_steps", 24)),
+                max_counterexamples=int(getattr(self.cfg, "sym_trace_max_counterexamples", 4)),
+            )
+        except Exception:
+            trace_bundle = None
+        facts = self._dedupe_facts(facts, self._ctx_ast_max_facts)
+        # Витягуємо правила-шаблони (пункт 6 ідеальної реалізації)
+        try:
+            rule_templates = self.ast_parser.extract_rule_templates(facts, max_rules=16)
+        except Exception:
+            rule_templates = []
+        # Зберігаємо в кеш
+        self._fact_cache.put(src_row, facts, rule_templates, trace_bundle)
+        return facts
+
+    def _ast_rules_from_bytes(self, src_row: torch.Tensor):
+        """
+        Повертає правила-шаблони для src_row (з кешу або парсинг).
+        Відповідає пункту 6 ідеальної реалізації:
+          «AST-факти як джерело правил, а не тільки фактів.»
+        """
+        # Спочатку перевіряємо кеш (попередньо заповнений _ast_facts_from_bytes)
+        cached = self._fact_cache.get(src_row)
+        if cached is not None:
+            _facts, rules, _trace = cached
+            return rules
+        # Примусово парсимо, щоб заповнити кеш
+        self._ast_facts_from_bytes(src_row)
+        cached = self._fact_cache.get(src_row)
+        if cached is not None:
+            return cached[1]
+        return []
+
+    def _ast_trace_from_bytes(self, src_row: torch.Tensor):
+        cached = self._fact_cache.get(src_row)
+        if cached is not None:
+            _facts, _rules, trace_bundle = cached
+            return trace_bundle
+        self._ast_facts_from_bytes(src_row)
+        cached = self._fact_cache.get(src_row)
+        if cached is not None:
+            return cached[2]
+        return None
 
     def _build_counterfactual_actions(self, src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
         n_cf = max(int(getattr(self.cfg, "n_counterfactual", 0)), 0)
@@ -760,10 +2051,22 @@ class OMENScale(nn.Module):
         gap_norm: torch.Tensor,
         hot_dims: torch.Tensor,
         saliency_out: Optional[object],
+        h_tok: Optional[torch.Tensor] = None,
+        decoder_signal: Optional[Dict[str, object]] = None,
+        memory_facts: Optional[List[HornAtom]] = None,
     ) -> SymbolicTaskContext:
+        """
+        Будує SymbolicTaskContext для S-Core.
+
+        Ідеальна реалізація (пункти 1, 3, 6):
+          1. Факти беруться з SymbolicFactCache (без повторного парсингу).
+          6. AST правила-шаблони завантажуються в прувер KB (статус: verified).
+          3. Ціль формується динамічно через SymbolicQueryGenerator
+             (якщо доступний h_tok), а не як останній факт AST.
+        """
         src_row = src[0].detach().cpu()
         tgt_row = tgt[0].detach().cpu()
-        observed: List[HornAtom] = []
+        observed: List[HornAtom] = list(memory_facts or [])
 
         pair_cap = min(src_row.numel(), max(self._ctx_max_facts // 2, 8))
         start_idx = max(src_row.numel() - pair_cap, 0)
@@ -777,24 +2080,62 @@ class OMENScale(nn.Module):
         last_tgt = int(tgt_row[-1].item())
         observed.append(HornAtom(SEQ_LAST_TOKEN_PRED, (last_src, src_row.numel() - 1)))
 
+        decoder_pred = last_tgt
+        decoder_miss = 0.0
+        decoder_surprise = 0.0
+        decoder_probe_ce = 0.0
+        if decoder_signal is not None and torch.is_tensor(decoder_signal.get("pred_tokens")):
+            pred_tokens = decoder_signal["pred_tokens"]
+            misses = decoder_signal["misses"]
+            surprises = decoder_signal["surprise"]
+            probe_ce = decoder_signal["probe_ce"]
+            if pred_tokens.numel() > 0:
+                decoder_pred = int(pred_tokens[0].item())
+                decoder_miss = float(misses[0].item())
+                decoder_surprise = float(surprises[0].item())
+                decoder_probe_ce = float(probe_ce[0].item())
+                surprise_bucket = int(round(max(0.0, min(1.0, decoder_surprise)) * 100.0))
+                observed.append(HornAtom(SEQ_DECODER_GUESS_PRED, (last_src, decoder_pred)))
+                observed.append(HornAtom(SEQ_DECODER_SURPRISE_PRED, (last_src, surprise_bucket)))
+                if decoder_miss > 0.0:
+                    observed.append(HornAtom(SEQ_DECODER_MISS_PRED, (decoder_pred, last_tgt)))
+
         hot_idx = hot_dims[0].nonzero(as_tuple=True)[0].tolist()[:8]
         for dim_idx in hot_idx:
             observed.append(HornAtom(SEQ_GAP_DIM_PRED, (int(dim_idx), 1)))
 
-        next_goal = HornAtom(SEQ_PREDICT_NEXT_PRED, (last_src, last_tgt))
+        next_goal  = HornAtom(SEQ_PREDICT_NEXT_PRED, (last_src, last_tgt))
         actual_next = HornAtom(SEQ_ACTUAL_NEXT_PRED, (last_src, last_tgt))
-        goal = next_goal
+        goal = HornAtom(SEQ_PREDICT_NEXT_PRED, (last_src, Var("NEXT")))
         provenance = "token"
 
+        # ── Пункт 1: факти з кешу (або on-the-fly при miss) ──────────────────
         ast_facts = self._ast_facts_from_bytes(src_row)
+        trace_bundle = self._ast_trace_from_bytes(src_row)
+
+        # ── Пункт 6: завантажуємо AST правила-шаблони в KB (verified) ─────────
+        # Це відповідає: «AST-факти як джерело правил, а не тільки фактів.»
+        ast_rules = self._ast_rules_from_bytes(src_row)
+        if ast_rules:
+            from omen_prolog import EpistemicStatus
+            for rule in ast_rules:
+                # Перевіряємо що правило ще не в KB
+                try:
+                    self.prover.kb.add_rule(rule, status=EpistemicStatus.verified)
+                except Exception:
+                    pass
+
         saliency_semantic = list(saliency_out.sal_semantic_facts[0]) if saliency_out is not None else []
         saliency_expected = list(saliency_out.sal_expected_facts[0]) if saliency_out is not None else []
 
-        if len(ast_facts) >= 2:
-            goal = ast_facts[-1]
-            observed.extend(ast_facts[:-1])
-            observed.append(HornAtom(SEQ_AST_SUPPORT_PRED, (goal.pred, self._first_const(goal))))
+        # ── Базова ціль і дискретний контекст ─────────────────────────────────
+        if ast_facts:
+            observed.extend(ast_facts)
+            observed.append(HornAtom(SEQ_AST_SUPPORT_PRED, (ast_facts[-1].pred, self._first_const(ast_facts[-1]))))
             provenance = "ast"
+        if trace_bundle is not None:
+            observed.extend(list(trace_bundle.observed_facts)[: max(self._ctx_ast_max_facts // 2, 12)])
+            provenance = "ast_trace" if provenance.startswith("ast") else "trace"
         elif saliency_expected:
             goal = saliency_expected[0]
             observed.extend(saliency_expected[1:])
@@ -802,36 +2143,82 @@ class OMENScale(nn.Module):
             provenance = "saliency"
 
         observed.extend(saliency_semantic)
-        if provenance != "ast":
+        if provenance not in ("ast", "ast_dynamic"):
             observed.extend(ast_facts[:4])
         observed = self._dedupe_facts(observed, self._ctx_max_facts)
+        if (
+            provenance in ("token", "ast")
+            and self._sym_qg_enabled
+            and self.sym_query_gen is not None
+            and observed
+        ):
+            try:
+                device = next(self.parameters()).device
+                h_last = h_tok[0:1, -1, :] if h_tok is not None and h_tok.numel() > 0 else None
+                symbolic_state = self.prover.ground(frozenset(observed), device)
+                candidate_preds = self._queryable_candidate_preds(observed, goal=goal)
+                goal = self.sym_query_gen.generate_query(
+                    h_last,
+                    self.cfg.sym_vocab,
+                    context_anchor=last_src,
+                    symbolic_state=symbolic_state,
+                    candidate_preds=candidate_preds,
+                )
+                provenance = "ast_dynamic" if provenance == "ast" else "token_dynamic"
+            except Exception:
+                pass
 
-        target_facts = self._dedupe_facts([goal, next_goal, actual_next], limit=8)
+        trace_targets = (
+            self._prioritize_trace_targets(trace_bundle.target_facts, limit=8)
+            if trace_bundle is not None else []
+        )
+        target_facts = self._dedupe_facts(
+            [next_goal, actual_next] + ([goal] if goal.is_ground() else []) + trace_targets,
+            limit=16,
+        )
         gap_value = float(gap_norm.mean().item())
         sal_consistency = (
             float(getattr(saliency_out, "sal_consistency", 1.0))
             if saliency_out is not None else 1.0
         )
         trigger_abduction = (
-            gap_value > float(getattr(self.cfg, "epistemic_tau", 0.3))
+            decoder_miss > 0.0
+            or decoder_surprise >= float(getattr(self.cfg, "sym_decoder_surprise_threshold", 0.35))
+            or gap_value > float(getattr(self.cfg, "epistemic_tau", 0.3))
             or sal_consistency < float(getattr(self.cfg, "saliency_consistency_threshold", 0.55))
         )
         return SymbolicTaskContext(
             observed_facts=frozenset(observed),
             goal=goal,
             target_facts=frozenset(target_facts),
+            execution_trace=trace_bundle,
             provenance=provenance,
             trigger_abduction=trigger_abduction,
             hot_dims=tuple(int(i) for i in hot_idx),
             metadata={
                 "gap_norm": gap_value,
                 "saliency_consistency": sal_consistency,
+                "last_src": float(last_src),
+                "last_tgt": float(last_tgt),
+                "decoder_pred": float(decoder_pred),
+                "decoder_target": float(last_tgt),
+                "decoder_miss": decoder_miss,
+                "decoder_surprise": decoder_surprise,
+                "decoder_probe_ce": decoder_probe_ce,
+                "memory_facts": float(len(memory_facts or [])),
+                "trace_steps": float(len(trace_bundle.transitions) if trace_bundle is not None else 0),
+                "trace_counterexamples": float(len(trace_bundle.counterexamples) if trace_bundle is not None else 0),
             },
         )
 
-    def _build_generation_task_context(self, prompt: torch.Tensor) -> SymbolicTaskContext:
+    def _build_generation_task_context(
+        self,
+        prompt: torch.Tensor,
+        h_tok: Optional[torch.Tensor] = None,
+        memory_facts: Optional[List[HornAtom]] = None,
+    ) -> SymbolicTaskContext:
         prompt_row = prompt[0].detach().cpu()
-        observed: List[HornAtom] = []
+        observed: List[HornAtom] = list(memory_facts or [])
         if prompt_row.numel() > 1:
             pair_cap = min(prompt_row.numel() - 1, max(self._ctx_max_facts // 2, 8))
             start_idx = max(prompt_row.numel() - pair_cap - 1, 0)
@@ -846,24 +2233,48 @@ class OMENScale(nn.Module):
         observed.append(HornAtom(SEQ_LAST_TOKEN_PRED, (last_token, last_pos)))
 
         ast_facts = self._ast_facts_from_bytes(prompt_row)
+        trace_bundle = self._ast_trace_from_bytes(prompt_row)
         provenance = "token"
         if ast_facts:
-            goal = ast_facts[-1]
-            observed.extend(ast_facts[:-1])
-            observed.append(HornAtom(SEQ_AST_SUPPORT_PRED, (goal.pred, self._first_const(goal))))
+            observed.extend(ast_facts)
+            observed.append(HornAtom(SEQ_AST_SUPPORT_PRED, (ast_facts[-1].pred, self._first_const(ast_facts[-1]))))
             provenance = "ast"
-        else:
-            goal = HornAtom(SEQ_LAST_TOKEN_PRED, (last_token, last_pos))
-
+        if trace_bundle is not None:
+            observed.extend(list(trace_bundle.observed_facts)[: max(self._ctx_ast_max_facts // 2, 12)])
+            provenance = "ast_trace" if provenance.startswith("ast") else "trace"
+        goal = HornAtom(SEQ_PREDICT_NEXT_PRED, (last_token, Var("NEXT")))
         observed = self._dedupe_facts(observed, self._ctx_max_facts)
+        if self._sym_qg_enabled and self.sym_query_gen is not None and observed:
+            try:
+                device = next(self.parameters()).device
+                h_last = h_tok[0:1, -1, :] if h_tok is not None and h_tok.numel() > 0 else None
+                symbolic_state = self.prover.ground(frozenset(observed), device)
+                candidate_preds = self._queryable_candidate_preds(observed, goal=goal)
+                goal = self.sym_query_gen.generate_query(
+                    h_last,
+                    self.cfg.sym_vocab,
+                    context_anchor=last_token,
+                    symbolic_state=symbolic_state,
+                    candidate_preds=candidate_preds,
+                )
+                provenance = "ast_dynamic" if provenance == "ast" else "token_dynamic"
+            except Exception:
+                pass
         return SymbolicTaskContext(
             observed_facts=frozenset(observed),
             goal=goal,
-            target_facts=frozenset({goal}),
+            target_facts=frozenset({goal} | (trace_bundle.target_facts if trace_bundle is not None else frozenset())),
+            execution_trace=trace_bundle,
             provenance=provenance,
             trigger_abduction=False,
             hot_dims=tuple(),
-            metadata={"mode": "generate"},
+            metadata={
+                "mode": "generate",
+                "last_src": float(last_token),
+                "memory_facts": float(len(memory_facts or [])),
+                "trace_steps": float(len(trace_bundle.transitions) if trace_bundle is not None else 0),
+                "trace_counterexamples": float(len(trace_bundle.counterexamples) if trace_bundle is not None else 0),
+            },
         )
 
 
@@ -881,6 +2292,7 @@ class OMENScale(nn.Module):
         """
         if self.training:
             self._train_step.add_(1)
+            self._seen_tokens.add_(int(max(tgt[:, 1:].ne(0).sum().item(), 1)))
         # ══ Рівень 1: Token → Concept  ═══════════════════════════════════════
         net_info   = {}
         vq_indices = None
@@ -900,7 +2312,8 @@ class OMENScale(nn.Module):
                 h_tok = self.tok_encoder(src)                               # (B,T,d_tok)
             saliency_hidden = h_tok
 
-        latents, z = self.perceiver(h_tok)                             # (B,n,d_lat), (B,d_lat)
+        latents, z_base = self.perceiver(h_tok)                        # (B,n,d_lat), (B,d_lat)
+        z, z_mu, z_logvar = self._sample_variational_latent(z_base)    # q(z|o)
 
         # ── Level 2: M-Core читання ───────────────────────────────────────────
         v_mem = self._retrieve_memory(z)                               # (B, d_lat)
@@ -925,6 +2338,14 @@ class OMENScale(nn.Module):
             z, E, hot_dims, gap_norm, self.memory, self.world_rnn,
             counterfactual_actions=cf_actions,
         )
+        v_mem = self._retrieve_memory(z_enr)
+        z_symbolic_in = self._pre_symbolic_state(z_enr, v_mem)
+        decoder_signal = self._decoder_surprise_signal(h_tok, z_symbolic_in, tgt)
+        seed_memory_facts = self._seed_symbolic_memory_facts(src, decoder_signal=decoder_signal)
+        recalled_memory_facts = self._recall_symbolic_memory_facts(
+            z_symbolic_in,
+            hint_facts=seed_memory_facts,
+        )
 
         saliency_out = None
         if self.saliency_enabled:
@@ -935,10 +2356,23 @@ class OMENScale(nn.Module):
                 prover=self.prover,
                 train_step=int(self._train_step.item()),
             )
+        # ── Пункт 1+3+6: передаємо h_tok для динамічної цілі та кешованих фактів
         task_context = self._build_symbolic_task_context(
             src, tgt, gap_norm, hot_dims, saliency_out,
+            h_tok=h_tok,  # <-- тепер передається для SymbolicQueryGenerator
+            decoder_signal=decoder_signal,
+            memory_facts=recalled_memory_facts,
         )
         self.prover.set_task_context(task_context)
+
+        # ── Пункт 2: load_observed_facts() — завантажуємо факти у WM, не в KB ──
+        # (materialize_task_context_facts вже викликається в prover.forward(),
+        #  але load_observed_facts() дає явний контроль до prover.forward())
+        if task_context.observed_facts:
+            self.prover.load_observed_facts(
+                task_context.observed_facts,
+                limit=int(getattr(self.cfg, "symbolic_context_max_facts", 96)),
+            )
 
         # ── Level 3: ∂-Prolog (через EMC або напряму) ─────────────────────────
         world_err  = F.mse_loss(z_sim_traj, world_targets).detach()
@@ -948,47 +2382,41 @@ class OMENScale(nn.Module):
             # π_meta визначає: Stop | RecallMCore | ForwardChainStep | Abduce
             # Повертає (z_sym, sym_loss, v_mem_emc, meta_loss, traj_stats)
             z_sym, sym_loss, v_mem_emc, meta_loss, traj_stats = self.emc.run_episode(
-                z_enr, gap_norm, hot_dims, self.prover, self.memory,
+                z_symbolic_in, gap_norm, hot_dims, self.prover, self.memory,
                 world_err, device=z_enr.device,
             )
             # Якщо EMC виконав RecallMCore → використовуємо збагачений v_mem
             if v_mem_emc.norm() > 1e-6:
                 v_mem = v_mem_emc
+                z_symbolic_in = self._pre_symbolic_state(z_enr, v_mem)
         else:
             # ── Класичний шлях (eval або emc_enabled=False) ────────────────────
-            z_sym, sym_loss = self.prover(z_enr, world_err)
+            z_sym, sym_loss = self.prover(z_symbolic_in, world_err)
             meta_loss = torch.zeros(1, device=z_enr.device).squeeze()
             traj_stats = None
-        self.prover.clear_task_context()
-
         # ── Semantic Feedback Pairs для NET (I(Z;Γ) апроксимація) ────────────
-        # S-Core виявляє логічно пов'язані токени → NET наближає їх вектори.
-        # Перетворюємо HornClause-пари на (token_idx_1, token_idx_2, score).
-        # OPT-SEM: кешуємо результат, інвалідуємо лише при зміні кількості правил.
+        # FIX: прибрано дублювання — раніше sem_pairs_net обчислювався двічі:
+        #   1) через _sem_pairs_cache (рядки 1267-1284)
+        #   2) через semantic_feedback_pairs() (рядок 1287, перезаписував #1)
+        # Тепер — єдина точка обчислення з кешем.
         _n_rules_now = len(self.prover)
         if _n_rules_now != self._sem_pairs_n_rules:
-            self._sem_pairs_cache = []
+            # Кеш застарів — оновлюємо
+            self._sem_pairs_cache = (
+                self.prover.semantic_feedback_pairs(max_pairs=64)
+                if self.net_enabled else []
+            )
             self._sem_pairs_n_rules = _n_rules_now
-        sem_pairs_raw = self._sem_pairs_cache
-        sem_pairs_net: list = []
-        if self.net_enabled and sem_pairs_raw:
-            V_cur = self.net.quantizer.current_size.item()
-            for (r1, r2, score) in sem_pairs_raw:
-                # Використовуємо pred як проксі для token_idx (обидва < V_cur)
-                i1 = r1.head.pred % max(V_cur, 1)
-                i2 = r2.head.pred % max(V_cur, 1)
-                if i1 != i2:
-                    sem_pairs_net.append((i1, i2, score))
+        sem_pairs_net: list = self._sem_pairs_cache
 
         # ── VeM Penalty: δ·E[max(0, τ − U(R))] ─────────────────────────────
-        sem_pairs_net = self.prover.semantic_feedback_pairs(max_pairs=64) if self.net_enabled else []
         vem_pen = self.prover.vem_loss(
             z_enr,
             delta=getattr(self.cfg, 'delta_vem', 1e-3)
         )
 
         # ── Об'єднуємо рівні ─────────────────────────────────────────────────
-        z_final = self._combine_levels(z_enr, z_sym, v_mem)          # (B, d_lat)
+        z_final = self._combine_levels(z_symbolic_in, z_sym, v_mem)  # (B, d_lat)
 
         # ── M-Core: буферизований запис ───────────────────────────────────────
         sym_stats = getattr(self.prover, "last_forward_info", {})
@@ -997,6 +2425,10 @@ class OMENScale(nn.Module):
         surprise = 0.5 * gap_norm.clamp(0, 1) + 0.5 * (1.0 - target_coverage * goal_proved)
         conf = (1.0 - surprise).clamp(0.0, 1.0)
         self.memory.schedule_write(z.detach(), world_targets[:, -1].detach(), conf.detach())
+        sym_mem_written = self._write_symbolic_memory_facts(
+            getattr(self.prover, "last_all_facts", frozenset()),
+            float(conf.mean().item()),
+        )
 
         # ══ Рівень 1: Decode  ════════════════════════════════════════════════
         # Ініціалізуємо osf_out заздалегідь — завжди визначена змінна незалежно
@@ -1012,7 +2444,7 @@ class OMENScale(nn.Module):
                 net_info, l_rec,
                 sem_pairs=sem_pairs_net if sem_pairs_net else None
             )
-            net_loss = net_loss_dict["net_total"]
+            net_loss = net_loss_dict.get("net_aux_tensor", net_loss_dict["net_total"])
             if self.osf_enabled:
                 osf_logits, osf_out = self.osf(
                     h_tok      = h_tok,
@@ -1053,24 +2485,80 @@ class OMENScale(nn.Module):
             net_loss_dict = {}
             sem_pairs_net = []
 
+        if self._sym_qg_enabled and self.sym_query_gen is not None:
+            logits = self.sym_query_gen(
+                logits=logits,
+                h_tok=h_tok,
+                z_sym=z_sym,
+                prover=self.prover,
+            )
+
         # ── Loss J(θ,Γ,M) + η_tok·L_NET + δ·VeM + ω_meta·L_AC ──────────────
-        ltm_pen = self.prover.rule_regularizer(
-            self.cfg.lam_sym,
-            eta_utility=getattr(self.cfg, 'eta_utility', 0.1)
+        rule_bits_raw = self.prover.kb.complexity_penalty()
+        rule_utility_adjusted = self.prover.kb.utility_adjusted_penalty(
+            getattr(self.cfg, 'eta_utility', 0.1)
         )
+        rule_utility_credit = max(float(rule_bits_raw) - float(rule_utility_adjusted), 0.0)
         # 7-ма компонента J_OMEN+EMC: ω_meta·E_τ[Σ_t r_t]
         traj_reward = traj_stats.trajectory_reward if traj_stats is not None else None
+        mem_prior_mu, mem_prior_logvar = self._conditional_gaussian_prior(
+            v_mem,
+            self.memory_prior_mu,
+            self.memory_prior_logvar,
+        )
+        sym_prior_mu, sym_prior_logvar = self._conditional_gaussian_prior(
+            z_sym,
+            self.symbolic_prior_mu,
+            self.symbolic_prior_logvar,
+        )
+        mem_read_mu = z + self.memory_read_mu(z)
+        mem_read_logvar = self.memory_read_logvar(z).clamp(-6.0, 2.0)
+        reasoning_cost = 0.0
+        if traj_stats is not None:
+            reasoning_cost = (
+                float(getattr(self.cfg, "emc_lambda_mdl", 0.01)) * float(traj_stats.proof_mdl)
+                + float(getattr(self.cfg, "emc_lambda_time", 0.05)) * float(traj_stats.n_steps)
+            )
+        priors = {
+            "mem_mu": mem_prior_mu,
+            "mem_logvar": mem_prior_logvar,
+            "mem_read_mu": mem_read_mu,
+            "mem_read_logvar": mem_read_logvar,
+            "sym_mu": sym_prior_mu,
+            "sym_logvar": sym_prior_logvar,
+            "tok_code_mu": self.token_code_mu.view(1, 1, -1),
+            "tok_code_logvar": self.token_code_logvar.view(1, 1, -1).clamp(-6.0, 2.0),
+            "conc_code_mu": self.concept_code_mu.view(1, 1, -1),
+            "conc_code_logvar": self.concept_code_logvar.view(1, 1, -1).clamp(-6.0, 2.0),
+            "world_obs_logvar": self.world_obs_logvar.view(1, 1, 1).clamp(-6.0, 2.0),
+        }
+        model_bits = self._model_description_bits()
         out = self.loss_fn(
-            logits, tgt, z_final,
+            logits, tgt, z_final, z_mu, z_logvar,
             h_tok, latents,
-            z_sim_traj, world_targets, v_mem, sym_loss, ltm_pen, cf_loss,
+            z_sim_traj, world_targets, v_mem, z_sym, sym_loss, rule_bits_raw, cf_loss,
             self.world_rnn,
             net_loss,
+            priors=priors,
+            model_bits=model_bits,
             vem_penalty=vem_pen,
             meta_loss=meta_loss,
             traj_reward=traj_reward,
+            reasoning_cost=reasoning_cost,
+            seen_tokens=int(max(int(self._seen_tokens.item()), 1)),
             train_step=int(self._train_step.item()),
         )
+        query_stats = getattr(self.sym_query_gen, "last_query_info", {}) if self.sym_query_gen is not None else {}
+        query_aux_tensor = query_stats.get("aux_loss_tensor")
+        if self.training and torch.is_tensor(query_aux_tensor):
+            out["total"] = out["total"] + float(getattr(self.cfg, "sym_query_lambda", 0.05)) * query_aux_tensor
+        decoder_probe_tensor = None if decoder_signal is None else decoder_signal.get("loss_tensor")
+        if self.training and torch.is_tensor(decoder_probe_tensor):
+            out["total"] = out["total"] + float(
+                getattr(self.cfg, "sym_decoder_surprise_lambda", 0.05)
+            ) * decoder_probe_tensor
+        out["rule_utility_credit"] = float(rule_utility_credit)
+        out["rule_utility_adjusted_bits"] = float(rule_utility_adjusted)
 
         # ── OSF: додаємо J_OSF до загального лосу ─────────────────────────────
         # osf_out завжди визначений (ініціалізований вище як {}), тому
@@ -1121,7 +2609,63 @@ class OMENScale(nn.Module):
         out["sym_unresolved_targets"] = float(sym_stats.get("unresolved_targets", 0.0))
         out["sym_abduced_rules"] = float(sym_stats.get("abduced_rules", 0.0))
         out["sym_abduction_utility"] = float(sym_stats.get("abduction_utility", 0.0))
+        out["sym_induction_checked"] = float(sym_stats.get("induction_checked", 0.0))
+        out["sym_induction_verified"] = float(sym_stats.get("induction_verified", 0.0))
+        out["sym_induction_contradicted"] = float(sym_stats.get("induction_contradicted", 0.0))
+        out["sym_induction_retained"] = float(sym_stats.get("induction_retained", 0.0))
+        out["sym_induction_repaired"] = float(sym_stats.get("induction_repaired", 0.0))
+        out["sym_induction_matches"] = float(sym_stats.get("induction_matches", 0.0))
+        out["sym_induction_score"] = float(sym_stats.get("induction_score", 0.0))
+        out["sym_cycle_checked"] = float(sym_stats.get("cycle_checked", 0.0))
+        out["sym_cycle_accepted"] = float(sym_stats.get("cycle_accepted", 0.0))
+        out["sym_cycle_added"] = float(sym_stats.get("cycle_added", 0.0))
+        out["sym_cycle_verified"] = float(sym_stats.get("cycle_verified", 0.0))
+        out["sym_cycle_contradicted"] = float(sym_stats.get("cycle_contradicted", 0.0))
+        out["sym_cycle_retained"] = float(sym_stats.get("cycle_retained", 0.0))
+        out["sym_cycle_repaired"] = float(sym_stats.get("cycle_repaired", 0.0))
+        out["sym_cycle_error"] = float(sym_stats.get("cycle_error", 0.0))
+        out["sym_cycle_symbolic_error"] = float(sym_stats.get("cycle_symbolic_error", 0.0))
+        out["sym_cycle_soft_symbolic_error"] = float(sym_stats.get("cycle_soft_symbolic_error", 0.0))
+        out["sym_cycle_relaxed_body_error"] = float(sym_stats.get("cycle_relaxed_body_error", 0.0))
+        out["sym_cycle_relaxed_head_error"] = float(sym_stats.get("cycle_relaxed_head_error", 0.0))
+        out["sym_cycle_trace_error"] = float(sym_stats.get("cycle_trace_error", 0.0))
+        out["sym_cycle_counterexample_error"] = float(sym_stats.get("cycle_counterexample_error", 0.0))
+        out["sym_cycle_world_error"] = float(sym_stats.get("cycle_world_error", 0.0))
+        out["sym_cycle_token_error"] = float(sym_stats.get("cycle_token_error", 0.0))
+        out["sym_cycle_graph_energy"] = float(sym_stats.get("cycle_graph_energy", 0.0))
+        out["sym_cycle_policy_loss"] = float(sym_stats.get("cycle_policy_loss", 0.0))
+        out["sym_cycle_loss"] = float(sym_stats.get("cycle_loss", 0.0))
+        out["sym_graph_reasoning_calls"] = float(sym_stats.get("graph_reasoning_calls", 0.0))
+        out["sym_graph_reasoning_guided_calls"] = float(sym_stats.get("graph_reasoning_guided_calls", 0.0))
+        out["sym_graph_reasoning_fallbacks"] = float(sym_stats.get("graph_reasoning_fallbacks", 0.0))
+        out["sym_graph_reasoning_mean_subset"] = float(sym_stats.get("graph_reasoning_mean_subset", 0.0))
+        out["sym_graph_reasoning_mean_full_facts"] = float(sym_stats.get("graph_reasoning_mean_full_facts", 0.0))
+        out["sym_graph_reasoning_mean_solutions"] = float(sym_stats.get("graph_reasoning_mean_solutions", 0.0))
+        out["sym_trace_steps"] = float(sym_stats.get("trace_steps", 0.0))
+        out["sym_trace_counterexamples"] = float(sym_stats.get("trace_counterexamples", 0.0))
+        out["sym_used_rules"] = float(sym_stats.get("used_rules", 0.0))
         out["sym_provenance"] = sym_stats.get("provenance", task_context.provenance)
+        out["sym_query_pred"] = float(query_stats.get("pred", -1.0))
+        out["sym_query_support"] = float(query_stats.get("support", 0.0))
+        out["sym_query_answers"] = float(query_stats.get("n_answers", 0.0))
+        out["sym_query_candidates"] = float(query_stats.get("candidate_count", 0.0))
+        out["sym_query_fallback"] = float(query_stats.get("fallback", 0.0))
+        out["sym_query_hit"] = float(query_stats.get("hit", 0.0))
+        out["sym_query_reward"] = float(query_stats.get("reward", 0.0))
+        out["sym_query_entropy"] = float(query_stats.get("entropy", 0.0))
+        out["sym_query_loss"] = float(query_stats.get("aux_loss", 0.0))
+        out["sym_query_hard_mask"] = float(query_stats.get("hard_mask", 0.0))
+        out["sym_decoder_pred"] = float(task_context.metadata.get("decoder_pred", -1.0))
+        out["sym_decoder_target"] = float(task_context.metadata.get("decoder_target", -1.0))
+        out["sym_decoder_miss"] = float(task_context.metadata.get("decoder_miss", 0.0))
+        out["sym_decoder_surprise"] = float(task_context.metadata.get("decoder_surprise", 0.0))
+        out["sym_decoder_probe_ce"] = float(task_context.metadata.get("decoder_probe_ce", 0.0))
+        out["sym_trigger_abduction"] = float(task_context.trigger_abduction)
+        out["sym_mem_recalled"] = float(len(recalled_memory_facts))
+        out["sym_mem_written"] = float(sym_mem_written)
+        if net_loss_dict:
+            out["net_aux"] = float(net_loss_dict.get("net_aux", 0.0))
+            out["net_vocab_pen"] = float(net_loss_dict.get("net_vocab_pen", 0.0))
 
         out["logits"]    = logits
         out["z"]         = z_final
@@ -1161,7 +2705,173 @@ class OMENScale(nn.Module):
         # O(n_records) sum comprehension по _records на кожному батчі.
         out["n_proposed"]   = self.prover.kb.n_proposed
         out["n_verified"]   = self.prover.kb.n_verified
+
+        # ── CE-driven Induce: ЗАМИКАЄМО Abduce→Deduce→Induce цикл ───────────
+        # Це ключовий пункт 1 ідеальної реалізації:
+        #   «reinforce_recent_rules ПОВИНЕН викликатись після L_ce,
+        #    з utility_target пропорційним покращенню перплексії»
+        if self.training and self.ce_reinforce_enabled:
+            self._ce_reinforce(out.get("ce", float("inf")), src.device)
+        out["ce_reinforce_utility"] = getattr(self, "_last_ce_utility", 0.0)
+
+        self.prover.clear_task_context()
         return out
+
+    def _generate_symbolic(
+        self,
+        prompt: torch.Tensor,
+        max_new: int,
+        temperature: float,
+        dynamic_reasoning: bool,
+    ) -> torch.Tensor:
+        self.eval()
+        if self.net_enabled:
+            h_tok, _, _ = self.net.encode(prompt)
+        else:
+            h_tok = self.tok_encoder(prompt)
+        _, z_det = self.perceiver(h_tok)
+        z, _, _ = self._sample_variational_latent(z_det)
+        v_mem = self._retrieve_memory(z)
+        z_symbolic_in = self._pre_symbolic_state(z, v_mem)
+        seed_memory_facts = self._seed_symbolic_memory_facts(prompt)
+        recalled_memory_facts = self._recall_symbolic_memory_facts(
+            z_symbolic_in,
+            hint_facts=seed_memory_facts,
+        )
+        init_context = self._build_generation_task_context(
+            prompt,
+            h_tok=h_tok,
+            memory_facts=recalled_memory_facts,
+        )
+        self.prover.set_task_context(init_context)
+        if init_context.observed_facts:
+            self.prover.load_observed_facts(
+                init_context.observed_facts,
+                limit=int(getattr(self.cfg, "symbolic_context_max_facts", 96)),
+            )
+
+        if self.emc_enabled:
+            z_sim_traj, _ = self._world_rollout_from_hidden(h_tok, prompt, teacher_forcing_ratio=0.0)
+            z_sim0 = z_sim_traj[:, -1]
+            _, gap_norm0, _ = self.epistemic.compute(z, self.world_rnn, z_sim0)
+            z_sym, v_mem_emc = self.emc.run_episode_eval(
+                z_symbolic_in, gap_norm0, None, self.prover, self.memory, device=z.device
+            )
+            if v_mem_emc.norm() > 1e-6:
+                v_mem = v_mem_emc
+                z_symbolic_in = self._pre_symbolic_state(z, v_mem)
+        else:
+            z_sym, _ = self.prover(z_symbolic_in, torch.tensor(0.0, device=z.device))
+
+        z_final = self._combine_levels(z_symbolic_in, z_sym, v_mem)
+        generated = prompt.clone()
+
+        for _ in range(max_new):
+            ctx = generated[:, -self.cfg.seq_len:]
+            if self.net_enabled:
+                h_ctx, _, _ = self.net.encode(ctx)
+            else:
+                h_ctx = self.tok_encoder(ctx)
+            _, z_ctx_det = self.perceiver(h_ctx)
+            z_ctx, _, _ = self._sample_variational_latent(z_ctx_det)
+            v_mem_ctx = self._retrieve_memory(z_ctx)
+            z_symbolic_ctx = self._pre_symbolic_state(z_ctx, v_mem_ctx)
+            step_seed_facts = self._seed_symbolic_memory_facts(ctx)
+            recalled_step = self._recall_symbolic_memory_facts(
+                z_symbolic_ctx,
+                hint_facts=step_seed_facts,
+            )
+            step_context = self._build_generation_task_context(
+                ctx,
+                h_tok=h_ctx,
+                memory_facts=recalled_step,
+            )
+            self.prover.set_task_context(step_context)
+            if step_context.observed_facts:
+                self.prover.load_observed_facts(
+                    step_context.observed_facts,
+                    limit=int(getattr(self.cfg, "symbolic_context_max_facts", 96)),
+                )
+
+            if dynamic_reasoning:
+                if self.emc_enabled:
+                    z_sim_step = self._world_rollout_from_hidden(
+                        h_ctx, ctx, teacher_forcing_ratio=0.0
+                    )[0][:, -1]
+                    _, gap_step, _ = self.epistemic.compute(z_ctx, self.world_rnn, z_sim_step)
+                    z_sym_step, v_mem_step = self.emc.run_episode_eval(
+                        z_symbolic_ctx,
+                        gap_step,
+                        None,
+                        self.prover,
+                        self.memory,
+                        device=z_ctx.device,
+                    )
+                else:
+                    z_sym_step, _ = self.prover(
+                        z_symbolic_ctx, torch.tensor(0.0, device=z_ctx.device)
+                    )
+                    v_mem_step = v_mem_ctx
+
+                if self.emc_enabled and v_mem_step.norm() > 1e-6:
+                    v_mem_use = v_mem_step
+                else:
+                    v_mem_use = v_mem_ctx
+                z_symbolic_ctx = self._pre_symbolic_state(z_ctx, v_mem_use)
+                z_final = self._combine_levels(z_symbolic_ctx, z_sym_step, v_mem_use)
+                z_sym_for_bias = z_sym_step
+            else:
+                z_sym_for_bias = z_sym
+
+            h_for_decode = h_ctx if (self.net_enabled or self.osf_enabled) else None
+            symbolic_goal = getattr(self.prover, "last_goal", None) or step_context.goal
+            symbolic_facts = getattr(self.prover, "last_context_facts", frozenset()) or step_context.observed_facts
+            if self.net_enabled:
+                net_logits, _ = self.net.decode(ctx, z_final, h_for_decode)
+                logits = net_logits
+                if self.osf_enabled:
+                    _intent_state = self.osf.intent_encoder(z_final)
+                    _plan = self.osf.planner(
+                        _intent_state,
+                        symbolic_goal=symbolic_goal,
+                        symbolic_facts=symbolic_facts,
+                        prover=self.prover,
+                    )
+                    osf_logits, _ = self.osf.hier_decoder(
+                        h_tok=h_for_decode,
+                        z_intent=_intent_state.z_intent,
+                        plan=_plan,
+                    )
+                    logits = 0.8 * net_logits + 0.2 * osf_logits
+            elif self.osf_enabled:
+                _intent_state = self.osf.intent_encoder(z_final)
+                _plan = self.osf.planner(
+                    _intent_state,
+                    symbolic_goal=symbolic_goal,
+                    symbolic_facts=symbolic_facts,
+                    prover=self.prover,
+                )
+                logits, _ = self.osf.hier_decoder(
+                    h_tok=h_for_decode,
+                    z_intent=_intent_state.z_intent,
+                    plan=_plan,
+                )
+            else:
+                logits = self.tok_decoder(ctx, z_final)
+
+            if self._sym_qg_enabled and self.sym_query_gen is not None and h_for_decode is not None:
+                logits = self.sym_query_gen(
+                    logits=logits,
+                    h_tok=h_for_decode,
+                    z_sym=z_sym_for_bias,
+                    prover=self.prover,
+                )
+
+            probs = F.softmax(logits[:, -1] / temperature, -1)
+            generated = torch.cat([generated, torch.multinomial(probs, 1)], 1)
+
+        self.prover.clear_task_context()
+        return generated
 
     # ── Генерація ─────────────────────────────────────────────────────────────
     @torch.no_grad()
@@ -1191,8 +2901,12 @@ class OMENScale(nn.Module):
           і залишається фіксованим протягом всієї генерації.
           Швидший, але без динамічного «розуміння».
         """
-        self.eval()
-        self.prover.set_task_context(self._build_generation_task_context(prompt))
+        return self._generate_symbolic(
+            prompt=prompt,
+            max_new=max_new,
+            temperature=temperature,
+            dynamic_reasoning=dynamic_reasoning,
+        )
 
         # ── Ініціальний стан (для dynamic=False або як база) ─────────────────
         if self.net_enabled:
@@ -1307,6 +3021,15 @@ class OMENScale(nn.Module):
                 )
             else:
                 logits = self.tok_decoder(ctx, z_final)
+
+            if self._sym_qg_enabled and self.sym_query_gen is not None and h_for_decode is not None:
+                z_sym_for_bias = z_sym_step if dynamic_reasoning else z_sym
+                logits = self.sym_query_gen(
+                    logits=logits,
+                    h_tok=h_for_decode,
+                    z_sym=z_sym_for_bias,
+                    prover=self.prover,
+                )
 
             probs     = F.softmax(logits[:, -1] / temperature, -1)
             generated = torch.cat([generated, torch.multinomial(probs, 1)], 1)
@@ -1473,7 +3196,43 @@ def run_tests_scale(cfg: OMENScaleConfig) -> None:
     t0  = time.perf_counter()
     out = model(src, tgt)
     ms  = (time.perf_counter() - t0) * 1000
-    for k in ("total", "ce", "world", "l_scale", "sym_ground", "gap_norm"):
+    for k in (
+        "sym_query_pred",
+        "sym_query_support",
+        "sym_query_answers",
+        "sym_query_candidates",
+        "sym_query_fallback",
+        "sym_query_hit",
+        "sym_query_reward",
+        "sym_query_entropy",
+        "sym_query_loss",
+        "sym_decoder_pred",
+        "sym_decoder_target",
+        "sym_decoder_miss",
+        "sym_decoder_surprise",
+        "sym_decoder_probe_ce",
+        "sym_trigger_abduction",
+        "sym_induction_checked",
+        "sym_induction_verified",
+        "sym_induction_contradicted",
+        "sym_induction_repaired",
+        "sym_cycle_checked",
+        "sym_cycle_accepted",
+        "sym_cycle_added",
+        "sym_cycle_repaired",
+        "sym_cycle_error",
+        "sym_cycle_relaxed_body_error",
+        "sym_cycle_relaxed_head_error",
+        "sym_cycle_trace_error",
+        "sym_cycle_counterexample_error",
+        "sym_cycle_world_error",
+        "sym_cycle_token_error",
+        "sym_cycle_loss",
+        "sym_trace_steps",
+        "sym_trace_counterexamples",
+    ):
+        assert k in out, f"FAIL: РІС–РґСЃСѓС‚РЅС–Р№ symbolic query key {k}"
+    for k in ("total", "total_bits", "bits_per_token", "mdl_seen_tokens", "ce", "world", "world_nll", "kl", "mem_kl", "sym_kl", "memory_read_nll", "reasoning_cost", "free_energy", "fe_obs", "fe_complex", "l_scale", "sym_ground", "gap_norm"):
         assert k in out, f"FAIL: відсутній ключ {k}"
     assert out["logits"].shape == (B, T, cfg.vocab_size), \
         f"logits {out['logits'].shape}"
@@ -1486,8 +3245,89 @@ def run_tests_scale(cfg: OMENScaleConfig) -> None:
     if getattr(cfg, "saliency_enabled", False):
         for k in ("sal_total", "sal_role", "sal_struct", "sal_consistency", "sal_edges"):
             assert k in out, f"FAIL: відсутній Saliency ключ {k}"
-    print(f"  Forward {ms:.0f} ms  CE={out['ce']:.3f}  L_scale={out['l_scale']:.5f}")
-    print(f"  gap_norm={out['gap_norm']:.4f}  rules={out['n_rules']}  [PASS]")
+    print(
+        f"  Forward {ms:.0f} ms  CE={out['ce']:.3f}  "
+        f"FE={out['free_energy']:.3f}  obs={out['fe_obs']:.3f}  "
+        f"memNLL={out['memory_read_nll']:.3f}  reason={out['reasoning_cost']:.3f}"
+    )
+    assert 0.0 <= out["sym_query_support"] <= 1.0, f"bad query support {out['sym_query_support']}"
+    assert out["sym_cycle_checked"] >= 1.0, "FAIL: continuous hypothesis cycle did not run"
+    assert 0.0 <= out["sym_cycle_relaxed_body_error"] <= 1.0, "FAIL: bad relaxed body error"
+    assert 0.0 <= out["sym_cycle_relaxed_head_error"] <= 1.0, "FAIL: bad relaxed head error"
+    assert 0.0 <= out["sym_cycle_trace_error"] <= 1.0, "FAIL: bad trace error"
+    assert 0.0 <= out["sym_cycle_counterexample_error"] <= 1.0, "FAIL: bad counterexample error"
+    assert out["sym_graph_reasoning_calls"] >= 0.0, "FAIL: bad graph reasoning telemetry"
+    assert out["sym_graph_reasoning_mean_subset"] >= 0.0, "FAIL: bad graph reasoning subset telemetry"
+    if not getattr(cfg, "ce_reinforce_enabled", False):
+        assert out["ce_reinforce_utility"] == 0.0, "FAIL: CE reinforce leaked into disabled path"
+    print(
+        f"  gap_norm={out['gap_norm']:.4f}  rules={out['n_rules']}  "
+        f"q_sup={out['sym_query_support']:.3f}  q_loss={out['sym_query_loss']:.4f}  "
+        f"miss={out['sym_decoder_miss']:.1f}  surprise={out['sym_decoder_surprise']:.3f}  "
+        f"cycle={out['sym_cycle_checked']:.0f}/{out['sym_cycle_added']:.0f}  "
+        f"repair={out['sym_cycle_repaired']:.0f}  "
+        f"ind_v={out['sym_induction_verified']:.1f}  [PASS]"
+    )
+
+    sep("TEST S1b · Trace-aware symbolic task context")
+    code = "def add(a, b):\n    return a + b\n"
+    code_ids = torch.tensor([[ord(ch) for ch in code]], device=DEVICE, dtype=torch.long)
+    gap_stub = torch.zeros(1, device=DEVICE)
+    hot_stub = torch.zeros(1, cfg.d_latent, device=DEVICE, dtype=torch.bool)
+    trace_ctx = model._build_symbolic_task_context(
+        code_ids,
+        code_ids,
+        gap_stub,
+        hot_stub,
+        saliency_out=None,
+        h_tok=None,
+        decoder_signal=None,
+        memory_facts=None,
+    )
+    assert trace_ctx.execution_trace is not None, "FAIL: execution trace not attached to task context"
+    assert len(trace_ctx.execution_trace.transitions) >= 1, "FAIL: missing primary trace transitions"
+    assert len(trace_ctx.execution_trace.counterexamples) >= 1, "FAIL: missing counterexample traces"
+    assert len(trace_ctx.target_facts) >= 1, "FAIL: trace targets missing from task context"
+    print(
+        f"  trace_steps={len(trace_ctx.execution_trace.transitions)}  "
+        f"counterexamples={len(trace_ctx.execution_trace.counterexamples)}  "
+        f"targets={len(trace_ctx.target_facts)}  [PASS]"
+    )
+
+    sep("TEST S1c · Rich code trace semantics")
+    rich_code = (
+        "def total(xs):\n"
+        "    acc = 0\n"
+        "    for x in xs:\n"
+        "        acc = acc + x\n"
+        "    return acc\n\n"
+        "nums = [1, 2, 3]\n"
+        "first = nums[0]\n"
+        "lookup = {'a': 7}\n"
+        "value = lookup['a']\n"
+        "result = total(nums)\n"
+    )
+    rich_ids = torch.tensor([[ord(ch) for ch in rich_code]], device=DEVICE, dtype=torch.long)
+    rich_ctx = model._build_symbolic_task_context(
+        rich_ids,
+        rich_ids,
+        gap_stub,
+        hot_stub,
+        saliency_out=None,
+        h_tok=None,
+        decoder_signal=None,
+        memory_facts=None,
+    )
+    assert rich_ctx.execution_trace is not None, "FAIL: rich trace missing from task context"
+    rich_targets = list(rich_ctx.target_facts)
+    assert len(rich_ctx.execution_trace.transitions) >= 4, "FAIL: rich trace too short"
+    assert any(fact.pred == TRACE_RETURN_EVENT_PRED for fact in rich_targets), "FAIL: rich trace missing return targets"
+    assert any(fact.pred == TRACE_BINOP_EVENT_PRED for fact in rich_targets), "FAIL: rich trace missing operator targets"
+    print(
+        f"  rich_steps={len(rich_ctx.execution_trace.transitions)}  "
+        f"rich_counter={len(rich_ctx.execution_trace.counterexamples)}  "
+        f"rich_targets={len(rich_targets)}  [PASS]"
+    )
 
     sep("TEST S2 · Backward — grad flow по всіх рівнях")
     model.train()
@@ -1509,6 +3349,10 @@ def run_tests_scale(cfg: OMENScaleConfig) -> None:
                      if "perceiver" in n and p.grad is not None)
     prover_g   = sum(p.grad.norm().item() for n,p in model.named_parameters()
                      if "prover" in n and p.grad is not None)
+    abductor_g = sum(p.grad.norm().item() for n,p in model.named_parameters()
+                     if "prover.abductor" in n and p.grad is not None)
+    graph_unif_g = sum(p.grad.norm().item() for n,p in model.named_parameters()
+                       if "prover.graph_unif" in n and p.grad is not None)
     wrnn_g     = sum(p.grad.norm().item() for n,p in model.named_parameters()
                      if "world_rnn" in n and p.grad is not None)
     sal_g = 0.0
@@ -1522,11 +3366,15 @@ def run_tests_scale(cfg: OMENScaleConfig) -> None:
     print(f"  {enc_label} grad : {enc_g:.4f}")
     print(f"  Perceiver grad      : {perceiver_g:.4f}")
     print(f"  ∂-Prolog grad       : {prover_g:.4f}")
+    print(f"  AbductionHead grad  : {abductor_g:.4f}")
+    print(f"  GraphUnif grad      : {graph_unif_g:.4f}")
     print(f"  WorldRNN grad       : {wrnn_g:.4f}")
     if getattr(cfg, "saliency_enabled", False):
         print(f"  Saliency grad       : {sal_g:.4f}")
     assert enc_g       > 0, f"FAIL: {enc_label} без граду"
     assert perceiver_g > 0, "FAIL: Perceiver без граду"
+    assert abductor_g  > 0, "FAIL: AbductionHead without gradient"
+    assert graph_unif_g > 0, "FAIL: GraphMatchingUnifier without gradient"
     if getattr(cfg, "saliency_enabled", False):
         assert sal_g > 0, "FAIL: Saliency role classifier без граду"
     model.zero_grad()
@@ -1545,6 +3393,84 @@ def run_tests_scale(cfg: OMENScaleConfig) -> None:
     print(f"  Writes before={n_before}  after={n_after}  (delta={n_after-n_before})")
     assert n_after > n_before, "FAIL: flush не спрацював"
     print("  [PASS]")
+
+    sep("TEST S3b · Symbolic memory shares exact and associative recall")
+    from omen_prolog import HornAtom, Const
+    sym_facts = [
+        HornAtom(pred=77, args=(Const(1), Const(2))),
+        HornAtom(pred=78, args=(Const(2), Const(3))),
+    ]
+    sym_embs = model.prover.term_emb(sym_facts, DEVICE)
+    n_sym = model.memory.write_symbolic_atoms(sym_facts, sym_embs)
+    model.memory.flush()
+    recalled_sym = model.memory.recall_symbolic_atoms(sym_embs[:1], top_k=2, min_sim=0.0)
+    recalled_vec = model.memory.episodic_recall(sym_embs[:1], k=1)
+    recalled_struct = model.memory.recall_symbolic_atoms(
+        sym_embs[:1],
+        top_k=2,
+        min_sim=0.0,
+        predicate_hints=[78],
+        anchor_values=[3],
+    )
+    assert n_sym == len(sym_facts), f"FAIL: wrote {n_sym} symbolic atoms"
+    assert recalled_sym and recalled_sym[0] == sym_facts[0], f"FAIL: exact recall {recalled_sym}"
+    assert recalled_vec.norm().item() > 0.0, "FAIL: associative symbolic recall is empty"
+    assert sym_facts[1] in recalled_struct, f"FAIL: structured symbolic recall missed {sym_facts[1]}"
+    graph_goal = model.sym_query_gen.generate_query(
+        h_last=None,
+        sym_vocab=cfg.sym_vocab,
+        context_anchor=1,
+        symbolic_state=model.prover.ground(frozenset(sym_facts), DEVICE),
+        candidate_preds=(77, 78, SEQ_PREDICT_NEXT_PRED),
+    )
+    assert graph_goal.pred in {77, 78, SEQ_PREDICT_NEXT_PRED}, f"FAIL: graph-conditioned query {graph_goal}"
+    unary_facts = [HornAtom(pred=5, args=(Const(9),))]
+    unary_candidates = model._queryable_candidate_preds(unary_facts)
+    assert unary_candidates == (SEQ_PREDICT_NEXT_PRED,), f"FAIL: unary facts should not become query candidates: {unary_candidates}"
+    print(
+        f"  exact={len(recalled_sym)}  structured={len(recalled_struct)}  "
+        f"assoc_norm={recalled_vec.norm().item():.4f}  [PASS]"
+    )
+
+    sep("TEST S3c · Symbolic hard mask stays safe during training")
+    from omen_prolog import SymbolicTaskContext, Var as QueryVar
+    train_ctx = SymbolicTaskContext(
+        observed_facts=frozenset(sym_facts),
+        goal=HornAtom(SEQ_PREDICT_NEXT_PRED, (Const(1), QueryVar("NEXT"))),
+        metadata={"last_src": 1.0, "last_tgt": 9.0},
+    )
+
+    class _FakeProver:
+        def __init__(self, ctx, d_latent):
+            self.task_context = ctx
+            self.last_goal = ctx.goal
+            self._d_latent = d_latent
+
+        def ground(self, facts, device):
+            return torch.zeros(1, self._d_latent, device=device)
+
+        def answer_query(self, goal, device):
+            return (
+                torch.zeros(1, self._d_latent, device=device),
+                (7,),
+                torch.tensor(1.0, device=device),
+            )
+
+    fake_prover = _FakeProver(train_ctx, cfg.d_latent)
+    fake_logits = torch.zeros(1, 4, cfg.vocab_size, device=DEVICE)
+    fake_h = torch.randn(1, 4, cfg.d_tok, device=DEVICE)
+    fake_z = torch.randn(1, cfg.d_latent, device=DEVICE)
+    model.sym_query_gen.train()
+    masked_train = model.sym_query_gen(fake_logits.clone(), fake_h, fake_z, fake_prover)
+    assert model.sym_query_gen.last_query_info["hard_mask"] == 0.0, "FAIL: train hard mask should not veto mismatched gold"
+    model.sym_query_gen.eval()
+    masked_eval = model.sym_query_gen(fake_logits.clone(), fake_h, fake_z, fake_prover)
+    assert model.sym_query_gen.last_query_info["hard_mask"] == 1.0, "FAIL: eval hard mask should activate on confident proof"
+    assert masked_train[0, -1, 9].item() > -1e3, "FAIL: training veto masked out gold token"
+    assert masked_eval[0, -1, 9].item() < -1e3, "FAIL: eval veto did not constrain logits"
+    assert masked_eval[0, -1, 7].item() > masked_train[0, -1, 7].item(), "FAIL: train mode still over-trusts mismatched symbolic answer"
+    model.sym_query_gen.train()
+    print("  training_safe=1  eval_veto=1  [PASS]")
 
     sep("TEST S4 · ∂-Prolog — Forward Chaining + Abduce")
     prover = model.prover
@@ -1571,22 +3497,48 @@ def run_tests_scale(cfg: OMENScaleConfig) -> None:
     n_add, _, _, _ = prover.abduce_and_learn(z_abd, error=2.0, force=True)
     print(f"  Abduce додав: {n_add} правил  [PASS]")
 
-    sep("TEST S5 · L_scale penalty — MDL ефект")
-    from omen_perceiver import l_scale_penalty
-    # Великий вектор → великий штраф (заохочує стиснення)
-    z_big   = torch.randn(B, T, cfg.d_tok, device=DEVICE) * 10
-    z_small = torch.randn(B, T, cfg.d_tok, device=DEVICE) * 0.1
-    z_conc  = torch.randn(B, cfg.n_latents, cfg.d_latent, device=DEVICE)
-    pen_big   = l_scale_penalty(z_big,   z_conc, cfg.lambda_tok, cfg.lambda_conc)
-    pen_small = l_scale_penalty(z_small, z_conc, cfg.lambda_tok, cfg.lambda_conc)
-    assert pen_big > pen_small, "FAIL: L_scale не реагує на норму"
-    print(f"  L_scale(big)={pen_big.item():.4f}  L_scale(small)={pen_small.item():.4f}  [PASS]")
+    sep("TEST S5 · Fixed-bit MDL penalties")
+    from omen_prolog import Compound
+    small_weights = torch.full((8,), 0.05, device=DEVICE)
+    big_weights = torch.full((8,), 3.0, device=DEVICE)
+    bits_small = gaussian_tensor_bits(small_weights, sigma=0.1)
+    bits_big = gaussian_tensor_bits(big_weights, sigma=0.1)
+    assert bits_big > bits_small, "FAIL: parameter bit-cost does not grow with weight magnitude"
+
+    short_rule = HornClause(
+        head=HornAtom(pred=1, args=(Var("X"),)),
+        body=(HornAtom(pred=2, args=(Var("X"),)),),
+    )
+    long_rule = HornClause(
+        head=HornAtom(pred=1, args=(Var("X"), Compound(3, (Const(4), Var("Y"))))),
+        body=(
+            HornAtom(pred=2, args=(Var("X"),)),
+            HornAtom(pred=5, args=(Compound(6, (Var("Y"), Const(7))),)),
+        ),
+    )
+    short_bits = short_rule.description_length_bits()
+    long_bits = long_rule.description_length_bits()
+    assert long_bits > short_bits, "FAIL: rule bit-cost does not grow with structural complexity"
+    mdl_bits = model._model_description_bits()
+    if cfg.net_enabled:
+        vocab_bits = model.net.quantizer.vocab_description_bits()
+        assert torch.allclose(
+            mdl_bits["vocab"],
+            vocab_bits.to(device=mdl_bits["vocab"].device, dtype=mdl_bits["vocab"].dtype),
+            atol=1e-4,
+            rtol=1e-4,
+        ), "FAIL: vocab bits in model MDL should match quantizer fixed-code bits"
+    print(
+        f"  param_bits: small={bits_small.item():.2f} big={bits_big.item():.2f}  "
+        f"rule_bits: short={short_bits:.2f} long={long_bits:.2f}  [PASS]"
+    )
 
     sep("TEST S6 · Мінімальне навчання 15 ітерацій")
     model.train()
     ds  = make_counting(64, cfg.seq_len)
     opt = AdamW(model.parameters(), lr=3e-4)
     hist_ce = []
+    seen_start = out["mdl_seen_tokens"]
     for step in range(15):
         batch = random.sample(ds, 4)
         s, t  = collate(batch)
@@ -1602,6 +3554,8 @@ def run_tests_scale(cfg: OMENScaleConfig) -> None:
     last5  = sum(hist_ce[-5:]) / 5
     print(f"  CE (перші 5): {first5:.3f}  (останні 5): {last5:.3f}")
     assert last5 < first5, "FAIL: CE не знижується"
+    post_train = model(src, tgt)
+    assert post_train["mdl_seen_tokens"] > seen_start, "FAIL: seen-token amortization did not advance"
     print("  [PASS]")
 
     sep("TEST S7 · Генерація токенів (dynamic_reasoning=True/False)")

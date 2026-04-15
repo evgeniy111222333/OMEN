@@ -38,9 +38,12 @@ class OMENScaleConfig:
     # ─── M-Core (async updates) ───────────────────────────────────────────────
     mem_heads:        int   = 16
     mem_cache_size:   int   = 2_048
+    mem_symbolic_cache_size: int = 2_048
     mem_write_tau:    float = 0.3
     mem_update_steps: int   = 8      # оновлення кожні N кроків (не на кожному)
     mem_decay:        float = 0.995
+    mem_symbolic_recall_topk: int = 8
+    mem_symbolic_min_sim: float = 0.20
 
     # ─── ∂-Prolog (Symbolic) ──────────────────────────────────────────────────
     sym_vocab:        int   = 128     # розмір символьного словника
@@ -51,6 +54,25 @@ class OMENScaleConfig:
     sym_max_facts:    int   = 64      # макс. фактів у WorkingMemory
     abduct_candidates: int  = 8       # кандидати абдуктивного движка
     sym_gnn_layers:   int   = 2       # сумісність з OMENv2
+    continuous_cycle_enabled: bool = True
+    continuous_cycle_contextual: int = 4
+    continuous_cycle_neural: int = 4
+    continuous_cycle_accept_threshold: float = 0.55
+    continuous_cycle_verify_threshold: float = 0.75
+    continuous_cycle_contradict_threshold: float = 0.15
+    continuous_cycle_symbolic_weight: float = 0.45
+    continuous_cycle_world_weight: float = 0.25
+    continuous_cycle_token_weight: float = 0.30
+    continuous_cycle_soft_symbolic_weight: float = 0.45
+    continuous_cycle_policy_weight: float = 0.25
+    continuous_cycle_policy_baseline_momentum: float = 0.90
+    continuous_cycle_candidate_tau: float = 0.70
+    continuous_cycle_repair_enabled: bool = True
+    continuous_cycle_repair_threshold: float = 0.35
+    continuous_cycle_max_repairs: int = 2
+    ce_reinforce_enabled: bool = False
+    ce_reinforce_fallback_only: bool = True
+    ce_reinforce_retro_every: int = 0
 
     # ─── Epistemic / Curiosity ────────────────────────────────────────────────
     epistemic_tau:    float = 0.3
@@ -58,19 +80,42 @@ class OMENScaleConfig:
     n_counterfactual: int   = 2
     symbolic_context_max_facts: int = 96
     symbolic_ast_max_facts: int = 48
+    sym_trace_max_steps: int = 24
+    sym_trace_max_counterexamples: int = 4
+    sym_graph_reasoning_enabled: bool = True
+    sym_graph_reasoning_top_k_facts: int = 12
+    sym_graph_reasoning_max_fact_subset: int = 96
+    sym_graph_reasoning_attention_threshold: float = 0.02
+    sym_graph_reasoning_tau: float = 0.5
+    sym_graph_reasoning_full_scan_cutoff: int = 64
+    sym_query_gen_enabled: bool = True
+    sym_query_alpha: float = 0.05
+    sym_query_lambda: float = 0.05
+    sym_query_entropy_beta: float = 1e-3
+    sym_query_gumbel_tau: float = 0.85
+    sym_query_hard_mask_threshold: float = 0.75
+    sym_decoder_surprise_enabled: bool = True
+    sym_decoder_surprise_lambda: float = 0.05
+    sym_decoder_surprise_threshold: float = 0.35
+    vfe_enabled: bool = True
+    vfe_beta_kl: float = 1.0
+    vfe_free_bits: float = 0.0
+    use_aux_loss_schedule: bool = False
 
-    # ─── MDL Loss Coefficients ─────────────────────────────────────────────────
-    #   J(θ,Γ,M) = Perplexity + β·L_proof + γ·L_world - α·I(Z;M)
-    #             + λ_tok·||z_t||² + λ_conc·||c||² + λ_rule·Σlen(R)
-    lambda_tok:  float = 1e-4   # L_scale: стискаємо токен-простір
-    lambda_conc: float = 1e-3   # L_scale: стискаємо концепт-простір
-    lambda_rule: float = 1e-4   # Complexity(Γ) = λ2·Σ_R len(R)
-    alpha:       float = 0.1    # Novelty bonus  −α·I(Z;M)
+    # ─── MDL / VFE Coefficients ───────────────────────────────────────────────
+    # FreeEnergy ~= Surprise(Data | z, G) + DescriptionLength(theta, rules)
+    #              + alpha * [-log P(Read(M, z) | z)]
+    lambda_tok:  float = 1.0    # kept for backward compatibility; no longer used as a unit-conversion hack
+    lambda_conc: float = 1.0    # kept for backward compatibility; no longer used as a unit-conversion hack
+    lambda_rule: float = 1e-4   # Symbolic rule complexity weight
+    alpha:       float = 0.1    # Memory-read likelihood weight
     beta:        float = 0.05   # Symbolic generalization
     gamma:       float = 0.1    # World consistency
     delta:       float = 1e-3   # WorldRNN complexity
     eta:         float = 0.05   # Memory recall
     lam_sym:     float = 0.005   # LTM regularizer (сумісність v2)
+    mdl_param_sigma: float = 0.05
+    mdl_token_budget: int = 262144  # legacy field; MDL is now normalized by actual valid tokens
 
     # ─── Neural Epistemic Tokenizer (NET) ─────────────────────────────────────
     # Замінює GPT-2 BPE (vocab=50257) нейро-символьним компресором.
@@ -132,6 +177,7 @@ class OMENScaleConfig:
     saliency_tau:     float = 0.20
     saliency_top_k:   int   = 4
     saliency_max_facts: int = 512
+    saliency_role_slots: int = 6
     saliency_beta_struct: float = 0.05
     saliency_gamma_role:  float = 0.05
     saliency_delta_cons:  float = 0.05

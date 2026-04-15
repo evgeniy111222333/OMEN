@@ -32,6 +32,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from omen_symbolic.universal_bits import gaussian_tensor_bits, universal_int_bits
+
 from omen_perceiver import LlamaDecoderBlock, LlamaAttention, RMSNorm, SwiGLUFFN
 
 
@@ -917,20 +919,26 @@ class EpistemicQuantizer(nn.Module):
         return pairwise[mask].mean()
 
     # ── MDL штраф на словник ──────────────────────────────────────────────────
+    def vocab_description_bits(self) -> torch.Tensor:
+        """Fixed-code dictionary length in bits under a universal code."""
+        active_w = self.codebook.weight[:self.current_size]
+        size_bits = torch.tensor(
+            universal_int_bits(int(self.current_size.item())),
+            dtype=active_w.dtype,
+            device=active_w.device,
+        )
+        if active_w.numel() == 0:
+            return size_bits
+        code_bits = gaussian_tensor_bits(active_w, sigma=1.0 / max(self.d_tok, 1) ** 0.5)
+        return size_bits + code_bits
+
     def vocab_mdl_penalty(self, lambda_voc: float) -> torch.Tensor:
         """
-        L_vocab = λ_voc · ( current_size/max_vocab  +  mean||e_v||² )
-
-        Два доданки:
-          · current_size/max_vocab  — штрафує за розмір словника (MDL розмір)
-          · mean||e_v||²            — штрафує за велику норму (MDL точність)
-
-        Більший словник → більший перший доданок → вищий штраф.
+        Weighted dictionary cost. The underlying unit is still bits;
+        lambda_voc only controls how strongly that bit-cost is exposed
+        inside the local NET objective.
         """
-        active_w     = self.codebook.weight[:self.current_size]
-        size_penalty = self.current_size.float() / max(self.max_vocab, 1)
-        norm_penalty = active_w.pow(2).mean()
-        return lambda_voc * (size_penalty + norm_penalty)
+        return float(lambda_voc) * self.vocab_description_bits()
 
     # ── Adaptive τ scheduling ────────────────────────────────────────────────
     def _adaptive_tau_step(self, usage_entropy: float, H_max: float) -> None:
@@ -1211,16 +1219,23 @@ class NETLoss(nn.Module):
         else:
             l_soft_H = torch.tensor(float(raw_soft_H), device=l_rec.device)
 
-        total = (l_code
-                 + l_rec
-                 + l_vocab
-                 + self.lambda_vq    * l_vq
-                 + l_semantic
-                 + self.lambda_enc_div * l_enc_div
-                 + self.lambda_soft_H  * l_soft_H)   # ← диференційована entropy
+        global_aux = (
+            l_code
+            + self.lambda_vq * l_vq
+            + l_semantic
+            + self.lambda_enc_div * l_enc_div
+            + self.lambda_soft_H * l_soft_H
+        )
+        stage_aux = global_aux + l_vocab
+        total = stage_aux + l_rec
 
         return {
             "net_total":        total,
+            "net_total_tensor": total,
+            "net_aux_tensor":   global_aux,
+            "net_aux":          global_aux.item(),
+            "net_stage_aux_tensor": stage_aux,
+            "net_stage_aux":    stage_aux.item(),
             "net_code":         l_code.item(),
             "net_vq":           l_vq.item() if torch.is_tensor(l_vq) else float(l_vq),
             "net_rec":          l_rec.item(),
@@ -1521,9 +1536,13 @@ def run_net_tests() -> None:
     assert not math.isnan(out3["net_vq"])
     assert not math.isnan(out3["net_rec"])
     assert not math.isnan(out3["net_vocab_pen"])
+    assert out3["net_total"].item() > out3["net_rec"], "FAIL: L_vocab/L_code не входять у L_NET"
+    assert out3["net_stage_aux"] > out3["net_aux"], "FAIL: stage aux should include vocab MDL on top of global aux"
     print(f"  L_vq       : {out3['net_vq']:.4f}")
     print(f"  L_rec      : {out3['net_rec']:.4f}")
     print(f"  L_vocab    : {out3['net_vocab_pen']:.6f}")
+    print(f"  L_aux      : {out3['net_aux']:.6f}")
+    print(f"  L_stageAux : {out3['net_stage_aux']:.6f}")
     print(f"  L_NET      : {out3['net_total'].item():.4f}")
     print(f"  vocab_size : {out3['net_vocab_size']}")
     print(f"  entropy    : {out3['net_entropy']:.4f}")
