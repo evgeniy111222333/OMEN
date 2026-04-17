@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -60,22 +62,33 @@ class BenchmarkProtocolTest(unittest.TestCase):
     def test_synthetic_protocol_emits_canonical_metrics(self) -> None:
         cfg = _benchmark_test_config()
         dataset = make_synthetic_dataset(cfg, n=12)
-        report = run_benchmark(cfg, dataset, batches=1, batch_size=1)
+        report = run_benchmark(cfg, dataset, batches=1, batch_size=1, seed=7)
 
         self.assertEqual(report["n_batches"], 1)
         self.assertEqual(report["canonical_stack"], "omen_scale_world_graph")
         self.assertEqual(report["canonical_public_module"], "omen.OMEN")
         self.assertEqual(report["canonical_repository_axis"], "omen_scale_single_canon_repository")
         self.assertIn("omen_v2.py", report["legacy_reference_modules"])
+        self.assertEqual(report["protocol_seed"], 7)
         summary = report["summary"]
         for key in (
             "program_anchor",
             "program_target_facts",
+            "sym_cycle_active",
             "sym_cycle_checked",
+            "sym_cycle_eval_active",
+            "sym_cycle_learning_active",
             "z_graph_primary",
             "z_graph_anchor",
             "world_graph_nodes",
+            "world_graph_execution_steps",
+            "world_graph_hidden_fallback_steps",
+            "world_graph_hidden_teacher_applied",
+            "world_graph_neutral_prior_applied",
+            "eval_world_self_update_applied",
+            "creative_oee_online_train_applied",
             "sal_named_role_preds",
+            "sal_named_role_rel_preds",
         ):
             self.assertIn(key, summary)
 
@@ -94,25 +107,88 @@ class BenchmarkProtocolTest(unittest.TestCase):
             if corpus_path and os.path.exists(corpus_path):
                 os.remove(corpus_path)
 
+    def test_time_budget_returns_partial_report(self) -> None:
+        cfg = _benchmark_test_config()
+        dataset = make_synthetic_dataset(cfg, n=12)
+        with mock.patch(
+            "benchmarks.benchmark_omen_scale_eval._budget_expired",
+            side_effect=[False, True],
+        ):
+            report = run_benchmark(
+                cfg,
+                dataset,
+                batches=4,
+                batch_size=1,
+                seed=5,
+                time_budget_sec=0.01,
+            )
+        self.assertEqual(report["n_batches"], 1)
+        self.assertEqual(report["requested_batches"], 4)
+        self.assertTrue(report["timed_out"])
+        self.assertEqual(report["stop_reason"], "time_budget_exhausted")
+        self.assertEqual(report["time_budget_sec"], 0.01)
+        self.assertGreaterEqual(report["wall_time_sec"], 0.0)
+
+    def test_progress_report_path_emits_partial_json(self) -> None:
+        cfg = _benchmark_test_config()
+        dataset = make_synthetic_dataset(cfg, n=12)
+        report_path = None
+        try:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".json") as fh:
+                report_path = fh.name
+            report = run_benchmark(
+                cfg,
+                dataset,
+                batches=2,
+                batch_size=1,
+                seed=3,
+                progress_report_path=report_path,
+            )
+            payload = json.loads(Path(report_path).read_text(encoding="utf-8"))
+            self.assertEqual(payload["n_batches"], report["n_batches"])
+            self.assertEqual(payload["requested_batches"], 2)
+            self.assertEqual(payload["canonical_stack"], "omen_scale_world_graph")
+            self.assertEqual(payload["canonical_public_module"], "omen.OMEN")
+        finally:
+            if report_path and os.path.exists(report_path):
+                os.remove(report_path)
+
     def test_manifest_protocol_runs_on_named_local_corpora(self) -> None:
         cfg = _benchmark_test_config()
         files = []
         manifest_path = None
         try:
             corpora = {
-                "python_real": "def add(a, b):\n    return a + b\n" * 4,
-                "javascript_real": "function add(a, b) {\n  return a + b;\n}\n" * 4,
+                "python_real": {
+                    "content": "def add(a, b):\n    return a + b\n" * 4,
+                    "language": "python",
+                    "family": "codeparrot",
+                    "source": "the-stack",
+                    "weight": 2.0,
+                },
+                "javascript_real": {
+                    "content": "function add(a, b) {\n  return a + b;\n}\n" * 4,
+                    "language": "javascript",
+                    "family": "commoncrawl",
+                    "source": "commoncrawl",
+                    "weight": 1.0,
+                },
             }
             manifest = {}
-            for name, content in corpora.items():
+            for name, spec in corpora.items():
                 with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".txt") as fh:
-                    fh.write(content)
+                    fh.write(spec["content"])
                     fh.flush()
                     files.append(fh.name)
-                    manifest[name] = fh.name
+                    manifest[name] = {
+                        "path": fh.name,
+                        "language": spec["language"],
+                        "family": spec["family"],
+                        "source": spec["source"],
+                        "split": "validation",
+                        "weight": spec["weight"],
+                    }
             with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".json") as fh:
-                import json
-
                 json.dump(manifest, fh)
                 fh.flush()
                 manifest_path = fh.name
@@ -124,11 +200,24 @@ class BenchmarkProtocolTest(unittest.TestCase):
                 eval_batches=1,
                 batch_size=1,
                 max_samples=1,
+                seed=11,
             )
             self.assertEqual(report["n_tasks"], 2)
             self.assertEqual(report["canonical_stack"], "omen_scale_world_graph")
             self.assertEqual(report["canonical_public_module"], "omen.OMEN")
             self.assertEqual(report["real_protocol_tasks"], 2.0)
+            self.assertEqual(report["real_protocol_languages"], 2.0)
+            self.assertEqual(report["real_protocol_families"], 2.0)
+            self.assertEqual(report["real_protocol_sources"], 2.0)
+            self.assertEqual(report["protocol_seed"], 11)
+            self.assertIn("python", report["protocol_language_summaries"])
+            self.assertIn("javascript", report["protocol_language_summaries"])
+            self.assertIn("codeparrot", report["protocol_family_summaries"])
+            self.assertIn("commoncrawl", report["protocol_family_summaries"])
+            self.assertIn("the-stack", report["protocol_source_summaries"])
+            self.assertIn("commoncrawl", report["protocol_source_summaries"])
+            self.assertIn("ce_bits", report["protocol_weighted_summary"])
+            self.assertEqual(report["corpus_protocol"]["python_real"]["family"], "codeparrot")
         finally:
             for path in files:
                 if os.path.exists(path):

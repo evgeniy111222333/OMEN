@@ -25,6 +25,7 @@ omen_scale.py — OMEN-Scale: canonical OMEN runtime stack
 from __future__ import annotations
 import math, time, random, warnings
 from collections import defaultdict, deque
+from contextlib import nullcontext
 from copy import deepcopy
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
@@ -1342,6 +1343,7 @@ class OMENScale(nn.Module):
             nn.GELU(),
             nn.Linear(cfg.d_latent, cfg.d_latent),
         )
+        self.world_state_prior = nn.Parameter(torch.zeros(cfg.d_latent))
         self.mem_query_proj = nn.Linear(cfg.d_latent, cfg.d_latent, bias=False)
         self.state_integrator = SymbolicStateIntegrator(cfg.d_latent)
         self.symbolic_token_head = nn.Sequential(
@@ -1556,6 +1558,7 @@ class OMENScale(nn.Module):
         #   чи правила, що були абдуковані, допомогли покращити мовну модель.
         self._prev_ce: float = float("inf")
         self._ce_ema: float = float("inf")   # окремий smooth EMA для VeM retro
+        self.last_generate_info: Dict[str, float] = {}
 
     @staticmethod
     def canonical_architecture() -> CanonicalArchitectureSpec:
@@ -1898,6 +1901,18 @@ class OMENScale(nn.Module):
         pad = pad_ref.expand(pad_steps, -1)
         return torch.cat([pad, seq], dim=0)
 
+    def _prior_world_targets(
+        self,
+        batch_size: int,
+        steps: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        prior = self.world_state_prior.to(device=device, dtype=dtype).view(1, 1, -1)
+        prior = prior.expand(batch_size, steps, -1).clone()
+        return prior, prior.clone()
+
     def _hidden_world_targets(
         self,
         h_tok: torch.Tensor,
@@ -1909,6 +1924,58 @@ class OMENScale(nn.Module):
         teacher_states = self.world_target_proj(h_slice[:, :-1]).detach()
         world_targets = self.world_target_proj(h_slice[:, 1:]).detach()
         return teacher_states, world_targets, steps
+
+    def _execution_world_targets(
+        self,
+        world_graph_batch: Optional[WorldGraphBatch],
+        steps: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        pad_with_first: bool = True,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, float]]:
+        stats = {
+            "execution_steps": 0.0,
+            "hidden_fallback_steps": 0.0,
+            "trace_supervised_steps": 0.0,
+            "trace_samples": 0.0,
+        }
+        if (
+            steps <= 0
+            or world_graph_batch is None
+            or not world_graph_batch.graphs
+            or world_graph_batch.pooled_states.numel() == 0
+            or not self.world_graph_enabled
+        ):
+            return None, None, stats
+
+        pooled_states = world_graph_batch.pooled_states.detach().to(device=device, dtype=dtype)
+        teacher_states = pooled_states.unsqueeze(1).expand(-1, steps, -1).clone()
+        world_targets = teacher_states.clone()
+        stats["execution_steps"] = float(teacher_states.size(0) * steps)
+
+        for batch_idx, graph in enumerate(world_graph_batch.graphs):
+            if graph.transition_targets is None or graph.transition_states is None:
+                continue
+            trace_teacher = self._fit_graph_sequence(
+                graph.transition_states.detach().to(device=device, dtype=dtype),
+                steps,
+                pad_with_first=pad_with_first,
+            )
+            trace_targets = self._fit_graph_sequence(
+                graph.transition_targets.detach().to(device=device, dtype=dtype),
+                steps,
+                pad_with_first=pad_with_first,
+            )
+            if trace_teacher is None or trace_targets is None:
+                continue
+            teacher_states[batch_idx] = trace_teacher
+            world_targets[batch_idx] = trace_targets
+            stats["trace_samples"] += 1.0
+            stats["trace_supervised_steps"] += float(
+                min(steps, graph.transition_targets.size(0), graph.transition_states.size(0))
+            )
+        return teacher_states, world_targets, stats
 
     def _compose_canonical_world_state(
         self,
@@ -1991,30 +2058,71 @@ class OMENScale(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         max_steps = max(int(getattr(self.cfg, 'world_rollout_steps', 8)), 1)
         if h_tok.size(1) > 1 and actions.size(1) > 0:
-            teacher_states, world_targets, steps = self._hidden_world_targets(
-                h_tok,
-                actions,
-                max_steps,
-            )
-            graph_mix = float(getattr(self.cfg, "world_graph_teacher_mix", 0.65))
-            pooled_mix = float(getattr(self.cfg, "world_graph_pooled_mix", 0.25 * graph_mix))
-            trace_mix = float(getattr(self.cfg, "world_graph_trace_mix", graph_mix))
-            hidden_mix = float(getattr(self.cfg, "world_graph_hidden_mix", 0.15))
+            steps = min(max_steps, h_tok.size(1) - 1, actions.size(1))
             execution_driven = bool(getattr(self.cfg, "world_graph_execution_driven", True))
             pad_with_first = bool(getattr(self.cfg, "world_graph_trace_pad_with_first", True))
-            trace_supervised_steps = 0.0
-            if world_graph_batch is not None and world_graph_batch.graphs:
+            rollout_stats = {
+                "execution_steps": 0.0,
+                "hidden_fallback_steps": 0.0,
+                "trace_supervised_steps": 0.0,
+                "trace_samples": 0.0,
+                "hidden_teacher_applied": 0.0,
+                "neutral_prior_applied": 0.0,
+                "neutral_prior_steps": 0.0,
+            }
+            teacher_states = None
+            world_targets = None
+
+            if execution_driven:
+                execution_teacher, execution_targets, execution_stats = self._execution_world_targets(
+                    world_graph_batch,
+                    steps,
+                    device=h_tok.device,
+                    dtype=self.world_state_prior.dtype,
+                    pad_with_first=pad_with_first,
+                )
+                rollout_stats.update(execution_stats)
+                if execution_teacher is not None and execution_targets is not None:
+                    teacher_states = execution_teacher
+                    world_targets = execution_targets
+                    rollout_stats["hidden_fallback_steps"] = 0.0
+                    rollout_stats["hidden_teacher_applied"] = 0.0
+                else:
+                    teacher_states, world_targets = self._prior_world_targets(
+                        h_tok.size(0),
+                        steps,
+                        device=h_tok.device,
+                        dtype=self.world_state_prior.dtype,
+                    )
+                    rollout_stats["execution_steps"] = float(h_tok.size(0) * steps)
+                    rollout_stats["hidden_fallback_steps"] = 0.0
+                    rollout_stats["hidden_teacher_applied"] = 0.0
+                    rollout_stats["neutral_prior_applied"] = 1.0
+                    rollout_stats["neutral_prior_steps"] = float(h_tok.size(0) * steps)
+            else:
+                hidden_teacher, hidden_targets, _ = self._hidden_world_targets(
+                    h_tok,
+                    actions,
+                    max_steps,
+                )
+                rollout_stats["hidden_fallback_steps"] = float(hidden_teacher.size(0) * steps)
+                rollout_stats["hidden_teacher_applied"] = 1.0
+                teacher_states = hidden_teacher
+                world_targets = hidden_targets
+            if (
+                not execution_driven
+                and world_graph_batch is not None
+                and world_graph_batch.graphs
+            ):
                 pooled_states = world_graph_batch.pooled_states.detach().to(
                     device=teacher_states.device,
                     dtype=teacher_states.dtype,
                 )
                 pooled_states = pooled_states.unsqueeze(1).expand(-1, steps, -1)
-                if execution_driven:
-                    teacher_states = torch.lerp(pooled_states, teacher_states, hidden_mix)
-                    world_targets = torch.lerp(pooled_states, world_targets, hidden_mix)
-                else:
-                    teacher_states = torch.lerp(teacher_states, pooled_states, pooled_mix)
-                    world_targets = torch.lerp(world_targets, pooled_states, pooled_mix)
+                pooled_mix = float(getattr(self.cfg, "world_graph_pooled_mix", 0.15))
+                trace_mix = float(getattr(self.cfg, "world_graph_trace_mix", 1.0))
+                teacher_states = torch.lerp(hidden_teacher, pooled_states, pooled_mix)
+                world_targets = torch.lerp(hidden_targets, pooled_states, pooled_mix)
                 for batch_idx, graph in enumerate(world_graph_batch.graphs):
                     if graph.transition_targets is None or graph.transition_states is None:
                         continue
@@ -2036,31 +2144,36 @@ class OMENScale(nn.Module):
                     )
                     if trace_teacher is None or trace_targets is None:
                         continue
-                    if execution_driven:
-                        teacher_states[batch_idx] = torch.lerp(
-                            trace_teacher,
-                            teacher_states[batch_idx],
-                            hidden_mix,
-                        )
-                        world_targets[batch_idx] = trace_targets
-                    else:
-                        sample_steps = min(
-                            steps,
-                            graph.transition_targets.size(0),
-                            graph.transition_states.size(0),
-                        )
-                        teacher_states[batch_idx, -sample_steps:] = torch.lerp(
-                            teacher_states[batch_idx, -sample_steps:],
-                            trace_teacher[-sample_steps:],
-                            trace_mix,
-                        )
-                        world_targets[batch_idx, -sample_steps:] = torch.lerp(
-                            world_targets[batch_idx, -sample_steps:],
-                            trace_targets[-sample_steps:],
-                            trace_mix,
-                        )
-                    trace_supervised_steps += float(min(steps, trace_targets.size(0)))
-                world_graph_batch.metadata["trace_supervised_steps"] = trace_supervised_steps
+                    sample_steps = min(
+                        steps,
+                        graph.transition_targets.size(0),
+                        graph.transition_states.size(0),
+                    )
+                    teacher_states[batch_idx, -sample_steps:] = torch.lerp(
+                        teacher_states[batch_idx, -sample_steps:],
+                        trace_teacher[-sample_steps:],
+                        trace_mix,
+                    )
+                    world_targets[batch_idx, -sample_steps:] = torch.lerp(
+                        world_targets[batch_idx, -sample_steps:],
+                        trace_targets[-sample_steps:],
+                        trace_mix,
+                    )
+                    rollout_stats["trace_supervised_steps"] += float(sample_steps)
+                    rollout_stats["trace_samples"] += 1.0
+                    rollout_stats["execution_steps"] += float(sample_steps)
+                    rollout_stats["hidden_fallback_steps"] = max(
+                        0.0,
+                        rollout_stats["hidden_fallback_steps"] - float(sample_steps),
+                    )
+            if world_graph_batch is not None:
+                world_graph_batch.metadata["trace_supervised_steps"] = rollout_stats["trace_supervised_steps"]
+                world_graph_batch.metadata["execution_supervised_steps"] = rollout_stats["execution_steps"]
+                world_graph_batch.metadata["hidden_fallback_steps"] = rollout_stats["hidden_fallback_steps"]
+                world_graph_batch.metadata["trace_primary_samples"] = rollout_stats["trace_samples"]
+                world_graph_batch.metadata["hidden_teacher_applied"] = rollout_stats["hidden_teacher_applied"]
+                world_graph_batch.metadata["neutral_prior_applied"] = rollout_stats["neutral_prior_applied"]
+                world_graph_batch.metadata["neutral_prior_steps"] = rollout_stats["neutral_prior_steps"]
             action_seq = actions[:, -steps:]
             z_sim_traj = self.world_rnn.simulate_sequence(
                 teacher_states[:, 0],
@@ -2070,8 +2183,44 @@ class OMENScale(nn.Module):
             )
             return z_sim_traj, world_targets
 
-        fallback_state = self.world_target_proj(h_tok[:, -1:, :]).detach()
-        if world_graph_batch is not None and world_graph_batch.graphs:
+        execution_driven = bool(getattr(self.cfg, "world_graph_execution_driven", True))
+        fallback_targets = None
+        if execution_driven:
+            execution_teacher, execution_targets, rollout_stats = self._execution_world_targets(
+                world_graph_batch,
+                1,
+                device=h_tok.device,
+                dtype=self.world_state_prior.dtype,
+                pad_with_first=bool(getattr(self.cfg, "world_graph_trace_pad_with_first", True)),
+            )
+            if execution_teacher is not None and execution_targets is not None:
+                fallback_state = execution_teacher
+                fallback_targets = execution_targets
+                if world_graph_batch is not None:
+                    world_graph_batch.metadata["trace_supervised_steps"] = rollout_stats["trace_supervised_steps"]
+                    world_graph_batch.metadata["execution_supervised_steps"] = rollout_stats["execution_steps"]
+                    world_graph_batch.metadata["hidden_fallback_steps"] = 0.0
+                    world_graph_batch.metadata["trace_primary_samples"] = rollout_stats["trace_samples"]
+                    world_graph_batch.metadata["hidden_teacher_applied"] = 0.0
+                    world_graph_batch.metadata["neutral_prior_applied"] = 0.0
+                    world_graph_batch.metadata["neutral_prior_steps"] = 0.0
+            else:
+                fallback_state, fallback_targets = self._prior_world_targets(
+                    h_tok.size(0),
+                    1,
+                    device=h_tok.device,
+                    dtype=self.world_state_prior.dtype,
+                )
+                if world_graph_batch is not None:
+                    world_graph_batch.metadata["trace_supervised_steps"] = 0.0
+                    world_graph_batch.metadata["execution_supervised_steps"] = float(fallback_state.size(0))
+                    world_graph_batch.metadata["hidden_fallback_steps"] = 0.0
+                    world_graph_batch.metadata["trace_primary_samples"] = 0.0
+                    world_graph_batch.metadata["hidden_teacher_applied"] = 0.0
+                    world_graph_batch.metadata["neutral_prior_applied"] = 1.0
+                    world_graph_batch.metadata["neutral_prior_steps"] = float(fallback_state.size(0))
+        elif world_graph_batch is not None and world_graph_batch.graphs:
+            fallback_state = self.world_target_proj(h_tok[:, -1:, :]).detach()
             pooled_states = world_graph_batch.pooled_states.detach().to(
                 device=fallback_state.device,
                 dtype=fallback_state.dtype,
@@ -2081,6 +2230,24 @@ class OMENScale(nn.Module):
                 pooled_states,
                 float(getattr(self.cfg, "world_graph_pooled_mix", 0.15)),
             )
+            world_graph_batch.metadata["trace_supervised_steps"] = 0.0
+            world_graph_batch.metadata["execution_supervised_steps"] = float(fallback_state.size(0))
+            world_graph_batch.metadata["hidden_fallback_steps"] = 0.0
+            world_graph_batch.metadata["trace_primary_samples"] = 0.0
+            world_graph_batch.metadata["hidden_teacher_applied"] = 1.0
+            world_graph_batch.metadata["neutral_prior_applied"] = 0.0
+            world_graph_batch.metadata["neutral_prior_steps"] = 0.0
+        elif world_graph_batch is not None:
+            fallback_state = self.world_target_proj(h_tok[:, -1:, :]).detach()
+            world_graph_batch.metadata["trace_supervised_steps"] = 0.0
+            world_graph_batch.metadata["execution_supervised_steps"] = 0.0
+            world_graph_batch.metadata["hidden_fallback_steps"] = float(fallback_state.size(0))
+            world_graph_batch.metadata["trace_primary_samples"] = 0.0
+            world_graph_batch.metadata["hidden_teacher_applied"] = 1.0
+            world_graph_batch.metadata["neutral_prior_applied"] = 0.0
+            world_graph_batch.metadata["neutral_prior_steps"] = 0.0
+        else:
+            fallback_state = self.world_target_proj(h_tok[:, -1:, :]).detach()
         fallback_actions = actions[:, -1:] if actions.size(1) > 0 else torch.zeros(
             h_tok.size(0), 1, dtype=torch.long, device=h_tok.device
         )
@@ -2089,7 +2256,110 @@ class OMENScale(nn.Module):
             fallback_actions,
             teacher_forcing_ratio=teacher_forcing_ratio,
         )
+        if execution_driven and fallback_targets is not None:
+            return z_sim_traj, fallback_targets.to(device=z_sim_traj.device, dtype=z_sim_traj.dtype)
         return z_sim_traj, z_sim_traj.detach()
+
+    def _eval_world_self_update_active(self) -> bool:
+        if self.training:
+            return False
+        if not bool(getattr(self.cfg, "eval_world_self_update_enabled", True)):
+            return False
+        if not bool(getattr(self.cfg, "continuous_cycle_eval_learning_enabled", True)):
+            return False
+        if not torch.is_grad_enabled():
+            return False
+        if hasattr(torch, "is_inference_mode_enabled") and torch.is_inference_mode_enabled():
+            return False
+        return True
+
+    def _generation_online_learning_active(self) -> bool:
+        if self.training:
+            return False
+        if hasattr(torch, "is_inference_mode_enabled") and torch.is_inference_mode_enabled():
+            return False
+        if not torch.is_grad_enabled():
+            return False
+        return bool(getattr(self.cfg, "continuous_cycle_eval_learning_enabled", True))
+
+    def _maybe_eval_world_self_update(
+        self,
+        *,
+        world_loss: torch.Tensor,
+        program_anchor_loss: Optional[torch.Tensor] = None,
+    ) -> Dict[str, float]:
+        stats = {
+            "applied": 0.0,
+            "loss": 0.0,
+            "grad_norm": 0.0,
+            "effective_lr": 0.0,
+            "parameter_tensors": 0.0,
+            "parameter_elements": 0.0,
+            "program_weight": 0.0,
+        }
+        if not self._eval_world_self_update_active():
+            return stats
+        if not torch.is_tensor(world_loss) or not world_loss.requires_grad:
+            return stats
+        params = [param for param in self.world_rnn.parameters() if param.requires_grad]
+        if not params:
+            return stats
+
+        update_loss = world_loss
+        program_weight = float(getattr(self.cfg, "eval_world_self_update_program_weight", 0.0))
+        if (
+            program_weight > 0.0
+            and torch.is_tensor(program_anchor_loss)
+            and program_anchor_loss.requires_grad
+        ):
+            update_loss = update_loss + program_weight * program_anchor_loss
+            stats["program_weight"] = program_weight
+        if not bool(torch.isfinite(update_loss).all().item()):
+            return stats
+
+        grads = torch.autograd.grad(
+            update_loss,
+            params,
+            allow_unused=True,
+            retain_graph=True,
+        )
+        grad_sq = 0.0
+        valid_pairs = []
+        param_elements = 0.0
+        for param, grad in zip(params, grads):
+            if grad is None:
+                continue
+            if not bool(torch.isfinite(grad).all().item()):
+                continue
+            valid_pairs.append((param, grad))
+            grad_sq += float(grad.detach().pow(2).sum().item())
+            param_elements += float(param.numel())
+        if not valid_pairs:
+            return stats
+
+        grad_norm = grad_sq ** 0.5
+        clip = float(getattr(self.cfg, "eval_world_self_update_clip", 1.0))
+        lr = float(getattr(self.cfg, "eval_world_self_update_lr", 1e-3))
+        scale = 1.0
+        if clip > 0.0 and grad_norm > clip:
+            scale = clip / max(grad_norm, 1e-12)
+        effective_lr = lr * scale
+
+        with torch.no_grad():
+            for param, grad in valid_pairs:
+                param.add_(grad, alpha=-effective_lr)
+
+        stats.update(
+            {
+                "applied": 1.0,
+                "loss": float(update_loss.detach().item()),
+                "grad_norm": float(grad_norm),
+                "effective_lr": float(effective_lr),
+                "parameter_tensors": float(len(valid_pairs)),
+                "parameter_elements": float(param_elements),
+            }
+        )
+        return stats
 
     def _combine_levels(
         self,
@@ -2837,6 +3107,9 @@ class OMENScale(nn.Module):
                 "world_graph_nodes": float(world_graph_batch.metadata.get("mean_nodes", 0.0)),
                 "world_graph_edges": float(world_graph_batch.metadata.get("mean_edges", 0.0)),
                 "world_graph_trace_steps": float(world_graph_batch.metadata.get("trace_supervised_steps", 0.0)),
+                "world_graph_execution_steps": float(world_graph_batch.metadata.get("execution_supervised_steps", 0.0)),
+                "world_graph_hidden_fallback_steps": float(world_graph_batch.metadata.get("hidden_fallback_steps", 0.0)),
+                "world_graph_neutral_prior_steps": float(world_graph_batch.metadata.get("neutral_prior_steps", 0.0)),
             })
         program_target_facts = self._program_anchor_facts(task_context)
         self.prover.set_task_context(task_context)
@@ -2851,7 +3124,8 @@ class OMENScale(nn.Module):
             )
 
         # ── Level 3: ∂-Prolog (через EMC або напряму) ─────────────────────────
-        world_err  = F.mse_loss(z_sim_traj, world_targets).detach()
+        world_loss = F.mse_loss(z_sim_traj, world_targets)
+        world_err  = world_loss.detach()
 
         if self.emc_enabled and self.training:
             # ── EMC: Адаптивний контролер міркування ───────────────────────────
@@ -3064,6 +3338,10 @@ class OMENScale(nn.Module):
             seen_tokens=int(max(int(self._seen_tokens.item()), 1)),
             train_step=int(self._train_step.item()),
         )
+        eval_world_update_stats = self._maybe_eval_world_self_update(
+            world_loss=world_loss,
+            program_anchor_loss=program_anchor_loss,
+        )
         query_stats = getattr(self.sym_query_gen, "last_query_info", {}) if self.sym_query_gen is not None else {}
         query_aux_tensor = query_stats.get("aux_loss_tensor")
         if self.training and torch.is_tensor(query_aux_tensor):
@@ -3094,6 +3372,9 @@ class OMENScale(nn.Module):
             out["sal_abduced"] = saliency_out.sal_abduced
             out["sal_role_schema"] = "|".join(saliency_out.sal_role_names)
             out["sal_named_role_preds"] = float(len(getattr(self.saliency, "named_role_predicates", {})))
+            out["sal_named_role_rel_preds"] = float(
+                len(getattr(self.saliency, "named_role_relation_predicates", {}))
+            )
 
         if self.osf_enabled and "j_osf" in osf_out:
             j_osf = osf_out["j_osf"]
@@ -3134,6 +3415,13 @@ class OMENScale(nn.Module):
         out["sym_induction_repaired"] = float(sym_stats.get("induction_repaired", 0.0))
         out["sym_induction_matches"] = float(sym_stats.get("induction_matches", 0.0))
         out["sym_induction_score"] = float(sym_stats.get("induction_score", 0.0))
+        out["sym_cycle_active"] = float(sym_stats.get("cycle_active", 0.0))
+        out["sym_cycle_eval_active"] = float(sym_stats.get("cycle_eval_active", 0.0))
+        out["sym_cycle_learning_active"] = float(sym_stats.get("cycle_learning_active", 0.0))
+        out["sym_cycle_candidate_budget"] = float(sym_stats.get("cycle_candidate_budget", 0.0))
+        out["sym_cycle_trace_candidates"] = float(sym_stats.get("cycle_trace_candidates", 0.0))
+        out["sym_cycle_contextual_candidates"] = float(sym_stats.get("cycle_contextual_candidates", 0.0))
+        out["sym_cycle_neural_candidates"] = float(sym_stats.get("cycle_neural_candidates", 0.0))
         out["sym_cycle_checked"] = float(sym_stats.get("cycle_checked", 0.0))
         out["sym_cycle_accepted"] = float(sym_stats.get("cycle_accepted", 0.0))
         out["sym_cycle_added"] = float(sym_stats.get("cycle_added", 0.0))
@@ -3162,6 +3450,7 @@ class OMENScale(nn.Module):
         out["sym_trace_steps"] = float(sym_stats.get("trace_steps", 0.0))
         out["sym_trace_counterexamples"] = float(sym_stats.get("trace_counterexamples", 0.0))
         out["sym_used_rules"] = float(sym_stats.get("used_rules", 0.0))
+        out["sym_cycle_mode"] = sym_stats.get("cycle_mode", "off")
         out["sym_provenance"] = sym_stats.get("provenance", task_context.provenance)
         out["creative_abduction_candidates"] = float(sym_stats.get("creative_abduction_candidates", 0.0))
         out["creative_analogy_candidates"] = float(sym_stats.get("creative_analogy_candidates", 0.0))
@@ -3174,6 +3463,21 @@ class OMENScale(nn.Module):
         out["creative_analogy_projector_loss"] = float(sym_stats.get("creative_analogy_projector_loss", 0.0))
         out["creative_analogy_embedding_source"] = float(
             sym_stats.get("creative_analogy_embedding_source", 0.0)
+        )
+        out["creative_oee_model_initialized"] = float(
+            sym_stats.get("creative_oee_model_initialized", 0.0)
+        )
+        out["creative_oee_feedback_buffer_size"] = float(
+            sym_stats.get("creative_oee_feedback_buffer_size", 0.0)
+        )
+        out["creative_oee_online_train_applied"] = float(
+            sym_stats.get("creative_oee_online_train_applied", 0.0)
+        )
+        out["creative_oee_online_train_loss"] = float(
+            sym_stats.get("creative_oee_online_train_loss", 0.0)
+        )
+        out["creative_oee_online_train_steps"] = float(
+            sym_stats.get("creative_oee_online_train_steps", 0.0)
         )
         out["sym_query_pred"] = float(query_stats.get("pred", -1.0))
         out["sym_query_support"] = float(query_stats.get("support", 0.0))
@@ -3215,6 +3519,23 @@ class OMENScale(nn.Module):
         out["world_graph_nodes"] = float(world_graph_batch.metadata.get("mean_nodes", 0.0))
         out["world_graph_edges"] = float(world_graph_batch.metadata.get("mean_edges", 0.0))
         out["world_graph_trace_steps"] = float(world_graph_batch.metadata.get("trace_supervised_steps", 0.0))
+        out["world_graph_execution_steps"] = float(world_graph_batch.metadata.get("execution_supervised_steps", 0.0))
+        out["world_graph_hidden_fallback_steps"] = float(world_graph_batch.metadata.get("hidden_fallback_steps", 0.0))
+        out["world_graph_trace_samples"] = float(world_graph_batch.metadata.get("trace_primary_samples", 0.0))
+        out["world_graph_hidden_teacher_applied"] = float(world_graph_batch.metadata.get("hidden_teacher_applied", 0.0))
+        out["world_graph_neutral_prior_applied"] = float(world_graph_batch.metadata.get("neutral_prior_applied", 0.0))
+        out["world_graph_neutral_prior_steps"] = float(world_graph_batch.metadata.get("neutral_prior_steps", 0.0))
+        out["eval_world_self_update_applied"] = float(eval_world_update_stats.get("applied", 0.0))
+        out["eval_world_self_update_loss"] = float(eval_world_update_stats.get("loss", 0.0))
+        out["eval_world_self_update_grad_norm"] = float(eval_world_update_stats.get("grad_norm", 0.0))
+        out["eval_world_self_update_lr"] = float(eval_world_update_stats.get("effective_lr", 0.0))
+        out["eval_world_self_update_params"] = float(eval_world_update_stats.get("parameter_tensors", 0.0))
+        out["eval_world_self_update_param_elems"] = float(
+            eval_world_update_stats.get("parameter_elements", 0.0)
+        )
+        out["eval_world_self_update_program_weight"] = float(
+            eval_world_update_stats.get("program_weight", 0.0)
+        )
         out["world_graph_gate"] = float(z_graph_gate.mean().item())
         out["z_graph_primary"] = 1.0
         out["z_graph_anchor"] = float(z_graph_anchor.mean().item()) if z_graph_anchor.numel() > 0 else 0.0
@@ -3278,6 +3599,16 @@ class OMENScale(nn.Module):
         dynamic_reasoning: bool,
     ) -> torch.Tensor:
         self.eval()
+        adaptive_generation = self._generation_online_learning_active()
+        generate_info: Dict[str, float] = {
+            "adaptive_learning_active": 1.0 if adaptive_generation else 0.0,
+            "eval_world_self_update_applied": 0.0,
+            "eval_world_self_update_loss": 0.0,
+            "eval_world_self_update_grad_norm": 0.0,
+            "eval_world_self_update_steps": 0.0,
+            "generated_tokens": 0.0,
+        }
+        self.last_generate_info = dict(generate_info)
         if self.net_enabled:
             h_tok, _, _ = self.net.encode(prompt)
         else:
@@ -3305,14 +3636,27 @@ class OMENScale(nn.Module):
                 limit=int(getattr(self.cfg, "symbolic_context_max_facts", 96)),
             )
 
-        if self.emc_enabled:
-            z_sim_traj, _ = self._world_rollout_from_hidden(
+        init_z_sim_traj = None
+        init_world_targets = None
+        if self.emc_enabled or adaptive_generation:
+            init_z_sim_traj, init_world_targets = self._world_rollout_from_hidden(
                 h_tok,
                 prompt,
                 world_graph_batch=init_world_graph,
                 teacher_forcing_ratio=0.0,
             )
-            z_sim0 = z_sim_traj[:, -1]
+        if adaptive_generation and init_z_sim_traj is not None and init_world_targets is not None:
+            init_update = self._maybe_eval_world_self_update(
+                world_loss=F.mse_loss(init_z_sim_traj, init_world_targets)
+            )
+            generate_info["eval_world_self_update_applied"] += float(init_update.get("applied", 0.0))
+            generate_info["eval_world_self_update_loss"] += float(init_update.get("loss", 0.0))
+            generate_info["eval_world_self_update_grad_norm"] += float(init_update.get("grad_norm", 0.0))
+            generate_info["eval_world_self_update_steps"] += float(init_update.get("applied", 0.0))
+
+        if self.emc_enabled:
+            assert init_z_sim_traj is not None
+            z_sim0 = init_z_sim_traj[:, -1]
             _, gap_norm0, _ = self.epistemic.compute(z, self.world_rnn, z_sim0)
             z_sym, v_mem_emc = self.emc.run_episode_eval(
                 z_symbolic_in, gap_norm0, None, self.prover, self.memory, device=z.device
@@ -3359,14 +3703,28 @@ class OMENScale(nn.Module):
                     limit=int(getattr(self.cfg, "symbolic_context_max_facts", 96)),
                 )
 
+            step_z_sim_traj = None
+            step_world_targets = None
+            if self.emc_enabled or adaptive_generation:
+                step_z_sim_traj, step_world_targets = self._world_rollout_from_hidden(
+                    h_ctx,
+                    ctx,
+                    world_graph_batch=step_world_graph,
+                    teacher_forcing_ratio=0.0,
+                )
+            if adaptive_generation and step_z_sim_traj is not None and step_world_targets is not None:
+                step_update = self._maybe_eval_world_self_update(
+                    world_loss=F.mse_loss(step_z_sim_traj, step_world_targets)
+                )
+                generate_info["eval_world_self_update_applied"] += float(step_update.get("applied", 0.0))
+                generate_info["eval_world_self_update_loss"] += float(step_update.get("loss", 0.0))
+                generate_info["eval_world_self_update_grad_norm"] += float(step_update.get("grad_norm", 0.0))
+                generate_info["eval_world_self_update_steps"] += float(step_update.get("applied", 0.0))
+
             if dynamic_reasoning:
                 if self.emc_enabled:
-                    z_sim_step = self._world_rollout_from_hidden(
-                        h_ctx,
-                        ctx,
-                        world_graph_batch=step_world_graph,
-                        teacher_forcing_ratio=0.0,
-                    )[0][:, -1]
+                    assert step_z_sim_traj is not None
+                    z_sim_step = step_z_sim_traj[:, -1]
                     _, gap_step, _ = self.epistemic.compute(z_ctx, self.world_rnn, z_sim_step)
                     z_sym_step, v_mem_step = self.emc.run_episode_eval(
                         z_symbolic_ctx,
@@ -3442,12 +3800,17 @@ class OMENScale(nn.Module):
 
             probs = F.softmax(logits[:, -1] / temperature, -1)
             generated = torch.cat([generated, torch.multinomial(probs, 1)], 1)
+            generate_info["generated_tokens"] += 1.0
 
+        if generate_info["eval_world_self_update_steps"] > 0.0:
+            scale = generate_info["eval_world_self_update_steps"]
+            generate_info["eval_world_self_update_loss"] /= scale
+            generate_info["eval_world_self_update_grad_norm"] /= scale
+        self.last_generate_info = generate_info
         self.prover.clear_task_context()
         return generated
 
     # ── Генерація ─────────────────────────────────────────────────────────────
-    @torch.no_grad()
     def generate(self, prompt: torch.Tensor,
                  max_new: int = 32,
                  temperature: float = 0.8,
@@ -3474,12 +3837,14 @@ class OMENScale(nn.Module):
           і залишається фіксованим протягом всієї генерації.
           Швидший, але без динамічного «розуміння».
         """
-        return self._generate_symbolic(
-            prompt=prompt,
-            max_new=max_new,
-            temperature=temperature,
-            dynamic_reasoning=dynamic_reasoning,
-        )
+        ctx = nullcontext() if self._generation_online_learning_active() else torch.no_grad()
+        with ctx:
+            return self._generate_symbolic(
+                prompt=prompt,
+                max_new=max_new,
+                temperature=temperature,
+                dynamic_reasoning=dynamic_reasoning,
+            )
 
         # ── Ініціальний стан (для dynamic=False або як база) ─────────────────
         if self.net_enabled:
@@ -3835,7 +4200,10 @@ def run_tests_scale(cfg: OMENScaleConfig) -> None:
         assert k in out, f"FAIL: відсутній ключ {k}"
     assert out["logits"].shape == (B, T, cfg.vocab_size), \
         f"logits {out['logits'].shape}"
-    assert out["z"].shape == (B, cfg.d_latent), f"z {out['z'].shape}"
+    assert isinstance(out["z"], CanonicalWorldState), f"z type {type(out['z'])}"
+    assert out["z_dense"].shape == (B, cfg.d_latent), f"z_dense {out['z_dense'].shape}"
+    assert out["z"] is out["world_state"], "FAIL: canonical world state alias broken"
+    assert torch.allclose(out["z_world"], out["z_dense"]), "FAIL: dense world-state view drifted"
     if cfg.osf_enabled:
         for k in ("osf_l_plan", "osf_plan_depth"):
             assert k in out, f"FAIL: відсутній OSF ключ {k}"

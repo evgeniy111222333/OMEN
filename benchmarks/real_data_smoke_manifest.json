@@ -1,0 +1,20 @@
+{
+  "codesearchnet_python": {
+    "path": "../codesearchnet_python.txt",
+    "language": "python",
+    "family": "code",
+    "source": "codesearchnet",
+    "split": "smoke",
+    "weight": 2.0,
+    "tags": ["real", "code"]
+  },
+  "concept_docs": {
+    "path": "../concept.md",
+    "language": "ukrainian",
+    "family": "docs",
+    "source": "local_docs",
+    "split": "smoke",
+    "weight": 1.0,
+    "tags": ["real", "docs"]
+  }
+}

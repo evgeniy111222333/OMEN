@@ -87,6 +87,10 @@ class OMENScaleConfig:
     continuous_cycle_repair_threshold: float = 0.35
     continuous_cycle_max_repairs: int = 2
     continuous_cycle_eval_learning_enabled: bool = True
+    eval_world_self_update_enabled: bool = True
+    eval_world_self_update_lr: float = 1e-3
+    eval_world_self_update_clip: float = 1.0
+    eval_world_self_update_program_weight: float = 0.05
     creative_cycle_enabled: bool = True
     creative_cycle_every: int = 4
     creative_max_selected_rules: int = 2
@@ -232,7 +236,7 @@ class OMENScaleConfig:
     saliency_tau:     float = 0.20
     saliency_top_k:   int   = 4
     saliency_max_facts: int = 512
-    saliency_role_slots: int = 6
+    saliency_role_slots: int = 6   # prefix of a fixed role ontology; no anonymous role_n fallback
     saliency_beta_struct: float = 0.05
     saliency_gamma_role:  float = 0.05
     saliency_delta_cons:  float = 0.05

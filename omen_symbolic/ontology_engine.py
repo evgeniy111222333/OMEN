@@ -1214,6 +1214,10 @@ class OntologyExpansionEngine:
         # Буфер для online learning
         self._feedback_buffer: Deque[_FeedbackRecord] = deque(maxlen=feedback_buffer_size)
         self._call_count: int = 0
+        self._online_train_steps: int = 0
+        self._last_online_train_applied: float = 0.0
+        self._last_online_train_loss: float = 0.0
+        self._last_online_train_buffer_size: float = 0.0
 
         # Стан останнього виклику (для record_feedback)
         self._last_context_input: Optional[torch.Tensor] = None
@@ -1369,6 +1373,9 @@ class OntologyExpansionEngine:
         Градієнти течуть через context_encoder + h_decoder, оскільки
         ми ре-форвардимо збережені context_input вектори через поточну модель.
         """
+        self._last_online_train_applied = 0.0
+        self._last_online_train_loss = 0.0
+        self._last_online_train_buffer_size = float(len(self._feedback_buffer))
         if len(self._feedback_buffer) < 4 or self._optimizer is None:
             return 0.0
 
@@ -1412,6 +1419,9 @@ class OntologyExpansionEngine:
                 nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 self._optimizer.step()
                 loss_val = float(loss.item())
+                self._online_train_steps += 1
+                self._last_online_train_applied = 1.0
+                self._last_online_train_loss = loss_val
 
         except Exception:
             pass
@@ -1454,6 +1464,9 @@ class OntologyExpansionEngine:
           Heuristic (fallback): evристика якщо ембеддинги недоступні
         """
         self._call_count += 1
+        self._last_online_train_applied = 0.0
+        self._last_online_train_loss = 0.0
+        self._last_online_train_buffer_size = float(len(self._feedback_buffer))
 
         cluster_sum = float(self._cluster_pressure.get(self._last_cluster_key, 0.0))
         cluster_count = float(self._cluster_counts.get(self._last_cluster_key, 0.0))
@@ -1803,6 +1816,10 @@ class OntologyExpansionEngine:
             ),
             "oee_model_initialized": float(self._latent_model is not None),
             "oee_call_count": float(self._call_count),
+            "oee_online_train_applied": float(self._last_online_train_applied),
+            "oee_online_train_loss": float(self._last_online_train_loss),
+            "oee_online_train_steps": float(self._online_train_steps),
+            "oee_online_train_buffer_size": float(self._last_online_train_buffer_size),
             "oee_predicate_vocab_size": float(len(vocab)),
             "oee_fixed_preds": float(fixed_n),
             "oee_proposed_preds": float(proposed_n),

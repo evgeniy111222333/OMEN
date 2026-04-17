@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import statistics
 import sys
 import time
 from copy import deepcopy
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping
+from typing import Any, Callable, Dict, Iterable, List, Mapping
 
 import torch
 from torch.optim import AdamW
@@ -40,13 +41,28 @@ DEFAULT_METRIC_KEYS = [
     "program_anchor",
     "program_target_facts",
     "sym_target_coverage",
+    "sym_cycle_active",
     "sym_cycle_checked",
+    "sym_cycle_eval_active",
+    "sym_cycle_learning_active",
+    "sym_cycle_trace_candidates",
+    "sym_cycle_contextual_candidates",
+    "sym_cycle_neural_candidates",
     "z_graph_primary",
     "z_graph_anchor",
     "world_graph_nodes",
     "world_graph_trace_steps",
+    "world_graph_execution_steps",
+    "world_graph_hidden_fallback_steps",
+    "world_graph_hidden_teacher_applied",
+    "world_graph_neutral_prior_applied",
+    "eval_world_self_update_applied",
+    "eval_world_self_update_loss",
+    "creative_oee_online_train_applied",
+    "creative_oee_online_train_loss",
     "sal_consistency",
     "sal_named_role_preds",
+    "sal_named_role_rel_preds",
     "creative_analogy_candidates",
     "creative_selected_rules",
     "creative_analogy_projector_loss",
@@ -57,6 +73,17 @@ DEFAULT_METRIC_KEYS = [
     "sym_ast_lang_other",
     "n_rules",
 ]
+
+
+def _set_protocol_seed(seed: int | None) -> int | None:
+    if seed is None:
+        return None
+    seed = int(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    return seed
 
 
 def build_config(name: str) -> OMENScaleConfig:
@@ -88,6 +115,50 @@ def aggregate(metrics: Iterable[Dict[str, float]]) -> Dict[str, float]:
     }
 
 
+def aggregate_weighted(metrics: Iterable[tuple[Dict[str, float], float]]) -> Dict[str, float]:
+    rows = [(row, float(weight)) for row, weight in metrics if row]
+    if not rows:
+        return {}
+    total_weight = sum(max(weight, 0.0) for _, weight in rows)
+    if total_weight <= 0.0:
+        return aggregate(row for row, _ in rows)
+    keys = sorted({key for row, _ in rows for key in row})
+    return {
+        key: float(
+            sum(row.get(key, 0.0) * max(weight, 0.0) for row, weight in rows) / total_weight
+        )
+        for key in keys
+    }
+
+
+def _normalize_time_budget(time_budget_sec: float | None) -> float | None:
+    if time_budget_sec is None:
+        return None
+    return max(float(time_budget_sec), 0.0)
+
+
+def _time_budget_deadline(
+    time_budget_sec: float | None,
+    *,
+    start_time: float | None = None,
+) -> float | None:
+    budget = _normalize_time_budget(time_budget_sec)
+    if budget is None:
+        return None
+    origin = time.perf_counter() if start_time is None else float(start_time)
+    return origin + budget
+
+
+def _budget_expired(deadline: float | None) -> bool:
+    return deadline is not None and time.perf_counter() >= deadline
+
+
+def _write_json_report(path: str | Path, payload: Mapping[str, object]) -> None:
+    report_path = Path(path)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def _collect_metrics(out: Dict[str, object], metric_keys: Iterable[str]) -> Dict[str, float]:
     return {
         key: float(out[key])
@@ -104,15 +175,23 @@ def _evaluate_model(
     batch_size: int = 2,
     device: torch.device = DEVICE,
     metric_keys: Iterable[str] = DEFAULT_METRIC_KEYS,
+    deadline: float | None = None,
+    progress_callback: Callable[[Dict[str, object]], None] | None = None,
 ) -> Dict[str, object]:
     metric_rows: List[Dict[str, float]] = []
     timings_ms: List[float] = []
+    requested_batches = max(int(batches), 1)
+    stop_reason = "completed"
 
     model.eval()
     with torch.inference_mode():
-        for _ in range(max(int(batches), 1)):
+        for _ in range(requested_batches):
+            if _budget_expired(deadline):
+                stop_reason = "time_budget_exhausted"
+                break
             batch = sample_examples(dataset, batch_size)
             if not batch:
+                stop_reason = "dataset_exhausted"
                 break
             src, tgt = collate(batch)
             src = src.to(device)
@@ -121,6 +200,20 @@ def _evaluate_model(
             out = model(src, tgt)
             timings_ms.append((time.perf_counter() - t0) * 1000.0)
             metric_rows.append(_collect_metrics(out, metric_keys))
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "summary": aggregate(metric_rows),
+                        "timings_ms": list(timings_ms),
+                        "metric_rows": list(metric_rows),
+                        "metric_keys": list(metric_keys),
+                        "n_batches": len(metric_rows),
+                        "requested_batches": requested_batches,
+                        "timed_out": False,
+                        "stop_reason": "running",
+                        "device": str(device),
+                    }
+                )
 
     return {
         "summary": aggregate(metric_rows),
@@ -128,6 +221,9 @@ def _evaluate_model(
         "metric_rows": metric_rows,
         "metric_keys": list(metric_keys),
         "n_batches": len(metric_rows),
+        "requested_batches": requested_batches,
+        "timed_out": stop_reason == "time_budget_exhausted",
+        "stop_reason": stop_reason,
         "device": str(device),
     }
 
@@ -143,6 +239,91 @@ def _stamp_canonical_report(
     return payload
 
 
+def _resolve_protocol_path(raw_path: str, base_dir: Path | None = None) -> str:
+    path = Path(raw_path)
+    if not path.is_absolute():
+        if base_dir is None:
+            base_dir = Path.cwd()
+        path = (base_dir / path).resolve()
+    return str(path)
+
+
+def _coerce_protocol_entry(
+    name: str,
+    raw_entry: str | Mapping[str, object],
+    *,
+    base_dir: Path | None = None,
+) -> Dict[str, object]:
+    if isinstance(raw_entry, str):
+        entry: Dict[str, object] = {"path": raw_entry}
+    elif isinstance(raw_entry, Mapping):
+        entry = dict(raw_entry)
+    else:
+        raise ValueError("Corpus protocol entries must be either strings or JSON objects")
+
+    raw_path = entry.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError(f"Corpus protocol entry '{name}' must define a non-empty 'path'")
+
+    language = entry.get("language")
+    source = entry.get("source")
+    family = entry.get("family")
+    split = entry.get("split")
+    weight = entry.get("weight", 1.0)
+    tags = entry.get("tags", ())
+    if not isinstance(weight, (int, float)):
+        raise ValueError(f"Corpus protocol entry '{name}' has non-numeric weight")
+    if tags is None:
+        tags = ()
+    if not isinstance(tags, (list, tuple)):
+        raise ValueError(f"Corpus protocol entry '{name}' must use a list for 'tags'")
+
+    return {
+        "path": _resolve_protocol_path(raw_path, base_dir=base_dir),
+        "language": str(language) if language else "unknown",
+        "source": str(source) if source else "local",
+        "family": str(family) if family else "unclassified",
+        "split": str(split) if split else "unspecified",
+        "weight": float(weight),
+        "tags": tuple(str(tag) for tag in tags),
+    }
+
+
+def coerce_corpus_protocol(
+    protocol: Mapping[str, str | Mapping[str, object]],
+    *,
+    base_dir: Path | None = None,
+) -> Dict[str, Dict[str, object]]:
+    if not isinstance(protocol, Mapping):
+        raise ValueError("Corpus protocol must be a mapping of task names to paths/specs")
+    entries: Dict[str, Dict[str, object]] = {}
+    for name, raw_entry in protocol.items():
+        if not isinstance(name, str):
+            raise ValueError("Corpus protocol task names must be strings")
+        entries[name] = _coerce_protocol_entry(name, raw_entry, base_dir=base_dir)
+    return entries
+
+
+def _group_protocol_summaries(
+    task_summaries: Mapping[str, Dict[str, float]],
+    protocol: Mapping[str, Mapping[str, object]],
+    field: str,
+) -> Dict[str, Dict[str, float]]:
+    grouped: Dict[str, List[tuple[Dict[str, float], float]]] = {}
+    for task_name, summary in task_summaries.items():
+        spec = protocol.get(task_name, {})
+        group_key = str(spec.get(field, "unknown"))
+        grouped.setdefault(group_key, []).append((summary, float(spec.get("weight", 1.0))))
+    return {
+        group_key: aggregate_weighted(group_rows)
+        for group_key, group_rows in grouped.items()
+    }
+
+
+def _protocol_taxonomy(protocol: Mapping[str, Mapping[str, object]], field: str) -> List[str]:
+    return sorted({str(spec.get(field, "unknown")) for spec in protocol.values()})
+
+
 def run_benchmark(
     cfg: OMENScaleConfig,
     dataset,
@@ -152,7 +333,14 @@ def run_benchmark(
     checkpoint: str | None = None,
     device: torch.device = DEVICE,
     metric_keys: Iterable[str] = DEFAULT_METRIC_KEYS,
+    seed: int | None = None,
+    time_budget_sec: float | None = None,
+    progress_report_path: str | Path | None = None,
 ) -> Dict[str, object]:
+    started_at = time.perf_counter()
+    deadline = _time_budget_deadline(time_budget_sec, start_time=started_at)
+    budget = _normalize_time_budget(time_budget_sec)
+    active_seed = _set_protocol_seed(seed)
     model = build_omen(cfg, device=device)
 
     if checkpoint:
@@ -161,6 +349,19 @@ def run_benchmark(
             state = state["model"]
         model.load_state_dict(state, strict=False)
 
+    def emit_progress(partial_report: Dict[str, object]) -> None:
+        if progress_report_path is None:
+            return
+        payload = dict(partial_report)
+        payload["wall_time_sec"] = float(time.perf_counter() - started_at)
+        payload["time_budget_sec"] = budget
+        if active_seed is not None:
+            payload["protocol_seed"] = int(active_seed)
+        _write_json_report(
+            progress_report_path,
+            _stamp_canonical_report(payload, include_repository_axis=True),
+        )
+
     report = _evaluate_model(
         model,
         dataset,
@@ -168,8 +369,17 @@ def run_benchmark(
         batch_size=batch_size,
         device=device,
         metric_keys=metric_keys,
+        deadline=deadline,
+        progress_callback=emit_progress if progress_report_path is not None else None,
     )
-    return _stamp_canonical_report(report, include_repository_axis=True)
+    report["wall_time_sec"] = float(time.perf_counter() - started_at)
+    report["time_budget_sec"] = budget
+    if active_seed is not None:
+        report["protocol_seed"] = int(active_seed)
+    final_report = _stamp_canonical_report(report, include_repository_axis=True)
+    if progress_report_path is not None:
+        _write_json_report(progress_report_path, final_report)
+    return final_report
 
 
 def build_transfer_tasks(
@@ -195,26 +405,19 @@ def build_transfer_tasks(
 def load_corpus_protocol(protocol_path: str | Path) -> Dict[str, str]:
     path = Path(protocol_path)
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, Mapping):
-        raise ValueError("Corpus protocol must be a JSON object mapping task names to file paths")
-    protocol: Dict[str, str] = {}
-    for name, raw_path in payload.items():
-        if not isinstance(name, str) or not isinstance(raw_path, str):
-            raise ValueError("Corpus protocol entries must be string -> string")
-        resolved = (path.parent / raw_path).resolve() if not Path(raw_path).is_absolute() else Path(raw_path)
-        protocol[name] = str(resolved)
-    return protocol
+    return coerce_corpus_protocol(payload, base_dir=path.parent)
 
 
 def build_real_transfer_tasks(
     cfg: OMENScaleConfig,
-    protocol: Mapping[str, str],
+    protocol: Mapping[str, str | Mapping[str, object]],
     *,
     max_samples: int = 4096,
 ) -> Dict[str, object]:
+    protocol_entries = coerce_corpus_protocol(protocol)
     tasks: Dict[str, object] = {}
-    for name, file_path in protocol.items():
-        tasks[str(name)] = load_text_corpus(str(file_path), cfg.seq_len, max_samples=max_samples)
+    for name, spec in protocol_entries.items():
+        tasks[str(name)] = load_text_corpus(str(spec["path"]), cfg.seq_len, max_samples=max_samples)
     return tasks
 
 
@@ -226,15 +429,28 @@ def _adapt_model(
     batch_size: int,
     device: torch.device,
     lr: float,
-) -> List[Dict[str, float]]:
-    if steps <= 0:
-        return []
+    deadline: float | None = None,
+) -> Dict[str, object]:
+    requested_steps = max(int(steps), 0)
+    if requested_steps <= 0:
+        return {
+            "history": [],
+            "requested_steps": 0,
+            "n_steps": 0,
+            "timed_out": False,
+            "stop_reason": "disabled",
+        }
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     history: List[Dict[str, float]] = []
+    stop_reason = "completed"
     model.train()
-    for _ in range(max(int(steps), 0)):
+    for _ in range(requested_steps):
+        if _budget_expired(deadline):
+            stop_reason = "time_budget_exhausted"
+            break
         batch = sample_examples(dataset, batch_size)
         if not batch:
+            stop_reason = "dataset_exhausted"
             break
         src, tgt = collate(batch)
         src = src.to(device)
@@ -250,7 +466,13 @@ def _adapt_model(
         model.memory.maybe_flush()
         history.append(_collect_metrics(out, ("total", "ce_bits", "world_nll", "sym_target_coverage")))
     model.eval()
-    return history
+    return {
+        "history": history,
+        "requested_steps": requested_steps,
+        "n_steps": len(history),
+        "timed_out": stop_reason == "time_budget_exhausted",
+        "stop_reason": stop_reason,
+    }
 
 
 def run_transfer_suite(
@@ -266,7 +488,13 @@ def run_transfer_suite(
     device: torch.device = DEVICE,
     force_creative_cycle: bool = True,
     metric_keys: Iterable[str] = DEFAULT_METRIC_KEYS,
+    seed: int | None = None,
+    time_budget_sec: float | None = None,
 ) -> Dict[str, object]:
+    started_at = time.perf_counter()
+    deadline = _time_budget_deadline(time_budget_sec, start_time=started_at)
+    budget = _normalize_time_budget(time_budget_sec)
+    active_seed = _set_protocol_seed(seed)
     suite_cfg = deepcopy(cfg)
     if force_creative_cycle:
         suite_cfg.creative_cycle_every = 1
@@ -280,7 +508,7 @@ def run_transfer_suite(
 
     task_map = tasks or build_transfer_tasks(suite_cfg)
     if not task_map:
-        return _stamp_canonical_report({
+        report = {
             "source_task": source_task,
             "adapt_steps": int(adapt_steps),
             "adapt_history": [],
@@ -289,24 +517,39 @@ def run_transfer_suite(
             "aggregate_summary": {},
             "transfer_deltas": {},
             "n_tasks": 0,
+            "requested_tasks": 0,
             "device": str(device),
-        }, include_repository_axis=True)
+            "timed_out": False,
+            "stop_reason": "empty_task_map",
+            "wall_time_sec": float(time.perf_counter() - started_at),
+            "time_budget_sec": budget,
+        }
+        if active_seed is not None:
+            report["protocol_seed"] = int(active_seed)
+        return _stamp_canonical_report(report, include_repository_axis=True)
 
     if source_task not in task_map:
         source_task = next(iter(task_map.keys()))
 
-    adapt_history = _adapt_model(
+    adapt_report = _adapt_model(
         model,
         task_map[source_task],
         steps=adapt_steps,
         batch_size=batch_size,
         device=device,
         lr=lr,
+        deadline=deadline,
     )
 
     task_reports: Dict[str, Dict[str, object]] = {}
     task_summaries: Dict[str, Dict[str, float]] = {}
+    timed_out = bool(adapt_report["timed_out"])
+    stop_reason = str(adapt_report["stop_reason"])
     for name, dataset in task_map.items():
+        if _budget_expired(deadline):
+            timed_out = True
+            stop_reason = "time_budget_exhausted"
+            break
         report = _evaluate_model(
             model,
             dataset,
@@ -314,9 +557,20 @@ def run_transfer_suite(
             batch_size=batch_size,
             device=device,
             metric_keys=metric_keys,
+            deadline=deadline,
         )
         task_reports[name] = report
         task_summaries[name] = report["summary"]
+        if report["timed_out"]:
+            timed_out = True
+            stop_reason = str(report["stop_reason"])
+            break
+        if report["stop_reason"] != "completed":
+            stop_reason = str(report["stop_reason"])
+            break
+
+    if not timed_out and stop_reason in {"completed", "disabled"}:
+        stop_reason = "completed"
 
     aggregate_summary = aggregate(task_summaries.values())
     source_summary = task_summaries.get(source_task, {})
@@ -341,22 +595,34 @@ def run_transfer_suite(
                 delta[f"{key}_delta"] = float(summary[key] - source_summary[key])
         transfer_deltas[name] = delta
 
-    return _stamp_canonical_report({
+    report = {
         "source_task": source_task,
         "adapt_steps": int(adapt_steps),
-        "adapt_history": adapt_history,
+        "adapt_history": adapt_report["history"],
+        "adapt_requested_steps": adapt_report["requested_steps"],
+        "adapt_completed_steps": adapt_report["n_steps"],
+        "adapt_timed_out": adapt_report["timed_out"],
+        "adapt_stop_reason": adapt_report["stop_reason"],
         "task_reports": task_reports,
         "task_summaries": task_summaries,
         "aggregate_summary": aggregate_summary,
         "transfer_deltas": transfer_deltas,
         "n_tasks": len(task_summaries),
+        "requested_tasks": len(task_map),
         "device": str(device),
-    }, include_repository_axis=True)
+        "timed_out": timed_out,
+        "stop_reason": stop_reason,
+        "wall_time_sec": float(time.perf_counter() - started_at),
+        "time_budget_sec": budget,
+    }
+    if active_seed is not None:
+        report["protocol_seed"] = int(active_seed)
+    return _stamp_canonical_report(report, include_repository_axis=True)
 
 
 def run_corpus_protocol(
     cfg: OMENScaleConfig,
-    protocol: Mapping[str, str] | str | Path,
+    protocol: Mapping[str, str | Mapping[str, object]] | str | Path,
     *,
     source_task: str | None = None,
     adapt_steps: int = 1,
@@ -368,13 +634,15 @@ def run_corpus_protocol(
     device: torch.device = DEVICE,
     force_creative_cycle: bool = True,
     metric_keys: Iterable[str] = DEFAULT_METRIC_KEYS,
+    seed: int | None = None,
+    time_budget_sec: float | None = None,
 ) -> Dict[str, object]:
-    protocol_map = (
+    protocol_entries = (
         load_corpus_protocol(protocol)
         if isinstance(protocol, (str, Path))
-        else {str(name): str(path) for name, path in protocol.items()}
+        else coerce_corpus_protocol(protocol)
     )
-    tasks = build_real_transfer_tasks(cfg, protocol_map, max_samples=max_samples)
+    tasks = build_real_transfer_tasks(cfg, protocol_entries, max_samples=max_samples)
     source = source_task or (next(iter(tasks.keys())) if tasks else "")
     report = run_transfer_suite(
         cfg,
@@ -388,9 +656,35 @@ def run_corpus_protocol(
         device=device,
         force_creative_cycle=force_creative_cycle,
         metric_keys=metric_keys,
+        seed=seed,
+        time_budget_sec=time_budget_sec,
     )
-    report["corpus_protocol"] = dict(protocol_map)
-    report["real_protocol_tasks"] = float(len(protocol_map))
+    weighted_summary = aggregate_weighted(
+        (report["task_summaries"].get(task_name, {}), float(spec.get("weight", 1.0)))
+        for task_name, spec in protocol_entries.items()
+    )
+    report["corpus_protocol"] = {name: dict(spec) for name, spec in protocol_entries.items()}
+    report["corpus_protocol_paths"] = {
+        name: str(spec["path"]) for name, spec in protocol_entries.items()
+    }
+    report["protocol_languages"] = _protocol_taxonomy(protocol_entries, "language")
+    report["protocol_families"] = _protocol_taxonomy(protocol_entries, "family")
+    report["protocol_sources"] = _protocol_taxonomy(protocol_entries, "source")
+    report["protocol_splits"] = _protocol_taxonomy(protocol_entries, "split")
+    report["protocol_language_summaries"] = _group_protocol_summaries(
+        report["task_summaries"], protocol_entries, "language"
+    )
+    report["protocol_family_summaries"] = _group_protocol_summaries(
+        report["task_summaries"], protocol_entries, "family"
+    )
+    report["protocol_source_summaries"] = _group_protocol_summaries(
+        report["task_summaries"], protocol_entries, "source"
+    )
+    report["protocol_weighted_summary"] = weighted_summary
+    report["real_protocol_tasks"] = float(len(protocol_entries))
+    report["real_protocol_languages"] = float(len(report["protocol_languages"]))
+    report["real_protocol_families"] = float(len(report["protocol_families"]))
+    report["real_protocol_sources"] = float(len(report["protocol_sources"]))
     return report
 
 
@@ -404,6 +698,14 @@ def main() -> None:
     parser.add_argument("--synthetic_samples", type=int, default=96)
     parser.add_argument("--batches", type=int, default=8)
     parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--adapt_steps", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--time_budget_sec",
+        type=float,
+        default=None,
+        help="Optional wall-clock budget for the whole run. Returns a partial report instead of hanging.",
+    )
     args = parser.parse_args()
 
     cfg = build_config(args.config)
@@ -411,19 +713,31 @@ def main() -> None:
         report = run_corpus_protocol(
             cfg,
             args.real_manifest,
-            adapt_steps=1,
+            adapt_steps=args.adapt_steps,
             eval_batches=args.batches,
             batch_size=args.batch_size,
             checkpoint=args.checkpoint,
             max_samples=args.max_samples,
             device=DEVICE,
+            seed=args.seed,
+            time_budget_sec=args.time_budget_sec,
         )
         print("omen-scale corpus protocol")
         print(f"device={report['device']}")
         print(f"config={args.config}")
         print(f"canonical_stack={report['canonical_stack']}")
         print(f"tasks={report['n_tasks']}")
+        print(f"requested_tasks={report['requested_tasks']}")
         print(f"source_task={report['source_task']}")
+        print(f"adapt_completed_steps={report['adapt_completed_steps']}")
+        print(f"seed={report.get('protocol_seed', args.seed)}")
+        print(f"timed_out={int(report['timed_out'])}")
+        print(f"stop_reason={report['stop_reason']}")
+        print(f"wall_time_sec={report['wall_time_sec']:.3f}")
+        if report.get("time_budget_sec") is not None:
+            print(f"time_budget_sec={report['time_budget_sec']:.3f}")
+        print(f"languages={','.join(report['protocol_languages'])}")
+        print(f"families={','.join(report['protocol_families'])}")
         for key, value in sorted(report["aggregate_summary"].items()):
             print(f"{key}={value:.6f}")
         return
@@ -436,6 +750,8 @@ def main() -> None:
         batch_size=args.batch_size,
         checkpoint=args.checkpoint,
         device=DEVICE,
+        seed=args.seed,
+        time_budget_sec=args.time_budget_sec,
     )
     summary = report["summary"]
     metric_keys = report["metric_keys"]
@@ -445,6 +761,13 @@ def main() -> None:
     print(f"config={args.config}")
     print(f"dataset={'real_text' if args.real_text else 'synthetic'}")
     print(f"batches={report['n_batches']}")
+    print(f"requested_batches={report['requested_batches']}")
+    print(f"seed={report.get('protocol_seed', args.seed)}")
+    print(f"timed_out={int(report['timed_out'])}")
+    print(f"stop_reason={report['stop_reason']}")
+    print(f"wall_time_sec={report['wall_time_sec']:.3f}")
+    if report.get("time_budget_sec") is not None:
+        print(f"time_budget_sec={report['time_budget_sec']:.3f}")
     if args.real_text:
         print(f"real_text={args.real_text}")
     if timings_ms:

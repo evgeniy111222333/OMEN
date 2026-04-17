@@ -72,9 +72,14 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertTrue(torch.allclose(out["z_world"], out["z_dense"]))
         self.assertIsInstance(out["z_graph_struct"], WorldGraphState)
         self.assertEqual(out["world_state"].batch_size, 1)
+        self.assertIsNotNone(out["world_state"].program_state)
+        self.assertGreater(len(out["world_state"].target_facts), 0)
         self.assertGreaterEqual(out["world_graph_nodes"], 1.0)
         self.assertGreaterEqual(out["world_graph_edges"], 1.0)
         self.assertGreaterEqual(out["world_graph_trace_steps"], 1.0)
+        self.assertGreaterEqual(out["world_graph_execution_steps"], 1.0)
+        self.assertEqual(out["world_graph_hidden_fallback_steps"], 0.0)
+        self.assertEqual(out["world_graph_hidden_teacher_applied"], 0.0)
         self.assertGreaterEqual(out["program_target_facts"], 1.0)
         self.assertGreaterEqual(out["program_anchor"], 0.0)
         self.assertGreaterEqual(out["program_decoder_ce"], 0.0)
@@ -192,6 +197,37 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         )
         self.assertIsNotNone(expected)
         self.assertTrue(torch.allclose(world_targets[0], expected, atol=1e-5, rtol=1e-4))
+        self.assertEqual(world_graph_batch.metadata["execution_supervised_steps"], float(world_targets.size(1)))
+        self.assertEqual(world_graph_batch.metadata["hidden_fallback_steps"], 0.0)
+        self.assertEqual(world_graph_batch.metadata["hidden_teacher_applied"], 0.0)
+
+    def test_execution_driven_fallback_uses_neutral_world_prior(self) -> None:
+        cfg = OMENScaleConfig.demo()
+        cfg.net_enabled = False
+        cfg.osf_enabled = False
+        cfg.emc_enabled = False
+        cfg.saliency_enabled = False
+        cfg.continuous_cycle_enabled = False
+        cfg.creative_cycle_enabled = False
+        cfg.world_graph_enabled = False
+        model = OMENScale(cfg)
+        model.eval()
+
+        code = "def add(a, b):\n    return a + b\n"
+        encoded = [ord(ch) for ch in code.encode("ascii", errors="ignore").decode("ascii")]
+        encoded = encoded[: cfg.seq_len]
+        if len(encoded) < cfg.seq_len:
+            encoded = encoded + [0] * (cfg.seq_len - len(encoded))
+        full = torch.tensor([encoded], dtype=torch.long)
+        src = full[:, :-1]
+        tgt = full[:, 1:]
+
+        out = model(src, tgt)
+        self.assertEqual(out["world_graph_hidden_teacher_applied"], 0.0)
+        self.assertEqual(out["world_graph_hidden_fallback_steps"], 0.0)
+        self.assertEqual(out["world_graph_neutral_prior_applied"], 1.0)
+        self.assertGreaterEqual(out["world_graph_neutral_prior_steps"], 1.0)
+        self.assertGreaterEqual(out["world_graph_execution_steps"], 1.0)
 
 
 if __name__ == "__main__":

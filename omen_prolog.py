@@ -4576,13 +4576,24 @@ class DifferentiableProver(nn.Module):
         zero = torch.zeros(1, device=device).squeeze()
         empty_stats = dict(empty_induction_stats())
         empty_stats.setdefault("repaired", 0.0)
+        cycle_active = bool(self.continuous_cycle_enabled and (self.training or self.continuous_cycle_eval_enabled))
+        eval_active = bool(cycle_active and not self.training)
+        learning_active = bool(cycle_active and (self.training or self.continuous_cycle_eval_learning_enabled))
         result: Dict[str, Any] = {
             "loss_tensor": zero,
             "mean_utility": 0.0,
             "accepted_rules": [],
             "added_rules": 0,
             "induction_stats": empty_stats,
+            "mode": "off",
             "stats": {
+                "active": float(cycle_active),
+                "eval_active": float(eval_active),
+                "learning_active": float(learning_active),
+                "candidate_budget": 0.0,
+                "trace_candidates": 0.0,
+                "contextual_candidates": 0.0,
+                "neural_candidates": 0.0,
                 "checked": 0.0,
                 "accepted": 0.0,
                 "added": 0.0,
@@ -4609,6 +4620,7 @@ class DifferentiableProver(nn.Module):
             return result
         if not self.training and not self.continuous_cycle_eval_enabled:
             return result
+        result["mode"] = "train" if self.training else "eval"
 
         effective_targets = target_facts or self._task_target_facts()
         if not effective_targets:
@@ -4638,6 +4650,9 @@ class DifferentiableProver(nn.Module):
                 tau=max(self.continuous_cycle_candidate_tau, 1e-3),
             )
             neural_specs = neural_specs[:self.continuous_cycle_max_neural]
+        result["stats"]["trace_candidates"] = float(len(trace_candidates))
+        result["stats"]["contextual_candidates"] = float(len(contextual_candidates))
+        result["stats"]["neural_candidates"] = float(len(neural_specs))
 
         candidate_specs: Dict[int, Tuple[HornClause, Optional[torch.Tensor], str, Optional[RelaxedHornClauseSpec]]] = {}
         for clause in trace_candidates:
@@ -4680,6 +4695,7 @@ class DifferentiableProver(nn.Module):
             + self.continuous_cycle_max_contextual
             + self.continuous_cycle_max_neural,
         )
+        result["stats"]["candidate_budget"] = float(budget)
         pending: List[Tuple[float, HornClause, Optional[torch.Tensor], str, Optional[RelaxedHornClauseSpec]]] = ranked_candidates[:budget]
         seen_candidate_hashes = {hash(clause) for _, clause, _, _, _ in pending}
         repair_budget = self.continuous_cycle_max_repairs
@@ -4981,6 +4997,8 @@ class DifferentiableProver(nn.Module):
                     + (1.0 - momentum) * float(reward_t.mean().item())
                 )
                 loss_tensor = loss_tensor + self.continuous_cycle_policy_weight * policy_loss_t
+            if not learning_active:
+                loss_tensor = loss_tensor.detach()
             result["loss_tensor"] = loss_tensor
 
         if accepted_rules:
@@ -5041,6 +5059,13 @@ class DifferentiableProver(nn.Module):
             "mean_score": mean_utility,
         }
         result["stats"] = {
+            "active": float(cycle_active),
+            "eval_active": float(eval_active),
+            "learning_active": float(learning_active),
+            "candidate_budget": float(budget),
+            "trace_candidates": float(len(trace_candidates)),
+            "contextual_candidates": float(len(contextual_candidates)),
+            "neural_candidates": float(len(neural_specs)),
             "checked": float(checked),
             "accepted": float(accepted),
             "added": float(added_rules),
@@ -6066,6 +6091,11 @@ class DifferentiableProver(nn.Module):
         self.last_goal = goal
         self.last_context_facts = working_facts
         self.last_all_facts = all_facts
+        cycle_mode = "off"
+        if self.continuous_cycle_enabled:
+            cycle_mode = "train" if self.training else (
+                "eval" if self.continuous_cycle_eval_enabled else "off"
+            )
         self.last_forward_info = {
             "goal_proved": 1.0 if goal_supported else 0.0,
             "target_coverage": target_coverage,
@@ -6081,6 +6111,13 @@ class DifferentiableProver(nn.Module):
               "induction_repaired": induction_stats.get("repaired", 0.0),
               "induction_matches": induction_stats["matched_predictions"],
               "induction_score": induction_stats["mean_score"],
+              "cycle_active": float(cycle_stats.get("active", 0.0)),
+              "cycle_eval_active": float(cycle_stats.get("eval_active", 0.0)),
+              "cycle_learning_active": float(cycle_stats.get("learning_active", 0.0)),
+              "cycle_candidate_budget": float(cycle_stats.get("candidate_budget", 0.0)),
+              "cycle_trace_candidates": float(cycle_stats.get("trace_candidates", 0.0)),
+              "cycle_contextual_candidates": float(cycle_stats.get("contextual_candidates", 0.0)),
+              "cycle_neural_candidates": float(cycle_stats.get("neural_candidates", 0.0)),
               "cycle_checked": float(cycle_stats.get("checked", 0.0)),
               "cycle_accepted": float(cycle_stats.get("accepted", 0.0)),
               "cycle_added": float(cycle_stats.get("added", 0.0)),
@@ -6130,6 +6167,21 @@ class DifferentiableProver(nn.Module):
               "creative_ontology_fixed_predicates": float(
                   creative_report.metrics.get("ontology_fixed_predicates", 0.0)
               ),
+              "creative_oee_model_initialized": float(
+                  creative_report.metrics.get("oee_model_initialized", 0.0)
+              ),
+              "creative_oee_feedback_buffer_size": float(
+                  creative_report.metrics.get("oee_feedback_buffer_size", 0.0)
+              ),
+              "creative_oee_online_train_applied": float(
+                  creative_report.metrics.get("oee_online_train_applied", 0.0)
+              ),
+              "creative_oee_online_train_loss": float(
+                  creative_report.metrics.get("oee_online_train_loss", 0.0)
+              ),
+              "creative_oee_online_train_steps": float(
+                  creative_report.metrics.get("oee_online_train_steps", 0.0)
+              ),
               "creative_selected_rules": float(creative_report.metrics.get("selected_rules", 0.0)),
               "creative_selected_mean_utility": float(creative_report.metrics.get("selected_mean_utility", 0.0)),
               "creative_intrinsic_value": float(creative_report.metrics.get("intrinsic_value", 0.0)),
@@ -6148,6 +6200,7 @@ class DifferentiableProver(nn.Module):
             "trace_steps": float(self.task_context.metadata.get("trace_steps", 0.0)) if self.task_context is not None else 0.0,
             "trace_counterexamples": float(self.task_context.metadata.get("trace_counterexamples", 0.0)) if self.task_context is not None else 0.0,
             "used_rules": float(len(self.last_used_rules)),
+            "cycle_mode": cycle_mode,
             "provenance": provenance,
         }
 

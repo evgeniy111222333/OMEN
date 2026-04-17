@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import sys
 import unittest
+from pathlib import Path
 
 import torch
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from omen_prolog import (
     Const,
@@ -386,6 +392,76 @@ class CreativeSymbolicEnginesTest(unittest.TestCase):
             contradiction_count=0,
         )
         self.assertTrue(candidates)
+
+    def test_oee_online_training_updates_latent_model_and_stats(self) -> None:
+        torch.manual_seed(0)
+        engine = OntologyExpansionEngine(
+            gap_threshold=0.2,
+            contradiction_threshold=1,
+            train_every_n_calls=1,
+        )
+        kb = KnowledgeBase(max_rules=16)
+        facts = [
+            atom(50, Const(1), Const(2)),
+            atom(51, Const(2), Const(3)),
+        ]
+        for fact in facts:
+            kb.add_fact(fact)
+        goal = atom(60, Const(1), Const(3))
+        predicate_embeddings = {
+            50: torch.randn(8),
+            51: torch.randn(8),
+            60: torch.randn(8),
+        }
+
+        for step in range(4):
+            candidates = engine.generate_candidates(
+                current_facts=facts,
+                goal=goal,
+                gap_norm=0.9,
+                contradiction_count=2,
+                max_candidates=2,
+                target_facts=[goal],
+                predicate_embeddings=predicate_embeddings,
+                kb=kb,
+                existing_rules=[],
+            )
+            self.assertTrue(candidates)
+            pred_ids = tuple(
+                int(candidate.metadata.get("invented_predicate", 0.0))
+                for candidate in candidates
+                if int(candidate.metadata.get("invented_predicate", 0.0)) > 0
+            )
+            self.assertTrue(pred_ids)
+            engine.record_feedback(
+                accepted=(step % 2 == 0),
+                accepted_pred_ids=pred_ids,
+                gap_before=0.9,
+                gap_after=0.2 if step % 2 == 0 else 0.9,
+                supporting_rules=[candidates[0].clause],
+            )
+
+        self.assertIsNotNone(engine._latent_model)
+        before = next(engine._latent_model.parameters()).detach().clone()
+        _ = engine.generate_candidates(
+            current_facts=facts,
+            goal=goal,
+            gap_norm=0.9,
+            contradiction_count=2,
+            max_candidates=2,
+            target_facts=[goal],
+            predicate_embeddings=predicate_embeddings,
+            kb=kb,
+            existing_rules=[],
+        )
+        after = next(engine._latent_model.parameters()).detach()
+        stats = engine.stats()
+
+        self.assertEqual(stats["oee_model_initialized"], 1.0)
+        self.assertEqual(stats["oee_online_train_applied"], 1.0)
+        self.assertGreater(stats["oee_online_train_loss"], 0.0)
+        self.assertGreaterEqual(stats["oee_online_train_steps"], 1.0)
+        self.assertFalse(torch.allclose(before, after))
 
     def test_counterfactual_patterns_can_be_routed_into_ame(self) -> None:
         x, y, z = Var("X"), Var("Y"), Var("Z")
