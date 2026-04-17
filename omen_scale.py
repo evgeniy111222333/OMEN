@@ -1,6 +1,6 @@
 """
-omen_scale.py — OMEN-Scale: Повна архітектура наступного покоління
-====================================================================
+omen_scale.py — OMEN-Scale: canonical OMEN runtime stack
+========================================================
 Три рівні + Async M-Core + ∂-Prolog:
 
   Level 1 (Token/Fine):   LlamaDecoderBlock stack,  d_tok, V≥50k
@@ -19,7 +19,7 @@ omen_scale.py — OMEN-Scale: Повна архітектура наступно
             + L_scale                                 ← MDL рівнів
             + λ_rule·Complexity(Γ)                    ← MDL правил
 
-Зовнішні залежності: omen_v2, omen_perceiver, omen_prolog, omen_scale_config
+Зовнішні залежності: omen_world_model, omen_data, omen_perceiver, omen_prolog, omen_scale_config
 """
 
 from __future__ import annotations
@@ -39,6 +39,11 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ─── Локальні модулі ──────────────────────────────────────────────────────────
 from omen_scale_config import OMENScaleConfig
+from omen_canonical import (
+    CANONICAL_OMEN_SPEC,
+    CanonicalArchitectureSpec,
+    inject_canonical_metadata,
+)
 from omen_perceiver    import (PerceiverResampler, LlamaDecoderBlock,
                                 RMSNorm, SwiGLUFFN, LlamaAttention,
                                 l_scale_penalty)
@@ -68,6 +73,7 @@ from omen_net_tokenizer import NeuralEpistemicTokenizer
 from omen_saliency import SaliencyTraceModule
 from omen_symbolic.integration import SymbolicStateIntegrator
 from omen_symbolic.memory_index import SymbolicMemoryIndex
+from omen_symbolic.world_graph import CanonicalWorldState, WorldGraphBatch, WorldGraphEncoder
 from omen_symbolic.execution_trace import (
     TRACE_ASSIGN_EVENT_PRED,
     TRACE_BINOP_EVENT_PRED,
@@ -89,14 +95,14 @@ from omen_emc import EfficientMetaController
 # OSF: OMEN Synthesis Framework (ієрархічна нейро-символьна генерація)
 from omen_osf import OSFSynthesizer, OSFConfig
 
-# Запозичуємо стабільні компоненти v2
-from omen_v2 import (
+# Канонічні world/model компоненти та датасет-утиліти
+from omen_world_model import (
     WorldRNN,
     EpistemicGapDetector,
     CuriosityModule,
-    OMENv2Config,
-    make_counting, make_python, make_rule_transfer, collate,
+    OMENCoreConfig,
 )
+from omen_data import make_counting, make_python, make_rule_transfer, collate
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -445,6 +451,8 @@ class OMENScaleLoss(nn.Module):
                 meta_loss:    Optional[torch.Tensor] = None,  # ω_meta·L_AC (EMC)
                 traj_reward:  Optional[float]       = None,   # Σ_t r_t траєкторії
                 reasoning_cost: Optional[float]    = None,   # Cost(Reasoning)
+                program_anchor: Optional[torch.Tensor] = None,
+                program_decoder_ce: Optional[torch.Tensor] = None,
                 seen_tokens:  Optional[int]        = None,
                 train_step:   int                  = 0,
                 ) -> Dict:
@@ -562,6 +570,17 @@ class OMENScaleLoss(nn.Module):
             to_bits=True,
             reduction="sum",
         )
+        memory_read_alpha = float(getattr(cfg, "alpha", 0.1))
+        vfe_beta = float(getattr(cfg, "vfe_beta_kl", 1.0))
+        latent_scale_bits = (
+            l_scale_penalty(
+                z_tok,
+                z_latents,
+                float(getattr(cfg, "lambda_tok", 1.0)),
+                float(getattr(cfg, "lambda_conc", 1.0)),
+            )
+            * float(valid_tokens)
+        )
 
         # ── 6. L_scale: MDL для рівнів у єдиній валюті bits/token ─────────────
         if model_bits is None:
@@ -575,11 +594,12 @@ class OMENScaleLoss(nn.Module):
                 "vocab", torch.zeros((), device=z.device, dtype=z.dtype)
             )
         L_scale = neural_model_bits + vocab_model_bits
-        rule_bits = torch.as_tensor(
+        rule_bits_raw = torch.as_tensor(
             float(ltm_penalty),
             dtype=z.dtype,
             device=z.device,
         )
+        rule_bits = float(getattr(cfg, "lambda_rule", 1e-4)) * rule_bits_raw
 
         # ── 7. Symbolic Generalization ────────────────────────────────────────
         L_sym   = sym_loss
@@ -618,6 +638,27 @@ class OMENScaleLoss(nn.Module):
             meta_w = omega_meta
 
         # ── 10. J_OMEN+EMC: 7-ма компонента — траєкторна мета-винагорода ─────
+        program_enabled = bool(getattr(cfg, "program_anchor_enabled", True))
+        program_anchor_w = (
+            float(getattr(cfg, "program_anchor_weight", 0.10))
+            if program_enabled else 0.0
+        )
+        program_decoder_w = (
+            float(getattr(cfg, "program_decoder_weight", 0.05))
+            if program_enabled else 0.0
+        )
+        program_anchor_t = (
+            program_anchor.clamp(max=5.0)
+            if program_anchor is not None and torch.is_tensor(program_anchor)
+            else torch.zeros((), device=z.device, dtype=z.dtype)
+        )
+        program_decoder_nats = (
+            program_decoder_ce.clamp(max=10.0)
+            if program_decoder_ce is not None and torch.is_tensor(program_decoder_ce)
+            else torch.zeros((), device=z.device, dtype=z.dtype)
+        )
+        program_decoder_bits = program_decoder_nats / math.log(2.0)
+
         if traj_reward is not None and traj_reward != 0.0:
             L_traj = -torch.tensor(traj_reward, dtype=torch.float32, device=z.device).clamp(-5.0, 5.0)
         else:
@@ -643,10 +684,9 @@ class OMENScaleLoss(nn.Module):
                             else min(float(curiosity_l), 5.0)
         observation_bits = token_bits_total + world_nll
         local_complexity_bits = (
-            L_kl
-            + L_mem_kl
-            + L_sym_kl
-            + memory_read_nll
+            vfe_beta * (L_kl + L_mem_kl + L_sym_kl)
+            + memory_read_alpha * memory_read_nll
+            + latent_scale_bits
         )
         mdl_seen_tokens = max(int(seen_tokens or valid_tokens), valid_tokens)
         global_model_bits = L_scale + rule_bits
@@ -667,6 +707,8 @@ class OMENScaleLoss(nn.Module):
             + meta_w * L_meta
             + meta_w * L_traj
             + meta_w * L_reason
+            + program_anchor_w * program_anchor_t
+            + program_decoder_w * program_decoder_bits
         )
         free_energy = bits_per_token
         total = bits_per_token + auxiliary_energy
@@ -693,16 +735,22 @@ class OMENScaleLoss(nn.Module):
             "kl":         (L_kl / float(valid_tokens)).item(),
             "mem_kl":     (L_mem_kl / float(valid_tokens)).item(),
             "sym_kl":     (L_sym_kl / float(valid_tokens)).item(),
+            "vfe_beta_kl": vfe_beta,
             "recall":     L_recall.item(),
-            "novelty":    (memory_read_nll / float(valid_tokens)).item(),
-            "memory_read_nll": (memory_read_nll / float(valid_tokens)).item(),
-            "memory_bits": memory_read_nll.item(),
+            "novelty":    (memory_read_alpha * memory_read_nll / float(valid_tokens)).item(),
+            "memory_read_nll": (memory_read_alpha * memory_read_nll / float(valid_tokens)).item(),
+            "memory_read_nll_raw": (memory_read_nll / float(valid_tokens)).item(),
+            "memory_read_alpha": memory_read_alpha,
+            "memory_bits": (memory_read_alpha * memory_read_nll).item(),
             "l_scale":    (L_scale / float(mdl_seen_tokens)).item(),
+            "l_scale_latent": (latent_scale_bits / float(valid_tokens)).item(),
             "model_bits": neural_model_bits.item(),
             "model_bits_bpt": (neural_model_bits / float(mdl_seen_tokens)).item(),
             "vocab_bits": vocab_model_bits.item(),
             "vocab_bits_bpt": (vocab_model_bits / float(mdl_seen_tokens)).item(),
             "rule_bits":  rule_bits.item(),
+            "rule_bits_raw": rule_bits_raw.item(),
+            "rule_lambda": float(getattr(cfg, "lambda_rule", 1e-4)),
             "rule_bits_bpt": (rule_bits / float(mdl_seen_tokens)).item(),
             "mdl_token_budget": float(valid_tokens),
             "mdl_seen_tokens": float(mdl_seen_tokens),
@@ -723,6 +771,11 @@ class OMENScaleLoss(nn.Module):
             "net_loss":   net_loss_scalar,
             "vem_pen":    L_vem.item() if torch.is_tensor(L_vem) else float(L_vem),
             "meta_loss":  L_meta.item() if torch.is_tensor(L_meta) else float(L_meta),
+            "program_anchor": program_anchor_t.item(),
+            "program_anchor_w": program_anchor_w,
+            "program_decoder_ce": program_decoder_nats.item(),
+            "program_decoder_bits": program_decoder_bits.item(),
+            "program_decoder_w": program_decoder_w,
             "traj_reward": traj_reward if traj_reward is not None else 0.0,
             "reasoning_cost": L_reason.item(),
             "aux_phase":  aux_phase,
@@ -746,8 +799,8 @@ class SymbolicFactCache:
       «Парсинг виконується один раз при підготовці даних, не замедляє навчання.»
 
     Ключ: SHA-1 хеш від байтів вхідної послідовності.
-    Значення: Tuple[List[HornAtom], List[HornClause], object]
-      (facts + rule templates + optional execution-trace bundle)
+    Значення: Tuple[List[HornAtom], List[HornClause], object, Optional[str]]
+      (facts + rule templates + optional execution-trace bundle + detected AST language)
 
     Розмір кешу обмежений max_entries (LRU eviction через OrderedDict).
     Thread-safe для читання (запис відбувається лише в одному потоці під GIL).
@@ -762,7 +815,7 @@ class SymbolicFactCache:
 
     def _key(self, src_row: torch.Tensor) -> str:
         import hashlib
-        raw = bytes(int(v) % 256 for v in src_row.tolist())
+        raw = bytes(int(v) % 256 for v in src_row.tolist()).rstrip(b"\x00")
         return hashlib.sha1(raw).hexdigest()
 
     @staticmethod
@@ -771,11 +824,14 @@ class SymbolicFactCache:
             return None
         if len(entry) == 2:
             facts, rules = entry
-            return facts, rules, None
+            return facts, rules, None, None
+        if len(entry) == 3:
+            facts, rules, trace_bundle = entry
+            return facts, rules, trace_bundle, None
         return entry
 
     def get(self, src_row: torch.Tensor):
-        """Повертає (facts, rules, trace_bundle) або None при cache miss."""
+        """Повертає (facts, rules, trace_bundle, detected_lang) або None при cache miss."""
         k = self._key(src_row)
         if k in self._cache:
             self._cache.move_to_end(k)
@@ -784,9 +840,9 @@ class SymbolicFactCache:
         self._misses += 1
         return None
 
-    def put(self, src_row: torch.Tensor, facts, rules, trace_bundle=None) -> None:
+    def put(self, src_row: torch.Tensor, facts, rules, trace_bundle=None, detected_lang: Optional[str] = None) -> None:
         k = self._key(src_row)
-        self._cache[k] = (facts, rules, trace_bundle)
+        self._cache[k] = (facts, rules, trace_bundle, detected_lang)
         self._cache.move_to_end(k)
         if len(self._cache) > self._max:
             self._cache.popitem(last=False)
@@ -1259,12 +1315,28 @@ class OMENScale(nn.Module):
         self.world_obs_logvar = nn.Parameter(torch.zeros(()))
 
         # ─── Рівень 2: Concept ────────────────────────────────────────────────
-        v2cfg = _make_v2_compat(cfg)
-        self.world_rnn = WorldRNN(v2cfg)
+        core_cfg = _make_core_compat(cfg)
+        self.world_rnn = WorldRNN(core_cfg)
         self.memory    = AsyncTensorProductMemory(cfg)
 
-        self.epistemic = EpistemicGapDetector(v2cfg)
-        self.curiosity = CuriosityModule(v2cfg)
+        self.epistemic = EpistemicGapDetector(core_cfg)
+        self.curiosity = CuriosityModule(core_cfg)
+        self.world_graph_enabled = bool(getattr(cfg, "world_graph_enabled", True))
+        self.world_graph = WorldGraphEncoder(
+            d_latent=cfg.d_latent,
+            pred_buckets=int(getattr(cfg, "world_graph_pred_buckets", 4096)),
+            term_buckets=int(getattr(cfg, "world_graph_term_buckets", 8192)),
+            max_nodes=int(getattr(cfg, "world_graph_max_nodes", 128)),
+            max_edges=int(getattr(cfg, "world_graph_max_edges", 512)),
+            n_layers=int(getattr(cfg, "world_graph_layers", 2)),
+            max_transitions=int(getattr(cfg, "world_graph_max_transitions", 16)),
+        )
+        self.world_graph_gate = nn.Sequential(
+            nn.Linear(cfg.d_latent * 2, cfg.d_latent),
+            nn.GELU(),
+            nn.Linear(cfg.d_latent, cfg.d_latent),
+            nn.Sigmoid(),
+        )
         self.world_target_proj = nn.Sequential(
             nn.Linear(cfg.d_tok, cfg.d_latent),
             nn.GELU(),
@@ -1312,6 +1384,8 @@ class OMENScale(nn.Module):
         self.prover.set_allow_latent_goal_fallback(False)
         self.prover.configure_hypothesis_cycle(
             enabled=getattr(cfg, "continuous_cycle_enabled", True),
+            eval_enabled=getattr(cfg, "continuous_cycle_eval_enabled", True),
+            eval_learning_enabled=getattr(cfg, "continuous_cycle_eval_learning_enabled", True),
             max_contextual=getattr(cfg, "continuous_cycle_contextual", 4),
             max_neural=getattr(cfg, "continuous_cycle_neural", 4),
             accept_threshold=getattr(cfg, "continuous_cycle_accept_threshold", 0.55),
@@ -1339,6 +1413,41 @@ class OMENScale(nn.Module):
 
         # ─── KB ↔ NET інтеграція: NET реєструє концепти прямо в Prolog-KB ──────
         # Раніше KB була відключена від NET → абдукція не бачила токен-концептів.
+        self.prover.configure_creative_cycle(
+            enabled=getattr(cfg, "creative_cycle_enabled", True),
+            cycle_every=getattr(cfg, "creative_cycle_every", 4),
+            max_selected_rules=getattr(cfg, "creative_max_selected_rules", 2),
+            analogy_dim=getattr(cfg, "ame_embedding_dim", 16),
+            tau_analogy=getattr(cfg, "ame_tau_analogy", 0.82),
+            analogy_hidden_dim=getattr(cfg, "ame_hidden_dim", 64),
+            analogy_gnn_layers=getattr(cfg, "ame_gnn_layers", 2),
+            analogy_spec_ratio=getattr(cfg, "ame_spec_ratio", 0.5),
+            analogy_temperature=getattr(cfg, "ame_temperature", 0.07),
+            analogy_contrastive_steps=getattr(cfg, "ame_contrastive_steps", 2),
+            analogy_contrastive_lr=getattr(cfg, "ame_contrastive_lr", 3e-3),
+            analogy_dropout=getattr(cfg, "ame_dropout", 0.10),
+            cwe_max_rule_mods=getattr(cfg, "cwe_max_rule_mods", 2),
+            cwe_surprise_lambda=getattr(cfg, "cwe_surprise_lambda", 0.5),
+            cwe_max_candidates=getattr(cfg, "cwe_max_candidates", 8),
+            cwe_max_transforms_per_rule=getattr(cfg, "cwe_max_transforms_per_rule", 4),
+            aee_population=getattr(cfg, "aee_population", 16),
+            aee_generations=getattr(cfg, "aee_generations", 2),
+            aee_gamma=getattr(cfg, "aee_gamma", 0.25),
+            aee_mutation_rate=getattr(cfg, "aee_mutation_rate", 0.35),
+            aee_crossover_rate=getattr(cfg, "aee_crossover_rate", 0.5),
+            aee_ltm_seed_ratio=getattr(cfg, "aee_ltm_seed_ratio", 0.35),
+            aee_gene_pool_size=getattr(cfg, "aee_gene_pool_size", 32),
+            oee_gap_threshold=getattr(cfg, "oee_gap_threshold", 0.45),
+            oee_contradiction_threshold=getattr(cfg, "oee_contradiction_threshold", 1),
+            oee_d_latent=getattr(cfg, "oee_d_latent", 32),
+            oee_consistency_lambda=getattr(cfg, "oee_consistency_lambda", 0.1),
+            oee_online_lr=getattr(cfg, "oee_online_lr", 1e-3),
+            oee_forward_chain_depth=getattr(cfg, "oee_forward_chain_depth", 2),
+            oee_max_interaction_preds=getattr(cfg, "oee_max_interaction_preds", 3),
+            oee_max_hypotheses=getattr(cfg, "oee_max_hypotheses", 8),
+            ice_state_history=getattr(cfg, "ice_state_history", 128),
+            ice_goal_threshold=getattr(cfg, "ice_goal_threshold", 0.35),
+        )
         if cfg.net_enabled:
             self.net.attach_kb(self.prover.kb)
 
@@ -1437,6 +1546,9 @@ class OMENScale(nn.Module):
         self._sym_qg_enabled = sym_qg_enabled
         self._last_ce_utility: float = 0.0
         self.ce_reinforce_enabled: bool = bool(getattr(cfg, "ce_reinforce_enabled", False))
+        self.ce_reinforce_eval_enabled: bool = bool(
+            getattr(cfg, "ce_reinforce_eval_enabled", True)
+        )
         self.ce_reinforce_fallback_only: bool = bool(getattr(cfg, "ce_reinforce_fallback_only", True))
         self.ce_reinforce_retro_every: int = int(getattr(cfg, "ce_reinforce_retro_every", 0))
         # Running CE EMA для reward feedback у S-Core (пункт 1/5 ідеальної реалізації)
@@ -1444,6 +1556,10 @@ class OMENScale(nn.Module):
         #   чи правила, що були абдуковані, допомогли покращити мовну модель.
         self._prev_ce: float = float("inf")
         self._ce_ema: float = float("inf")   # окремий smooth EMA для VeM retro
+
+    @staticmethod
+    def canonical_architecture() -> CanonicalArchitectureSpec:
+        return CANONICAL_OMEN_SPEC
 
     # ── CE-Driven Abduce→Deduce→Induce: замикання зворотного зв'язку ─────────
     def _install_symbolic_bootstrap_rules(self) -> None:
@@ -1671,18 +1787,280 @@ class OMENScale(nn.Module):
         weights = F.softmax(sims, dim=-1)
         return weights[:, :1] * v_holo + weights[:, 1:] * v_epi
 
+    def _build_world_graph_batch(
+        self,
+        src: torch.Tensor,
+        saliency_out: Optional[object] = None,
+    ) -> WorldGraphBatch:
+        if not self.world_graph_enabled:
+            zeros = torch.zeros(src.size(0), self.cfg.d_latent, device=src.device)
+            return WorldGraphBatch(graphs=tuple(), pooled_states=zeros, metadata={"enabled": 0.0})
+
+        graphs = []
+        pooled_states = []
+        total_nodes = 0.0
+        total_edges = 0.0
+        trace_graphs = 0.0
+        max_pairs = max(int(getattr(self.cfg, "world_graph_max_nodes", 128)) // 2, 8)
+        for batch_idx in range(src.size(0)):
+            src_row = src[batch_idx].detach().cpu()
+            pair_cap = min(max(src_row.numel() - 1, 0), max_pairs)
+            start_idx = max(src_row.numel() - pair_cap - 1, 0)
+            graph_facts: List[HornAtom] = []
+            for pos in range(start_idx, max(src_row.numel() - 1, 0)):
+                graph_facts.append(
+                    HornAtom(
+                        SEQ_EDGE_PRED,
+                        (int(src_row[pos].item()), int(src_row[pos + 1].item())),
+                    )
+                )
+            if src_row.numel() > 0:
+                graph_facts.append(
+                    HornAtom(
+                        SEQ_LAST_TOKEN_PRED,
+                        (int(src_row[-1].item()), max(int(src_row.numel()) - 1, 0)),
+                    )
+                )
+
+            ast_facts = self._ast_facts_from_bytes(src_row)
+            if ast_facts:
+                graph_facts.extend(ast_facts)
+            trace_bundle = self._ast_trace_from_bytes(src_row)
+            saliency_facts: List[HornAtom] = []
+            if saliency_out is not None:
+                saliency_facts.extend(list(saliency_out.sal_semantic_facts[batch_idx]))
+                saliency_facts.extend(list(saliency_out.sal_expected_facts[batch_idx]))
+            graph_facts = self._dedupe_facts(
+                graph_facts,
+                limit=int(getattr(self.cfg, "world_graph_max_nodes", 128)),
+            )
+            saliency_facts = self._dedupe_facts(
+                saliency_facts,
+                limit=max(int(getattr(self.cfg, "world_graph_max_nodes", 128)) // 2, 8),
+            )
+            graph = self.world_graph(
+                facts=graph_facts,
+                trace_bundle=trace_bundle,
+                saliency_facts=saliency_facts,
+                device=src.device,
+            )
+            graphs.append(graph)
+            pooled_states.append(graph.pooled_state)
+            total_nodes += float(len(graph.node_keys))
+            total_edges += float(len(graph.edges))
+            trace_graphs += float(graph.transition_targets is not None and graph.transition_targets.size(0) > 0)
+
+        metadata = {
+            "enabled": 1.0,
+            "mean_nodes": total_nodes / max(len(graphs), 1),
+            "mean_edges": total_edges / max(len(graphs), 1),
+            "trace_graphs": trace_graphs,
+            "trace_supervised_steps": 0.0,
+        }
+        if pooled_states:
+            pooled = torch.stack(pooled_states, dim=0)
+        else:
+            pooled = torch.zeros(src.size(0), self.cfg.d_latent, device=src.device)
+        return WorldGraphBatch(graphs=tuple(graphs), pooled_states=pooled, metadata=metadata)
+
+    def _ground_world_state(
+        self,
+        z_neural: torch.Tensor,
+        world_graph_batch: Optional[WorldGraphBatch],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if (
+            world_graph_batch is None
+            or world_graph_batch.pooled_states.numel() == 0
+            or not self.world_graph_enabled
+        ):
+            zeros = torch.zeros_like(z_neural)
+            ones = torch.zeros_like(z_neural)
+            return z_neural, zeros, ones
+        z_graph = world_graph_batch.pooled_states.to(device=z_neural.device, dtype=z_neural.dtype)
+        gate = self.world_graph_gate(torch.cat([z_neural, z_graph], dim=-1))
+        mix = float(getattr(self.cfg, "world_graph_state_mix", 0.35))
+        z_grounded = z_neural + mix * gate * (z_graph - z_neural)
+        return z_grounded, z_graph, gate
+
+    @staticmethod
+    def _fit_graph_sequence(
+        seq: Optional[torch.Tensor],
+        steps: int,
+        *,
+        pad_with_first: bool = True,
+    ) -> Optional[torch.Tensor]:
+        if seq is None or seq.numel() == 0 or steps <= 0:
+            return None
+        if seq.size(0) >= steps:
+            return seq[-steps:]
+        pad_steps = steps - seq.size(0)
+        pad_ref = seq[:1] if pad_with_first else seq[-1:]
+        pad = pad_ref.expand(pad_steps, -1)
+        return torch.cat([pad, seq], dim=0)
+
+    def _hidden_world_targets(
+        self,
+        h_tok: torch.Tensor,
+        actions: torch.Tensor,
+        max_steps: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        steps = min(max_steps, h_tok.size(1) - 1, actions.size(1))
+        h_slice = h_tok[:, -(steps + 1):, :]
+        teacher_states = self.world_target_proj(h_slice[:, :-1]).detach()
+        world_targets = self.world_target_proj(h_slice[:, 1:]).detach()
+        return teacher_states, world_targets, steps
+
+    def _compose_canonical_world_state(
+        self,
+        *,
+        z_neural: torch.Tensor,
+        z_graph_grounded: torch.Tensor,
+        z_graph_readout: torch.Tensor,
+        z_graph_anchor: torch.Tensor,
+        z_grounded: torch.Tensor,
+        z_graph: torch.Tensor,
+        z_program: torch.Tensor,
+        z_symbolic: torch.Tensor,
+        v_mem: torch.Tensor,
+        has_program_state: bool,
+        world_graph_batch: Optional[WorldGraphBatch],
+        task_context: SymbolicTaskContext,
+    ) -> CanonicalWorldState:
+        if world_graph_batch is None or not world_graph_batch.graphs:
+            fallback_graph = self.world_graph(
+                facts=tuple(task_context.observed_facts),
+                trace_bundle=task_context.execution_trace,
+                device=z_grounded.device,
+            )
+            graphs = tuple(fallback_graph for _ in range(z_grounded.size(0)))
+        else:
+            graphs = tuple(world_graph_batch.graphs)
+        metadata = {
+            "canonical_stack": 1.0,
+            "literal_graph_z": 1.0,
+            "graph_state_norm": float(z_graph.norm(dim=-1).mean().item()) if z_graph.numel() > 0 else 0.0,
+            "graph_readout_norm": float(z_graph_readout.norm(dim=-1).mean().item()) if z_graph_readout.numel() > 0 else 0.0,
+            "graph_anchor": float(z_graph_anchor.mean().item()) if z_graph_anchor.numel() > 0 else 0.0,
+            "grounded_state_norm": float(z_grounded.norm(dim=-1).mean().item()) if z_grounded.numel() > 0 else 0.0,
+            "program_state_norm": float(z_program.norm(dim=-1).mean().item()) if z_program.numel() > 0 else 0.0,
+        }
+        return CanonicalWorldState(
+            graphs=graphs,
+            neural_state=z_neural.detach(),
+            graph_grounded_state=z_graph_grounded.detach(),
+            graph_projection=z_graph.detach(),
+            graph_readout_state=z_graph_readout.detach(),
+            grounded_state=z_grounded.detach(),
+            symbolic_state=z_symbolic.detach(),
+            memory_state=v_mem.detach(),
+            program_state=z_program.detach() if has_program_state else None,
+            symbolic_facts=tuple(sorted(list(task_context.observed_facts), key=self._fact_sort_key)),
+            target_facts=tuple(sorted(list(task_context.target_facts), key=self._fact_sort_key)),
+            metadata=metadata,
+        )
+
+    def _graph_centered_decoder_state(
+        self,
+        z_query: torch.Tensor,
+        world_graph_batch: Optional[WorldGraphBatch],
+        *,
+        program_state: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if world_graph_batch is None or not world_graph_batch.graphs:
+            zeros = torch.zeros_like(z_query)
+            anchors = torch.zeros(
+                z_query.size(0),
+                device=z_query.device,
+                dtype=z_query.dtype,
+            )
+            return z_query, zeros, anchors
+        graph_mix = float(getattr(self.cfg, "world_graph_decoder_mix", 0.55))
+        return self.state_integrator.graph_centered(
+            z_query,
+            world_graph_batch.graphs,
+            program_state=program_state,
+            graph_mix=graph_mix,
+        )
+
     def _world_rollout_from_hidden(
         self,
         h_tok: torch.Tensor,
         actions: torch.Tensor,
+        world_graph_batch: Optional[WorldGraphBatch] = None,
         teacher_forcing_ratio: float = 0.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         max_steps = max(int(getattr(self.cfg, 'world_rollout_steps', 8)), 1)
         if h_tok.size(1) > 1 and actions.size(1) > 0:
-            steps = min(max_steps, h_tok.size(1) - 1, actions.size(1))
-            h_slice = h_tok[:, -(steps + 1):, :]
-            teacher_states = self.world_target_proj(h_slice[:, :-1]).detach()
-            world_targets = self.world_target_proj(h_slice[:, 1:]).detach()
+            teacher_states, world_targets, steps = self._hidden_world_targets(
+                h_tok,
+                actions,
+                max_steps,
+            )
+            graph_mix = float(getattr(self.cfg, "world_graph_teacher_mix", 0.65))
+            pooled_mix = float(getattr(self.cfg, "world_graph_pooled_mix", 0.25 * graph_mix))
+            trace_mix = float(getattr(self.cfg, "world_graph_trace_mix", graph_mix))
+            hidden_mix = float(getattr(self.cfg, "world_graph_hidden_mix", 0.15))
+            execution_driven = bool(getattr(self.cfg, "world_graph_execution_driven", True))
+            pad_with_first = bool(getattr(self.cfg, "world_graph_trace_pad_with_first", True))
+            trace_supervised_steps = 0.0
+            if world_graph_batch is not None and world_graph_batch.graphs:
+                pooled_states = world_graph_batch.pooled_states.detach().to(
+                    device=teacher_states.device,
+                    dtype=teacher_states.dtype,
+                )
+                pooled_states = pooled_states.unsqueeze(1).expand(-1, steps, -1)
+                if execution_driven:
+                    teacher_states = torch.lerp(pooled_states, teacher_states, hidden_mix)
+                    world_targets = torch.lerp(pooled_states, world_targets, hidden_mix)
+                else:
+                    teacher_states = torch.lerp(teacher_states, pooled_states, pooled_mix)
+                    world_targets = torch.lerp(world_targets, pooled_states, pooled_mix)
+                for batch_idx, graph in enumerate(world_graph_batch.graphs):
+                    if graph.transition_targets is None or graph.transition_states is None:
+                        continue
+                    trace_teacher = self._fit_graph_sequence(
+                        graph.transition_states.detach().to(
+                            device=teacher_states.device,
+                            dtype=teacher_states.dtype,
+                        ),
+                        steps,
+                        pad_with_first=pad_with_first,
+                    )
+                    trace_targets = self._fit_graph_sequence(
+                        graph.transition_targets.detach().to(
+                            device=world_targets.device,
+                            dtype=world_targets.dtype,
+                        ),
+                        steps,
+                        pad_with_first=pad_with_first,
+                    )
+                    if trace_teacher is None or trace_targets is None:
+                        continue
+                    if execution_driven:
+                        teacher_states[batch_idx] = torch.lerp(
+                            trace_teacher,
+                            teacher_states[batch_idx],
+                            hidden_mix,
+                        )
+                        world_targets[batch_idx] = trace_targets
+                    else:
+                        sample_steps = min(
+                            steps,
+                            graph.transition_targets.size(0),
+                            graph.transition_states.size(0),
+                        )
+                        teacher_states[batch_idx, -sample_steps:] = torch.lerp(
+                            teacher_states[batch_idx, -sample_steps:],
+                            trace_teacher[-sample_steps:],
+                            trace_mix,
+                        )
+                        world_targets[batch_idx, -sample_steps:] = torch.lerp(
+                            world_targets[batch_idx, -sample_steps:],
+                            trace_targets[-sample_steps:],
+                            trace_mix,
+                        )
+                    trace_supervised_steps += float(min(steps, trace_targets.size(0)))
+                world_graph_batch.metadata["trace_supervised_steps"] = trace_supervised_steps
             action_seq = actions[:, -steps:]
             z_sim_traj = self.world_rnn.simulate_sequence(
                 teacher_states[:, 0],
@@ -1693,6 +2071,16 @@ class OMENScale(nn.Module):
             return z_sim_traj, world_targets
 
         fallback_state = self.world_target_proj(h_tok[:, -1:, :]).detach()
+        if world_graph_batch is not None and world_graph_batch.graphs:
+            pooled_states = world_graph_batch.pooled_states.detach().to(
+                device=fallback_state.device,
+                dtype=fallback_state.dtype,
+            ).unsqueeze(1)
+            fallback_state = torch.lerp(
+                fallback_state,
+                pooled_states,
+                float(getattr(self.cfg, "world_graph_pooled_mix", 0.15)),
+            )
         fallback_actions = actions[:, -1:] if actions.size(1) > 0 else torch.zeros(
             h_tok.size(0), 1, dtype=torch.long, device=h_tok.device
         )
@@ -1818,6 +2206,19 @@ class OMENScale(nn.Module):
         query_emb = self.prover.ground(frozenset({query}), z_symbolic.device).expand(z_symbolic.size(0), -1)
         return self.symbolic_token_head(torch.cat([z_symbolic, query_emb], dim=-1))
 
+    @staticmethod
+    def _safe_cross_entropy(
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        ignore_index: int = 0,
+    ) -> torch.Tensor:
+        flat_targets = targets.reshape(-1)
+        flat_logits = logits.reshape(flat_targets.size(0), -1)
+        valid = flat_targets.ne(ignore_index)
+        if not bool(valid.any()):
+            return torch.zeros((), device=logits.device, dtype=logits.dtype)
+        return F.cross_entropy(flat_logits[valid], flat_targets[valid], reduction="mean")
+
     def _decoder_surprise_signal(
         self,
         h_tok: Optional[torch.Tensor],
@@ -1865,6 +2266,11 @@ class OMENScale(nn.Module):
         return unique
 
     @staticmethod
+    def _decode_source_bytes(src_row: torch.Tensor) -> str:
+        raw = bytes(int(v) % 256 for v in src_row.tolist()).rstrip(b"\x00")
+        return raw.decode("utf-8", errors="ignore")
+
+    @staticmethod
     def _prioritize_trace_targets(
         facts: FrozenSet[HornAtom],
         limit: int,
@@ -1888,6 +2294,35 @@ class OMENScale(nn.Module):
 
         ranked = sorted(list(facts), key=fact_key)
         return ranked[: max(int(limit), 0)]
+
+    @staticmethod
+    def _fact_sort_key(atom: HornAtom) -> Tuple[int, Tuple[int, ...], int]:
+        return (
+            int(atom.pred),
+            tuple(OMENScale._const_values_from_atom(atom)),
+            len(atom.args),
+        )
+
+    def _program_anchor_facts(
+        self,
+        task_context: SymbolicTaskContext,
+    ) -> FrozenSet[HornAtom]:
+        if not bool(getattr(self.cfg, "program_anchor_enabled", True)):
+            return frozenset()
+        limit = max(int(getattr(self.cfg, "program_anchor_max_facts", 24)), 0)
+        if limit <= 0:
+            return frozenset()
+        facts: List[HornAtom] = []
+        if task_context.goal is not None and task_context.goal.is_ground():
+            facts.append(task_context.goal)
+        facts.extend(sorted(list(task_context.target_facts), key=self._fact_sort_key))
+        trace_bundle = task_context.execution_trace
+        if trace_bundle is not None:
+            facts.extend(self._prioritize_trace_targets(trace_bundle.target_facts, limit=8))
+            facts.extend(
+                sorted(list(trace_bundle.observed_facts), key=self._fact_sort_key)[:8]
+            )
+        return frozenset(self._dedupe_facts(facts, limit=limit))
 
     @staticmethod
     def _first_const(atom: HornAtom) -> int:
@@ -1967,16 +2402,18 @@ class OMENScale(nn.Module):
         """
         cached = self._fact_cache.get(src_row)
         if cached is not None:
-            facts, _rules, _trace = cached
+            facts, _rules, _trace, _lang = cached
             return facts
 
         try:
-            code = bytes(int(v) % 256 for v in src_row.tolist()).decode("utf-8", errors="ignore")
+            code = self._decode_source_bytes(src_row)
         except Exception:
             return []
         if not code.strip():
             return []
+        detected_lang = "python"
         try:
+            detected_lang = self.ast_parser.detect_lang(code)
             # Автодетект мови замість фіксованого 'python'
             facts = self.ast_parser.parse_autodetect(code, source_id=0)
         except Exception:
@@ -1984,7 +2421,7 @@ class OMENScale(nn.Module):
         try:
             trace_bundle = build_symbolic_trace_bundle(
                 code,
-                lang_hint="python",
+                lang_hint=detected_lang,
                 max_steps=int(getattr(self.cfg, "sym_trace_max_steps", 24)),
                 max_counterexamples=int(getattr(self.cfg, "sym_trace_max_counterexamples", 4)),
             )
@@ -1997,7 +2434,7 @@ class OMENScale(nn.Module):
         except Exception:
             rule_templates = []
         # Зберігаємо в кеш
-        self._fact_cache.put(src_row, facts, rule_templates, trace_bundle)
+        self._fact_cache.put(src_row, facts, rule_templates, trace_bundle, detected_lang)
         return facts
 
     def _ast_rules_from_bytes(self, src_row: torch.Tensor):
@@ -2009,7 +2446,7 @@ class OMENScale(nn.Module):
         # Спочатку перевіряємо кеш (попередньо заповнений _ast_facts_from_bytes)
         cached = self._fact_cache.get(src_row)
         if cached is not None:
-            _facts, rules, _trace = cached
+            _facts, rules, _trace, _lang = cached
             return rules
         # Примусово парсимо, щоб заповнити кеш
         self._ast_facts_from_bytes(src_row)
@@ -2021,13 +2458,32 @@ class OMENScale(nn.Module):
     def _ast_trace_from_bytes(self, src_row: torch.Tensor):
         cached = self._fact_cache.get(src_row)
         if cached is not None:
-            _facts, _rules, trace_bundle = cached
+            _facts, _rules, trace_bundle, _lang = cached
             return trace_bundle
         self._ast_facts_from_bytes(src_row)
         cached = self._fact_cache.get(src_row)
         if cached is not None:
             return cached[2]
         return None
+
+    def _ast_lang_from_bytes(self, src_row: torch.Tensor) -> str:
+        cached = self._fact_cache.get(src_row)
+        if cached is not None:
+            _facts, _rules, _trace, detected_lang = cached
+            if isinstance(detected_lang, str) and detected_lang:
+                return detected_lang
+        try:
+            code = self._decode_source_bytes(src_row)
+        except Exception:
+            return "python"
+        if not code.strip():
+            return "python"
+        try:
+            detected_lang = self.ast_parser.detect_lang(code)
+        except Exception:
+            detected_lang = "python"
+        self._ast_facts_from_bytes(src_row)
+        return detected_lang
 
     def _build_counterfactual_actions(self, src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
         n_cf = max(int(getattr(self.cfg, "n_counterfactual", 0)), 0)
@@ -2112,6 +2568,7 @@ class OMENScale(nn.Module):
         # ── Пункт 1: факти з кешу (або on-the-fly при miss) ──────────────────
         ast_facts = self._ast_facts_from_bytes(src_row)
         trace_bundle = self._ast_trace_from_bytes(src_row)
+        ast_lang = self._ast_lang_from_bytes(src_row)
 
         # ── Пункт 6: завантажуємо AST правила-шаблони в KB (verified) ─────────
         # Це відповідає: «AST-факти як джерело правил, а не тільки фактів.»
@@ -2208,6 +2665,7 @@ class OMENScale(nn.Module):
                 "memory_facts": float(len(memory_facts or [])),
                 "trace_steps": float(len(trace_bundle.transitions) if trace_bundle is not None else 0),
                 "trace_counterexamples": float(len(trace_bundle.counterexamples) if trace_bundle is not None else 0),
+                "ast_lang": ast_lang,
             },
         )
 
@@ -2234,6 +2692,7 @@ class OMENScale(nn.Module):
 
         ast_facts = self._ast_facts_from_bytes(prompt_row)
         trace_bundle = self._ast_trace_from_bytes(prompt_row)
+        ast_lang = self._ast_lang_from_bytes(prompt_row)
         provenance = "token"
         if ast_facts:
             observed.extend(ast_facts)
@@ -2274,6 +2733,7 @@ class OMENScale(nn.Module):
                 "memory_facts": float(len(memory_facts or [])),
                 "trace_steps": float(len(trace_bundle.transitions) if trace_bundle is not None else 0),
                 "trace_counterexamples": float(len(trace_bundle.counterexamples) if trace_bundle is not None else 0),
+                "ast_lang": ast_lang,
             },
         )
 
@@ -2314,6 +2774,21 @@ class OMENScale(nn.Module):
 
         latents, z_base = self.perceiver(h_tok)                        # (B,n,d_lat), (B,d_lat)
         z, z_mu, z_logvar = self._sample_variational_latent(z_base)    # q(z|o)
+        z_neural = z
+
+        saliency_out = None
+        if self.saliency_enabled:
+            saliency_out = self.saliency(
+                attn_maps=attn_maps,
+                token_hidden=saliency_hidden,
+                z_neural=z,
+                prover=self.prover,
+                train_step=int(self._train_step.item()),
+            )
+
+
+        world_graph_batch = self._build_world_graph_batch(src, saliency_out=saliency_out)
+        z, z_graph, z_graph_gate = self._ground_world_state(z, world_graph_batch)
 
         # ── Level 2: M-Core читання ───────────────────────────────────────────
         v_mem = self._retrieve_memory(z)                               # (B, d_lat)
@@ -2324,7 +2799,10 @@ class OMENScale(nn.Module):
         # градієнт L_world тече → z_sim → WorldRNN.params, а не → z → perceiver.
         teacher_forcing_ratio = self._world_teacher_forcing_ratio() if self.training else 0.0
         z_sim_traj, world_targets = self._world_rollout_from_hidden(
-            h_tok, src, teacher_forcing_ratio=teacher_forcing_ratio
+            h_tok,
+            src,
+            world_graph_batch=world_graph_batch,
+            teacher_forcing_ratio=teacher_forcing_ratio,
         )
         z_sim    = z_sim_traj[:, -1]                                   # (B, d_lat)
 
@@ -2347,15 +2825,6 @@ class OMENScale(nn.Module):
             hint_facts=seed_memory_facts,
         )
 
-        saliency_out = None
-        if self.saliency_enabled:
-            saliency_out = self.saliency(
-                attn_maps=attn_maps,
-                token_hidden=saliency_hidden,
-                z_neural=z,
-                prover=self.prover,
-                train_step=int(self._train_step.item()),
-            )
         # ── Пункт 1+3+6: передаємо h_tok для динамічної цілі та кешованих фактів
         task_context = self._build_symbolic_task_context(
             src, tgt, gap_norm, hot_dims, saliency_out,
@@ -2363,6 +2832,13 @@ class OMENScale(nn.Module):
             decoder_signal=decoder_signal,
             memory_facts=recalled_memory_facts,
         )
+        if world_graph_batch.graphs:
+            task_context.metadata.update({
+                "world_graph_nodes": float(world_graph_batch.metadata.get("mean_nodes", 0.0)),
+                "world_graph_edges": float(world_graph_batch.metadata.get("mean_edges", 0.0)),
+                "world_graph_trace_steps": float(world_graph_batch.metadata.get("trace_supervised_steps", 0.0)),
+            })
+        program_target_facts = self._program_anchor_facts(task_context)
         self.prover.set_task_context(task_context)
 
         # ── Пункт 2: load_observed_facts() — завантажуємо факти у WM, не в KB ──
@@ -2416,15 +2892,53 @@ class OMENScale(nn.Module):
         )
 
         # ── Об'єднуємо рівні ─────────────────────────────────────────────────
-        z_final = self._combine_levels(z_symbolic_in, z_sym, v_mem)  # (B, d_lat)
+        z_fused = self._combine_levels(z_symbolic_in, z_sym, v_mem)  # (B, d_lat)
 
         # ── M-Core: буферизований запис ───────────────────────────────────────
+        z_program = torch.zeros_like(z_fused)
+        if program_target_facts:
+            z_program = self.prover.ground(program_target_facts, z_fused.device).expand(
+                z_fused.size(0), -1
+            )
+        z_final, z_graph_readout, z_graph_anchor = self._graph_centered_decoder_state(
+            z_fused,
+            world_graph_batch,
+            program_state=z_program if program_target_facts else None,
+        )
+        canonical_world_state = self._compose_canonical_world_state(
+            z_neural=z_neural,
+            z_graph_grounded=z,
+            z_graph_readout=z_graph_readout,
+            z_graph_anchor=z_graph_anchor,
+            z_grounded=z_final,
+            z_graph=z_graph,
+            z_program=z_program,
+            z_symbolic=z_sym,
+            v_mem=v_mem,
+            has_program_state=bool(program_target_facts),
+            world_graph_batch=world_graph_batch,
+            task_context=task_context,
+        )
+        program_anchor_loss = torch.zeros((), device=src.device)
+        program_decoder_ce = torch.zeros((), device=src.device)
+        if program_target_facts:
+            program_anchor_loss = 0.5 * (
+                F.mse_loss(z_final, z_program.detach())
+                + F.mse_loss(z_final.detach(), z_program)
+            )
+            program_decoder_logits = self._symbolic_token_logits(z_final, task_context)
+            program_decoder_ce = self._safe_cross_entropy(
+                program_decoder_logits,
+                tgt[:, -1].long(),
+                ignore_index=0,
+            )
+
         sym_stats = getattr(self.prover, "last_forward_info", {})
         target_coverage = float(sym_stats.get("target_coverage", 1.0))
         goal_proved = float(sym_stats.get("goal_proved", 1.0))
         surprise = 0.5 * gap_norm.clamp(0, 1) + 0.5 * (1.0 - target_coverage * goal_proved)
         conf = (1.0 - surprise).clamp(0.0, 1.0)
-        self.memory.schedule_write(z.detach(), world_targets[:, -1].detach(), conf.detach())
+        self.memory.schedule_write(z_final.detach(), world_targets[:, -1].detach(), conf.detach())
         sym_mem_written = self._write_symbolic_memory_facts(
             getattr(self.prover, "last_all_facts", frozenset()),
             float(conf.mean().item()),
@@ -2543,6 +3057,8 @@ class OMENScale(nn.Module):
             model_bits=model_bits,
             vem_penalty=vem_pen,
             meta_loss=meta_loss,
+            program_anchor=program_anchor_loss,
+            program_decoder_ce=program_decoder_ce,
             traj_reward=traj_reward,
             reasoning_cost=reasoning_cost,
             seen_tokens=int(max(int(self._seen_tokens.item()), 1)),
@@ -2576,6 +3092,8 @@ class OMENScale(nn.Module):
             out["sal_expected"] = saliency_out.sal_expected
             out["sal_edges"] = saliency_out.sal_edges
             out["sal_abduced"] = saliency_out.sal_abduced
+            out["sal_role_schema"] = "|".join(saliency_out.sal_role_names)
+            out["sal_named_role_preds"] = float(len(getattr(self.saliency, "named_role_predicates", {})))
 
         if self.osf_enabled and "j_osf" in osf_out:
             j_osf = osf_out["j_osf"]
@@ -2645,6 +3163,18 @@ class OMENScale(nn.Module):
         out["sym_trace_counterexamples"] = float(sym_stats.get("trace_counterexamples", 0.0))
         out["sym_used_rules"] = float(sym_stats.get("used_rules", 0.0))
         out["sym_provenance"] = sym_stats.get("provenance", task_context.provenance)
+        out["creative_abduction_candidates"] = float(sym_stats.get("creative_abduction_candidates", 0.0))
+        out["creative_analogy_candidates"] = float(sym_stats.get("creative_analogy_candidates", 0.0))
+        out["creative_metaphor_candidates"] = float(sym_stats.get("creative_metaphor_candidates", 0.0))
+        out["creative_counterfactual_candidates"] = float(sym_stats.get("creative_counterfactual_candidates", 0.0))
+        out["creative_ame_total_candidates"] = float(sym_stats.get("creative_ame_total_candidates", 0.0))
+        out["creative_ontology_candidates"] = float(sym_stats.get("creative_ontology_candidates", 0.0))
+        out["creative_selected_rules"] = float(sym_stats.get("creative_selected_rules", 0.0))
+        out["creative_intrinsic_value"] = float(sym_stats.get("creative_intrinsic_value", 0.0))
+        out["creative_analogy_projector_loss"] = float(sym_stats.get("creative_analogy_projector_loss", 0.0))
+        out["creative_analogy_embedding_source"] = float(
+            sym_stats.get("creative_analogy_embedding_source", 0.0)
+        )
         out["sym_query_pred"] = float(query_stats.get("pred", -1.0))
         out["sym_query_support"] = float(query_stats.get("support", 0.0))
         out["sym_query_answers"] = float(query_stats.get("n_answers", 0.0))
@@ -2663,12 +3193,32 @@ class OMENScale(nn.Module):
         out["sym_trigger_abduction"] = float(task_context.trigger_abduction)
         out["sym_mem_recalled"] = float(len(recalled_memory_facts))
         out["sym_mem_written"] = float(sym_mem_written)
+        ast_lang = str(task_context.metadata.get("ast_lang", ""))
+        out["sym_ast_lang_python"] = 1.0 if ast_lang == "python" else 0.0
+        out["sym_ast_lang_javascript"] = 1.0 if ast_lang == "javascript" else 0.0
+        out["sym_ast_lang_rust"] = 1.0 if ast_lang == "rust" else 0.0
+        out["sym_ast_lang_other"] = 1.0 if ast_lang not in ("", "python", "javascript", "rust") else 0.0
         if net_loss_dict:
             out["net_aux"] = float(net_loss_dict.get("net_aux", 0.0))
             out["net_vocab_pen"] = float(net_loss_dict.get("net_vocab_pen", 0.0))
 
         out["logits"]    = logits
-        out["z"]         = z_final
+        out["z"]         = canonical_world_state
+        out["z_dense"]   = z_final
+        out["z_program"] = z_program
+        out["z_graph"]   = z_graph
+        out["z_graph_readout"] = z_graph_readout
+        out["z_graph_struct"] = canonical_world_state.z
+        out["world_state"] = canonical_world_state
+        out["z_world"] = canonical_world_state.dense_state
+        out["program_target_facts"] = float(len(program_target_facts))
+        out["world_graph_nodes"] = float(world_graph_batch.metadata.get("mean_nodes", 0.0))
+        out["world_graph_edges"] = float(world_graph_batch.metadata.get("mean_edges", 0.0))
+        out["world_graph_trace_steps"] = float(world_graph_batch.metadata.get("trace_supervised_steps", 0.0))
+        out["world_graph_gate"] = float(z_graph_gate.mean().item())
+        out["z_graph_primary"] = 1.0
+        out["z_graph_anchor"] = float(z_graph_anchor.mean().item()) if z_graph_anchor.numel() > 0 else 0.0
+        out["z_graph_batch"] = float(canonical_world_state.batch_size)
         out["gap_norm"]  = gap_norm.mean().item()
         out["n_rules"]   = len(self.prover)
         out["n_writes"]  = self.memory.n_writes
@@ -2710,9 +3260,12 @@ class OMENScale(nn.Module):
         # Це ключовий пункт 1 ідеальної реалізації:
         #   «reinforce_recent_rules ПОВИНЕН викликатись після L_ce,
         #    з utility_target пропорційним покращенню перплексії»
-        if self.training and self.ce_reinforce_enabled:
+        if self.ce_reinforce_enabled and (
+            self.training or self.ce_reinforce_eval_enabled
+        ):
             self._ce_reinforce(out.get("ce", float("inf")), src.device)
         out["ce_reinforce_utility"] = getattr(self, "_last_ce_utility", 0.0)
+        inject_canonical_metadata(out)
 
         self.prover.clear_task_context()
         return out
@@ -2731,6 +3284,8 @@ class OMENScale(nn.Module):
             h_tok = self.tok_encoder(prompt)
         _, z_det = self.perceiver(h_tok)
         z, _, _ = self._sample_variational_latent(z_det)
+        init_world_graph = self._build_world_graph_batch(prompt, saliency_out=None)
+        z, _, _ = self._ground_world_state(z, init_world_graph)
         v_mem = self._retrieve_memory(z)
         z_symbolic_in = self._pre_symbolic_state(z, v_mem)
         seed_memory_facts = self._seed_symbolic_memory_facts(prompt)
@@ -2751,7 +3306,12 @@ class OMENScale(nn.Module):
             )
 
         if self.emc_enabled:
-            z_sim_traj, _ = self._world_rollout_from_hidden(h_tok, prompt, teacher_forcing_ratio=0.0)
+            z_sim_traj, _ = self._world_rollout_from_hidden(
+                h_tok,
+                prompt,
+                world_graph_batch=init_world_graph,
+                teacher_forcing_ratio=0.0,
+            )
             z_sim0 = z_sim_traj[:, -1]
             _, gap_norm0, _ = self.epistemic.compute(z, self.world_rnn, z_sim0)
             z_sym, v_mem_emc = self.emc.run_episode_eval(
@@ -2764,6 +3324,10 @@ class OMENScale(nn.Module):
             z_sym, _ = self.prover(z_symbolic_in, torch.tensor(0.0, device=z.device))
 
         z_final = self._combine_levels(z_symbolic_in, z_sym, v_mem)
+        z_final, _, _ = self._graph_centered_decoder_state(
+            z_final,
+            init_world_graph,
+        )
         generated = prompt.clone()
 
         for _ in range(max_new):
@@ -2774,6 +3338,8 @@ class OMENScale(nn.Module):
                 h_ctx = self.tok_encoder(ctx)
             _, z_ctx_det = self.perceiver(h_ctx)
             z_ctx, _, _ = self._sample_variational_latent(z_ctx_det)
+            step_world_graph = self._build_world_graph_batch(ctx, saliency_out=None)
+            z_ctx, _, _ = self._ground_world_state(z_ctx, step_world_graph)
             v_mem_ctx = self._retrieve_memory(z_ctx)
             z_symbolic_ctx = self._pre_symbolic_state(z_ctx, v_mem_ctx)
             step_seed_facts = self._seed_symbolic_memory_facts(ctx)
@@ -2796,7 +3362,10 @@ class OMENScale(nn.Module):
             if dynamic_reasoning:
                 if self.emc_enabled:
                     z_sim_step = self._world_rollout_from_hidden(
-                        h_ctx, ctx, teacher_forcing_ratio=0.0
+                        h_ctx,
+                        ctx,
+                        world_graph_batch=step_world_graph,
+                        teacher_forcing_ratio=0.0,
                     )[0][:, -1]
                     _, gap_step, _ = self.epistemic.compute(z_ctx, self.world_rnn, z_sim_step)
                     z_sym_step, v_mem_step = self.emc.run_episode_eval(
@@ -2819,6 +3388,10 @@ class OMENScale(nn.Module):
                     v_mem_use = v_mem_ctx
                 z_symbolic_ctx = self._pre_symbolic_state(z_ctx, v_mem_use)
                 z_final = self._combine_levels(z_symbolic_ctx, z_sym_step, v_mem_use)
+                z_final, _, _ = self._graph_centered_decoder_state(
+                    z_final,
+                    step_world_graph,
+                )
                 z_sym_for_bias = z_sym_step
             else:
                 z_sym_for_bias = z_sym
@@ -2914,6 +3487,8 @@ class OMENScale(nn.Module):
         else:
             h_tok = self.tok_encoder(prompt)
         _, z  = self.perceiver(h_tok)
+        init_world_graph = self._build_world_graph_batch(prompt, saliency_out=None)
+        z, _, _ = self._ground_world_state(z, init_world_graph)
         v_mem = self._retrieve_memory(z)
 
         # Початкове символьне представлення: через EMC (якщо ввімкнено) або прямо
@@ -2923,7 +3498,12 @@ class OMENScale(nn.Module):
             # на кожен виклик generate() — нові (не навчені) ваги + зайва пам'ять.
             # self.epistemic вже існує і compute() є pure-functional (закрита формула),
             # тому використовуємо self.epistemic замість fresh instance.
-            z_sim_traj, _ = self._world_rollout_from_hidden(h_tok, prompt, teacher_forcing_ratio=0.0)
+            z_sim_traj, _ = self._world_rollout_from_hidden(
+                h_tok,
+                prompt,
+                world_graph_batch=init_world_graph,
+                teacher_forcing_ratio=0.0,
+            )
             z_sim0     = z_sim_traj[:, -1]
             _, gap_norm0, _ = self.epistemic.compute(z, self.world_rnn, z_sim0)
             z_sym, v_mem_emc = self.emc.run_episode_eval(
@@ -2948,6 +3528,8 @@ class OMENScale(nn.Module):
                 else:
                     h_ctx = self.tok_encoder(ctx)
                 _, z_ctx = self.perceiver(h_ctx)
+                step_world_graph = self._build_world_graph_batch(ctx, saliency_out=None)
+                z_ctx, _, _ = self._ground_world_state(z_ctx, step_world_graph)
 
                 if self.emc_enabled:
                     # ── EMC адаптивне міркування під час inference ────────────
@@ -2955,7 +3537,10 @@ class OMENScale(nn.Module):
                     # Bellman зупинка замість фіксованого max_depth.
                     # FIX Bug-EGD: self.epistemic замість fresh EpistemicGapDetector
                     z_sim_step = self._world_rollout_from_hidden(
-                        h_ctx, ctx, teacher_forcing_ratio=0.0
+                        h_ctx,
+                        ctx,
+                        world_graph_batch=step_world_graph,
+                        teacher_forcing_ratio=0.0,
                     )[0][:, -1]
                     _, gap_step, _ = self.epistemic.compute(z_ctx, self.world_rnn, z_sim_step)
                     z_sym_step, v_mem_step = self.emc.run_episode_eval(
@@ -3098,8 +3683,22 @@ class OMENScale(nn.Module):
 # 6.  ДОПОМІЖНЕ: OMENv2Config-compat wrapper
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _make_v2_compat(cfg: OMENScaleConfig) -> OMENv2Config:
+def _make_core_compat(cfg: OMENScaleConfig) -> OMENCoreConfig:
     """Будує мінімальний OMENv2Config для компонентів WorldRNN / EGD / Curiosity."""
+    return OMENCoreConfig(
+        vocab_size        = cfg.vocab_size,
+        d_latent          = cfg.d_latent,
+        world_rnn_hidden  = cfg.world_rnn_hidden,
+        epistemic_tau     = cfg.epistemic_tau,
+        epistemic_exact_grad = getattr(cfg, "epistemic_exact_grad", False),
+        n_counterfactual  = cfg.n_counterfactual,
+    )
+
+
+def _make_v2_compat(cfg: OMENScaleConfig):
+    """Legacy-only bridge for ablations against the historical OMENv2 model."""
+    from omen_v2 import OMENv2Config
+
     return OMENv2Config(
         vocab_size        = cfg.vocab_size,
         d_model           = cfg.d_latent,

@@ -121,9 +121,13 @@ def _value_symbol(value: Any) -> int:
         return 330_000 + (_stable_hash(f"tuple:{repr(value)}") % 100_000)
     if isinstance(value, list):
         return 430_000 + (_stable_hash(f"list:{repr(value)}") % 100_000)
+    if isinstance(value, dict):
+        return 530_000 + (_stable_hash(f"dict:{repr(sorted(value.items(), key=repr))}") % 100_000)
+    if isinstance(value, set):
+        return 630_000 + (_stable_hash(f"set:{repr(sorted(value, key=repr))}") % 100_000)
     if isinstance(value, _FunctionValue):
-        return 530_000 + (_stable_hash(f"fn:{value.name}") % 100_000)
-    return 630_000 + (_stable_hash(repr(value)) % 100_000)
+        return 730_000 + (_stable_hash(f"fn:{value.name}") % 100_000)
+    return 830_000 + (_stable_hash(repr(value)) % 100_000)
 
 
 def _type_name(value: Any) -> str:
@@ -134,6 +138,80 @@ def _type_name(value: Any) -> str:
     if value is None:
         return "none"
     return type(value).__name__.lower()
+
+
+def sample_function_trace_bindings(
+    fn_node: ast.FunctionDef,
+    max_counterexamples: int = 4,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    params = [arg.arg for arg in fn_node.args.args]
+    if not params:
+        return [{}], []
+    iterable_params = set()
+    indexed_params = set()
+    mapping_params = set()
+    for node in ast.walk(fn_node):
+        if isinstance(node, ast.For) and isinstance(node.iter, ast.Name):
+            iterable_params.add(node.iter.id)
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            indexed_params.add(node.value.id)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if isinstance(node.func.value, ast.Name):
+                owner_name = node.func.value.id
+                if node.func.attr in {"get", "keys", "values", "items", "setdefault"}:
+                    mapping_params.add(owner_name)
+                if node.func.attr in {"append", "extend", "pop"}:
+                    iterable_params.add(owner_name)
+
+    primary: Dict[str, Any] = {}
+    for idx, name in enumerate(params):
+        if name in mapping_params:
+            primary[name] = {"a": idx + 1, "b": idx + 2}
+        elif name in iterable_params or name in indexed_params:
+            primary[name] = [idx + 1, idx + 2, idx + 3]
+        else:
+            primary[name] = idx + 1
+    counterexamples: List[Dict[str, Any]] = []
+
+    for node in ast.walk(fn_node):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            names = []
+            if isinstance(node.left, ast.Name) and node.left.id in primary:
+                names.append(node.left.id)
+            if isinstance(node.right, ast.Name) and node.right.id in primary:
+                names.append(node.right.id)
+            if len(names) >= 2:
+                bad = dict(primary)
+                bad[names[0]] = "a"
+                bad[names[1]] = 2
+                counterexamples.append(bad)
+                break
+            if len(names) == 1:
+                bad = dict(primary)
+                bad[names[0]] = "a"
+                counterexamples.append(bad)
+                break
+        if isinstance(node, ast.UnaryOp) and isinstance(node.operand, ast.Name):
+            if node.operand.id in primary:
+                bad = dict(primary)
+                bad[node.operand.id] = "a"
+                counterexamples.append(bad)
+                break
+        if isinstance(node, ast.For) and isinstance(node.iter, ast.Name):
+            if node.iter.id in primary:
+                bad = dict(primary)
+                bad[node.iter.id] = 7
+                counterexamples.append(bad)
+                break
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            if node.value.id in primary:
+                bad = dict(primary)
+                bad[node.value.id] = "a"
+                counterexamples.append(bad)
+                break
+    if max_counterexamples >= 0:
+        counterexamples = counterexamples[: max_counterexamples]
+    return [primary], counterexamples
 
 
 class _PythonTraceBuilder:
@@ -199,72 +277,10 @@ class _PythonTraceBuilder:
         self,
         fn_node: ast.FunctionDef,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        params = [arg.arg for arg in fn_node.args.args]
-        if not params:
-            return [{}], []
-        iterable_params = set()
-        indexed_params = set()
-        mapping_params = set()
-        for node in ast.walk(fn_node):
-            if isinstance(node, ast.For) and isinstance(node.iter, ast.Name):
-                iterable_params.add(node.iter.id)
-            if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
-                indexed_params.add(node.value.id)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                if isinstance(node.func.value, ast.Name):
-                    owner_name = node.func.value.id
-                    if node.func.attr in {"get", "keys", "values", "items", "setdefault"}:
-                        mapping_params.add(owner_name)
-                    if node.func.attr in {"append", "extend", "pop"}:
-                        iterable_params.add(owner_name)
-
-        primary: Dict[str, Any] = {}
-        for idx, name in enumerate(params):
-            if name in mapping_params:
-                primary[name] = {"a": idx + 1, "b": idx + 2}
-            elif name in iterable_params or name in indexed_params:
-                primary[name] = [idx + 1, idx + 2, idx + 3]
-            else:
-                primary[name] = idx + 1
-        counterexamples: List[Dict[str, Any]] = []
-
-        for node in ast.walk(fn_node):
-            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-                names = []
-                if isinstance(node.left, ast.Name) and node.left.id in primary:
-                    names.append(node.left.id)
-                if isinstance(node.right, ast.Name) and node.right.id in primary:
-                    names.append(node.right.id)
-                if len(names) >= 2:
-                    bad = dict(primary)
-                    bad[names[0]] = "a"
-                    bad[names[1]] = 2
-                    counterexamples.append(bad)
-                    break
-                if len(names) == 1:
-                    bad = dict(primary)
-                    bad[names[0]] = "a"
-                    counterexamples.append(bad)
-                    break
-            if isinstance(node, ast.UnaryOp) and isinstance(node.operand, ast.Name):
-                if node.operand.id in primary:
-                    bad = dict(primary)
-                    bad[node.operand.id] = "a"
-                    counterexamples.append(bad)
-                    break
-            if isinstance(node, ast.For) and isinstance(node.iter, ast.Name):
-                if node.iter.id in primary:
-                    bad = dict(primary)
-                    bad[node.iter.id] = 7
-                    counterexamples.append(bad)
-                    break
-            if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
-                if node.value.id in primary:
-                    bad = dict(primary)
-                    bad[node.value.id] = "a"
-                    counterexamples.append(bad)
-                    break
-        return [primary], counterexamples
+        return sample_function_trace_bindings(
+            fn_node,
+            max_counterexamples=self.max_counterexamples,
+        )
 
     def _execute_function(
         self,

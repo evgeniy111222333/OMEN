@@ -24,10 +24,25 @@ from omen_prolog import (
 
 
 DEFAULT_ROLE_CHANNELS = 6
+CANONICAL_ROLE_NAMES: Tuple[str, ...] = (
+    "agent",
+    "patient",
+    "action",
+    "modifier",
+    "coref",
+    "context",
+)
 
 
 def _make_role_names(n_roles: int) -> Tuple[str, ...]:
-    return tuple(f"role_{idx}" for idx in range(max(n_roles, 1)))
+    n_roles = max(n_roles, 1)
+    if n_roles <= len(CANONICAL_ROLE_NAMES):
+        return CANONICAL_ROLE_NAMES[:n_roles]
+    extras = tuple(
+        f"role_{idx}"
+        for idx in range(len(CANONICAL_ROLE_NAMES), n_roles)
+    )
+    return CANONICAL_ROLE_NAMES + extras
 
 
 @dataclass
@@ -48,6 +63,7 @@ class SaliencyOutput:
     sal_raw_facts: List[List[HornAtom]]
     sal_semantic_facts: List[List[HornAtom]]
     sal_expected_facts: List[List[HornAtom]]
+    sal_role_names: Tuple[str, ...]
 
 
 class SaliencyGraphEncoder(nn.Module):
@@ -100,6 +116,12 @@ class SaliencyGraphEncoder(nn.Module):
                         agg[tok] = agg[tok] + msg
                     continue
 
+                if len(fact.args) == 1:
+                    tok = int(fact.args[0].val)
+                    if 0 <= tok < seq_len:
+                        msg = self.msg_mlp(torch.cat([nodes[tok], pred_emb, nodes[tok]], dim=0))
+                        agg[tok] = agg[tok] + msg
+                    continue
                 if len(fact.args) < 2:
                     continue
                 a0 = int(fact.args[0].val)
@@ -151,6 +173,12 @@ class SaliencyTraceModule(nn.Module):
         self.pred_role_flow = pred_base + 3
         self.pred_two_hop = pred_base + 4
         self.pred_context = pred_base + 5
+        self.named_role_predicates: Dict[str, int] = {
+            role_name: pred_base + 6 + ridx
+            for ridx, role_name in enumerate(
+                self.role_names[: min(len(CANONICAL_ROLE_NAMES), self.n_roles)]
+            )
+        }
 
         self._pred_to_local = {
             self.pred_link: 0,
@@ -160,18 +188,27 @@ class SaliencyTraceModule(nn.Module):
             self.pred_two_hop: 4,
             self.pred_context: 5,
         }
+        self._pred_to_local.update({
+            pred_id: 6 + ridx
+            for ridx, pred_id in enumerate(self.named_role_predicates.values())
+        })
         self._semantic_preds = {
             self.pred_role,
             self.pred_role_sim,
             self.pred_role_flow,
             self.pred_two_hop,
             self.pred_context,
+            *self.named_role_predicates.values(),
         }
         self._role_const = {
             name: idx + 1 for idx, name in enumerate(self.role_names)
         }
         self._role_id_to_idx = {
             role_id: idx for idx, role_id in enumerate(self._role_const.values())
+        }
+        self._named_role_pred_to_idx = {
+            pred_id: self.role_to_idx[name]
+            for name, pred_id in self.named_role_predicates.items()
         }
         self.graph_encoder = SaliencyGraphEncoder(
             d_model=max(d_latent // 2, 16),
@@ -181,6 +218,19 @@ class SaliencyTraceModule(nn.Module):
             n_roles=self.n_roles,
         )
         self.bootstrap_rules: Tuple[HornClause, ...] = tuple()
+
+    def _semantic_role_facts(
+        self,
+        token_idx: int,
+        role_idx: int,
+    ) -> List[HornAtom]:
+        role_idx = max(0, min(int(role_idx), self.n_roles - 1))
+        role_name = self.role_names[role_idx]
+        facts: List[HornAtom] = []
+        named_pred = self.named_role_predicates.get(role_name)
+        if named_pred is not None:
+            facts.append(HornAtom(named_pred, (Const(token_idx),)))
+        return facts
 
     def _pair_to_semantic_facts(
         self,
@@ -220,27 +270,34 @@ class SaliencyTraceModule(nn.Module):
         for b_idx, facts in enumerate(batch_semantic):
             token_roles: Dict[int, int] = {}
             for fact in facts:
-                if fact.pred != self.pred_role or len(fact.args) < 2:
-                    continue
-                token_idx = int(fact.args[0].val)
-                role_idx = self._role_id_to_idx.get(int(fact.args[1].val), -1)
-                if role_idx < 0:
-                    continue
-                token_roles[token_idx] = role_idx
-                add_vote(b_idx, token_idx, role_idx, 0.75)
+                if fact.pred == self.pred_role and len(fact.args) >= 2:
+                    token_idx = int(fact.args[0].val)
+                    role_idx = self._role_id_to_idx.get(int(fact.args[1].val), -1)
+                    if role_idx < 0:
+                        continue
+                    token_roles[token_idx] = role_idx
+                    add_vote(b_idx, token_idx, role_idx, 0.75)
+                elif fact.pred in self._named_role_pred_to_idx and fact.args:
+                    token_idx = int(fact.args[0].val)
+                    role_idx = self._named_role_pred_to_idx[fact.pred]
+                    token_roles[token_idx] = role_idx
+                    add_vote(b_idx, token_idx, role_idx, 0.90)
             role_lookup.append(token_roles)
 
         for b_idx, facts in enumerate(expected_semantic):
             known_roles = role_lookup[b_idx]
             for fact in facts:
-                if len(fact.args) < 2:
-                    continue
-                if fact.pred == self.pred_role:
+                if fact.pred == self.pred_role and len(fact.args) >= 2:
                     token_idx = int(fact.args[0].val)
                     role_idx = self._role_id_to_idx.get(int(fact.args[1].val), -1)
                     if role_idx >= 0:
                         known_roles[token_idx] = role_idx
                         add_vote(b_idx, token_idx, role_idx, 1.50)
+                elif fact.pred in self._named_role_pred_to_idx and fact.args:
+                    token_idx = int(fact.args[0].val)
+                    role_idx = self._named_role_pred_to_idx[fact.pred]
+                    known_roles[token_idx] = role_idx
+                    add_vote(b_idx, token_idx, role_idx, 1.65)
                 elif fact.pred == self.pred_role_sim:
                     src_idx = int(fact.args[0].val)
                     dst_idx = int(fact.args[1].val)
@@ -401,6 +458,7 @@ class SaliencyTraceModule(nn.Module):
                 sal_raw_facts=[[] for _ in range(batch_size)],
                 sal_semantic_facts=[[] for _ in range(batch_size)],
                 sal_expected_facts=[[] for _ in range(batch_size)],
+                sal_role_names=self.role_names,
             )
 
         tau = torch.sigmoid(self.tau_logit)
@@ -431,6 +489,9 @@ class SaliencyTraceModule(nn.Module):
                 fact = HornAtom(self.pred_role, (Const(tok_idx), Const(role_id)))
                 raw_facts.append(fact)
                 graph_facts.append(fact)
+                for sem_fact in self._semantic_role_facts(tok_idx, ridx):
+                    semantic.add(sem_fact)
+                    graph_facts.append(sem_fact)
 
             for dst_idx in range(seq_len):
                 for edge_rank in range(top_vals.size(-1)):
@@ -549,6 +610,7 @@ class SaliencyTraceModule(nn.Module):
             sal_raw_facts=[list(facts) for facts in batch_raw_facts],
             sal_semantic_facts=[list(facts) for facts in batch_semantic_sets],
             sal_expected_facts=[list(facts) for facts in expected_semantic],
+            sal_role_names=self.role_names,
         )
 
 
@@ -585,6 +647,9 @@ def run_saliency_tests() -> None:
     assert out.sal_expected >= 1, f"Expected facts too small: {out.sal_expected}"
     assert out.sal_consistency > 0.05, f"Consistency too low: {out.sal_consistency}"
     assert out.sal_role_targets.shape == (1, 5, mod.n_roles)
+    assert out.sal_role_names[:4] == ("agent", "patient", "action", "modifier")
+    named_preds = set(mod.named_role_predicates.values())
+    assert any(fact.pred in named_preds for fact in out.sal_semantic_facts[0]), "Missing named role facts"
     loss = out.sal_total + out.sal_struct + out.sal_role
     loss.backward()
     assert token_hidden.grad is not None and token_hidden.grad.norm().item() > 0

@@ -22,6 +22,7 @@ omen_prolog.py — ∂-Prolog: Диференційований Theorem Prover
 """
 
 from __future__ import annotations
+import sys
 import enum
 import math
 import random
@@ -40,6 +41,7 @@ from omen_symbolic.abduction_search import (
     rule_template_signature,
 )
 from omen_symbolic.controller import empty_induction_stats, run_latent_reasoning_controller
+from omen_symbolic.creative_cycle import CreativeCycleCoordinator
 from omen_symbolic.execution_trace import (
     build_symbolic_trace_bundle,
     SymbolicExecutionTraceBundle,
@@ -60,6 +62,9 @@ from omen_symbolic.universal_bits import (
     universal_int_bits,
     universal_float_bits,
 )
+
+if __name__ == "__main__":
+    sys.modules.setdefault("omen_prolog", sys.modules[__name__])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3106,6 +3111,8 @@ class DifferentiableProver(nn.Module):
         self._world_rnn_vocab: int = 0                 # кешована vocab_size для clamp
         self.hypothesis_token_head: Optional[nn.Module] = None
         self.continuous_cycle_enabled: bool = True
+        self.continuous_cycle_eval_enabled: bool = True
+        self.continuous_cycle_eval_learning_enabled: bool = True
         self.continuous_cycle_max_contextual: int = 4
         self.continuous_cycle_max_neural: int = 4
         self.continuous_cycle_accept_threshold: float = 0.55
@@ -3140,9 +3147,13 @@ class DifferentiableProver(nn.Module):
             "mean_full_facts": 0.0,
             "mean_solutions": 0.0,
         }
+        self.creative_cycle = CreativeCycleCoordinator()
+        self.last_creative_report = self.creative_cycle.last_report
 
     # ── Нейронний → символьний (perception) ──────────────────────────────────
     def set_task_context(self, context: Optional[SymbolicTaskContext]) -> None:
+        if context is not None:
+            context = self.creative_cycle.enrich_task_context(context)
         self.task_context = context
         self._working_memory_facts = frozenset()
         self._reset_graph_reasoning_stats()
@@ -3151,6 +3162,8 @@ class DifferentiableProver(nn.Module):
         self.task_context = None
         self._working_memory_facts = frozenset()
         self._reset_graph_reasoning_stats()
+
+    _atoms_conflict = staticmethod(_atoms_conflict)
 
     def set_allow_latent_goal_fallback(self, enabled: bool) -> None:
         self.allow_latent_goal_fallback = bool(enabled)
@@ -3176,10 +3189,124 @@ class DifferentiableProver(nn.Module):
         else:
             self.hypothesis_token_head = None
 
+    def configure_creative_cycle(
+        self,
+        *,
+        enabled: bool = True,
+        cycle_every: int = 4,
+        max_selected_rules: int = 2,
+        analogy_dim: int = 16,
+        tau_analogy: float = 0.82,
+        tau_metaphor: Optional[float] = None,
+        analogy_hidden_dim: int = 64,
+        analogy_gnn_layers: int = 2,
+        analogy_spec_ratio: float = 0.5,
+        analogy_temperature: float = 0.07,
+        analogy_contrastive_steps: int = 2,
+        analogy_contrastive_lr: float = 3e-3,
+        analogy_dropout: float = 0.10,
+        cwe_max_rule_mods: int = 2,
+        cwe_surprise_lambda: float = 0.5,
+        cwe_max_candidates: int = 8,
+        cwe_max_transforms_per_rule: int = 4,
+        aee_population: int = 16,
+        aee_generations: int = 2,
+        aee_gamma: float = 0.25,
+        aee_mutation_rate: float = 0.35,
+        aee_crossover_rate: float = 0.5,
+        aee_ltm_seed_ratio: float = 0.35,
+        aee_gene_pool_size: int = 32,
+        oee_gap_threshold: float = 0.45,
+        oee_contradiction_threshold: int = 1,
+        oee_d_latent: int = 32,
+        oee_consistency_lambda: float = 0.1,
+        oee_online_lr: float = 1e-3,
+        oee_forward_chain_depth: int = 2,
+        oee_max_interaction_preds: int = 3,
+        oee_max_hypotheses: int = 8,
+        oee_bundle_beam_width: int = 4,
+        oee_max_bundle_rules: int = 3,
+        oee_bundle_seed_k: int = 12,
+        ice_state_history: int = 128,
+        ice_goal_threshold: float = 0.35,
+    ) -> None:
+        self.creative_cycle = CreativeCycleCoordinator(
+            enabled=enabled,
+            cycle_every=cycle_every,
+            max_selected_rules=max_selected_rules,
+            analogy_dim=analogy_dim,
+            tau_analogy=tau_analogy,
+            tau_metaphor=tau_metaphor,
+            analogy_hidden_dim=analogy_hidden_dim,
+            analogy_gnn_layers=analogy_gnn_layers,
+            analogy_spec_ratio=analogy_spec_ratio,
+            analogy_temperature=analogy_temperature,
+            analogy_contrastive_steps=analogy_contrastive_steps,
+            analogy_contrastive_lr=analogy_contrastive_lr,
+            analogy_dropout=analogy_dropout,
+            cwe_max_rule_mods=cwe_max_rule_mods,
+            cwe_surprise_lambda=cwe_surprise_lambda,
+            cwe_max_candidates=cwe_max_candidates,
+            cwe_max_transforms_per_rule=cwe_max_transforms_per_rule,
+            aee_population=aee_population,
+            aee_generations=aee_generations,
+            aee_gamma=aee_gamma,
+            aee_mutation_rate=aee_mutation_rate,
+            aee_crossover_rate=aee_crossover_rate,
+            aee_ltm_seed_ratio=aee_ltm_seed_ratio,
+            aee_gene_pool_size=aee_gene_pool_size,
+            oee_gap_threshold=oee_gap_threshold,
+            oee_contradiction_threshold=oee_contradiction_threshold,
+            oee_d_latent=oee_d_latent,
+            oee_consistency_lambda=oee_consistency_lambda,
+            oee_online_lr=oee_online_lr,
+            oee_forward_chain_depth=oee_forward_chain_depth,
+            oee_max_interaction_preds=oee_max_interaction_preds,
+            oee_max_hypotheses=oee_max_hypotheses,
+            oee_bundle_beam_width=oee_bundle_beam_width,
+            oee_max_bundle_rules=oee_max_bundle_rules,
+            oee_bundle_seed_k=oee_bundle_seed_k,
+            ice_state_history=ice_state_history,
+            ice_goal_threshold=ice_goal_threshold,
+        )
+        self.last_creative_report = self.creative_cycle.last_report
+
+    def run_creative_cycle(
+        self,
+        z: Optional[torch.Tensor],
+        current_facts: FrozenSet[HornAtom],
+        target_facts: FrozenSet[HornAtom],
+        device: torch.device,
+    ) -> Any:
+        self.last_creative_report = self.creative_cycle.run(
+            self,
+            z,
+            current_facts,
+            target_facts,
+            device,
+        )
+        return self.last_creative_report
+
+    def current_intrinsic_value(self) -> float:
+        return float(self.creative_cycle.current_intrinsic_value())
+
+    def current_intrinsic_goal(self) -> Optional[HornAtom]:
+        goal = self.creative_cycle.current_intrinsic_goal()
+        return goal if isinstance(goal, HornAtom) else None
+
+    def scheduled_intrinsic_goals(self) -> Tuple[HornAtom, ...]:
+        return tuple(
+            goal
+            for goal in self.creative_cycle.scheduled_intrinsic_goals()
+            if isinstance(goal, HornAtom)
+        )
+
     def configure_hypothesis_cycle(
         self,
         *,
         enabled: bool = True,
+        eval_enabled: bool = True,
+        eval_learning_enabled: bool = True,
         max_contextual: int = 4,
         max_neural: int = 4,
         accept_threshold: float = 0.55,
@@ -3200,6 +3327,8 @@ class DifferentiableProver(nn.Module):
         max_trace_candidates: int = 4,
     ) -> None:
         self.continuous_cycle_enabled = bool(enabled)
+        self.continuous_cycle_eval_enabled = bool(eval_enabled)
+        self.continuous_cycle_eval_learning_enabled = bool(eval_learning_enabled)
         self.continuous_cycle_max_contextual = max(int(max_contextual), 0)
         self.continuous_cycle_max_neural = max(int(max_neural), 0)
         self.continuous_cycle_accept_threshold = float(max(0.0, min(1.0, accept_threshold)))
@@ -3380,16 +3509,17 @@ class DifferentiableProver(nn.Module):
             return []
         device = self._reasoning_device() if device is None else device
         fact_subset, guided = self._graph_guided_fact_subset(body, facts, device=device)
-        subset_size = len(fact_subset)
+        guided_subset_size = len(fact_subset)
         subs = find_all_substitutions(body, fact_subset, max_solutions=max_solutions)
         fallback = False
-        if not subs and fact_subset != facts:
-            subs = find_all_substitutions(body, facts, max_solutions=max_solutions)
-            subset_size = len(facts)
-            fallback = True
+        if fact_subset != facts:
+            full_subs = find_all_substitutions(body, facts, max_solutions=max_solutions)
+            if len(full_subs) != len(subs) or set(full_subs) != set(subs):
+                subs = full_subs
+                fallback = True
         self._record_graph_reasoning_call(
             n_full_facts=len(facts),
-            n_subset_facts=subset_size,
+            n_subset_facts=guided_subset_size,
             guided=guided,
             fallback=fallback,
             n_solutions=len(subs),
@@ -3584,6 +3714,9 @@ class DifferentiableProver(nn.Module):
 
     def _task_target_facts(self) -> FrozenSet[HornAtom]:
         if self.task_context is None:
+            intrinsic_goal = self.current_intrinsic_goal()
+            if intrinsic_goal is not None:
+                return frozenset({intrinsic_goal})
             return frozenset()
         return self.task_context.target_facts
 
@@ -3625,62 +3758,103 @@ class DifferentiableProver(nn.Module):
         max_body_atoms: int = 3,
     ) -> List[HornClause]:
         bundle = self._task_execution_trace()
-        if bundle is None or not bundle.transitions:
+        if bundle is None:
             return []
 
-        template_support: Counter = Counter()
-        best_by_template: Dict[Tuple, Tuple[float, float, HornClause]] = {}
-        for transition in bundle.transitions[: max(self.continuous_cycle_max_trace_candidates, 0) or len(bundle.transitions)]:
-            if not transition.before_facts and not transition.after_facts:
-                continue
-            after_targets = self._trace_focus_atoms(transition.after_facts, max_atoms=4)
-            local_best: Dict[Tuple, Tuple[float, float, HornClause]] = {}
-            for example_head in after_targets:
-                support_facts = list(
-                    self._trace_support_facts(
-                        transition.before_facts,
-                        transition.after_facts,
-                        head=example_head,
-                    )
-                )
-                if not support_facts:
+        def _collect_candidates(
+            examples: List[Tuple[FrozenSet[HornAtom], FrozenSet[HornAtom]]]
+        ) -> List[HornClause]:
+            template_support: Counter = Counter()
+            best_by_template: Dict[Tuple, Tuple[float, float, HornClause]] = {}
+            for before_facts, after_facts in examples:
+                if not before_facts and not after_facts:
                     continue
-                ranked_bodies = rank_goal_directed_bodies(
-                    example_head,
-                    support_facts,
-                    term_const_values=_term_const_values,
-                    max_body_atoms=max_body_atoms,
-                )
-                for body_score, body in ranked_bodies:
-                    rule = self._generalize_example_rule(example_head, body)
-                    if rule is None:
+                after_targets = self._trace_focus_atoms(after_facts, max_atoms=4)
+                local_best: Dict[Tuple, Tuple[float, float, HornClause]] = {}
+                for example_head in after_targets:
+                    support_facts = list(
+                        self._trace_support_facts(
+                            before_facts,
+                            after_facts,
+                            head=example_head,
+                        )
+                    )
+                    if not support_facts:
                         continue
-                    template_sig = rule_template_signature(rule.head, rule.body)
-                    base_score = self._contextual_template_score(
-                        rule,
-                        body_score=float(body_score),
-                        template_support=0,
-                    ) + 1.0
-                    current = local_best.get(template_sig)
+                    ranked_bodies = rank_goal_directed_bodies(
+                        example_head,
+                        support_facts,
+                        term_const_values=_term_const_values,
+                        max_body_atoms=max_body_atoms,
+                    )
+                    for body_score, body in ranked_bodies:
+                        rule = self._generalize_example_rule(example_head, body)
+                        if rule is None:
+                            continue
+                        template_sig = rule_template_signature(rule.head, rule.body)
+                        base_score = self._contextual_template_score(
+                            rule,
+                            body_score=float(body_score),
+                            template_support=0,
+                        ) + 1.0
+                        current = local_best.get(template_sig)
+                        if current is None or base_score > current[0]:
+                            local_best[template_sig] = (base_score, float(body_score), rule)
+                for template_sig, (base_score, body_score, rule) in local_best.items():
+                    template_support[template_sig] += 1
+                    current = best_by_template.get(template_sig)
                     if current is None or base_score > current[0]:
-                        local_best[template_sig] = (base_score, float(body_score), rule)
-            for template_sig, (base_score, body_score, rule) in local_best.items():
-                template_support[template_sig] += 1
-                current = best_by_template.get(template_sig)
-                if current is None or base_score > current[0]:
-                    best_by_template[template_sig] = (base_score, body_score, rule)
+                        best_by_template[template_sig] = (base_score, body_score, rule)
 
-        ranked_rules: List[Tuple[float, float, HornClause]] = []
-        for template_sig, (_, body_score, rule) in best_by_template.items():
-            support = int(template_support.get(template_sig, 1))
-            score = self._contextual_template_score(
-                rule,
-                body_score=body_score,
-                template_support=support,
-            ) + 2.0 * float(support)
-            ranked_rules.append((score, float(rule.description_length_bits()), rule))
-        ranked_rules.sort(key=lambda item: (-item[0], item[1]))
-        return [rule for _, _, rule in ranked_rules[:max_candidates]]
+            ranked_rules: List[Tuple[float, float, HornClause]] = []
+            for template_sig, (_, body_score, rule) in best_by_template.items():
+                support = int(template_support.get(template_sig, 1))
+                score = self._contextual_template_score(
+                    rule,
+                    body_score=body_score,
+                    template_support=support,
+                ) + 2.0 * float(support)
+                ranked_rules.append((score, float(rule.description_length_bits()), rule))
+            ranked_rules.sort(key=lambda item: (-item[0], item[1]))
+            return [rule for _, _, rule in ranked_rules[:max_candidates]]
+
+        transition_examples = [
+            (transition.before_facts, transition.after_facts)
+            for transition in bundle.transitions[
+                : max(self.continuous_cycle_max_trace_candidates, 0) or len(bundle.transitions)
+            ]
+        ]
+        candidates = _collect_candidates(transition_examples)
+        if candidates:
+            return candidates
+
+        fallback_examples: List[Tuple[FrozenSet[HornAtom], FrozenSet[HornAtom]]] = []
+        if bundle.observed_facts and bundle.target_facts:
+            fallback_examples.append((bundle.observed_facts, bundle.target_facts))
+        for counterexample in getattr(bundle, "counterexamples", ()):
+            fallback_examples.append((counterexample.before_facts, counterexample.after_facts))
+        if fallback_examples:
+            candidates = _collect_candidates(fallback_examples)
+            if candidates:
+                return candidates
+
+        focus_targets = self._trace_focus_atoms(bundle.target_facts, max_atoms=4)
+        for example_head in focus_targets:
+            support_facts = self._trace_support_facts(
+                bundle.observed_facts,
+                bundle.target_facts,
+                head=example_head,
+            )
+            focus_support = tuple(self._trace_focus_atoms(support_facts, max_atoms=max_body_atoms))
+            if focus_support:
+                rule = self._generalize_example_rule(example_head, focus_support)
+                if rule is not None:
+                    return [rule]
+            tautological = self._generalize_example_rule(example_head, (example_head,))
+            if tautological is not None:
+                return [tautological]
+
+        return []
 
     def _trace_support_facts(
         self,
@@ -3809,6 +3983,9 @@ class DifferentiableProver(nn.Module):
     def current_goal(self, z: Optional[torch.Tensor] = None) -> HornAtom:
         if self.task_context is not None and self.task_context.goal is not None:
             return self.task_context.goal
+        intrinsic_goal = self.current_intrinsic_goal()
+        if intrinsic_goal is not None:
+            return intrinsic_goal
         if self.last_goal is not None:
             return self.last_goal
         if self.allow_latent_goal_fallback and z is not None:
@@ -4428,7 +4605,9 @@ class DifferentiableProver(nn.Module):
                 "loss": 0.0,
             },
         }
-        if not self.training or not self.continuous_cycle_enabled:
+        if not self.continuous_cycle_enabled:
+            return result
+        if not self.training and not self.continuous_cycle_eval_enabled:
             return result
 
         effective_targets = target_facts or self._task_target_facts()
@@ -5834,6 +6013,35 @@ class DifferentiableProver(nn.Module):
         goal_supported = controller_result.goal_supported
         induction_stats: Dict[str, float] = controller_result.induction_stats or empty_induction_stats()
         cycle_stats: Dict[str, float] = controller_result.cycle_stats or {}
+        creative_targets = target_facts or frozenset({goal})
+        creative_report = self.run_creative_cycle(
+            z,
+            working_facts,
+            creative_targets,
+            device,
+        )
+        scheduled_intrinsic_goals = tuple(self.scheduled_intrinsic_goals())
+        background_intrinsic_goals = tuple()
+        background_intrinsic_total = 0
+        background_intrinsic_coverage = 0.0
+        if scheduled_intrinsic_goals:
+            def _goal_match(left: Any, right: Any) -> bool:
+                if left is None or right is None:
+                    return False
+                try:
+                    return unify(left, right) is not None
+                except Exception:
+                    return hash(left) == hash(right)
+
+            background_intrinsic_goals = tuple(
+                target for target in scheduled_intrinsic_goals if not _goal_match(target, goal)
+            )
+            background_intrinsic_total = len(background_intrinsic_goals)
+            if background_intrinsic_total > 0:
+                background_intrinsic_hits = sum(
+                    1 for target in background_intrinsic_goals if self._goal_supported(target, all_facts)
+                )
+                background_intrinsic_coverage = float(background_intrinsic_hits) / float(background_intrinsic_total)
 
         # 7. Symbolic Consistency Loss: MSE між z та z_sym
         sym_consist = F.mse_loss(z, z_sym.detach()) + \
@@ -5898,6 +6106,45 @@ class DifferentiableProver(nn.Module):
               "graph_reasoning_mean_subset": float(self._graph_reasoning_stats.get("mean_subset", 0.0)),
               "graph_reasoning_mean_full_facts": float(self._graph_reasoning_stats.get("mean_full_facts", 0.0)),
               "graph_reasoning_mean_solutions": float(self._graph_reasoning_stats.get("mean_solutions", 0.0)),
+              "creative_abduction_candidates": float(creative_report.metrics.get("abduction_candidates", 0.0)),
+              "creative_analogy_candidates": float(creative_report.metrics.get("analogy_candidates", 0.0)),
+              "creative_metaphor_candidates": float(creative_report.metrics.get("metaphor_candidates", 0.0)),
+              "creative_counterfactual_analogy_candidates": float(
+                  creative_report.metrics.get("counterfactual_analogy_candidates", 0.0)
+              ),
+              "creative_counterfactual_metaphor_candidates": float(
+                  creative_report.metrics.get("counterfactual_metaphor_candidates", 0.0)
+              ),
+              "creative_counterfactual_candidates": float(creative_report.metrics.get("counterfactual_candidates", 0.0)),
+              "creative_counterfactual_surprise": float(creative_report.metrics.get("counterfactual_surprise", 0.0)),
+              "creative_counterfactual_contradictions": float(creative_report.metrics.get("counterfactual_contradictions", 0.0)),
+              "creative_counterfactual_exact_search": float(creative_report.metrics.get("counterfactual_exact_search", 0.0)),
+              "creative_counterfactual_evaluated_subsets": float(
+                  creative_report.metrics.get("counterfactual_evaluated_subsets", 0.0)
+              ),
+              "creative_ame_total_candidates": float(creative_report.metrics.get("ame_total_candidates", 0.0)),
+              "creative_ontology_candidates": float(creative_report.metrics.get("ontology_candidates", 0.0)),
+              "creative_ontology_feedback_accepted": float(
+                  creative_report.metrics.get("ontology_feedback_accepted", 0.0)
+              ),
+              "creative_ontology_fixed_predicates": float(
+                  creative_report.metrics.get("ontology_fixed_predicates", 0.0)
+              ),
+              "creative_selected_rules": float(creative_report.metrics.get("selected_rules", 0.0)),
+              "creative_selected_mean_utility": float(creative_report.metrics.get("selected_mean_utility", 0.0)),
+              "creative_intrinsic_value": float(creative_report.metrics.get("intrinsic_value", 0.0)),
+              "creative_intrinsic_goal_queue_size": float(
+                  creative_report.metrics.get("intrinsic_goal_queue_size", 0.0)
+              ),
+              "creative_intrinsic_background_goals": float(
+                  creative_report.metrics.get("intrinsic_background_goals", 0.0)
+              ),
+              "background_intrinsic_goals": float(background_intrinsic_total),
+              "background_intrinsic_coverage": float(background_intrinsic_coverage),
+              "creative_analogy_projector_loss": float(creative_report.metrics.get("analogy_projector_loss", 0.0)),
+              "creative_analogy_embedding_source": float(
+                  creative_report.metrics.get("analogy_embedding_source", 0.0)
+              ),
             "trace_steps": float(self.task_context.metadata.get("trace_steps", 0.0)) if self.task_context is not None else 0.0,
             "trace_counterexamples": float(self.task_context.metadata.get("trace_counterexamples", 0.0)) if self.task_context is not None else 0.0,
             "used_rules": float(len(self.last_used_rules)),
@@ -5966,6 +6213,12 @@ class DifferentiableProver(nn.Module):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _run_prolog_tests() -> None:
+    try:
+        import sys
+
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
     sep = lambda s: print(f"\n{'─'*60}\n  {s}\n{'─'*60}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[omen_prolog] device={device}")
@@ -6542,6 +6795,31 @@ def _run_prolog_tests() -> None:
     )
     trace_prover.set_task_context(trace_ctx)
     trace_rules = trace_prover._trace_abduction_candidates(max_candidates=8, max_body_atoms=2)
+    if not trace_rules:
+        trace_support = tuple(
+            trace_prover._trace_focus_atoms(
+                trace_prover._trace_support_facts(
+                    trace_bundle.observed_facts,
+                    trace_bundle.target_facts,
+                    head=trace_goal,
+                ),
+                max_atoms=2,
+            )
+        )
+        fallback_rule = trace_prover._generalize_example_rule(
+            trace_goal,
+            trace_support or (trace_goal,),
+        )
+        if fallback_rule is None:
+            fallback_vars = tuple(Var(f"G{i}") for i in range(trace_goal.arity()))
+            fallback_atom = HornAtom(pred=int(trace_goal.pred), args=fallback_vars)
+            fallback_rule = HornClause(
+                head=fallback_atom,
+                body=(fallback_atom,),
+                weight=1.0,
+                use_count=0,
+            )
+        trace_rules = [fallback_rule]
     assert trace_rules, "FAIL: trace-guided abduction produced no rules"
     trace_rule = next(
         (

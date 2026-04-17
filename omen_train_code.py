@@ -58,9 +58,9 @@ from torch.utils.data import DataLoader, Dataset, Subset
 import contextlib
 import pickle
 
+from omen import OMEN, build_omen, canonical_architecture
 from omen_scale_config import OMENScaleConfig
-from omen_scale import OMENScale
-from omen_v2 import make_counting, make_python, make_rule_transfer, collate
+from omen_data import make_counting, make_python, make_rule_transfer, collate
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -204,7 +204,7 @@ def make_synthetic_dataset(cfg: OMENScaleConfig,
 # 2. STAGE 1 — NET PRETRAINING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def pretrain_net(model: OMENScale,
+def pretrain_net(model: OMEN,
                  dataset: Union[Sequence[Tuple[torch.Tensor, torch.Tensor]], Dataset],
                  n_steps: int = 500,
                  batch_size: int = 8,
@@ -297,7 +297,7 @@ def pretrain_net(model: OMENScale,
 # 3. STAGE 2 — JOINT TRAINING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def joint_train(model: OMENScale,
+def joint_train(model: OMEN,
                 dataset: Union[Sequence[Tuple[torch.Tensor, torch.Tensor]], Dataset],
                 n_epochs: int = 10,
                 batch_size: int = 8,
@@ -709,7 +709,7 @@ def _save_ckpt(model, optimizer, epoch, metrics, save_dir):
 # ══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def net_diagnostics(model: OMENScale,
+def net_diagnostics(model: OMEN,
                     dataset: Union[Sequence[Tuple[torch.Tensor, torch.Tensor]], Dataset],
                     n_samples: int = 32) -> None:
     if not model.net_enabled:
@@ -745,7 +745,7 @@ def smoke_test() -> None:
     print("═" * 68)
 
     cfg     = OMENScaleConfig.demo()
-    model   = OMENScale(cfg).to(DEVICE)
+    model   = build_omen(cfg, device=DEVICE)
     dataset = make_synthetic_dataset(cfg, n=128)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -829,7 +829,11 @@ def main():
     if args.no_net:
         cfg.net_enabled = False
 
-    print(f"Config={args.config}  device={DEVICE}  NET={'on' if cfg.net_enabled else 'off'}")
+    canon = canonical_architecture()
+    print(
+        f"Config={args.config}  device={DEVICE}  NET={'on' if cfg.net_enabled else 'off'}  "
+        f"canonical={canon.stack_id}"
+    )
 
     # Підказка: GPU-оптимізація
     if DEVICE.type == "cuda" and not args.amp:
@@ -848,7 +852,7 @@ def main():
     else:
         train_ds = dataset[:split]
 
-    model = OMENScale(cfg).to(DEVICE)
+    model = build_omen(cfg, device=DEVICE)
     _resume_opt_state = None
     if args.resume:
         ckpt = torch.load(args.resume, map_location=DEVICE, weights_only=False)

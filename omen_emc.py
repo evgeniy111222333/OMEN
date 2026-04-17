@@ -619,7 +619,7 @@ class EfficientMetaController(nn.Module):
         rewards_list:   List[float]        = []
         u_stop_list:    List[float]        = []  # для логування
 
-        r_int_cumulative = 0.0
+        r_int_cumulative = float(getattr(prover, "current_intrinsic_value", lambda: 0.0)())
         goal_proved      = False
         # Підрахунок дій для кодування стану (action_hist)
         action_counts: List[int] = [0] * N_ACTIONS
@@ -884,6 +884,13 @@ class EfficientMetaController(nn.Module):
                 r_int_cumulative += mean_utility
         if cycle_recent_rules:
             prover._extend_recent_abduced_rules(cycle_recent_rules)
+        creative_report = prover.run_creative_cycle(
+            z_cur,
+            working_facts,
+            effective_targets,
+            device,
+        )
+        r_int_cumulative += float(creative_report.metrics.get("selected_mean_utility", 0.0))
         target_ground = effective_targets
         z_target = prover.ground(target_ground, device).expand(B, -1)
         coverage_loss = torch.tensor(
@@ -908,7 +915,40 @@ class EfficientMetaController(nn.Module):
                     + 0.01 * vem_self_loss)
 
         # ── 6. Фінальна нагорода за задачу + оновлення траєкторії ─────────────
-        r_task = 1.0 if goal_proved else 0.0
+        intrinsic_goal = getattr(prover, "current_intrinsic_goal", lambda: None)()
+        intrinsic_value = float(getattr(prover, "current_intrinsic_value", lambda: 0.0)())
+        scheduled_intrinsic_goals = tuple(getattr(prover, "scheduled_intrinsic_goals", lambda: ())())
+
+        def _goal_match(left, right) -> bool:
+            if left is None or right is None:
+                return False
+            try:
+                from omen_prolog import unify
+
+                return unify(left, right) is not None
+            except Exception:
+                return hash(left) == hash(right)
+
+        intrinsic_task_active = intrinsic_goal is not None and _goal_match(goal, intrinsic_goal)
+        background_intrinsic_goals = tuple(
+            target for target in scheduled_intrinsic_goals if not _goal_match(target, goal)
+        )
+        background_intrinsic_hits = sum(
+            1 for target in background_intrinsic_goals if prover._goal_supported(target, all_facts)
+        )
+        background_intrinsic_total = len(background_intrinsic_goals)
+        background_intrinsic_coverage = (
+            float(background_intrinsic_hits) / float(background_intrinsic_total)
+            if background_intrinsic_total > 0 else 0.0
+        )
+        primary_intrinsic_coverage = (
+            1.0 if intrinsic_task_active and prover._goal_supported(intrinsic_goal, all_facts) else 0.0
+        )
+        r_task = (
+            intrinsic_value * primary_intrinsic_coverage
+            if intrinsic_task_active else
+            (1.0 if goal_proved else 0.0) + intrinsic_value * background_intrinsic_coverage
+        )
         if rewards_list:
             rewards_list[-1] += r_task
         elif not log_probs_list:
@@ -991,6 +1031,42 @@ class EfficientMetaController(nn.Module):
               "cycle_graph_energy": float(cycle_stats.get("mean_graph_energy", 0.0)),
               "cycle_policy_loss": float(cycle_stats.get("policy_loss", 0.0)),
               "cycle_loss": float(cycle_stats.get("loss", 0.0)),
+              "creative_abduction_candidates": float(creative_report.metrics.get("abduction_candidates", 0.0)),
+              "creative_analogy_candidates": float(creative_report.metrics.get("analogy_candidates", 0.0)),
+              "creative_metaphor_candidates": float(creative_report.metrics.get("metaphor_candidates", 0.0)),
+              "creative_counterfactual_analogy_candidates": float(
+                  creative_report.metrics.get("counterfactual_analogy_candidates", 0.0)
+              ),
+              "creative_counterfactual_metaphor_candidates": float(
+                  creative_report.metrics.get("counterfactual_metaphor_candidates", 0.0)
+              ),
+              "creative_counterfactual_candidates": float(creative_report.metrics.get("counterfactual_candidates", 0.0)),
+              "creative_counterfactual_surprise": float(creative_report.metrics.get("counterfactual_surprise", 0.0)),
+              "creative_counterfactual_contradictions": float(creative_report.metrics.get("counterfactual_contradictions", 0.0)),
+              "creative_counterfactual_exact_search": float(creative_report.metrics.get("counterfactual_exact_search", 0.0)),
+              "creative_counterfactual_evaluated_subsets": float(
+                  creative_report.metrics.get("counterfactual_evaluated_subsets", 0.0)
+              ),
+              "creative_ontology_candidates": float(creative_report.metrics.get("ontology_candidates", 0.0)),
+              "creative_ontology_feedback_accepted": float(
+                  creative_report.metrics.get("ontology_feedback_accepted", 0.0)
+              ),
+              "creative_ontology_fixed_predicates": float(
+                  creative_report.metrics.get("ontology_fixed_predicates", 0.0)
+              ),
+              "creative_selected_rules": float(creative_report.metrics.get("selected_rules", 0.0)),
+              "creative_selected_mean_utility": float(creative_report.metrics.get("selected_mean_utility", 0.0)),
+              "creative_intrinsic_value": float(creative_report.metrics.get("intrinsic_value", 0.0)),
+              "creative_intrinsic_goal_queue_size": float(
+                  creative_report.metrics.get("intrinsic_goal_queue_size", 0.0)
+              ),
+              "creative_intrinsic_background_goals": float(
+                  creative_report.metrics.get("intrinsic_background_goals", 0.0)
+              ),
+              "background_intrinsic_goals": float(background_intrinsic_total),
+              "background_intrinsic_coverage": float(background_intrinsic_coverage),
+              "creative_intrinsic_task_active": 1.0 if intrinsic_task_active else 0.0,
+              "creative_analogy_projector_loss": float(creative_report.metrics.get("analogy_projector_loss", 0.0)),
             "provenance": (
                 prover.task_context.provenance
                 if getattr(prover, "task_context", None) is not None else "latent"
@@ -1043,7 +1119,7 @@ class EfficientMetaController(nn.Module):
 
         action_counts: List[int] = [0] * N_ACTIONS
         proof_derivations: List[Tuple[object, Optional[object]]] = []
-        r_int_cumulative = 0.0
+        r_int_cumulative = float(getattr(prover, "current_intrinsic_value", lambda: 0.0)())
         induction_stats = {
             "checked": 0.0,
             "verified": 0.0,
@@ -1157,6 +1233,40 @@ class EfficientMetaController(nn.Module):
             float(target_hits) / float(target_total)
             if target_total > 0 else (1.0 if goal_supported else 0.0)
         )
+        creative_targets = target_facts or frozenset({goal})
+        creative_report = prover.run_creative_cycle(
+            z_cur,
+            working_facts,
+            creative_targets,
+            device,
+        )
+        r_int_cumulative += float(creative_report.metrics.get("selected_mean_utility", 0.0))
+        intrinsic_goal = getattr(prover, "current_intrinsic_goal", lambda: None)()
+        intrinsic_value = float(getattr(prover, "current_intrinsic_value", lambda: 0.0)())
+        scheduled_intrinsic_goals = tuple(getattr(prover, "scheduled_intrinsic_goals", lambda: ())())
+
+        def _goal_match(left, right) -> bool:
+            if left is None or right is None:
+                return False
+            try:
+                from omen_prolog import unify
+
+                return unify(left, right) is not None
+            except Exception:
+                return hash(left) == hash(right)
+
+        intrinsic_task_active = intrinsic_goal is not None and _goal_match(goal, intrinsic_goal)
+        background_intrinsic_goals = tuple(
+            target for target in scheduled_intrinsic_goals if not _goal_match(target, goal)
+        )
+        background_intrinsic_hits = sum(
+            1 for target in background_intrinsic_goals if prover._goal_supported(target, all_facts)
+        )
+        background_intrinsic_total = len(background_intrinsic_goals)
+        background_intrinsic_coverage = (
+            float(background_intrinsic_hits) / float(background_intrinsic_total)
+            if background_intrinsic_total > 0 else 0.0
+        )
         prover.last_goal = goal
         prover.last_context_facts = working_facts
         prover.last_all_facts = all_facts
@@ -1175,6 +1285,42 @@ class EfficientMetaController(nn.Module):
               "induction_repaired": induction_stats.get("repaired", 0.0),
               "induction_matches": induction_stats["matched_predictions"],
               "induction_score": induction_stats["mean_score"],
+              "creative_abduction_candidates": float(creative_report.metrics.get("abduction_candidates", 0.0)),
+              "creative_analogy_candidates": float(creative_report.metrics.get("analogy_candidates", 0.0)),
+              "creative_metaphor_candidates": float(creative_report.metrics.get("metaphor_candidates", 0.0)),
+              "creative_counterfactual_analogy_candidates": float(
+                  creative_report.metrics.get("counterfactual_analogy_candidates", 0.0)
+              ),
+              "creative_counterfactual_metaphor_candidates": float(
+                  creative_report.metrics.get("counterfactual_metaphor_candidates", 0.0)
+              ),
+              "creative_counterfactual_candidates": float(creative_report.metrics.get("counterfactual_candidates", 0.0)),
+              "creative_counterfactual_surprise": float(creative_report.metrics.get("counterfactual_surprise", 0.0)),
+              "creative_counterfactual_contradictions": float(creative_report.metrics.get("counterfactual_contradictions", 0.0)),
+              "creative_counterfactual_exact_search": float(creative_report.metrics.get("counterfactual_exact_search", 0.0)),
+              "creative_counterfactual_evaluated_subsets": float(
+                  creative_report.metrics.get("counterfactual_evaluated_subsets", 0.0)
+              ),
+              "creative_ontology_candidates": float(creative_report.metrics.get("ontology_candidates", 0.0)),
+              "creative_ontology_feedback_accepted": float(
+                  creative_report.metrics.get("ontology_feedback_accepted", 0.0)
+              ),
+              "creative_ontology_fixed_predicates": float(
+                  creative_report.metrics.get("ontology_fixed_predicates", 0.0)
+              ),
+              "creative_selected_rules": float(creative_report.metrics.get("selected_rules", 0.0)),
+              "creative_selected_mean_utility": float(creative_report.metrics.get("selected_mean_utility", 0.0)),
+              "creative_intrinsic_value": float(creative_report.metrics.get("intrinsic_value", 0.0)),
+              "creative_intrinsic_goal_queue_size": float(
+                  creative_report.metrics.get("intrinsic_goal_queue_size", 0.0)
+              ),
+              "creative_intrinsic_background_goals": float(
+                  creative_report.metrics.get("intrinsic_background_goals", 0.0)
+              ),
+              "background_intrinsic_goals": float(background_intrinsic_total),
+              "background_intrinsic_coverage": float(background_intrinsic_coverage),
+              "creative_intrinsic_task_active": 1.0 if intrinsic_task_active else 0.0,
+              "creative_analogy_projector_loss": float(creative_report.metrics.get("analogy_projector_loss", 0.0)),
             "provenance": (
                 prover.task_context.provenance
                 if getattr(prover, "task_context", None) is not None else "latent"
@@ -1309,6 +1455,12 @@ class EfficientMetaController(nn.Module):
 
 def _run_emc_tests() -> None:
     """Самостійні тести EMC без залежності від інших OMEN-модулів."""
+    try:
+        import sys
+
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
     import torch
     sep = lambda s: print(f"\n{'─'*60}\n  {s}\n{'─'*60}")
 

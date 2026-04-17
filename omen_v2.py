@@ -1,6 +1,17 @@
 """
-OMEN v2 — Omni-Modal Epistemic Network (AGI Extension)
-=======================================================
+OMEN v2 — legacy reference architecture for OMEN
+================================================
+Цей файл зберігає ранній «чистий» варіант OMEN як дослідницький reference.
+
+Canonical runtime stack для поточної системи:
+  omen_scale.OMENScale
+
+Тут лишається історично важлива реалізація:
+  · DualStreamAttention
+  · GraphAttentionEncoder
+  · CausalGraphDecoder
+  · ранні M-Core / Curiosity / S-Core ідеї
+
 Розширення v1 трьома новими фундаментальними компонентами:
 
   M-Core  : Tensor Product Memory — голографічна пам'ять у VRAM
@@ -20,6 +31,11 @@ OMEN v2 — Omni-Modal Epistemic Network (AGI Extension)
 
 Стек: PyTorch 2.x — нуль зовнішніх солверів.
 """
+
+LEGACY_RUNTIME = True
+LEGACY_RUNTIME_ROLE = "legacy_reference"
+CANONICAL_SUCCESSOR = "omen_scale.OMENScale"
+CANONICAL_PUBLIC_SUCCESSOR = "omen.OMEN"
 
 import math, time, random, warnings
 from copy import deepcopy

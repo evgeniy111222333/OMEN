@@ -66,7 +66,7 @@ def run_latent_reasoning_controller(
     device: torch.device,
 ) -> LatentControllerResult:
     """
-    Run latent-conditioned training-only control around a pure symbolic step.
+    Run latent-conditioned control around a pure symbolic step.
 
     The symbolic executor itself stays discrete. This controller owns the
     latent-dependent policy, abduction, and VeM updates.
@@ -128,7 +128,9 @@ def run_latent_reasoning_controller(
 
     effective_targets = target_facts or frozenset({goal})
     cycle_recent_rules = []
-    if prover.training and getattr(prover, "continuous_cycle_enabled", False):
+    cycle_enabled = bool(getattr(prover, "continuous_cycle_enabled", False))
+    cycle_eval_enabled = bool(getattr(prover, "continuous_cycle_eval_enabled", True))
+    if cycle_enabled and (prover.training or cycle_eval_enabled):
         cycle = prover.continuous_hypothesis_cycle(
             z[:1],
             working_facts,
@@ -150,7 +152,17 @@ def run_latent_reasoning_controller(
     trigger_abduction = (
         prover.task_context is not None and prover.task_context.trigger_abduction
     )
-    should_abduce = prover.training and (trigger_abduction or mismatch_error > 0.0)
+    eval_learning_enabled = bool(
+        getattr(prover, "continuous_cycle_eval_learning_enabled", False)
+    )
+    should_abduce = (
+        prover.training
+        or (
+            not prover.training
+            and cycle_eval_enabled
+            and eval_learning_enabled
+        )
+    ) and (trigger_abduction or mismatch_error > 0.0)
     if should_abduce:
         added, vem_hinge, abductor_aux, mean_utility = prover.abduce_and_learn(
             z,

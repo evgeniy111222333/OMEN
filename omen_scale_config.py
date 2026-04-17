@@ -31,9 +31,24 @@ class OMENScaleConfig:
 
     # ─── WorldRNN (концепт-рівень) ─────────────────────────────────────────────
     world_rnn_hidden: int  = 512
+    world_rollout_steps: int = 8
     world_teacher_forcing_start: float = 0.35
     world_teacher_forcing_end:   float = 0.05
     world_teacher_forcing_steps: int   = 2_000
+    world_graph_enabled: bool = True
+    world_graph_pred_buckets: int = 4_096
+    world_graph_term_buckets: int = 8_192
+    world_graph_layers: int = 2
+    world_graph_max_nodes: int = 128
+    world_graph_max_edges: int = 512
+    world_graph_max_transitions: int = 16
+    world_graph_state_mix: float = 0.35
+    world_graph_teacher_mix: float = 0.65
+    world_graph_pooled_mix: float = 0.15
+    world_graph_trace_mix: float = 1.0
+    world_graph_execution_driven: bool = True
+    world_graph_hidden_mix: float = 0.15
+    world_graph_trace_pad_with_first: bool = True
 
     # ─── M-Core (async updates) ───────────────────────────────────────────────
     mem_heads:        int   = 16
@@ -55,6 +70,7 @@ class OMENScaleConfig:
     abduct_candidates: int  = 8       # кандидати абдуктивного движка
     sym_gnn_layers:   int   = 2       # сумісність з OMENv2
     continuous_cycle_enabled: bool = True
+    continuous_cycle_eval_enabled: bool = True
     continuous_cycle_contextual: int = 4
     continuous_cycle_neural: int = 4
     continuous_cycle_accept_threshold: float = 0.55
@@ -70,8 +86,43 @@ class OMENScaleConfig:
     continuous_cycle_repair_enabled: bool = True
     continuous_cycle_repair_threshold: float = 0.35
     continuous_cycle_max_repairs: int = 2
-    ce_reinforce_enabled: bool = False
-    ce_reinforce_fallback_only: bool = True
+    continuous_cycle_eval_learning_enabled: bool = True
+    creative_cycle_enabled: bool = True
+    creative_cycle_every: int = 4
+    creative_max_selected_rules: int = 2
+    ame_embedding_dim: int = 16
+    ame_tau_analogy: float = 0.82
+    ame_hidden_dim: int = 64
+    ame_gnn_layers: int = 2
+    ame_spec_ratio: float = 0.5
+    ame_temperature: float = 0.07
+    ame_contrastive_steps: int = 2
+    ame_contrastive_lr: float = 3e-3
+    ame_dropout: float = 0.10
+    cwe_max_rule_mods: int = 2
+    cwe_surprise_lambda: float = 0.5
+    cwe_max_candidates: int = 8
+    cwe_max_transforms_per_rule: int = 4
+    aee_population: int = 16
+    aee_generations: int = 2
+    aee_gamma: float = 0.25
+    aee_mutation_rate: float = 0.35
+    aee_crossover_rate: float = 0.5
+    aee_ltm_seed_ratio: float = 0.35
+    aee_gene_pool_size: int = 32
+    oee_gap_threshold: float = 0.45
+    oee_contradiction_threshold: int = 1
+    oee_d_latent: int = 32
+    oee_consistency_lambda: float = 0.1
+    oee_online_lr: float = 1e-3
+    oee_forward_chain_depth: int = 2
+    oee_max_interaction_preds: int = 3
+    oee_max_hypotheses: int = 8
+    ice_state_history: int = 128
+    ice_goal_threshold: float = 0.35
+    ce_reinforce_enabled: bool = True
+    ce_reinforce_eval_enabled: bool = True
+    ce_reinforce_fallback_only: bool = False
     ce_reinforce_retro_every: int = 0
 
     # ─── Epistemic / Curiosity ────────────────────────────────────────────────
@@ -97,6 +148,10 @@ class OMENScaleConfig:
     sym_decoder_surprise_enabled: bool = True
     sym_decoder_surprise_lambda: float = 0.05
     sym_decoder_surprise_threshold: float = 0.35
+    program_anchor_enabled: bool = True
+    program_anchor_weight: float = 0.10
+    program_decoder_weight: float = 0.05
+    program_anchor_max_facts: int = 24
     vfe_enabled: bool = True
     vfe_beta_kl: float = 1.0
     vfe_free_bits: float = 0.0
@@ -273,7 +328,8 @@ class OMENScaleConfig:
             # vocab_size=4096 (legacy) давало MeanSim=0.9935 → 83% dead codes.
             vocab_size=256,     d_tok=256,    n_heads_tok=4,  n_layers_tok=2,
             seq_len=128,        d_latent=64,  n_latents=16,   n_heads_lat=4,
-            n_layers_lat=1,     world_rnn_hidden=128,
+            n_layers_lat=1,     world_rnn_hidden=128, world_rollout_steps=8,
+            world_graph_max_nodes=64, world_graph_max_edges=192, world_graph_max_transitions=8,
             mem_heads=4,        mem_cache_size=256,  mem_update_steps=4,
             sym_vocab=64,       sym_embed_dim=32,    max_proof_depth=3,
             n_proof_cands=8,    ltm_max_rules=256,   sym_max_facts=32,
