@@ -142,7 +142,7 @@ class WorldGraphIntegrationTest(unittest.TestCase):
             any(getattr(fact, "pred", None) in (TRACE_TEXT_STATE_PRED, TRACE_TEXT_GOAL_PRED) for fact in bundle.target_facts)
         )
 
-    def test_ast_language_heuristics_cover_javascript_and_observation_text(self) -> None:
+    def test_ast_language_router_covers_code_and_observation_domains(self) -> None:
         cfg = OMENScaleConfig.demo()
         cfg.allow_noncanonical_ablation = True
         cfg.net_enabled = False
@@ -161,12 +161,44 @@ class WorldGraphIntegrationTest(unittest.TestCase):
             return torch.tensor(encoded[:-1], dtype=torch.long)
 
         js_row = encode_row("class Node {\n  constructor(v) {\n    this.v = v;\n  }\n}\n")
+        ts_row = encode_row("interface User { id: number; name: string }\nconst user: User = { id: 1, name: 'a' };\n")
+        bash_row = encode_row("#!/bin/bash\nexport VALUE=1\nif [ \"$1\" = \"go\" ]; then\n  echo ok\nfi\n")
         obs_row = encode_row("weather is rain. rain becomes flood. however flood is not safe.")
         structured_row = encode_row("step1: weather=rain, road=wet\nstep2: road=closed, alert=yellow\ntarget evacuation=safe_exit")
 
+        js_routing = model._source_routing_from_bytes(js_row)
+        ts_routing = model._source_routing_from_bytes(ts_row)
+        bash_routing = model._source_routing_from_bytes(bash_row)
+        obs_routing = model._source_routing_from_bytes(obs_row)
+        structured_routing = model._source_routing_from_bytes(structured_row)
+
         self.assertEqual(model._ast_lang_from_bytes(js_row), "javascript")
+        self.assertEqual(model._ast_lang_from_bytes(ts_row), "typescript")
+        self.assertEqual(model._ast_lang_from_bytes(bash_row), "bash")
         self.assertEqual(model._ast_lang_from_bytes(obs_row), "text")
         self.assertEqual(model._ast_lang_from_bytes(structured_row), "text")
+        self.assertEqual(js_routing.domain, "code")
+        self.assertEqual(ts_routing.domain, "code")
+        self.assertEqual(bash_routing.domain, "code")
+        self.assertEqual(obs_routing.domain, "observation_text")
+        self.assertEqual(structured_routing.domain, "structured_observation")
+        self.assertGreater(js_routing.confidence, 0.5)
+        self.assertGreater(structured_routing.confidence, 0.5)
+
+    def test_row_runtime_cache_keeps_full_tokens_but_strips_decode_padding(self) -> None:
+        cfg = OMENScaleConfig.demo()
+        cfg.allow_noncanonical_ablation = True
+        model = OMENScale(cfg)
+        row = torch.tensor([97, 98, 0, 0], dtype=torch.long)
+
+        tokens = model._row_token_values(row)
+        decoded = model._decode_source_bytes(row)
+        key_a = model._row_fact_cache_key(row)
+        key_b = model._row_fact_cache_key(row)
+
+        self.assertEqual(tokens, [97, 98, 0, 0])
+        self.assertEqual(decoded, "ab")
+        self.assertEqual(key_a, key_b)
 
     def test_omen_scale_forward_emits_world_graph_telemetry(self) -> None:
         cfg = OMENScaleConfig.demo()
@@ -218,6 +250,8 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertEqual(out["z_graph_primary"], 1.0)
         self.assertGreaterEqual(out["z_graph_anchor"], 0.0)
         self.assertEqual(out["world_graph_signature_encoder_active"], 1.0)
+        self.assertEqual(out["sym_source_domain_code"], 1.0)
+        self.assertGreater(out["sym_source_confidence"], 0.0)
         self.assertGreater(out["world_graph_context_facts"], 0.0)
         self.assertEqual(out["world_graph_semantic_graph_enriched"], 1.0)
         self.assertEqual(out["z_posterior_graph_native"], 1.0)

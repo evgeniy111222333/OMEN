@@ -186,7 +186,8 @@ def sample_examples(dataset: Union[Sequence, Dataset],
 def build_loader(dataset_obj: Dataset,
                  batch_size: int,
                  num_workers: int = 0,
-                 shuffle: bool = True) -> DataLoader:
+                 shuffle: bool = True,
+                 drop_last: bool = True) -> DataLoader:
     """
     Будує DataLoader з pin_memory (якщо CUDA) і prefetch_factor.
     num_workers=0 — безпечно з будь-яким GPU/CPU, >0 лише якщо CUDA і стабільно.
@@ -197,7 +198,7 @@ def build_loader(dataset_obj: Dataset,
         "shuffle": shuffle,
         "pin_memory": (DEVICE.type == "cuda"),
         "num_workers": num_workers,
-        "drop_last": True,
+        "drop_last": drop_last,
     }
     if num_workers > 0:
         loader_kwargs["prefetch_factor"] = 2
@@ -249,7 +250,9 @@ def pretrain_net(model: OMEN,
                  n_steps: int = 500,
                  batch_size: int = 8,
                  lr: float = 3e-4,
-                 log_every: int = 50) -> Dict:
+                 log_every: int = 50,
+                 use_amp: bool = False,
+                 num_workers: int = 0) -> Dict:
     """
     Stage 1: попереднє навчання NET без символьної частини.
     Оптимізує лише: L_NET = L_code + L_rec + L_vocab + λ_vq·L_vq
@@ -257,6 +260,9 @@ def pretrain_net(model: OMEN,
     """
     if not model.net_enabled:
         print("  [Stage 1] NET вимкнений — пропускаємо")
+        return {}
+    if len(dataset) == 0:
+        print("  [Stage 1] empty dataset — skipping")
         return {}
 
     print("\n" + "═" * 68)
@@ -273,38 +279,88 @@ def pretrain_net(model: OMEN,
     opt   = AdamW(net_params, lr=lr, weight_decay=1e-5)
     sched = CosineAnnealingLR(opt, T_max=max(n_steps, 1), eta_min=lr * 0.01)
     history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=log_every))
+    use_amp = use_amp and _AMP_AVAILABLE
+    _device_type = "cuda" if DEVICE.type == "cuda" else "cpu"
+
+    def _amp_ctx():
+        return torch.autocast(
+            device_type=_device_type,
+            dtype=torch.float16 if use_amp else torch.float32,
+            enabled=use_amp,
+        )
+
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=use_amp,
+        init_scale=2.0 ** 10,
+    )
+    loader = build_loader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        shuffle=True,
+        drop_last=False,
+    )
+    loader_iter = iter(loader)
+    amp_overflow_steps = 0.0
 
     model.net.train()
     t0 = time.perf_counter()
 
     for step in range(1, n_steps + 1):
-        batch    = sample_examples(dataset, batch_size)
-        src, tgt = collate(batch)
+        try:
+            batch = next(loader_iter)
+        except StopIteration:
+            loader_iter = iter(loader)
+            batch = next(loader_iter)
+        if isinstance(batch, (tuple, list)) and len(batch) == 2:
+            src, tgt = batch
+        else:
+            src = batch[:, :-1]
+            tgt = batch[:, 1:]
         non_blocking = DEVICE.type == "cuda"
         src = src.to(DEVICE, non_blocking=non_blocking)
         tgt = tgt.to(DEVICE, non_blocking=non_blocking)
 
         opt.zero_grad(set_to_none=True)
 
-        h_q, _, vq_info = model.net.encode(src)
-        z_dummy = torch.zeros(src.size(0), model.cfg.d_latent, device=DEVICE)
-        _, l_rec = model.net.decode(tgt, z_dummy, h_q)
+        with _amp_ctx():
+            h_q, _, vq_info = model.net.encode(src)
+            z_dummy = torch.zeros(
+                src.size(0),
+                model.cfg.d_latent,
+                device=DEVICE,
+                dtype=h_q.dtype,
+            )
+            _, l_rec = model.net.decode(
+                tgt,
+                z_dummy,
+                h_q,
+                return_logits=False,
+                return_recon_loss=True,
+            )
 
-        # Non-autoregressive reconstruction loss (позиційна, без causal bypass).
-        # Без цього decoder навчається передбачати tgt[i+1] з tgt[0..i]
-        # БЕЗ використання h_q → gradient через h_q до encoder слабшає → collapse.
-        # stage1_rec_loss форсує h_q[i] кодувати саме src[i].
-        l_nonauto = model.net.stage1_rec_loss(h_q, src)
+            # Non-autoregressive reconstruction loss (позиційна, без causal bypass).
+            # Без цього decoder навчається передбачати tgt[i+1] з tgt[0..i]
+            # БЕЗ використання h_q → gradient через h_q до encoder слабшає → collapse.
+            # stage1_rec_loss форсує h_q[i] кодувати саме src[i].
+            l_nonauto = model.net.stage1_rec_loss(h_q, src)
 
-        loss_dict = model.net.compute_loss(vq_info, l_rec)
-        loss = loss_dict["net_total"] + 0.5 * l_nonauto
+            loss_dict = model.net.compute_loss(vq_info, l_rec)
+            loss = loss_dict["net_total"] + 0.5 * l_nonauto
 
         if torch.isnan(loss) or torch.isinf(loss):
             continue
 
-        loss.backward()
+        prev_scale = float(scaler.get_scale()) if use_amp else 1.0
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(net_params, 1.0)
-        opt.step()
+        scaler.step(opt)
+        scaler.update()
+        next_scale = float(scaler.get_scale()) if use_amp else prev_scale
+        if use_amp and next_scale < prev_scale:
+            amp_overflow_steps += 1.0
         model.memory.maybe_flush()
         sched.step()
 
@@ -332,7 +388,11 @@ def pretrain_net(model: OMEN,
     print(f"\n  Stage 1 done. vocab={q.current_size.item()}/{q.max_vocab}  "
           f"new_tokens={q.n_new_tokens}  "
           f"kb_facts={model.prover.kb.n_facts()}")
-    return {"final_vocab": q.current_size.item(), "new_tokens": q.n_new_tokens}
+    return {
+        "final_vocab": q.current_size.item(),
+        "new_tokens": q.n_new_tokens,
+        "amp_overflow_steps": amp_overflow_steps,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -993,7 +1053,9 @@ def main():
         print("  [resume] Stage 1 skipped because NET state was restored from the checkpoint")
     else:
         pretrain_net(model, train_ds, n_steps=args.stage1_steps,
-                     batch_size=args.batch_size)
+                     batch_size=args.batch_size,
+                     use_amp=args.amp,
+                     num_workers=args.num_workers)
     if cfg.net_enabled:
         net_diagnostics(model, train_ds)
 

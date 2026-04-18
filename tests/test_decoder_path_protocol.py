@@ -130,6 +130,64 @@ class DecoderPathProtocolTest(unittest.TestCase):
         self.assertEqual(float(model.last_generate_info.get("decoder_path_net", 1.0)), 0.0)
         self.assertEqual(float(model.last_generate_info.get("decoder_osf_replaces_net", 0.0)), 1.0)
 
+    def test_training_does_not_call_net_decode_when_osf_replaces_decoder(self) -> None:
+        cfg = _decoder_test_config()
+        model = OMENScale(cfg)
+        model.eval()
+        src, tgt = self._encode_example(cfg, "def sub(a, b):\n    return a - b\n")
+
+        def fake_encode(x: torch.Tensor, return_attn: bool = False, summarize_attn: bool = False):
+            del return_attn, summarize_attn
+            batch, steps = x.shape
+            h_tok = torch.zeros(batch, steps, cfg.d_tok, dtype=torch.float32)
+            return h_tok, torch.zeros(batch, steps, dtype=torch.long), {}
+
+        def fail_net_decode(*args, **kwargs):
+            raise AssertionError("NET.decode should not be called in Stage 2 when OSF replaces the decoder")
+
+        def fake_osf(*args, **kwargs):
+            self.assertTrue(kwargs.get("fast_mode"))
+            tgt_tokens = kwargs["tgt"]
+            logits = torch.full(
+                (tgt_tokens.size(0), tgt_tokens.size(1), cfg.vocab_size),
+                -1e4,
+                device=tgt_tokens.device,
+            )
+            logits[:, :, 7] = 1e4
+            return logits, {
+                "l_plan": torch.tensor(0.0, device=tgt_tokens.device),
+                "l_sim": torch.tensor(0.0, device=tgt_tokens.device),
+                "l_refl": torch.tensor(0.0, device=tgt_tokens.device),
+                "l_meta": torch.tensor(0.0, device=tgt_tokens.device),
+                "l_intent": torch.tensor(0.0, device=tgt_tokens.device),
+                "struct": torch.tensor(0.0, device=tgt_tokens.device),
+                "plan_rl": torch.tensor(0.0, device=tgt_tokens.device),
+            }
+
+        prover_out = (
+            torch.zeros(1, cfg.d_latent, dtype=torch.float32),
+            torch.tensor(0.0, dtype=torch.float32),
+        )
+
+        with mock.patch.object(model.net, "encode", side_effect=fake_encode), \
+             mock.patch.object(model.net, "decode", side_effect=fail_net_decode), \
+             mock.patch.object(model.net, "compute_loss", return_value={
+                 "net_total": torch.tensor(0.0),
+                 "net_aux_tensor": torch.tensor(0.0),
+                 "net_aux": 0.0,
+                 "net_vocab_pen": 0.0,
+             }), \
+             mock.patch.object(model.osf, "forward", side_effect=fake_osf), \
+             mock.patch.object(model.prover, "forward", return_value=prover_out), \
+             mock.patch.object(model, "_ast_facts_from_bytes", return_value=[]), \
+             mock.patch.object(model, "_ast_rules_from_bytes", return_value=[]), \
+             mock.patch.object(model, "_ast_trace_from_bytes", return_value=None), \
+             mock.patch.object(model, "_ast_lang_from_bytes", return_value=""):
+            out = model(src, tgt, metric_profile="train_fast")
+
+        self.assertIn("total", out)
+        self.assertIn("ce", out)
+
 
 if __name__ == "__main__":
     unittest.main()

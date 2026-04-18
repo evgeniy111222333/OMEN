@@ -437,7 +437,12 @@ class EMCGapProtocolTest(unittest.TestCase):
         z, z_sim, _ = _z_triplet(cfg.d_latent)
         prover = _FCGapProver(cfg.d_latent, z_sim)
         memory = _MockMemory(torch.zeros_like(z))
-        gap_feedback = model._make_emc_gap_feedback(z_sim)
+        gap_feedback_base = model._make_emc_gap_feedback(z_sim)
+        gap_feedback_calls = {"count": 0}
+
+        def gap_feedback(z_state, signal):
+            gap_feedback_calls["count"] += 1
+            return gap_feedback_base(z_state, signal)
 
         with mock.patch.object(model.emc.actor, "forward", side_effect=_scripted_actor([ACTION_FC, ACTION_STOP])), \
              mock.patch.object(model.emc.critic, "forward", return_value=torch.zeros(1, dtype=torch.float32)), \
@@ -456,6 +461,7 @@ class EMCGapProtocolTest(unittest.TestCase):
 
         self.assertGreater(float(prover.last_forward_info.get("emc_gap_delta_mean", 0.0)), 0.0)
         self.assertEqual(float(prover.last_forward_info.get("emc_recall_steps", 0.0)), 0.0)
+        self.assertEqual(gap_feedback_calls["count"], 1)
 
     def test_eval_episode_measures_abduce_gap_from_post_action_state(self) -> None:
         cfg = _emc_gap_config()
@@ -464,7 +470,12 @@ class EMCGapProtocolTest(unittest.TestCase):
         z, z_sim, _ = _z_triplet(cfg.d_latent)
         prover = _AbduceGapProver(cfg.d_latent, z_sim)
         memory = _MockMemory(torch.zeros_like(z))
-        gap_feedback = model._make_emc_gap_feedback(z_sim)
+        gap_feedback_base = model._make_emc_gap_feedback(z_sim)
+        gap_feedback_calls = {"count": 0}
+
+        def gap_feedback(z_state, signal):
+            gap_feedback_calls["count"] += 1
+            return gap_feedback_base(z_state, signal)
 
         with mock.patch.object(model.emc.actor, "forward", side_effect=_scripted_actor([ACTION_ABDUCE, ACTION_STOP])), \
              mock.patch.object(model.emc.critic, "forward", return_value=torch.zeros(1, dtype=torch.float32)), \
@@ -483,6 +494,7 @@ class EMCGapProtocolTest(unittest.TestCase):
 
         self.assertGreater(float(prover.last_forward_info.get("emc_gap_delta_mean", 0.0)), 0.0)
         self.assertEqual(float(prover.last_forward_info.get("emc_recall_steps", 0.0)), 0.0)
+        self.assertEqual(gap_feedback_calls["count"], 1)
 
     def test_eval_episode_can_focus_intrinsic_goal(self) -> None:
         cfg = _emc_gap_config()

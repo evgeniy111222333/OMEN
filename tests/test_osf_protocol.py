@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from omen_osf import OSFConfig, OSFSynthesizer
-from omen_osf_meta import STRATEGY_CAREFUL
+from omen_osf_meta import STRATEGY_CAREFUL, STRATEGY_FAST
 from omen_osf_planner import SymbolicPlanner
 
 
@@ -111,6 +111,56 @@ class OSFProtocolTest(unittest.TestCase):
         self.assertEqual(tried, 1)
         self.assertEqual(plan_with_strategy.call_count, 1)
         self.assertEqual(verifier.call_count, 1)
+
+    def test_fast_mode_forces_fast_strategy_for_high_ce_training_steps(self) -> None:
+        synth = OSFSynthesizer(
+            OSFConfig(
+                d_intent=8,
+                n_goals=4,
+                d_plan=8,
+                n_operators=6,
+                template_len=4,
+                max_plan_depth=3,
+                beam_width=2,
+                use_simulation=True,
+                use_reflection=True,
+                use_meta=True,
+                fast_ce_threshold=4.5,
+            ),
+            d_latent=8,
+            d_tok=8,
+            vocab_size=32,
+        )
+        synth.train()
+        h_tok = torch.randn(1, 6, 8)
+        z_final = torch.randn(1, 8)
+        tgt = torch.randint(0, 32, (1, 6))
+
+        with mock.patch.object(
+            synth.meta_ctrl,
+            "select_strategy",
+            side_effect=AssertionError("meta controller should be bypassed in forced fast mode"),
+        ), mock.patch.object(
+            synth,
+            "_repair_plan_symbolically",
+            side_effect=AssertionError("symbolic repair should be bypassed in forced fast mode"),
+        ), mock.patch.object(
+            synth.simulator,
+            "forward",
+            side_effect=AssertionError("simulation should be bypassed in forced fast mode"),
+        ):
+            logits, osf_out = synth(
+                h_tok,
+                z_final,
+                tgt,
+                world_rnn=mock.Mock(),
+                ce_loss=5.0,
+                fast_mode=True,
+            )
+
+        self.assertEqual(tuple(logits.shape), (1, 6, 32))
+        self.assertEqual(osf_out["osf_strategy"], STRATEGY_FAST)
+        self.assertEqual(float(osf_out["osf_fast_forced"]), 1.0)
 
 
 if __name__ == "__main__":

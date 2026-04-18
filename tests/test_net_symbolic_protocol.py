@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sys
 import unittest
 from pathlib import Path
@@ -11,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from omen_net_tokenizer import ByteDecoder, SemanticFeedbackLoss
 from omen_prolog import HornAtom
 from omen_scale import (
     NET_CONTEXT_PRED,
@@ -86,8 +88,13 @@ class NetSymbolicProtocolTest(unittest.TestCase):
             h_tok = torch.zeros(batch, steps, cfg.d_tok, dtype=torch.float32)
             return h_tok, self._vq_indices(batch, steps), {}
 
-        def fake_decode(tgt_tokens: torch.Tensor, z_final: torch.Tensor, h_tok: torch.Tensor):
-            del z_final, h_tok
+        def fake_decode(
+            tgt_tokens: torch.Tensor,
+            z_final: torch.Tensor,
+            h_tok: torch.Tensor,
+            **kwargs,
+        ):
+            del z_final, h_tok, kwargs
             logits = torch.full(
                 (tgt_tokens.size(0), tgt_tokens.size(1), cfg.vocab_size),
                 -1e4,
@@ -173,6 +180,65 @@ class NetSymbolicProtocolTest(unittest.TestCase):
         self.assertEqual(float(masked[0, generator.pred_to_index[5]].item()), -1e4)
         self.assertEqual(float(masked[0, generator.pred_to_index[7]].item()), -1e4)
 
+    def test_semantic_feedback_loss_ignores_invalid_pairs_and_matches_expectation(self) -> None:
+        loss_fn = SemanticFeedbackLoss(lambda_semantic=0.5)
+        codebook = torch.tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 1.0, 0.0],
+            ],
+            dtype=torch.float32,
+        )
+        pairs = [
+            (0, 2, 1.0),
+            (2, 1, 0.25),
+            (1, 1, 0.9),
+            (0, 9, 0.5),
+        ]
+
+        loss = loss_fn(codebook, pairs)
+        expected_cos = 1.0 / math.sqrt(2.0)
+        expected = -0.5 * ((expected_cos * 1.0) + (expected_cos * 0.25)) / 2.0
+        self.assertAlmostEqual(float(loss), expected, places=6)
+
+    def test_net_encode_can_return_head_summarized_attention(self) -> None:
+        cfg = _net_symbolic_config()
+        model = OMENScale(cfg)
+        model.eval()
+        src = torch.tensor([[17, 19, 23, 29, 31, 37]], dtype=torch.long)
+
+        with torch.no_grad():
+            _, _, full_info = model.net.encode(src, return_attn=True)
+            _, _, summary_info = model.net.encode(src, return_attn=True, summarize_attn=True)
+
+        full_attn = full_info["attention_maps"]
+        summary_attn = summary_info["attention_maps"]
+        self.assertEqual(tuple(full_attn.shape[:3]), (1, cfg.net_byte_layers, cfg.n_heads_tok))
+        self.assertEqual(tuple(summary_attn.shape), (1, cfg.net_byte_layers, src.size(1), src.size(1)))
+        self.assertTrue(torch.allclose(full_attn.mean(dim=2), summary_attn, atol=1e-6))
+
+    def test_byte_decoder_single_context_fast_path_matches_attention_in_eval(self) -> None:
+        cfg = _net_symbolic_config()
+        dec = ByteDecoder(
+            vocab_size=cfg.vocab_size,
+            d_tok=cfg.d_tok,
+            d_latent=cfg.d_latent,
+            n_layers=cfg.net_dec_layers,
+            n_heads=cfg.n_heads_tok,
+            dropout=cfg.dropout,
+        )
+        dec.eval()
+        x = torch.randn(2, 5, cfg.d_tok)
+        z_final = torch.randn(2, cfg.d_latent)
+        z_ctx = dec.z_proj(z_final).unsqueeze(1)
+
+        with torch.no_grad():
+            expected = dec.z_xattn(dec.z_norm(x), context=z_ctx)
+            actual = dec._broadcast_z_context(z_final, x.size(1), dtype=x.dtype)
+
+        self.assertTrue(torch.allclose(expected, actual, atol=1e-6))
+
     def test_generation_routes_net_concepts_into_memory_hints_and_symbolic_context(self) -> None:
         cfg = _net_symbolic_config()
         model = OMENScale(cfg)
@@ -189,8 +255,13 @@ class NetSymbolicProtocolTest(unittest.TestCase):
             h_tok = torch.zeros(batch, steps, cfg.d_tok, dtype=torch.float32)
             return h_tok, self._vq_indices(batch, steps), {}
 
-        def fake_decode(tgt_tokens: torch.Tensor, z_final: torch.Tensor, h_tok: torch.Tensor):
-            del z_final, h_tok
+        def fake_decode(
+            tgt_tokens: torch.Tensor,
+            z_final: torch.Tensor,
+            h_tok: torch.Tensor,
+            **kwargs,
+        ):
+            del z_final, h_tok, kwargs
             logits = torch.full(
                 (tgt_tokens.size(0), tgt_tokens.size(1), cfg.vocab_size),
                 -1e4,

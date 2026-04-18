@@ -604,7 +604,9 @@ class EfficientMetaController(nn.Module):
             return torch.zeros(batch_size, prover.d, device=device)
         sample_size = min(len(facts), 64)
         if len(facts) > sample_size:
-            facts = frozenset(random.sample(list(facts), sample_size))
+            # Use a stable subset so prover.ground() can hit its runtime cache within
+            # one EMC episode instead of re-encoding a different random sample each step.
+            facts = frozenset(sorted(facts, key=hash)[:sample_size])
         return prover.ground(facts, device).expand(batch_size, -1)
 
     def _rule_trigger_flag(self, prover, facts: Optional[frozenset] = None) -> float:
@@ -964,21 +966,21 @@ class EfficientMetaController(nn.Module):
                     z_cur = prover.ground(working_facts, device).expand(B, -1)
                     if gap_feedback is not None:
                         zero_signal = torch.zeros_like(z_before)
-                        gap_before_t, before_stats = self._measure_gap_feedback_state(
-                            z_before,
-                            gap_norm_cur,
-                            zero_signal,
-                            gap_feedback=gap_feedback,
+                        gap_before = float(
+                            current_gap_features.get(
+                                "gap_memory_grounded",
+                                float(gap_norm_cur.mean().item()),
+                            )
                         )
                         gap_after_t, after_stats = self._measure_gap_feedback_state(
                             z_cur,
-                            gap_before_t,
+                            gap_norm_cur,
                             zero_signal,
                             gap_feedback=gap_feedback,
                         )
                         gap_norm_cur = gap_after_t
                         gap_delta = float(
-                            before_stats.get("gap_memory_grounded", float(gap_before_t.mean().item()))
+                            gap_before
                             - after_stats.get("gap_memory_grounded", float(gap_after_t.mean().item()))
                         )
                     else:
@@ -1018,21 +1020,21 @@ class EfficientMetaController(nn.Module):
                     z_cur = prover.ground(refined_facts or working_facts, device).expand(B, -1)
                     if gap_feedback is not None:
                         zero_signal = torch.zeros_like(z_before)
-                        gap_before_t, before_stats = self._measure_gap_feedback_state(
-                            z_before,
-                            gap_norm_cur,
-                            zero_signal,
-                            gap_feedback=gap_feedback,
+                        gap_before = float(
+                            current_gap_features.get(
+                                "gap_memory_grounded",
+                                float(gap_norm_cur.mean().item()),
+                            )
                         )
                         gap_after_t, after_stats = self._measure_gap_feedback_state(
                             z_cur,
-                            gap_before_t,
+                            gap_norm_cur,
                             zero_signal,
                             gap_feedback=gap_feedback,
                         )
                         gap_norm_cur = gap_after_t
                         gap_delta = float(
-                            before_stats.get("gap_memory_grounded", float(gap_before_t.mean().item()))
+                            gap_before
                             - after_stats.get("gap_memory_grounded", float(gap_after_t.mean().item()))
                         )
                     else:
@@ -1595,22 +1597,22 @@ class EfficientMetaController(nn.Module):
                     z_cur = prover.ground(working_facts, device).expand(B, -1)
                     if gap_feedback is not None:
                         zero_signal = torch.zeros_like(z_before)
-                        gap_before_t, before_stats = self._measure_gap_feedback_state(
-                            z_before,
-                            gap_norm_cur,
-                            zero_signal,
-                            gap_feedback=gap_feedback,
+                        gap_before = float(
+                            current_gap_features.get(
+                                "gap_memory_grounded",
+                                float(gap_norm_cur.mean().item()),
+                            )
                         )
                         gap_after_t, after_stats = self._measure_gap_feedback_state(
                             z_cur,
-                            gap_before_t,
+                            gap_norm_cur,
                             zero_signal,
                             gap_feedback=gap_feedback,
                         )
                         gap_norm_cur = gap_after_t
                         gap_deltas.append(
                             float(
-                                before_stats.get("gap_memory_grounded", float(gap_before_t.mean().item()))
+                                gap_before
                                 - after_stats.get("gap_memory_grounded", float(gap_after_t.mean().item()))
                             )
                         )
@@ -1653,22 +1655,22 @@ class EfficientMetaController(nn.Module):
                     z_cur = prover.ground(refined_facts or working_facts, device).expand(B, -1)
                     if gap_feedback is not None:
                         zero_signal = torch.zeros_like(z_before)
-                        gap_before_t, before_stats = self._measure_gap_feedback_state(
-                            z_before,
-                            gap_norm_cur,
-                            zero_signal,
-                            gap_feedback=gap_feedback,
+                        gap_before = float(
+                            current_gap_features.get(
+                                "gap_memory_grounded",
+                                float(gap_norm_cur.mean().item()),
+                            )
                         )
                         gap_after_t, after_stats = self._measure_gap_feedback_state(
                             z_cur,
-                            gap_before_t,
+                            gap_norm_cur,
                             zero_signal,
                             gap_feedback=gap_feedback,
                         )
                         gap_norm_cur = gap_after_t
                         gap_deltas.append(
                             float(
-                                before_stats.get("gap_memory_grounded", float(gap_before_t.mean().item()))
+                                gap_before
                                 - after_stats.get("gap_memory_grounded", float(gap_after_t.mean().item()))
                             )
                         )

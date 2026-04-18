@@ -24,6 +24,7 @@ from omen_train_code import (
     build_loader,
     joint_train,
     make_synthetic_dataset,
+    pretrain_net,
 )
 
 
@@ -85,6 +86,58 @@ class TrainingCheckpointProtocolTest(unittest.TestCase):
         loader = build_loader(dataset, batch_size=2, num_workers=1, shuffle=False)
         self.assertTrue(loader.persistent_workers)
         self.assertEqual(loader.prefetch_factor, 2)
+
+    def test_build_loader_can_keep_partial_batches_when_drop_last_disabled(self) -> None:
+        cfg = tiny_cfg(creative_enabled=False)
+        dataset = make_synthetic_dataset(cfg, n=4)
+        loader = build_loader(dataset, batch_size=8, num_workers=0, shuffle=False, drop_last=False)
+        batches = list(loader)
+        self.assertEqual(len(batches), 1)
+        batch = batches[0]
+        self.assertEqual(batch.shape[0], len(dataset))
+
+    def test_pretrain_net_handles_dataset_smaller_than_batch(self) -> None:
+        cfg = tiny_cfg(creative_enabled=False)
+        model = build_omen(cfg, device=TRAIN_DEVICE)
+        dataset = make_synthetic_dataset(cfg, n=4)
+        result = pretrain_net(
+            model,
+            dataset,
+            n_steps=1,
+            batch_size=8,
+            use_amp=False,
+            num_workers=0,
+        )
+        self.assertIn("final_vocab", result)
+        self.assertIn("new_tokens", result)
+        self.assertEqual(float(result["amp_overflow_steps"]), 0.0)
+
+    def test_pretrain_net_requests_decoder_loss_without_returning_logits(self) -> None:
+        cfg = tiny_cfg(creative_enabled=False)
+        model = build_omen(cfg, device=TRAIN_DEVICE)
+        dataset = make_synthetic_dataset(cfg, n=4)
+
+        with mock.patch.object(model.net, "decode", wraps=model.net.decode) as decode_mock:
+            result = pretrain_net(
+                model,
+                dataset,
+                n_steps=1,
+                batch_size=4,
+                use_amp=False,
+                num_workers=0,
+            )
+
+        self.assertIn("final_vocab", result)
+        self.assertTrue(decode_mock.called)
+        kwargs = decode_mock.call_args.kwargs
+        self.assertEqual(kwargs.get("return_logits"), False)
+        self.assertEqual(kwargs.get("return_recon_loss"), True)
+
+    def test_pretrain_net_skips_empty_dataset(self) -> None:
+        cfg = tiny_cfg(creative_enabled=False)
+        model = build_omen(cfg, device=TRAIN_DEVICE)
+        result = pretrain_net(model, [], n_steps=1, batch_size=4, use_amp=False, num_workers=0)
+        self.assertEqual(result, {})
 
     def test_joint_train_sanitizes_non_finite_grad_norm_telemetry(self) -> None:
         cfg = tiny_cfg(creative_enabled=False)

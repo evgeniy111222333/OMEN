@@ -95,7 +95,12 @@ class ByteContextEncoder(nn.Module):
                 _seg_lut[_sb] = True
         self.register_buffer('_seg_lut', _seg_lut, persistent=False)
 
-    def forward(self, tokens: torch.Tensor, return_attn: bool = False):
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        return_attn: bool = False,
+        summarize_attn: bool = False,
+    ):
         """
         tokens : (B, T) ∈ [0, vocab_size)
         Returns: (B, T, d_tok)  — у byte-режимі розмір T збережено (без pooling)
@@ -112,7 +117,11 @@ class ByteContextEncoder(nn.Module):
         for norm_a, attn, norm_f, ffn in zip(
                 self.attn_norms, self.attns, self.ffn_norms, self.ffns):
             if return_attn:
-                attn_out, attn_weights = attn(norm_a(x), need_weights=True)
+                attn_out, attn_weights = attn(
+                    norm_a(x),
+                    need_weights=True,
+                    average_attn_weights=summarize_attn,
+                )
                 attn_maps.append(attn_weights)
                 x = x + attn_out
             else:
@@ -124,7 +133,7 @@ class ByteContextEncoder(nn.Module):
             x = self._segment_pool(x, tokens)         # (B, T, d_tok) — pooled
 
         if return_attn:
-            return x, torch.stack(attn_maps, dim=1)   # (B, T, d_tok), (B, L, H, T, T)
+            return x, torch.stack(attn_maps, dim=1)
         return x                                       # (B, T, d_tok)
 
     def _segment_pool(self, h: torch.Tensor,
@@ -1009,10 +1018,43 @@ class ByteDecoder(nn.Module):
         self.lm_head  = nn.Linear(d_tok, vocab_size, bias=False)
         self.drop     = nn.Dropout(dropout)
 
+    def _broadcast_z_context(
+        self,
+        z_final: torch.Tensor,
+        tgt_len: int,
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """
+        The z_final path always attends over exactly one source position, so the
+        attention result is just the projected value broadcast to each target step.
+        """
+        B = z_final.size(0)
+        attn = self.z_xattn
+        z_ctx = self.z_proj(z_final)
+        value = attn.v_proj(z_ctx).view(B, attn.h, attn.dh)
+        value = value.unsqueeze(2).expand(-1, -1, tgt_len, -1)
+        if self.training and attn.drop > 0.0:
+            keep = 1.0 - float(attn.drop)
+            mask = torch.rand(
+                B,
+                attn.h,
+                tgt_len,
+                1,
+                device=value.device,
+                dtype=torch.float32,
+            )
+            value = value * (mask >= float(attn.drop)).to(value.dtype) / keep
+        flat = value.transpose(1, 2).contiguous().view(B, tgt_len, -1)
+        return attn.o_proj(flat).to(dtype=dtype)
+
     def forward(self,
                 tgt: torch.Tensor,
                 z_final: torch.Tensor,
-                h_q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                h_q: torch.Tensor,
+                *,
+                return_recon_loss: bool = True,
+                return_logits: bool = True) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Returns:
           logits : (B, T, vocab_size)
@@ -1027,8 +1069,7 @@ class ByteDecoder(nn.Module):
         x = x + self.hq_xattn(self.hq_norm(x), context=h_q)
 
         # ── 3. Cross-attn: концепт z_final → d_tok контекст ──────────────────
-        z_ctx = self.z_proj(z_final).unsqueeze(1)                   # (B, 1, d_tok)
-        x = x + self.z_xattn(self.z_norm(x), context=z_ctx)
+        x = x + self._broadcast_z_context(z_final, T, dtype=x.dtype)
 
         # ── 4. Self-attention блоки ────────────────────────────────────────────
         for blk in self.blocks:
@@ -1039,12 +1080,17 @@ class ByteDecoder(nn.Module):
 
         # ── 6. L_rec: авторегресивна помилка відновлення ──────────────────────
         # Зсуваємо: logits[0..T-2] → targets[1..T-1]
-        l_rec = F.cross_entropy(
-            logits[:, :-1].reshape(-1, logits.size(-1)),
-            tgt[:, 1:].reshape(-1),
-            ignore_index=0,
-        )
+        if return_recon_loss:
+            l_rec = F.cross_entropy(
+                logits[:, :-1].transpose(1, 2),
+                tgt[:, 1:],
+                ignore_index=0,
+            )
+        else:
+            l_rec = None
 
+        if not return_logits:
+            logits = None
         return logits, l_rec
 
 
@@ -1096,21 +1142,19 @@ class SemanticFeedbackLoss(nn.Module):
         device = codebook.device
         V      = codebook.shape[0]
         cb_n   = F.normalize(codebook, dim=-1)   # (V, d) нормований
-
-        total_sem = torch.zeros(1, device=device)
-        n_valid   = 0
-        for (i1, i2, score) in pair_indices:
-            if i1 >= V or i2 >= V or i1 == i2:
-                continue
-            cos_sim    = (cb_n[i1] * cb_n[i2]).sum()   # scalar
-            total_sem  = total_sem + cos_sim * float(score)
-            n_valid   += 1
-
-        if n_valid == 0:
+        valid_pairs = [
+            (int(i1), int(i2), float(score))
+            for (i1, i2, score) in pair_indices
+            if 0 <= int(i1) < V and 0 <= int(i2) < V and int(i1) != int(i2)
+        ]
+        if not valid_pairs:
             return torch.zeros(1, device=device).squeeze()
 
-        # Нормуємо на кількість пар → стабільний градієнт незалежно від n_pairs
-        avg_sem = total_sem / n_valid
+        idx1 = torch.tensor([item[0] for item in valid_pairs], dtype=torch.long, device=device)
+        idx2 = torch.tensor([item[1] for item in valid_pairs], dtype=torch.long, device=device)
+        scores = torch.tensor([item[2] for item in valid_pairs], dtype=cb_n.dtype, device=device)
+        cos_sim = (cb_n.index_select(0, idx1) * cb_n.index_select(0, idx2)).sum(dim=-1)
+        avg_sem = (cos_sim * scores).mean()
         # −λ · I(Z;Γ): мінімізація → максимізація cosine з S-Core-вагами
         return -self.lambda_semantic * avg_sem
 
@@ -1150,7 +1194,7 @@ class NETLoss(nn.Module):
 
     def forward(self,
                 vq_info:       Dict,
-                l_rec:         torch.Tensor,
+                l_rec:         Optional[torch.Tensor],
                 quantizer:     "EpistemicQuantizer",
                 sem_pairs:     Optional[List[Tuple[int, int, float]]] = None,
                 ) -> Dict:
@@ -1159,6 +1203,9 @@ class NETLoss(nn.Module):
                     Якщо None → L_semantic = 0.
         Returns dict з усіма складовими та total.
         """
+        if l_rec is None:
+            l_rec = torch.zeros((), device=quantizer.codebook.weight.device, dtype=quantizer.codebook.weight.dtype)
+
         l_vq    = vq_info["vq_loss"]
         l_vocab = quantizer.vocab_mdl_penalty(self.lambda_voc)
 
@@ -1306,7 +1353,12 @@ class NeuralEpistemicTokenizer(nn.Module):
         )
 
     # ── encode ────────────────────────────────────────────────────────────────
-    def encode(self, src: torch.Tensor, return_attn: bool = False) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+    def encode(
+        self,
+        src: torch.Tensor,
+        return_attn: bool = False,
+        summarize_attn: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         """
         src : (B, T) — вхідна послідовність
         Returns:
@@ -1316,7 +1368,11 @@ class NeuralEpistemicTokenizer(nn.Module):
         """
         # f_θ: контекстне кодування
         if return_attn:
-            h_ctx, attn_maps = self.byte_encoder(src, return_attn=True)   # (B, T, d_tok), (B, L, H, T, T)
+            h_ctx, attn_maps = self.byte_encoder(
+                src,
+                return_attn=True,
+                summarize_attn=summarize_attn,
+            )
         else:
             h_ctx = self.byte_encoder(src)                             # (B, T, d_tok)
             attn_maps = None
@@ -1331,7 +1387,10 @@ class NeuralEpistemicTokenizer(nn.Module):
     def decode(self,
                tgt:     torch.Tensor,
                z_final: torch.Tensor,
-               h_q:     torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+               h_q:     torch.Tensor,
+               *,
+               return_recon_loss: bool = True,
+               return_logits: bool = True) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         tgt     : (B, T) — цільова послідовність
         z_final : (B, d_latent) — концепт-рівень
@@ -1340,12 +1399,18 @@ class NeuralEpistemicTokenizer(nn.Module):
           logits : (B, T, vocab_size)
           l_rec  : scalar reconstruction loss
         """
-        return self.byte_decoder(tgt, z_final, h_q)
+        return self.byte_decoder(
+            tgt,
+            z_final,
+            h_q,
+            return_recon_loss=return_recon_loss,
+            return_logits=return_logits,
+        )
 
     # ── compute_net_loss ──────────────────────────────────────────────────────
     def compute_loss(self,
                      vq_info:   Dict,
-                     l_rec:     torch.Tensor,
+                     l_rec:     Optional[torch.Tensor],
                      sem_pairs: Optional[List[Tuple[int, int, float]]] = None,
                      ) -> Dict:
         """
@@ -1378,8 +1443,8 @@ class NeuralEpistemicTokenizer(nn.Module):
         dec = self.byte_decoder
         logits = dec.lm_head(dec.out_norm(h_q))          # (B, T, V) — без causal bypass
         return F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            src.reshape(-1),
+            logits.transpose(1, 2),
+            src,
             ignore_index=0,
         )
 

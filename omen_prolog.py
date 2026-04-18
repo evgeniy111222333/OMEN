@@ -426,6 +426,37 @@ class RelaxedHornClauseSpec:
     source: str = "neural"
 
 
+@dataclass
+class PreparedRelaxedCycleContext:
+    fact_sample: FrozenSet[HornAtom]
+    facts_list: List[HornAtom]
+    fact_embs: torch.Tensor
+    target_embs: torch.Tensor
+    graph_fact_embs: torch.Tensor
+    graph_keys: torch.Tensor
+    graph_values: torch.Tensor
+    graph_fact_pred_indices: Dict[int, torch.Tensor]
+    soft_fact_embs: torch.Tensor
+
+
+@dataclass
+class RuleSubstitutionCacheEntry:
+    substitutions: List[Substitution]
+    complete: bool
+    max_solutions: int
+    guided_subset_size: int
+    guided: bool
+    fallback: bool
+
+
+@dataclass
+class RulePredictionSummary:
+    pred_error: float
+    predicted_one: Optional[HornAtom]
+    predicted_facts: FrozenSet[HornAtom]
+    primary_sigma: Optional[Substitution]
+
+
 SEQ_EDGE_PRED = 470
 SEQ_LAST_TOKEN_PRED = 471
 SEQ_PREDICT_NEXT_PRED = 472
@@ -2563,7 +2594,8 @@ class SoftUnifier(nn.Module):
     def soft_unif_energy(self,
                          rule_body: Tuple[HornAtom, ...],
                          facts_list: List[HornAtom],
-                         device: torch.device) -> torch.Tensor:
+                         device: torch.device,
+                         fact_embs: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Диференційована енергія уніфікації тіла правила з фактами:
           E = Σ_j min_{F∈F} ||body_j_emb − F_emb||²
@@ -2574,7 +2606,8 @@ class SoftUnifier(nn.Module):
         if not facts_list or not rule_body:
             return torch.tensor(0.0, device=device)
 
-        fact_embs = self.term_emb(facts_list, device)           # (|F|, d)
+        if fact_embs is None:
+            fact_embs = self.term_emb(facts_list, device)       # (|F|, d)
         body_embs = self.term_emb(list(rule_body), device)      # (|body|, d)
 
         # (|body|, |F|) — матриця квадратних відстаней
@@ -2589,7 +2622,8 @@ class SoftUnifier(nn.Module):
     def variable_attention(self,
                            var_atom: HornAtom,
                            facts_list: List[HornAtom],
-                           device: torch.device
+                           device: torch.device,
+                           fact_embs: Optional[torch.Tensor] = None
                            ) -> Tuple[torch.Tensor, Optional[HornAtom]]:
         """
         Attention-розподіл підстановки для атому з змінними:
@@ -2601,7 +2635,8 @@ class SoftUnifier(nn.Module):
             return torch.zeros(0, device=device), None
 
         var_emb   = self.term_emb.embed_atom(var_atom, device)      # (d,)
-        fact_embs = self.term_emb(facts_list, device)               # (|F|, d)
+        if fact_embs is None:
+            fact_embs = self.term_emb(facts_list, device)           # (|F|, d)
 
         expanded = var_emb.unsqueeze(0).expand(len(facts_list), -1)
         pairs    = torch.cat([expanded, fact_embs], dim=-1)         # (|F|, 2d)
@@ -2615,20 +2650,22 @@ class SoftUnifier(nn.Module):
     def forward(self,
                 rule_body: Tuple[HornAtom, ...],
                 facts: FrozenSet[HornAtom],
-                device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+                device: torch.device,
+                prepared: Optional[PreparedRelaxedCycleContext] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Повертає (soft_energy, attn_entropy):
           soft_energy — диференційована енергія уніфікації
           attn_entropy — ентропія розподілу уваги (регуляризація)
         """
         facts_list = list(facts)
-        energy = self.soft_unif_energy(rule_body, facts_list, device)
+        fact_embs = prepared.soft_fact_embs if prepared is not None else None
+        energy = self.soft_unif_energy(rule_body, facts_list, device, fact_embs=fact_embs)
 
         entropies: List[torch.Tensor] = []
         for atom in rule_body:
             if not atom.vars():
                 continue               # ground atom — без змінних
-            attn, _ = self.variable_attention(atom, facts_list, device)
+            attn, _ = self.variable_attention(atom, facts_list, device, fact_embs=fact_embs)
             if attn.numel() > 1:
                 ent = -(attn * (attn + 1e-9).log()).sum()
                 entropies.append(ent)
@@ -2700,6 +2737,7 @@ class GraphMatchingUnifier(nn.Module):
         tau: float = 0.5,
         hard: bool = False,
         return_attention: bool = False,
+        prepared: Optional[PreparedRelaxedCycleContext] = None,
     ) -> Union[
         Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor],
         Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor, Dict[str, torch.Tensor]],
@@ -2726,9 +2764,16 @@ class GraphMatchingUnifier(nn.Module):
             return zero, {}, zero
 
         # ── Phase 0: ембеддинги фактів ────────────────────────────────────────
-        fact_embs = self.term_emb(facts_list, device)      # (|F|, d)
-        K = self.fact_k(fact_embs)                         # (|F|, d)
-        V = self.fact_v(fact_embs)                         # (|F|, d)
+        if prepared is not None:
+            fact_embs = prepared.graph_fact_embs
+            K = prepared.graph_keys
+            V = prepared.graph_values
+            fact_pred_indices = prepared.graph_fact_pred_indices
+        else:
+            fact_embs = self.term_emb(facts_list, device)  # (|F|, d)
+            K = self.fact_k(fact_embs)                     # (|F|, d)
+            V = self.fact_v(fact_embs)                     # (|F|, d)
+            fact_pred_indices = {}
 
         # ── Phase 1: збір унікальних змінних з тіла ───────────────────────────
         # Ключово: ?Y з різних атомів ОДИН вектор → консистентне прив'язування
@@ -2819,13 +2864,18 @@ class GraphMatchingUnifier(nn.Module):
                 atom_vec = self.term_emb.const_emb(
                     torch.tensor(idx, device=device))
 
-            same_pred = [f for f in facts_list if f.pred == atom.pred]
-            if same_pred:
-                sp_embs  = self.term_emb(same_pred, device)   # (k, d)
-                dists    = (atom_vec.unsqueeze(0) - sp_embs).pow(2).sum(-1)
-                tau_e    = 0.1
-                energy_j = -tau_e * torch.logsumexp(-dists / tau_e, dim=0)
-                total_energy = total_energy + energy_j
+            same_pred_idx = fact_pred_indices.get(int(atom.pred))
+            if same_pred_idx is not None and same_pred_idx.numel() > 0:
+                sp_embs = fact_embs.index_select(0, same_pred_idx)
+            else:
+                same_pred = [f for f in facts_list if f.pred == atom.pred]
+                if not same_pred:
+                    continue
+                sp_embs = self.term_emb(same_pred, device)   # (k, d)
+            dists    = (atom_vec.unsqueeze(0) - sp_embs).pow(2).sum(-1)
+            tau_e    = 0.1
+            energy_j = -tau_e * torch.logsumexp(-dists / tau_e, dim=0)
+            total_energy = total_energy + energy_j
 
         n_vars = max(len(var_names), 1)
         mean_entropy = total_entropy / n_vars
@@ -3026,48 +3076,53 @@ class NeuralAbductionHead(nn.Module):
         z: torch.Tensor,
         stochastic: bool = True,
         tau: float = 0.7,
+        max_candidates: Optional[int] = None,
     ) -> List[RelaxedHornClauseSpec]:
         logits = self.rule_gen(z.squeeze(0)).view(self.slots, self.sv)
-        specs: List[RelaxedHornClauseSpec] = []
-        topk = min(self.n_cands, self.sv)
-        deterministic_choices: List[torch.Tensor] = []
-        if not stochastic:
-            for i in range(self.slots):
-                deterministic_choices.append(torch.topk(logits[i], k=topk, dim=-1).indices)
+        body_pred_slot = 1 + self.max_arity
+        pred_logits = torch.stack([logits[0], logits[body_pred_slot]], dim=0)
+        n_emit = self.n_cands if max_candidates is None else min(max(int(max_candidates), 0), self.n_cands)
+        if n_emit <= 0:
+            return []
 
         tau = max(float(tau), 1e-3)
-        body_pred_slot = 1 + self.max_arity
-        for cand_i in range(self.n_cands):
-            indices: List[int] = []
-            slot_probs: List[torch.Tensor] = []
-            lp_sum = torch.zeros(1, device=z.device).squeeze()
-            for i in range(self.slots):
-                slot_logits = logits[i]
-                if stochastic:
-                    noisy_logits = slot_logits + torch.randn_like(slot_logits) * 0.05
-                    probs = F.gumbel_softmax(noisy_logits, tau=tau, hard=False, dim=-1)
-                    idx = int(probs.argmax().item())
-                    log_soft = F.log_softmax(noisy_logits / tau, dim=-1)
-                else:
-                    chosen = deterministic_choices[i][cand_i % topk]
-                    idx = int(chosen.item())
-                    probs = F.softmax(slot_logits / tau, dim=-1)
-                    log_soft = F.log_softmax(slot_logits / tau, dim=-1)
-                indices.append(idx)
-                slot_probs.append(probs)
-                lp_sum = lp_sum + log_soft[idx]
+        if stochastic:
+            expanded = pred_logits.unsqueeze(0).expand(n_emit, -1, -1)
+            noisy_logits = expanded + torch.randn_like(expanded) * 0.05
+            pred_probs = F.gumbel_softmax(noisy_logits, tau=tau, hard=False, dim=-1)
+            pred_indices = pred_probs.argmax(dim=-1)
+            log_soft = F.log_softmax(noisy_logits / tau, dim=-1)
+            log_prob_sums = log_soft.gather(-1, pred_indices.unsqueeze(-1)).squeeze(-1).sum(dim=-1)
+            head_prob_rows = pred_probs[:, 0, :]
+            body_prob_rows = pred_probs[:, 1, :]
+        else:
+            topk = min(n_emit, self.sv)
+            deterministic_choices = torch.topk(pred_logits, k=topk, dim=-1).indices
+            base_probs = F.softmax(pred_logits / tau, dim=-1)
+            base_log_soft = F.log_softmax(pred_logits / tau, dim=-1)
+            cand_slots = torch.arange(n_emit, device=z.device) % topk
+            pred_indices = deterministic_choices.index_select(1, cand_slots).transpose(0, 1).contiguous()
+            log_prob_sums = base_log_soft.unsqueeze(0).expand(n_emit, -1, -1).gather(
+                -1, pred_indices.unsqueeze(-1)
+            ).squeeze(-1).sum(dim=-1)
+            head_prob_rows = base_probs[0].unsqueeze(0).expand(n_emit, -1)
+            body_prob_rows = base_probs[1].unsqueeze(0).expand(n_emit, -1)
 
+        specs: List[RelaxedHornClauseSpec] = []
+        for cand_i in range(n_emit):
+            head_idx = int(pred_indices[cand_i, 0].item())
+            body_idx = int(pred_indices[cand_i, 1].item())
             head_args, body_args = self._variable_pattern(cand_i)
             clause = HornClause(
-                head=HornAtom(pred=indices[0], args=head_args),
-                body=(HornAtom(pred=indices[body_pred_slot], args=body_args),),
+                head=HornAtom(pred=head_idx, args=head_args),
+                body=(HornAtom(pred=body_idx, args=body_args),),
             )
             specs.append(
                 RelaxedHornClauseSpec(
                     clause=clause,
-                    head_pred_probs=slot_probs[0],
-                    body_pred_probs=(slot_probs[body_pred_slot],),
-                    log_prob=lp_sum,
+                    head_pred_probs=head_prob_rows[cand_i],
+                    body_pred_probs=(body_prob_rows[cand_i],),
+                    log_prob=log_prob_sums[cand_i],
                     source="neural",
                 )
             )
@@ -3078,6 +3133,7 @@ class NeuralAbductionHead(nn.Module):
         z: torch.Tensor,
         stochastic: bool = True,
         tau: float = 0.7,
+        max_candidates: Optional[int] = None,
     ) -> Tuple[List[HornClause], torch.Tensor]:
         """
         z: (1, d_latent)
@@ -3099,6 +3155,7 @@ class NeuralAbductionHead(nn.Module):
             z,
             stochastic=stochastic,
             tau=tau,
+            max_candidates=max_candidates,
         )
         clauses = [spec.clause for spec in specs]
         log_probs = [spec.log_prob for spec in specs if spec.log_prob is not None]
@@ -3183,9 +3240,16 @@ class DifferentiableProver(nn.Module):
         self._last_used_rule_hashes: Set[int] = set()
         self._rule_utility_history: Dict[int, List[float]] = defaultdict(list)
         self._ground_cache: Dict[Tuple[str, FrozenSet[HornAtom]], torch.Tensor] = {}
-        self._mental_rule_cache: Dict[Tuple[int, FrozenSet[HornAtom], str], Tuple[float, Optional[HornAtom]]] = {}
+        self._rule_prediction_cache: Dict[
+            Tuple[int, FrozenSet[HornAtom], str, int],
+            RulePredictionSummary,
+        ] = {}
         self._pred_error_cache: Dict[Tuple[int, FrozenSet[HornAtom]], float] = {}
         self._world_rule_error_cache: Dict[Tuple[int, Optional[HornAtom], str], Optional[float]] = {}
+        self._substitution_cache: Dict[
+            Tuple[Tuple[HornAtom, ...], FrozenSet[HornAtom], str],
+            RuleSubstitutionCacheEntry,
+        ] = {}
         # fc_cache видалено: TensorKnowledgeBase.forward_chain виконується
         # за ~0.1–0.5 ms/батч через GPU broadcast — кешування не потрібне.
 
@@ -3267,9 +3331,10 @@ class DifferentiableProver(nn.Module):
 
     def _clear_runtime_caches(self) -> None:
         self._ground_cache.clear()
-        self._mental_rule_cache.clear()
+        self._rule_prediction_cache.clear()
         self._pred_error_cache.clear()
         self._world_rule_error_cache.clear()
+        self._substitution_cache.clear()
 
     _atoms_conflict = staticmethod(_atoms_conflict)
 
@@ -3763,6 +3828,18 @@ class DifferentiableProver(nn.Module):
         if not body:
             return []
         device = self._reasoning_device() if device is None else device
+        cache_key = (body, facts, str(device))
+        cached = self._substitution_cache.get(cache_key)
+        if cached is not None and (cached.complete or cached.max_solutions >= max_solutions):
+            subs = cached.substitutions[:max_solutions]
+            self._record_graph_reasoning_call(
+                n_full_facts=len(facts),
+                n_subset_facts=cached.guided_subset_size,
+                guided=cached.guided,
+                fallback=cached.fallback,
+                n_solutions=len(subs),
+            )
+            return subs
         fact_subset, guided = self._graph_guided_fact_subset(body, facts, device=device)
         guided_subset_size = len(fact_subset)
         subs = find_all_substitutions(body, fact_subset, max_solutions=max_solutions)
@@ -3779,6 +3856,16 @@ class DifferentiableProver(nn.Module):
             fallback=fallback,
             n_solutions=len(subs),
         )
+        complete = len(subs) < max_solutions
+        if cached is None or complete or max_solutions > cached.max_solutions:
+            self._substitution_cache[cache_key] = RuleSubstitutionCacheEntry(
+                substitutions=list(subs),
+                complete=complete,
+                max_solutions=max_solutions,
+                guided_subset_size=guided_subset_size,
+                guided=guided,
+                fallback=fallback,
+            )
         return subs
 
     def _guided_unify_body(
@@ -4276,9 +4363,8 @@ class DifferentiableProver(nn.Module):
             conflict = any(_atoms_conflict(clause.head, target) for target in after_facts)
             return (1.0 if head_match else 0.0), (1.0 if head_match or conflict else 0.0), conflict
 
-        fresh = freshen_vars(clause)
         subs = self._find_rule_substitutions(
-            fresh.body,
+            clause.body,
             support_facts,
             max_solutions=max_solutions,
         )
@@ -4290,7 +4376,7 @@ class DifferentiableProver(nn.Module):
         any_conflict = False
         for sigma in subs:
             support = 1.0
-            derived = sigma.apply_atom(fresh.head)
+            derived = sigma.apply_atom(clause.head)
             if not derived.is_ground():
                 continue
             if any(unify(derived, target) is not None for target in after_facts):
@@ -4629,6 +4715,55 @@ class DifferentiableProver(nn.Module):
         score += float(max(len(src_preds), len(dst_preds)) - overlap)
         return score
 
+    def _prepare_relaxed_cycle_context(
+        self,
+        observed_facts: FrozenSet[HornAtom],
+        target_facts: FrozenSet[HornAtom],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> PreparedRelaxedCycleContext:
+        fact_sample = observed_facts
+        if len(fact_sample) > 24:
+            fact_sample = frozenset(random.sample(list(fact_sample), 24))
+        facts_list = list(fact_sample)
+        zero_states = torch.zeros(0, self.d, device=device, dtype=dtype)
+        zero_native = torch.zeros(0, self.d, device=device)
+        if facts_list:
+            fact_embs = self.term_emb(facts_list, device).to(dtype=dtype)
+            graph_fact_embs = self.graph_unif.term_emb(facts_list, device)
+            graph_keys = self.graph_unif.fact_k(graph_fact_embs)
+            graph_values = self.graph_unif.fact_v(graph_fact_embs)
+            soft_fact_embs = self.soft_unif.term_emb(facts_list, device)
+            pred_slots: Dict[int, List[int]] = defaultdict(list)
+            for idx, fact in enumerate(facts_list):
+                pred_slots[int(fact.pred)].append(idx)
+            graph_fact_pred_indices = {
+                pred: torch.tensor(indices, device=device, dtype=torch.long)
+                for pred, indices in pred_slots.items()
+            }
+        else:
+            fact_embs = zero_states
+            graph_fact_embs = zero_native
+            graph_keys = zero_native
+            graph_values = zero_native
+            soft_fact_embs = zero_native
+            graph_fact_pred_indices = {}
+        target_embs = (
+            self.term_emb(list(target_facts), device).to(dtype=dtype)
+            if target_facts else zero_states
+        )
+        return PreparedRelaxedCycleContext(
+            fact_sample=fact_sample,
+            facts_list=facts_list,
+            fact_embs=fact_embs,
+            target_embs=target_embs,
+            graph_fact_embs=graph_fact_embs,
+            graph_keys=graph_keys,
+            graph_values=graph_values,
+            graph_fact_pred_indices=graph_fact_pred_indices,
+            soft_fact_embs=soft_fact_embs,
+        )
+
     def _relaxed_symbolic_cycle_trace(
         self,
         clause: HornClause,
@@ -4638,6 +4773,7 @@ class DifferentiableProver(nn.Module):
         device: torch.device,
         z_target: Optional[torch.Tensor] = None,
         relaxed_spec: Optional[RelaxedHornClauseSpec] = None,
+        prepared: Optional[PreparedRelaxedCycleContext] = None,
     ) -> Dict[str, torch.Tensor]:
         dtype = z_query.dtype
         zero = torch.zeros((), device=device, dtype=dtype)
@@ -4650,14 +4786,16 @@ class DifferentiableProver(nn.Module):
             "head_emb": self.term_emb.embed_atom(clause.head, device).to(dtype=dtype),
         }
 
-        fact_sample = observed_facts
-        if len(fact_sample) > 24:
-            fact_sample = frozenset(random.sample(list(fact_sample), 24))
-        facts_list = list(fact_sample)
-        fact_embs = (
-            self.term_emb(facts_list, device).to(dtype=dtype)
-            if facts_list else torch.zeros(0, self.d, device=device, dtype=dtype)
-        )
+        if prepared is None:
+            prepared = self._prepare_relaxed_cycle_context(
+                observed_facts,
+                target_facts,
+                device,
+                dtype,
+            )
+        fact_sample = prepared.fact_sample
+        facts_list = prepared.facts_list
+        fact_embs = prepared.fact_embs
 
         body_pred_probs = (
             relaxed_spec.body_pred_probs
@@ -4693,6 +4831,7 @@ class DifferentiableProver(nn.Module):
                     tau=max(self.continuous_cycle_candidate_tau, 1e-3),
                     hard=False,
                     return_attention=True,
+                    prepared=prepared,
                 )
                 for name, attn in graph_attn.items():
                     var_assign[name] = (attn.to(dtype=dtype).unsqueeze(0) @ fact_embs).squeeze(0)
@@ -4700,6 +4839,7 @@ class DifferentiableProver(nn.Module):
                     clause.body,
                     fact_sample,
                     device,
+                    prepared=prepared,
                 )
             except Exception:
                 pass
@@ -4726,11 +4866,10 @@ class DifferentiableProver(nn.Module):
         )
 
         head_emb = self._soft_atom_embedding(clause.head, head_pred_probs, var_assign, device)
-        if target_facts:
-            target_embs = self.term_emb(list(target_facts), device).to(dtype=dtype)
+        if prepared.target_embs.numel() > 0:
             head_match_t, _ = self._smooth_embedding_match(
                 head_emb,
-                target_embs,
+                prepared.target_embs,
                 tau=max(self.continuous_cycle_candidate_tau, 1e-3),
                 scale=0.10,
             )
@@ -4921,13 +5060,12 @@ class DifferentiableProver(nn.Module):
                 if clause.head in new_facts:
                     self._note_used_rule(clause)
                 continue
-            fresh = freshen_vars(clause)
             for sigma in self._find_rule_substitutions(
-                fresh.body,
+                clause.body,
                 fact_space,
                 max_solutions=max_solutions,
             ):
-                derived = sigma.apply_atom(fresh.head)
+                derived = sigma.apply_atom(clause.head)
                 if any(unify(derived, new_fact) is not None for new_fact in new_facts):
                     self._note_used_rule(clause)
                     break
@@ -4946,13 +5084,12 @@ class DifferentiableProver(nn.Module):
                 if unify(goal, clause.head) is not None:
                     self._note_used_rule(clause)
                 continue
-            fresh = freshen_vars(clause)
             for sigma in self._find_rule_substitutions(
-                fresh.body,
+                clause.body,
                 fact_space,
                 max_solutions=max_solutions,
             ):
-                derived = sigma.apply_atom(fresh.head)
+                derived = sigma.apply_atom(clause.head)
                 if unify(goal, derived) is not None:
                     self._note_used_rule(clause)
                     break
@@ -5039,29 +5176,17 @@ class DifferentiableProver(nn.Module):
                 z[:1],
                 stochastic=self.training,
                 tau=max(self.continuous_cycle_candidate_tau, 1e-3),
+                max_candidates=self.continuous_cycle_max_neural,
             )
-            neural_specs = neural_specs[:self.continuous_cycle_max_neural]
         result["stats"]["trace_candidates"] = float(len(trace_candidates))
         result["stats"]["contextual_candidates"] = float(len(contextual_candidates))
         result["stats"]["neural_candidates"] = float(len(neural_specs))
 
         candidate_specs: Dict[int, Tuple[HornClause, Optional[torch.Tensor], str, Optional[RelaxedHornClauseSpec]]] = {}
         for clause in trace_candidates:
-            relaxed = self._relaxed_spec_for_clause(
-                clause,
-                device,
-                z.dtype,
-                source="trace",
-            )
-            candidate_specs[hash(clause)] = (clause, None, "trace", relaxed)
+            candidate_specs[hash(clause)] = (clause, None, "trace", None)
         for clause in contextual_candidates:
-            relaxed = self._relaxed_spec_for_clause(
-                clause,
-                device,
-                z.dtype,
-                source="contextual",
-            )
-            candidate_specs[hash(clause)] = (clause, None, "contextual", relaxed)
+            candidate_specs[hash(clause)] = (clause, None, "contextual", None)
         for spec in neural_specs:
             clause = spec.clause
             rule_hash = hash(clause)
@@ -5072,6 +5197,12 @@ class DifferentiableProver(nn.Module):
             return result
 
         observed = current_facts or self.current_working_facts()
+        relaxed_cycle_context = self._prepare_relaxed_cycle_context(
+            observed,
+            effective_targets,
+            device,
+            z.dtype,
+        )
         lam_mdl = float(getattr(self, "_mdl_lambda", 0.5))
         ranked_candidates: List[Tuple[float, HornClause, Optional[torch.Tensor], str, Optional[RelaxedHornClauseSpec]]] = []
         for clause, log_prob, source, relaxed_spec in candidate_specs.values():
@@ -5131,8 +5262,15 @@ class DifferentiableProver(nn.Module):
         while pending and checked < (budget + self.continuous_cycle_max_repairs):
             _mdl_score, clause, log_prob, _source, relaxed_spec = pending.pop(0)
             checked += 1
-            pred_error, predicted_one = self._mental_simulate_rule(clause, observed, device)
-            predicted_facts = self._predict_rule_facts(clause, observed)
+            summary = self._rule_prediction_summary(
+                clause,
+                observed,
+                device,
+                max_predictions=8,
+            )
+            pred_error = summary.pred_error
+            predicted_one = summary.predicted_one
+            predicted_facts = summary.predicted_facts
             if predicted_one is not None:
                 predicted_facts = predicted_facts | frozenset({predicted_one})
             if not predicted_facts and clause.head.is_ground():
@@ -5184,6 +5322,7 @@ class DifferentiableProver(nn.Module):
                 device,
                 z_target=z_target,
                 relaxed_spec=relaxed_spec,
+                prepared=relaxed_cycle_context,
             )
             soft_symbolic_t = relaxed_trace["soft_score_t"]
             graph_energy_t = relaxed_trace["graph_energy_t"]
@@ -5321,12 +5460,7 @@ class DifferentiableProver(nn.Module):
                         repair_candidate,
                         None,
                         "repair",
-                        self._relaxed_spec_for_clause(
-                            repair_candidate,
-                            device,
-                            z.dtype,
-                            source="repair",
-                        ),
+                        None,
                     ))
                     seen_candidate_hashes.add(hash(repair_candidate))
                     repair_budget -= 1
@@ -5599,15 +5733,14 @@ class DifferentiableProver(nn.Module):
                 continue
             if not clause.body:
                 continue
-            fresh = freshen_vars(clause)
             current_snapshot = frozenset(current_set)
             for sigma in self._find_rule_substitutions(
-                fresh.body,
+                clause.body,
                 current_snapshot,
                 max_solutions=128,
                 device=device,
             ):
-                derived = sigma.apply_atom(fresh.head)
+                derived = sigma.apply_atom(clause.head)
                 if not derived.is_ground():
                     continue
                 if derived in current_set or derived in new_facts:
@@ -5696,14 +5829,13 @@ class DifferentiableProver(nn.Module):
                 continue
             if not clause.body:
                 continue
-            fresh = freshen_vars(clause)
             for sigma in self._find_rule_substitutions(
-                fresh.body,
+                clause.body,
                 current,
                 max_solutions=128,
                 device=device,
             ):
-                derived = sigma.apply_atom(fresh.head)
+                derived = sigma.apply_atom(clause.head)
                 if not derived.is_ground():
                     continue
                 if derived in current or derived in new_facts:
@@ -5724,6 +5856,104 @@ class DifferentiableProver(nn.Module):
 
     # ── Mental Simulation helpers (Deduction pre-check) ──────────────────────
 
+    def _rule_prediction_summary(
+        self,
+        rule: "HornClause",
+        current_facts: "FrozenSet[HornAtom]",
+        device: torch.device,
+        *,
+        max_predictions: int = 8,
+    ) -> RulePredictionSummary:
+        max_predictions = max(1, int(max_predictions))
+        cache_key = (hash(rule), current_facts, str(device), max_predictions)
+        cached = self._rule_prediction_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        if not rule.body:
+            predicted_one = rule.head if rule.head.is_ground() else None
+            summary = RulePredictionSummary(
+                pred_error=0.0,
+                predicted_one=predicted_one,
+                predicted_facts=frozenset({predicted_one}) if predicted_one is not None else frozenset(),
+                primary_sigma=None,
+            )
+            self._rule_prediction_cache[cache_key] = summary
+            return summary
+
+        solutions = self._find_rule_substitutions(
+            rule.body,
+            current_facts,
+            max_solutions=max_predictions,
+            device=device,
+        )
+        primary_sigma = solutions[0] if solutions else None
+        predicted_atoms: List[HornAtom] = []
+        for sigma in solutions:
+            derived = sigma.apply_atom(rule.head)
+            if not derived.is_ground():
+                continue
+            if any(_atoms_conflict(derived, known) for known in current_facts):
+                continue
+            predicted_atoms.append(derived)
+            if len(predicted_atoms) >= max_predictions:
+                break
+        predicted_facts = frozenset(predicted_atoms)
+
+        if primary_sigma is None:
+            summary = RulePredictionSummary(
+                pred_error=1.0,
+                predicted_one=None,
+                predicted_facts=predicted_facts,
+                primary_sigma=None,
+            )
+            self._rule_prediction_cache[cache_key] = summary
+            return summary
+
+        derived = primary_sigma.apply_atom(rule.head)
+        if not derived.is_ground():
+            summary = RulePredictionSummary(
+                pred_error=0.5,
+                predicted_one=None,
+                predicted_facts=predicted_facts,
+                primary_sigma=primary_sigma,
+            )
+            self._rule_prediction_cache[cache_key] = summary
+            return summary
+
+        if any(_atoms_conflict(derived, known) for known in current_facts):
+            summary = RulePredictionSummary(
+                pred_error=1.0,
+                predicted_one=None,
+                predicted_facts=predicted_facts,
+                primary_sigma=primary_sigma,
+            )
+            self._rule_prediction_cache[cache_key] = summary
+            return summary
+
+        mental_facts = current_facts
+        if len(mental_facts) > 32:
+            mental_facts = frozenset(sorted(mental_facts, key=hash)[:32])
+        try:
+            su_energy, _ = self.soft_unif(rule.body, mental_facts, device)
+            pred_error = float(torch.tanh(su_energy.detach() * 0.1).item())
+        except Exception:
+            pred_error = 0.0
+
+        world_pred_error = self._world_rule_prediction_error(
+            rule,
+            derived,
+            device=device,
+        )
+        summary = RulePredictionSummary(
+            pred_error=self._rule_prediction_error_score(pred_error, world_pred_error),
+            predicted_one=derived,
+            predicted_facts=predicted_facts,
+            primary_sigma=primary_sigma,
+        )
+        self._rule_prediction_cache[cache_key] = summary
+        return summary
+
     def _mental_simulate_rule(
         self,
         rule: "HornClause",
@@ -5740,55 +5970,13 @@ class DifferentiableProver(nn.Module):
           0.0 = правило консистентне з фактами
           1.0 = правило конфліктує або не уніфікується
         """
-        cache_key = (hash(rule), current_facts, str(device))
-        cached = self._mental_rule_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        if not rule.body:
-            result = (0.0, rule.head if rule.head.is_ground() else None)
-            self._mental_rule_cache[cache_key] = result
-            return result
-
-        fresh = freshen_vars(rule)
-        sigma = self._guided_unify_body(fresh.body, current_facts, device=device)
-
-        if sigma is None:
-            # Тіло не уніфікується → prediction_error максимальна
-            result = (1.0, None)
-            self._mental_rule_cache[cache_key] = result
-            return result
-
-        derived = sigma.apply_atom(fresh.head)
-        if not derived.is_ground():
-            result = (0.5, None)
-            self._mental_rule_cache[cache_key] = result
-            return result
-
-        # Перевіряємо суперечності з відомими фактами
-        for known in current_facts:
-            if _atoms_conflict(derived, known):
-                return 1.0, None  # Суперечність → відхиляємо
-
-        # SoftUnifier-енергія як диференційована міра prediction error
-        _MENTAL_MAX_FACTS = 32
-        fact_sample = (
-            frozenset(random.sample(list(current_facts), _MENTAL_MAX_FACTS))
-            if len(current_facts) > _MENTAL_MAX_FACTS else current_facts
-        )
-        try:
-            su_energy, _ = self.soft_unif(rule.body, fact_sample, device)
-            pred_error = float(torch.tanh(su_energy.detach() * 0.1).item())
-        except Exception:
-            pred_error = 0.0
-
-        world_pred_error = self._world_rule_prediction_error(
+        summary = self._rule_prediction_summary(
             rule,
-            derived,
-            device=device,
+            current_facts,
+            device,
+            max_predictions=8,
         )
-        result = (self._rule_prediction_error_score(pred_error, world_pred_error), derived)
-        self._mental_rule_cache[cache_key] = result
-        return result
+        return summary.pred_error, summary.predicted_one
 
         # ── WorldRNN latent-space Prediction Error (Дедукція, розділ 2) ─────
         # Концепція: «WorldRNN отримує на вхід z та дію (правило) і передбачає
@@ -5822,24 +6010,13 @@ class DifferentiableProver(nn.Module):
         current_facts: "FrozenSet[HornAtom]",
         max_predictions: int = 8,
     ) -> FrozenSet[HornAtom]:
-        if not rule.body:
-            return frozenset({rule.head}) if rule.head.is_ground() else frozenset()
-        fresh = freshen_vars(rule)
-        predicted: List[HornAtom] = []
-        for sigma in self._find_rule_substitutions(
-            fresh.body,
+        summary = self._rule_prediction_summary(
+            rule,
             current_facts,
-            max_solutions=max_predictions,
-        ):
-            derived = sigma.apply_atom(fresh.head)
-            if not derived.is_ground():
-                continue
-            if any(_atoms_conflict(derived, known) for known in current_facts):
-                continue
-            predicted.append(derived)
-            if len(predicted) >= max_predictions:
-                break
-        return frozenset(predicted)
+            self._reasoning_device(),
+            max_predictions=max_predictions,
+        )
+        return summary.predicted_facts
 
     def _induce_proposed_rules_locally(
         self,
@@ -5861,10 +6038,17 @@ class DifferentiableProver(nn.Module):
             if self._rule_status(clause) != EpistemicStatus.proposed:
                 continue
             checked += 1
-            pred_error, predicted_one = self._mental_simulate_rule(clause, current_facts, device)
+            summary = self._rule_prediction_summary(
+                clause,
+                current_facts,
+                device,
+                max_predictions=8,
+            )
+            pred_error = summary.pred_error
+            predicted_one = summary.predicted_one
             trace_pred_error = self._trace_prediction_error_for_rule(clause, trace_bundle)
             counterexample_error = self._counterexample_error_for_rule(clause, trace_bundle)
-            predicted_facts = self._predict_rule_facts(clause, current_facts)
+            predicted_facts = summary.predicted_facts
             if predicted_one is not None:
                 predicted_facts = predicted_facts | frozenset({predicted_one})
 
@@ -5955,9 +6139,8 @@ class DifferentiableProver(nn.Module):
             if not rule.body:
                 scores[i] = 0.5
                 continue
-            fresh = freshen_vars(rule)
             can_unify = (
-                self._guided_unify_body(fresh.body, current_facts, device=device) is not None
+                self._guided_unify_body(rule.body, current_facts, device=device) is not None
             )
             if can_unify:
                 vem_s = self.vem.score(rule, device)
@@ -6032,9 +6215,14 @@ class DifferentiableProver(nn.Module):
                 rule = self.kb.rules[rule_idx.item()]
 
                 # ── Ментальна симуляція ПЕРЕД застосуванням ───────────────────
-                pred_error, mentally_derived = self._mental_simulate_rule(
-                    rule, current_facts, device
+                summary = self._rule_prediction_summary(
+                    rule,
+                    current_facts,
+                    device,
+                    max_predictions=4,
                 )
+                pred_error = summary.pred_error
+                mentally_derived = summary.predicted_one
                 step_pred_errors.append(pred_error)
 
                 mental_threshold = float(getattr(self, "_mental_sim_threshold", 0.8))
@@ -6046,20 +6234,20 @@ class DifferentiableProver(nn.Module):
 
                 # Симуляція пройшла → застосовуємо реально
                 if rule.body:
-                    fresh = freshen_vars(rule)
-                    sigma = self._guided_unify_body(
-                        fresh.body,
-                        current_facts,
-                        device=device,
-                    )
+                    sigma = summary.primary_sigma
                     proof_steps.append((rule, sigma))
                     if sigma is not None:
                         self._note_used_rule(rule)
-                        derived = sigma.apply_atom(fresh.head)
+                        derived = mentally_derived if mentally_derived is not None else sigma.apply_atom(rule.head)
                         if derived.is_ground():
                             current_facts = current_facts | {derived}
                             if unify(goal, derived) is not None:
                                 proved = True
+                elif mentally_derived is not None:
+                    proof_steps.append((rule, None))
+                    current_facts = current_facts | {mentally_derived}
+                    if unify(goal, mentally_derived) is not None:
+                        proved = True
 
         # ── REINFORCE: L_proof = -E[R(T) - α·Cost(T)] ────────────────────────
         R = float(proved)
@@ -6149,22 +6337,22 @@ class DifferentiableProver(nn.Module):
         explained_atoms: Set[HornAtom] = set()
         explained_targets: Set[HornAtom] = set()
 
-        fresh = freshen_vars(clause)
+        body_atoms = clause.body
         subs = self._find_rule_substitutions(
-            fresh.body,
+            body_atoms,
             observed_facts,
             max_solutions=16,
         )
         world_errors: List[float] = []
         for sigma in subs:
             # Факти, що задовольнили тіло правила — «пояснені»
-            for b_atom in fresh.body:
+            for b_atom in body_atoms:
                 grounded = sigma.apply_atom(b_atom)
                 for obs in observed_facts:
                     if unify(grounded, obs) is not None:
                         explained_atoms.add(obs)
             # Виведений голова — якщо є у спостереженнях, теж пояснений
-            derived = sigma.apply_atom(fresh.head)
+            derived = sigma.apply_atom(clause.head)
             if derived.is_ground():
                 for obs in observed_facts:
                     if unify(derived, obs) is not None:

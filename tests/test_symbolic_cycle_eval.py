@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import omen_prolog
 from omen_prolog import Const, DifferentiableProver, HornAtom, HornClause, SymbolicTaskContext
 
 
@@ -115,6 +116,53 @@ class SymbolicCycleEvalTest(unittest.TestCase):
         self.assertEqual(cycle_learn["stats"].get("learning_active", 0.0), 1.0)
         self.assertTrue(cycle_learn["loss_tensor"].requires_grad)
 
+    def test_neural_abduction_sampler_respects_max_candidates(self) -> None:
+        prover = self._make_prover(eval_enabled=True)
+        z = torch.randn(1, 32, device=self.device)
+        specs = prover.abductor.sample_candidates_relaxed(
+            z,
+            stochastic=False,
+            max_candidates=2,
+        )
+        self.assertEqual(len(specs), 2)
+        clauses = [spec.clause for spec in specs]
+        self.assertTrue(all(len(clause.body) == 1 for clause in clauses))
+
+    def test_rule_substitution_runtime_cache_reuses_results(self) -> None:
+        prover = self._make_prover(eval_enabled=True)
+        rule = HornClause(
+            head=self.goal,
+            body=(
+                HornAtom(pred=5, args=(Const(1), Const(2))),
+                HornAtom(pred=6, args=(Const(2), Const(3))),
+            ),
+        )
+        prover._clear_runtime_caches()
+        with mock.patch.object(prover, "_graph_guided_fact_subset", return_value=(self.observed, False)), \
+             mock.patch("omen_prolog.find_all_substitutions", wraps=omen_prolog.find_all_substitutions) as find_all:
+            subs_a = prover._find_rule_substitutions(rule.body, self.observed, max_solutions=16, device=self.device)
+            subs_b = prover._find_rule_substitutions(rule.body, self.observed, max_solutions=8, device=self.device)
+        self.assertEqual(subs_a[: len(subs_b)], subs_b)
+        self.assertEqual(find_all.call_count, 1)
+
+    def test_rule_prediction_summary_cache_reuses_between_mental_and_predict(self) -> None:
+        prover = self._make_prover(eval_enabled=True)
+        rule = HornClause(
+            head=self.goal,
+            body=(
+                HornAtom(pred=5, args=(Const(1), Const(2))),
+                HornAtom(pred=6, args=(Const(2), Const(3))),
+            ),
+        )
+        prover._clear_runtime_caches()
+        with mock.patch.object(prover, "_find_rule_substitutions", wraps=prover._find_rule_substitutions) as find_subs:
+            pred_error, derived = prover._mental_simulate_rule(rule, self.observed, self.device)
+            predicted = prover._predict_rule_facts(rule, self.observed)
+        self.assertGreaterEqual(pred_error, 0.0)
+        self.assertEqual(derived, self.goal)
+        self.assertIn(self.goal, predicted)
+        self.assertEqual(find_subs.call_count, 1)
+
     def test_mental_simulation_prioritizes_world_prediction_error(self) -> None:
         prover = self._make_prover(eval_enabled=True)
         rule = HornClause(
@@ -168,6 +216,27 @@ class SymbolicCycleEvalTest(unittest.TestCase):
             self.assertAlmostEqual(score_a, score_b)
             self.assertGreater(calls_after_first, 0)
             self.assertEqual(world_error.call_count, calls_after_first)
+
+    def test_prove_with_policy_applies_verified_fact_rule(self) -> None:
+        prover = DifferentiableProver(
+            d_latent=32,
+            sym_vocab=32,
+            max_rules=8,
+            max_depth=2,
+            n_cands=2,
+        ).to(self.device)
+        goal = HornAtom(pred=9, args=(Const(1),))
+        prover.kb.add_rule(HornClause(head=goal, body=()), status=omen_prolog.EpistemicStatus.verified)
+
+        proved, trajectory, proof_loss = prover.prove_with_policy(
+            goal,
+            torch.randn(1, 32, device=self.device),
+            n_steps=1,
+            starting_facts=frozenset(),
+        )
+        self.assertTrue(proved)
+        self.assertEqual(len(trajectory), 1)
+        self.assertTrue(torch.isfinite(proof_loss))
 
 
 if __name__ == "__main__":

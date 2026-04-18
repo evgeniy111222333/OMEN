@@ -156,6 +156,14 @@ class SaliencyTraceModule(nn.Module):
         self.max_depth = max(int(getattr(cfg, "max_proof_depth", 2)), 1)
         self.top_k = max(int(getattr(cfg, "saliency_top_k", 4)), 1)
         self.max_facts = max(int(getattr(cfg, "saliency_max_facts", 512)), 64)
+        self.fast_graph_facts = max(
+            int(getattr(cfg, "saliency_fast_graph_facts", 128)),
+            32,
+        )
+        self.fast_reasoning_facts = max(
+            int(getattr(cfg, "saliency_fast_reasoning_facts", 128)),
+            32,
+        )
         self.abduce_every = max(int(getattr(cfg, "saliency_abduce_every", 5)), 1)
         self.consistency_threshold = float(getattr(cfg, "saliency_consistency_threshold", 0.55))
         self.beta_struct = float(getattr(cfg, "saliency_beta_struct", 0.05))
@@ -241,6 +249,18 @@ class SaliencyTraceModule(nn.Module):
             n_roles=self.n_roles,
         )
         self.bootstrap_rules = self._build_bootstrap_rules()
+
+    def _two_hop_semantic_facts(self, edge_pairs: Sequence[Tuple[int, int]]) -> Set[HornAtom]:
+        outgoing: Dict[int, Set[int]] = {}
+        two_hop: Set[HornAtom] = set()
+        for src_idx, dst_idx in edge_pairs:
+            outgoing.setdefault(int(src_idx), set()).add(int(dst_idx))
+        for src_idx, mid_idx in edge_pairs:
+            for dst_idx in outgoing.get(int(mid_idx), ()):
+                if int(src_idx) == int(dst_idx):
+                    continue
+                two_hop.add(HornAtom(self.pred_two_hop, (Const(int(src_idx)), Const(int(dst_idx)))))
+        return two_hop
 
     def _build_bootstrap_rules(self) -> Tuple[HornClause, ...]:
         rules: List[HornClause] = []
@@ -538,6 +558,7 @@ class SaliencyTraceModule(nn.Module):
         z_neural: torch.Tensor,
         prover=None,
         train_step: int = 0,
+        fast_mode: bool = False,
     ) -> SaliencyOutput:
         device = token_hidden.device
         batch_size, seq_len, _ = token_hidden.shape
@@ -573,7 +594,17 @@ class SaliencyTraceModule(nn.Module):
         tau = torch.sigmoid(self.tau_logit)
         role_logits = self.role_classifier(token_hidden)
         role_probs = role_logits.softmax(dim=-1)
-        aggregate = attn_maps.mean(dim=(1, 2))
+        if attn_maps.dim() == 5:
+            aggregate = attn_maps.mean(dim=(1, 2))
+        elif attn_maps.dim() == 4:
+            aggregate = attn_maps.mean(dim=1)
+        elif attn_maps.dim() == 3:
+            aggregate = attn_maps
+        else:
+            raise ValueError(
+                "SaliencyTraceModule expects attention maps with 3, 4, or 5 dims; "
+                f"got shape={tuple(attn_maps.shape)}"
+            )
         aggregate = aggregate.masked_fill(torch.eye(seq_len, device=device, dtype=torch.bool).unsqueeze(0), 0.0)
         top_vals, top_idx = aggregate.topk(k=min(self.top_k, seq_len), dim=-1)
         keep = top_vals > tau
@@ -583,6 +614,7 @@ class SaliencyTraceModule(nn.Module):
         batch_observed_sets: List[Set[HornAtom]] = []
         batch_graph_facts: List[List[HornAtom]] = []
         total_edges = 0
+        graph_fact_cap = min(self.max_facts, self.fast_graph_facts) if fast_mode else self.max_facts
 
         for b_idx in range(batch_size):
             raw_facts: List[HornAtom] = []
@@ -622,33 +654,33 @@ class SaliencyTraceModule(nn.Module):
                         semantic.add(sem_fact)
                         graph_facts.append(sem_fact)
 
-            for src_idx, mid_idx in edge_pairs:
-                for next_src, dst_idx in edge_pairs:
-                    if mid_idx != next_src or src_idx == dst_idx:
-                        continue
-                    two_hop = HornAtom(self.pred_two_hop, (Const(src_idx), Const(dst_idx)))
-                    semantic.add(two_hop)
-                    graph_facts.append(two_hop)
+            for two_hop in self._two_hop_semantic_facts(edge_pairs):
+                semantic.add(two_hop)
+                graph_facts.append(two_hop)
 
             batch_raw_facts.append(raw_facts)
             batch_semantic_sets.append(semantic)
             batch_observed_sets.append(set(raw_facts) | semantic)
-            batch_graph_facts.append(graph_facts[:self.max_facts])
+            batch_graph_facts.append(graph_facts[:graph_fact_cap])
 
         expected_semantic: List[Set[HornAtom]] = []
         consistency_scores: List[float] = []
         rule_penalties: List[float] = []
         abduced_total = 0
 
-        copied_rules = list(prover.kb.rules) if prover is not None else []
+        copied_rules = [] if fast_mode or prover is None else list(prover.kb.rules)
         reasoning_rules = list(self.bootstrap_rules) + copied_rules
-        if prover is not None:
+        if prover is not None and not fast_mode:
             base_rule_penalty = float(prover.kb.utility_adjusted_penalty(eta=0.1))
         else:
             base_rule_penalty = 0.0
+        reasoning_fact_cap = min(self.max_facts, self.fast_reasoning_facts) if fast_mode else self.max_facts
         for b_idx in range(batch_size):
+            reasoning_facts = batch_graph_facts[b_idx][:reasoning_fact_cap] if fast_mode else (
+                list(batch_raw_facts[b_idx]) + list(batch_semantic_sets[b_idx])
+            )
             all_facts = self._reason_expected_facts(
-                list(batch_raw_facts[b_idx]) + list(batch_semantic_sets[b_idx]),
+                reasoning_facts,
                 reasoning_rules,
             )
             entailed_sem = {
@@ -660,7 +692,11 @@ class SaliencyTraceModule(nn.Module):
             consistency_scores.append(consistency)
             rule_penalties.append(base_rule_penalty)
 
-            if consistency < self.consistency_threshold and (train_step % self.abduce_every == 0):
+            if (
+                not fast_mode
+                and consistency < self.consistency_threshold
+                and (train_step % self.abduce_every == 0)
+            ):
                 abduced_total += self._abduce_trace_rules(
                     batch_observed_sets[b_idx],
                     entailed_sem,

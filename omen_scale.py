@@ -12,11 +12,11 @@ Core contract:
 """
 
 from __future__ import annotations
-import math, time, random, warnings
+import json, math, random, re, time, warnings
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 
 import torch
@@ -150,101 +150,266 @@ def _enforce_canonical_stack(cfg: OMENScaleConfig) -> bool:
     return changed
 
 
+@dataclass(frozen=True)
+class SourceRoutingDecision:
+    language: str
+    domain: str
+    confidence: float
+    evidence: Dict[str, float]
+
+
+_ROUTER_LANGUAGE_MARKERS: Dict[str, Tuple[Tuple[str, float], ...]] = {
+    "python": (
+        ("def ", 2.6),
+        ("import ", 1.8),
+        ("class ", 1.4),
+        ("self.", 1.6),
+        ("elif ", 1.2),
+        ("lambda ", 1.0),
+        ("__name__ == '__main__'", 1.8),
+    ),
+    "javascript": (
+        ("function ", 2.1),
+        ("const ", 2.0),
+        ("let ", 1.7),
+        ("=>", 1.5),
+        ("console.log", 1.5),
+        ("this.", 1.2),
+        ("constructor(", 1.4),
+        ("module.exports", 1.3),
+    ),
+    "typescript": (
+        ("interface ", 2.2),
+        (": string", 1.8),
+        (": number", 1.8),
+        (": boolean", 1.6),
+        ("implements ", 1.2),
+        ("readonly ", 1.1),
+        (" as ", 0.8),
+    ),
+    "java": (
+        ("public class", 2.3),
+        ("private ", 1.4),
+        ("protected ", 1.2),
+        ("system.out", 1.8),
+        ("public static void main", 2.3),
+        ("new ", 0.8),
+        ("@override", 1.2),
+    ),
+    "rust": (
+        ("fn ", 2.4),
+        ("let mut", 1.7),
+        ("impl ", 1.6),
+        ("::", 1.0),
+        ("pub ", 1.2),
+        ("->", 0.8),
+        ("vec<", 0.8),
+        ("&str", 1.2),
+    ),
+    "go": (
+        ("package ", 2.2),
+        ("func ", 2.1),
+        (":=", 1.8),
+        ("fmt.", 1.3),
+        ("go ", 0.9),
+        ("defer ", 1.1),
+    ),
+    "c": (
+        ("#include", 2.0),
+        ("printf(", 1.7),
+        ("malloc(", 1.4),
+        ("int main(", 2.0),
+        ("typedef ", 1.1),
+    ),
+    "cpp": (
+        ("#include", 1.4),
+        ("std::", 2.0),
+        ("cout <<", 2.0),
+        ("vector<", 1.5),
+        ("auto ", 1.0),
+    ),
+    "bash": (
+        ("#!/bin/", 2.2),
+        ("echo ", 1.2),
+        (" fi", 0.7),
+        (" then", 0.7),
+        (" done", 0.7),
+        ("$(", 1.0),
+        ("$1", 1.0),
+        ("export ", 1.1),
+    ),
+    "lua": (
+        ("local ", 1.8),
+        ("function ", 1.6),
+        ("require(", 1.3),
+        (" ipairs(", 1.0),
+        (" nil", 0.8),
+        (" then", 0.6),
+    ),
+}
+
+
+def _weighted_marker_score(text: str, markers: Tuple[Tuple[str, float], ...]) -> float:
+    score = 0.0
+    for marker, weight in markers:
+        if marker in text:
+            score += weight
+    return score
+
+
+def _infer_source_routing(
+    text: str,
+    *,
+    parser_lang: Optional[str] = None,
+    supported_languages: Sequence[str] = (),
+) -> SourceRoutingDecision:
+    stripped = text.strip()
+    if not stripped:
+        return SourceRoutingDecision(
+            language="text",
+            domain="empty",
+            confidence=0.0,
+            evidence={"code_score": 0.0, "structured_score": 0.0, "observation_score": 0.0},
+        )
+
+    lower = stripped.lower()
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    probe = lines[: min(len(lines), 8)]
+    supported = tuple(sorted(set(supported_languages) | set(_ROUTER_LANGUAGE_MARKERS.keys())))
+    language_scores: Dict[str, float] = {
+        lang: _weighted_marker_score(lower, _ROUTER_LANGUAGE_MARKERS.get(lang, ()))
+        for lang in supported
+    }
+
+    if re.search(r"^\s*def\s+\w+\s*\(", stripped, flags=re.MULTILINE):
+        language_scores["python"] = language_scores.get("python", 0.0) + 1.5
+    if re.search(r"^\s*for\s+\w+\s+in\s+range\s*\(", stripped, flags=re.MULTILINE):
+        language_scores["python"] = language_scores.get("python", 0.0) + 2.0
+    if re.search(r"^\s*if\b.+:\s*$", stripped, flags=re.MULTILINE):
+        language_scores["python"] = language_scores.get("python", 0.0) + 1.2
+    if "print(" in lower:
+        language_scores["python"] = language_scores.get("python", 0.0) + 0.8
+    if any(line.endswith(":") for line in probe) and any(line.startswith(("    ", "\t")) for line in lines[1:]):
+        language_scores["python"] = language_scores.get("python", 0.0) + 1.0
+    if re.search(r"^\s*class\s+\w+\s*\{", stripped, flags=re.MULTILINE):
+        language_scores["javascript"] = language_scores.get("javascript", 0.0) + 0.8
+        language_scores["typescript"] = language_scores.get("typescript", 0.0) + 0.8
+    if re.search(r"^\s*fn\s+\w+\s*\(", stripped, flags=re.MULTILINE):
+        language_scores["rust"] = language_scores.get("rust", 0.0) + 1.4
+    if re.search(r"^\s*package\s+\w+", stripped, flags=re.MULTILINE):
+        language_scores["go"] = language_scores.get("go", 0.0) + 1.2
+    if re.search(r"^\s*#include\s+[<\"]", stripped, flags=re.MULTILINE):
+        language_scores["c"] = language_scores.get("c", 0.0) + 1.2
+        language_scores["cpp"] = language_scores.get("cpp", 0.0) + 1.2
+
+    general_code_score = 0.0
+    if any(token in stripped for token in ("{", "}", ";", "(", ")", "=>")):
+        general_code_score += 0.8
+    if any(line.startswith(("def ", "class ", "fn ", "function ", "package ", "#include")) for line in probe):
+        general_code_score += 1.0
+    if any(line.startswith(("    ", "\t")) for line in lines[1:]):
+        general_code_score += 0.5
+
+    structured_score = 0.0
+    json_like_records = 0
+    for line in probe:
+        if line.startswith("{") and line.endswith("}") and ":" in line:
+            json_like_records += 1
+            structured_score += 1.3
+            try:
+                json.loads(line)
+                structured_score += 0.8
+            except Exception:
+                pass
+        elif "=" in line or ":" in line:
+            structured_score += 0.5
+    if json_like_records >= 2:
+        structured_score += 1.4
+    if any(re.search(r"\b(step|state|goal|target|status|next)\b", line.lower()) for line in probe):
+        structured_score += 1.1
+
+    relation_hits = len(re.findall(r"\b(is|becomes|causes|leads to|requires|must|not|after|before|however)\b", lower))
+    sentence_hits = len(re.findall(r"[.!?](?:\s|$)", stripped))
+    observation_score = min(float(relation_hits) * 0.45, 3.2) + min(float(sentence_hits) * 0.25, 1.5)
+
+    ranked_languages = sorted(language_scores.items(), key=lambda item: item[1], reverse=True)
+    top_lang, top_score = ranked_languages[0] if ranked_languages else ("python", 0.0)
+    second_score = ranked_languages[1][1] if len(ranked_languages) > 1 else 0.0
+    parser_supported = parser_lang if isinstance(parser_lang, str) and parser_lang in language_scores else None
+    code_score = top_score + general_code_score
+    if parser_supported is not None:
+        code_score = max(code_score, language_scores.get(parser_supported, 0.0) + general_code_score + 0.2)
+
+    domain_scores = {
+        "code": code_score,
+        "structured_observation": structured_score,
+        "observation_text": observation_score,
+    }
+
+    if structured_score >= max(code_score * 1.05, observation_score * 0.95, 2.2):
+        language = "json" if json_like_records > 0 else "text"
+        domain = "structured_observation"
+        selected_score = structured_score
+    elif observation_score >= max(code_score * 1.10, structured_score * 0.90, 1.5):
+        language = "text"
+        domain = "observation_text"
+        selected_score = observation_score
+    elif code_score >= 1.6:
+        language = top_lang
+        if parser_supported is not None and (
+            top_score < 1.5 or language_scores.get(parser_supported, 0.0) >= top_score - 0.2
+        ):
+            language = parser_supported
+        domain = "code"
+        selected_score = code_score
+    else:
+        language = "text"
+        domain = "text"
+        selected_score = max(structured_score, observation_score, code_score)
+
+    domain_runner_up = max(
+        score for key, score in domain_scores.items()
+        if key != domain
+    ) if domain in domain_scores else 0.0
+    parser_agreement = 0.15 if parser_supported is not None and language == parser_supported else 0.0
+    confidence = 0.35 + 0.08 * min(selected_score, 6.0) + 0.10 * max(top_score - second_score, 0.0)
+    confidence += 0.08 * max(selected_score - domain_runner_up, 0.0) + parser_agreement
+    confidence = max(0.05, min(confidence, 0.99))
+
+    evidence = {
+        "code_score": round(code_score, 4),
+        "structured_score": round(structured_score, 4),
+        "observation_score": round(observation_score, 4),
+        "top_language_score": round(top_score, 4),
+        "second_language_score": round(second_score, 4),
+        "parser_agreement": 1.0 if parser_supported is not None and language == parser_supported else 0.0,
+    }
+    return SourceRoutingDecision(
+        language=language,
+        domain=domain,
+        confidence=confidence,
+        evidence=evidence,
+    )
+
+
 def _looks_structured_observation_text(text: str) -> bool:
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not lines:
-        return False
-    probe = lines[: min(len(lines), 4)]
-    if all(line.startswith("{") and line.endswith("}") and ":" in line for line in probe):
-        return True
-    head = probe[0]
-    if (
-        head.startswith("{")
-        and ":" in head
-        and any(marker in text for marker in ('"step"', '"goal"', '"target"', '"status"', '"state"'))
-    ):
-        return True
-    if all(("=" in line or ":" in line) for line in probe):
-        lower_probe = [line.lower() for line in probe]
-        observation_markers = ("step", "state:", "next:", "target ", "goal ", "1)", "2)", "3)")
-        if any(any(marker in line for marker in observation_markers) for line in lower_probe):
-            return True
-    return False
+    return _infer_source_routing(text).domain == "structured_observation"
 
 
 def _looks_plain_observation_text(text: str) -> bool:
-    lower = text.lower()
-    code_markers = (
-        "def ",
-        "class ",
-        "function ",
-        "fn ",
-        "return ",
-        "console.log",
-        "constructor(",
-        "this.",
-        "=>",
-        "::",
-        "#include",
-    )
-    if any(marker in lower for marker in code_markers):
-        return False
-    relation_markers = (
-        " is ",
-        " becomes ",
-        " causes ",
-        " leads to ",
-        " however ",
-        " target ",
-        " goal ",
-        " must ",
-        " not ",
-    )
-    sentence_count = sum(lower.count(marker) for marker in (". ", "! ", "? "))
-    relation_hits = sum(1 for marker in relation_markers if marker in lower)
-    return sentence_count >= 1 and relation_hits >= 1
+    return _infer_source_routing(text).domain == "observation_text"
 
 
 def _looks_javascript_source(text: str) -> bool:
-    lower = text.lower()
-    js_markers = (
-        "console.log",
-        "const ",
-        "let ",
-        "=>",
-        "constructor(",
-        "this.",
-        "function ",
-    )
-    if any(marker in lower for marker in js_markers):
-        return True
-    stripped = text.strip()
-    return stripped.startswith("class ") and "{" in stripped and "}" in stripped
+    return _infer_source_routing(text).language == "javascript"
 
 
 def _looks_rust_source(text: str) -> bool:
-    lower = text.lower()
-    rust_markers = (
-        "fn ",
-        "struct ",
-        "i32",
-        "::",
-        ".iter()",
-        "&[",
-    )
-    return any(marker in lower for marker in rust_markers)
+    return _infer_source_routing(text).language == "rust"
 
 
 def _heuristic_source_language(text: str) -> Optional[str]:
-    if _looks_javascript_source(text):
-        return "javascript"
-    if _looks_rust_source(text):
-        return "rust"
-    if _looks_structured_observation_text(text):
-        return "json" if "{" in text and "}" in text else "text"
-    if _looks_plain_observation_text(text):
-        return "text"
-    return None
+    return _infer_source_routing(text).language
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -477,13 +642,22 @@ class TokenEncoder(nn.Module):
         self.norm = RMSNorm(cfg.d_tok)
         self.drop = nn.Dropout(cfg.dropout)
 
-    def forward(self, tokens: torch.Tensor, return_attn: bool = False):
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        return_attn: bool = False,
+        summarize_attn: bool = False,
+    ):
         """tokens: (B, T) → hidden: (B, T, d_tok)"""
         x = self.drop(self.embed(tokens))
         attn_maps: List[torch.Tensor] = []
         for blk in self.blocks:
             if return_attn:
-                x, attn_weights = blk(x, need_weights=True)
+                x, attn_weights = blk(
+                    x,
+                    need_weights=True,
+                    average_attn_weights=summarize_attn,
+                )
                 attn_maps.append(attn_weights)
             else:
                 x = blk(x)
@@ -907,6 +1081,33 @@ class OMENScaleLoss(nn.Module):
                            else (net_loss.item() if torch.is_tensor(net_loss)
                                  else float(net_loss)))
 
+        out = {"total": total}
+        if metric_profile == "train_fast":
+            out.update({
+                "ce": token_nll_nats.item(),
+                "world": L_world.item(),
+                "world_alignment": world_alignment.item(),
+                "world_causal_error": world_causal_error.item(),
+                "l_scale": (L_scale / float(mdl_seen_tokens)).item(),
+                "sym_ground": L_sym_clamped.item() if torch.is_tensor(L_sym_clamped) else float(L_sym_clamped),
+                "ltm_pen": (rule_bits / float(mdl_seen_tokens)).item(),
+                "ltm_pen_raw": float(ltm_penalty),
+                "curiosity": curiosity_l.item(),
+                "net_loss": net_loss_scalar,
+                "vem_pen": L_vem.item() if torch.is_tensor(L_vem) else float(L_vem),
+                "meta_loss": L_meta.item() if torch.is_tensor(L_meta) else float(L_meta),
+                "program_anchor": program_anchor_t.item(),
+                "program_decoder_ce": program_decoder_nats.item(),
+                "program_decoder_bits": program_decoder_bits.item(),
+                "traj_reward": traj_reward if traj_reward is not None else 0.0,
+                "reasoning_cost": L_reason.item(),
+                "aux_phase": aux_phase,
+                "world_w": world_w,
+                "sym_w": sym_w,
+                "net_w": net_w,
+                "meta_w": meta_w,
+            })
+            return out
         metrics = {
             "ce":         token_nll_nats.item(),
             "ce_bits":    token_nll.item(),
@@ -969,10 +1170,6 @@ class OMENScaleLoss(nn.Module):
             "net_w":      net_w,
             "meta_w":     meta_w,
         }
-        out = {"total": total}
-        if metric_profile == "train_fast":
-            out.update({key: metrics[key] for key in TRAIN_FAST_LOSS_KEYS})
-            return out
         out.update(metrics)
         return out
 
@@ -1004,9 +1201,17 @@ class SymbolicFactCache:
         self._hits = 0
         self._misses = 0
 
+    @staticmethod
+    def _raw_bytes(src_row: torch.Tensor) -> bytes:
+        row = src_row.detach()
+        if row.device.type != "cpu" or row.dtype != torch.uint8:
+            row = row.to(device="cpu", dtype=torch.uint8)
+        row = row.contiguous()
+        return row.numpy().tobytes().rstrip(b"\x00")
+
     def _key(self, src_row: torch.Tensor) -> str:
         import hashlib
-        raw = bytes(int(v) % 256 for v in src_row.tolist()).rstrip(b"\x00")
+        raw = self._raw_bytes(src_row)
         return hashlib.sha1(raw).hexdigest()
 
     @staticmethod
@@ -1015,15 +1220,22 @@ class SymbolicFactCache:
             return None
         if len(entry) == 2:
             facts, rules = entry
-            return facts, rules, None, None
+            return facts, rules, None, None, None
         if len(entry) == 3:
             facts, rules, trace_bundle = entry
-            return facts, rules, trace_bundle, None
-        return entry
+            return facts, rules, trace_bundle, None, None
+        if len(entry) == 4:
+            facts, rules, trace_bundle, detected_lang = entry
+            return facts, rules, trace_bundle, detected_lang, None
+        return entry[:5]
 
     def get(self, src_row: torch.Tensor):
         """Повертає (facts, rules, trace_bundle, detected_lang) або None при cache miss."""
         k = self._key(src_row)
+        return self.get_by_key(k)
+
+    def get_by_key(self, cache_key: str):
+        k = cache_key
         if k in self._cache:
             self._cache.move_to_end(k)
             self._hits += 1
@@ -1031,9 +1243,29 @@ class SymbolicFactCache:
         self._misses += 1
         return None
 
-    def put(self, src_row: torch.Tensor, facts, rules, trace_bundle=None, detected_lang: Optional[str] = None) -> None:
+    def put(
+        self,
+        src_row: torch.Tensor,
+        facts,
+        rules,
+        trace_bundle=None,
+        detected_lang: Optional[str] = None,
+        routing: Optional[SourceRoutingDecision] = None,
+    ) -> None:
         k = self._key(src_row)
-        self._cache[k] = (facts, rules, trace_bundle, detected_lang)
+        self.put_by_key(k, facts, rules, trace_bundle, detected_lang, routing)
+
+    def put_by_key(
+        self,
+        cache_key: str,
+        facts,
+        rules,
+        trace_bundle=None,
+        detected_lang: Optional[str] = None,
+        routing: Optional[SourceRoutingDecision] = None,
+    ) -> None:
+        k = cache_key
+        self._cache[k] = (facts, rules, trace_bundle, detected_lang, routing)
         self._cache.move_to_end(k)
         if len(self._cache) > self._max:
             self._cache.popitem(last=False)
@@ -1728,6 +1960,7 @@ class OMENScale(nn.Module):
         self._fact_cache = SymbolicFactCache(
             max_entries=int(getattr(cfg, "fact_cache_size", 4096))
         )
+        self._row_runtime_cache: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
         # SymbolicQueryGenerator: генерує Horn-цілі з прихованого стану декодера
         # і коригує логіти декодера відповідно до результату доведення (пункт 3)
         sym_qg_enabled = getattr(cfg, "sym_query_gen_enabled", True)
@@ -2094,21 +2327,23 @@ class OMENScale(nn.Module):
         src_cpu = src.detach().to(device="cpu")
         for batch_idx in range(src.size(0)):
             src_row = src_cpu[batch_idx]
-            pair_cap = min(max(src_row.numel() - 1, 0), max_pairs)
-            start_idx = max(src_row.numel() - pair_cap - 1, 0)
+            src_tokens = self._row_token_values(src_row)
+            row_len = len(src_tokens)
+            pair_cap = min(max(row_len - 1, 0), max_pairs)
+            start_idx = max(row_len - pair_cap - 1, 0)
             graph_facts: List[HornAtom] = []
-            for pos in range(start_idx, max(src_row.numel() - 1, 0)):
+            for pos in range(start_idx, max(row_len - 1, 0)):
                 graph_facts.append(
                     HornAtom(
                         SEQ_EDGE_PRED,
-                        (int(src_row[pos].item()), int(src_row[pos + 1].item())),
+                        (src_tokens[pos], src_tokens[pos + 1]),
                     )
                 )
-            if src_row.numel() > 0:
+            if row_len > 0:
                 graph_facts.append(
                     HornAtom(
                         SEQ_LAST_TOKEN_PRED,
-                        (int(src_row[-1].item()), max(int(src_row.numel()) - 1, 0)),
+                        (src_tokens[-1], max(row_len - 1, 0)),
                     )
                 )
 
@@ -3103,12 +3338,20 @@ class OMENScale(nn.Module):
         targets: torch.Tensor,
         ignore_index: int = 0,
     ) -> torch.Tensor:
+        if not bool(targets.ne(ignore_index).any()):
+            return torch.zeros((), device=logits.device, dtype=logits.dtype)
+        if logits.dim() == targets.dim() + 1:
+            if logits.dim() == 2:
+                return F.cross_entropy(logits, targets, ignore_index=ignore_index, reduction="mean")
+            return F.cross_entropy(
+                logits.transpose(-1, -2),
+                targets,
+                ignore_index=ignore_index,
+                reduction="mean",
+            )
         flat_targets = targets.reshape(-1)
         flat_logits = logits.reshape(flat_targets.size(0), -1)
-        valid = flat_targets.ne(ignore_index)
-        if not bool(valid.any()):
-            return torch.zeros((), device=logits.device, dtype=logits.dtype)
-        return F.cross_entropy(flat_logits[valid], flat_targets[valid], reduction="mean")
+        return F.cross_entropy(flat_logits, flat_targets, ignore_index=ignore_index, reduction="mean")
 
     def _decoder_surprise_signal(
         self,
@@ -3157,9 +3400,53 @@ class OMENScale(nn.Module):
         return unique
 
     @staticmethod
-    def _decode_source_bytes(src_row: torch.Tensor) -> str:
-        raw = bytes(int(v) % 256 for v in src_row.tolist()).rstrip(b"\x00")
-        return raw.decode("utf-8", errors="ignore")
+    def _row_runtime_cache_token(src_row: torch.Tensor) -> Tuple[int, int, int]:
+        return (
+            int(src_row.data_ptr()),
+            int(src_row.storage_offset()),
+            int(src_row.numel()),
+        )
+
+    def _row_runtime_info(self, src_row: torch.Tensor) -> Dict[str, Any]:
+        token = self._row_runtime_cache_token(src_row)
+        cached = self._row_runtime_cache.get(token)
+        if cached is not None:
+            return cached
+        row = src_row.detach()
+        if row.device.type != "cpu" or row.dtype != torch.uint8:
+            row = row.to(device="cpu", dtype=torch.uint8)
+        row = row.contiguous()
+        raw_full = row.numpy().tobytes()
+        cached = {
+            "raw_full": raw_full,
+            "raw": raw_full.rstrip(b"\x00"),
+            "tokens": list(raw_full),
+        }
+        self._row_runtime_cache[token] = cached
+        return cached
+
+    def _row_fact_cache_key(self, src_row: torch.Tensor) -> str:
+        info = self._row_runtime_info(src_row)
+        cache_key = info.get("fact_cache_key")
+        if cache_key is None:
+            import hashlib
+            cache_key = hashlib.sha1(info["raw"]).hexdigest()
+            info["fact_cache_key"] = cache_key
+        return cache_key
+
+    def _row_token_values(self, src_row: torch.Tensor) -> List[int]:
+        return self._row_runtime_info(src_row)["tokens"]
+
+    def _clear_row_runtime_cache(self) -> None:
+        self._row_runtime_cache.clear()
+
+    def _decode_source_bytes(self, src_row: torch.Tensor) -> str:
+        info = self._row_runtime_info(src_row)
+        text = info.get("text")
+        if text is None:
+            text = info["raw"].decode("utf-8", errors="ignore")
+            info["text"] = text
+        return text
 
     @staticmethod
     def _prioritize_trace_targets(
@@ -3263,16 +3550,18 @@ class OMENScale(nn.Module):
         row = tokens[0].detach().cpu()
         if row.numel() == 0:
             return []
+        row_tokens = self._row_token_values(row)
         seed: List[HornAtom] = []
-        edge_cap = min(max(int(row.numel()) - 1, 0), 6)
-        start_idx = max(int(row.numel()) - edge_cap - 1, 0)
-        for idx in range(start_idx, max(int(row.numel()) - 1, 0)):
+        row_len = len(row_tokens)
+        edge_cap = min(max(row_len - 1, 0), 6)
+        start_idx = max(row_len - edge_cap - 1, 0)
+        for idx in range(start_idx, max(row_len - 1, 0)):
             seed.append(HornAtom(
                 SEQ_EDGE_PRED,
-                (int(row[idx].item()), int(row[idx + 1].item())),
+                (row_tokens[idx], row_tokens[idx + 1]),
             ))
-        last_token = int(row[-1].item())
-        seed.append(HornAtom(SEQ_LAST_TOKEN_PRED, (last_token, max(int(row.numel()) - 1, 0))))
+        last_token = row_tokens[-1]
+        seed.append(HornAtom(SEQ_LAST_TOKEN_PRED, (last_token, max(row_len - 1, 0))))
         if decoder_signal is not None and torch.is_tensor(decoder_signal.get("pred_tokens")):
             pred_tokens = decoder_signal["pred_tokens"]
             if pred_tokens.numel() > 0:
@@ -3391,6 +3680,15 @@ class OMENScale(nn.Module):
             selected.append(atom)
             if len(selected) >= limit:
                 break
+        if not selected:
+            for _node_type, atom in records:
+                atom_hash = hash(atom)
+                if atom_hash in seen:
+                    continue
+                seen.add(atom_hash)
+                selected.append(atom)
+                if len(selected) >= limit:
+                    break
         return selected
 
     def _attach_world_context_to_task(
@@ -3480,9 +3778,10 @@ class OMENScale(nn.Module):
         Returns:
             List[HornAtom] — знайдені факти (ліміт _ctx_ast_max_facts)
         """
-        cached = self._fact_cache.get(src_row)
+        cache_key = self._row_fact_cache_key(src_row)
+        cached = self._fact_cache.get_by_key(cache_key)
         if cached is not None:
-            facts, _rules, _trace, _lang = cached
+            facts, _rules, _trace, _lang, _routing = cached
             return facts
 
         try:
@@ -3491,20 +3790,26 @@ class OMENScale(nn.Module):
             return []
         if not code.strip():
             return []
-        detected_lang = "text"
-        facts: List[HornAtom] = []
-        heuristic_lang = _heuristic_source_language(code)
-        if heuristic_lang is not None:
-            detected_lang = heuristic_lang
-        else:
-            try:
-                detected_lang = self.ast_parser.detect_lang(code)
-            except Exception:
-                detected_lang = "text"
+        parser_lang: Optional[str] = None
         try:
-            facts = self.ast_parser.parse_autodetect(code, source_id=0)
+            parser_lang = self.ast_parser.detect_lang(code)
         except Exception:
-            facts = []
+            parser_lang = None
+        routing = _infer_source_routing(
+            code,
+            parser_lang=parser_lang,
+            supported_languages=self.ast_parser.supported_languages(),
+        )
+        detected_lang = routing.language
+        facts: List[HornAtom] = []
+        if routing.domain == "code" and detected_lang in self.ast_parser.supported_languages():
+            try:
+                facts = self.ast_parser.parse(code, detected_lang, source_id=0)
+            except Exception:
+                try:
+                    facts = self.ast_parser.parse_autodetect(code, source_id=0)
+                except Exception:
+                    facts = []
         try:
             trace_bundle = build_symbolic_trace_bundle(
                 code,
@@ -3516,7 +3821,16 @@ class OMENScale(nn.Module):
             trace_bundle = None
         trace_lang = getattr(trace_bundle, "language", None) if trace_bundle is not None else None
         if isinstance(trace_lang, str) and trace_lang:
-            if not facts or trace_lang not in ("python", "javascript", "rust"):
+            if routing.domain != "code" and trace_lang in ("json", "text"):
+                detected_lang = trace_lang
+                routing = replace(
+                    routing,
+                    language=trace_lang,
+                    domain="structured_observation" if trace_lang == "json" else routing.domain,
+                    confidence=max(routing.confidence, 0.75),
+                    evidence={**routing.evidence, "trace_lang_override": 1.0},
+                )
+            elif not facts or trace_lang not in ("python", "javascript", "rust"):
                 detected_lang = trace_lang
         if not facts and trace_bundle is not None:
             facts = self._dedupe_facts(
@@ -3530,7 +3844,7 @@ class OMENScale(nn.Module):
         except Exception:
             rule_templates = []
         # Зберігаємо в кеш
-        self._fact_cache.put(src_row, facts, rule_templates, trace_bundle, detected_lang)
+        self._fact_cache.put_by_key(cache_key, facts, rule_templates, trace_bundle, detected_lang, routing)
         return facts
 
     def _ast_rules_from_bytes(self, src_row: torch.Tensor):
@@ -3540,32 +3854,66 @@ class OMENScale(nn.Module):
           «AST-факти як джерело правил, а не тільки фактів.»
         """
         # Спочатку перевіряємо кеш (попередньо заповнений _ast_facts_from_bytes)
-        cached = self._fact_cache.get(src_row)
+        cache_key = self._row_fact_cache_key(src_row)
+        cached = self._fact_cache.get_by_key(cache_key)
         if cached is not None:
-            _facts, rules, _trace, _lang = cached
+            _facts, rules, _trace, _lang, _routing = cached
             return rules
         # Примусово парсимо, щоб заповнити кеш
         self._ast_facts_from_bytes(src_row)
-        cached = self._fact_cache.get(src_row)
+        cached = self._fact_cache.get_by_key(cache_key)
         if cached is not None:
             return cached[1]
         return []
 
     def _ast_trace_from_bytes(self, src_row: torch.Tensor):
-        cached = self._fact_cache.get(src_row)
+        cache_key = self._row_fact_cache_key(src_row)
+        cached = self._fact_cache.get_by_key(cache_key)
         if cached is not None:
-            _facts, _rules, trace_bundle, _lang = cached
+            _facts, _rules, trace_bundle, _lang, _routing = cached
             return trace_bundle
         self._ast_facts_from_bytes(src_row)
-        cached = self._fact_cache.get(src_row)
+        cached = self._fact_cache.get_by_key(cache_key)
         if cached is not None:
             return cached[2]
         return None
 
-    def _ast_lang_from_bytes(self, src_row: torch.Tensor) -> str:
-        cached = self._fact_cache.get(src_row)
+    def _source_routing_from_bytes(self, src_row: torch.Tensor) -> SourceRoutingDecision:
+        cache_key = self._row_fact_cache_key(src_row)
+        cached = self._fact_cache.get_by_key(cache_key)
         if cached is not None:
-            _facts, _rules, trace_bundle, detected_lang = cached
+            _facts, _rules, _trace, detected_lang, routing = cached
+            if routing is not None:
+                return routing
+            if isinstance(detected_lang, str) and detected_lang:
+                return SourceRoutingDecision(
+                    language=detected_lang,
+                    domain="code" if detected_lang not in ("text", "json") else "text",
+                    confidence=0.5,
+                    evidence={},
+                )
+        self._ast_facts_from_bytes(src_row)
+        cached = self._fact_cache.get_by_key(cache_key)
+        if cached is not None:
+            _facts, _rules, _trace, detected_lang, routing = cached
+            if routing is not None:
+                return routing
+            if isinstance(detected_lang, str) and detected_lang:
+                return SourceRoutingDecision(
+                    language=detected_lang,
+                    domain="code" if detected_lang not in ("text", "json") else "text",
+                    confidence=0.5,
+                    evidence={},
+                )
+        return SourceRoutingDecision(language="text", domain="text", confidence=0.0, evidence={})
+
+    def _ast_lang_from_bytes(self, src_row: torch.Tensor) -> str:
+        cache_key = self._row_fact_cache_key(src_row)
+        cached = self._fact_cache.get_by_key(cache_key)
+        if cached is not None:
+            _facts, _rules, trace_bundle, detected_lang, routing = cached
+            if routing is not None and routing.language:
+                return routing.language
             trace_lang = getattr(trace_bundle, "language", None) if trace_bundle is not None else None
             if isinstance(trace_lang, str) and trace_lang and trace_lang not in ("python", "javascript", "rust"):
                 return trace_lang
@@ -3577,16 +3925,7 @@ class OMENScale(nn.Module):
             return "python"
         if not code.strip():
             return "python"
-        heuristic_lang = _heuristic_source_language(code)
-        if heuristic_lang is not None:
-            detected_lang = heuristic_lang
-        else:
-            try:
-                detected_lang = self.ast_parser.detect_lang(code)
-            except Exception:
-                detected_lang = "python"
-        self._ast_facts_from_bytes(src_row)
-        return detected_lang
+        return self._source_routing_from_bytes(src_row).language
 
     def _build_counterfactual_actions(self, src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
         n_cf = max(int(getattr(self.cfg, "n_counterfactual", 0)), 0)
@@ -3610,16 +3949,24 @@ class OMENScale(nn.Module):
         attn_maps: Optional[torch.Tensor] = None
         saliency_hidden: Optional[torch.Tensor] = None
         if self.net_enabled:
-            h_tok, vq_indices, net_info = self.net.encode(
-                tokens,
-                return_attn=self.saliency_enabled,
-            )
+            if self.saliency_enabled:
+                h_tok, vq_indices, net_info = self.net.encode(
+                    tokens,
+                    return_attn=True,
+                    summarize_attn=True,
+                )
+            else:
+                h_tok, vq_indices, net_info = self.net.encode(tokens)
             attn_maps = net_info.get("attention_maps")
             saliency_hidden = net_info.get("h_ctx", h_tok)
             return h_tok, attn_maps, saliency_hidden, vq_indices
 
         if self.saliency_enabled:
-            h_tok, attn_maps = self.tok_encoder(tokens, return_attn=True)
+            h_tok, attn_maps = self.tok_encoder(
+                tokens,
+                return_attn=True,
+                summarize_attn=True,
+            )
         else:
             h_tok = self.tok_encoder(tokens)
         saliency_hidden = h_tok
@@ -3631,6 +3978,7 @@ class OMENScale(nn.Module):
         attn_maps: Optional[torch.Tensor],
         saliency_hidden: Optional[torch.Tensor],
         z_neural: torch.Tensor,
+        fast_mode: bool = False,
     ) -> Optional[object]:
         if (
             not self.saliency_enabled
@@ -3645,6 +3993,7 @@ class OMENScale(nn.Module):
             z_neural=z_neural,
             prover=self.prover,
             train_step=int(self._train_step.item()),
+            fast_mode=fast_mode,
         )
 
     @staticmethod
@@ -3872,22 +4221,25 @@ class OMENScale(nn.Module):
         """
         src_row = src[0].detach().cpu()
         tgt_row = tgt[0].detach().cpu()
+        src_tokens = self._row_token_values(src_row)
+        tgt_tokens = self._row_token_values(tgt_row)
         observed_now: List[HornAtom] = []
         memory_derived = list(memory_facts or [])
         saliency_derived: List[HornAtom] = []
         net_derived = list(net_facts or [])
 
-        pair_cap = min(src_row.numel(), max(self._ctx_max_facts // 2, 8))
-        start_idx = max(src_row.numel() - pair_cap, 0)
-        for idx in range(start_idx, src_row.numel()):
+        row_len = min(len(src_tokens), len(tgt_tokens))
+        pair_cap = min(row_len, max(self._ctx_max_facts // 2, 8))
+        start_idx = max(row_len - pair_cap, 0)
+        for idx in range(start_idx, row_len):
             observed_now.append(HornAtom(
                 SEQ_EDGE_PRED,
-                (int(src_row[idx].item()), int(tgt_row[idx].item())),
+                (src_tokens[idx], tgt_tokens[idx]),
             ))
 
-        last_src = int(src_row[-1].item())
-        last_tgt = int(tgt_row[-1].item())
-        observed_now.append(HornAtom(SEQ_LAST_TOKEN_PRED, (last_src, src_row.numel() - 1)))
+        last_src = src_tokens[-1]
+        last_tgt = tgt_tokens[-1]
+        observed_now.append(HornAtom(SEQ_LAST_TOKEN_PRED, (last_src, row_len - 1)))
 
         decoder_pred = last_tgt
         decoder_miss = 0.0
@@ -3922,6 +4274,7 @@ class OMENScale(nn.Module):
         ast_facts = self._ast_facts_from_bytes(src_row)
         trace_bundle = self._ast_trace_from_bytes(src_row)
         ast_lang = self._ast_lang_from_bytes(src_row)
+        source_routing = self._source_routing_from_bytes(src_row)
 
         # ── Пункт 6: завантажуємо AST правила-шаблони в KB (verified) ─────────
         # Це відповідає: «AST-факти як джерело правил, а не тільки фактів.»
@@ -4042,6 +4395,8 @@ class OMENScale(nn.Module):
                 "trace_steps": float(len(trace_bundle.transitions) if trace_bundle is not None else 0),
                 "trace_counterexamples": float(len(trace_bundle.counterexamples) if trace_bundle is not None else 0),
                 "ast_lang": ast_lang,
+                "source_domain": source_routing.domain,
+                "source_confidence": float(source_routing.confidence),
             },
         )
 
@@ -4074,6 +4429,7 @@ class OMENScale(nn.Module):
         ast_facts = self._ast_facts_from_bytes(prompt_row)
         trace_bundle = self._ast_trace_from_bytes(prompt_row)
         ast_lang = self._ast_lang_from_bytes(prompt_row)
+        source_routing = self._source_routing_from_bytes(prompt_row)
         saliency_semantic = list(saliency_out.sal_semantic_facts[0]) if saliency_out is not None else []
         saliency_expected = list(saliency_out.sal_expected_facts[0]) if saliency_out is not None else []
         net_stats = self._net_symbolic_stats(net_derived)
@@ -4152,6 +4508,8 @@ class OMENScale(nn.Module):
                 "trace_steps": float(len(trace_bundle.transitions) if trace_bundle is not None else 0),
                 "trace_counterexamples": float(len(trace_bundle.counterexamples) if trace_bundle is not None else 0),
                 "ast_lang": ast_lang,
+                "source_domain": source_routing.domain,
+                "source_confidence": float(source_routing.confidence),
             },
         )
 
@@ -4197,6 +4555,7 @@ class OMENScale(nn.Module):
         fast_metrics = metric_profile == "train_fast"
         if self.world_graph_enabled:
             self.world_graph.clear_runtime_caches()
+        self._clear_row_runtime_cache()
         if self.training:
             self._train_step.add_(1)
             self._seen_tokens.add_(int(max(tgt[:, 1:].ne(0).sum().item(), 1)))
@@ -4208,15 +4567,25 @@ class OMENScale(nn.Module):
         saliency_hidden = None
         if self.net_enabled:
             # ── NET шлях: контекстне кодування + семантичне квантування ────────
-            h_tok, vq_indices, net_info = self.net.encode(
-                src, return_attn=self.saliency_enabled)        # (B,T,d_tok)
+            if self.saliency_enabled:
+                h_tok, vq_indices, net_info = self.net.encode(
+                    src,
+                    return_attn=True,
+                    summarize_attn=True,
+                )        # (B,T,d_tok)
+            else:
+                h_tok, vq_indices, net_info = self.net.encode(src)        # (B,T,d_tok)
             attn_maps = net_info.get("attention_maps")
             saliency_hidden = net_info.get("h_ctx", h_tok)
             net_facts = self._net_symbolic_facts(vq_indices)
         else:
             # ── Класичний шлях: просте Embedding + LlamaDecoderBlock ─────────
             if self.saliency_enabled:
-                h_tok, attn_maps = self.tok_encoder(src, return_attn=True)
+                h_tok, attn_maps = self.tok_encoder(
+                    src,
+                    return_attn=True,
+                    summarize_attn=True,
+                )
             else:
                 h_tok = self.tok_encoder(src)                               # (B,T,d_tok)
             saliency_hidden = h_tok
@@ -4246,6 +4615,7 @@ class OMENScale(nn.Module):
                 z_neural=z,
                 prover=self.prover,
                 train_step=int(self._train_step.item()),
+                fast_mode=fast_metrics,
             )
         world_graph_batch = self._build_world_graph_batch(
             src,
@@ -4476,12 +4846,11 @@ class OMENScale(nn.Module):
         decoder_uses_net_encoder = 1.0 if self.net_enabled else 0.0
         if self.net_enabled:
             # NET декодер: реконструює оригінальні токени з h_tok + z_final
-            net_logits, l_rec = self.net.decode(tgt, z_final, h_tok)  # (B,T,V), scalar
-            logits = net_logits
-            decoder_mode = "net_decoder"
+            net_logits = None
+            logits = None
             # L_NET з семантичним feedback: -λ·I(Z;Γ) через sem_pairs_net
             net_loss_dict = self.net.compute_loss(
-                net_info, l_rec,
+                net_info, None,
                 sem_pairs=sem_pairs_net if sem_pairs_net else None
             )
             net_loss = net_loss_dict.get("net_aux_tensor", net_loss_dict["net_total"])
@@ -4498,9 +4867,20 @@ class OMENScale(nn.Module):
                     prover     = self.prover,
                     symbolic_goal = getattr(self.prover, "last_goal", None) or task_context.goal,
                     symbolic_facts = getattr(self.prover, "last_context_facts", frozenset()) or task_context.observed_facts,
+                    fast_mode  = fast_metrics,
                 )
                 logits = osf_logits
                 decoder_mode = "osf_decoder_with_net_encoder"
+            else:
+                net_logits, _ = self.net.decode(
+                    tgt,
+                    z_final,
+                    h_tok,
+                    return_recon_loss=False,
+                    return_logits=True,
+                )
+                logits = net_logits
+                decoder_mode = "net_decoder"
         elif self.osf_enabled:
             # ── OSF: ієрархічна генерація H1→H2→H3→H4 ─────────────────────────
             # OSF замінює TokenDecoder через нейро-символьне планування.
@@ -4517,6 +4897,7 @@ class OMENScale(nn.Module):
                 prover     = self.prover,
                 symbolic_goal = getattr(self.prover, "last_goal", None) or task_context.goal,
                 symbolic_facts = getattr(self.prover, "last_context_facts", frozenset()) or task_context.observed_facts,
+                fast_mode  = fast_metrics,
             )
             decoder_mode = "osf_decoder"
             net_loss      = torch.tensor(0.0, device=src.device)
@@ -4834,6 +5215,12 @@ class OMENScale(nn.Module):
         out["sym_ast_lang_javascript"] = 1.0 if ast_lang == "javascript" else 0.0
         out["sym_ast_lang_rust"] = 1.0 if ast_lang == "rust" else 0.0
         out["sym_ast_lang_other"] = 1.0 if ast_lang not in ("", "python", "javascript", "rust") else 0.0
+        source_domain = str(task_context.metadata.get("source_domain", ""))
+        out["sym_source_domain_code"] = 1.0 if source_domain == "code" else 0.0
+        out["sym_source_domain_observation"] = 1.0 if source_domain == "observation_text" else 0.0
+        out["sym_source_domain_structured"] = 1.0 if source_domain == "structured_observation" else 0.0
+        out["sym_source_domain_other"] = 1.0 if source_domain not in ("", "code", "observation_text", "structured_observation") else 0.0
+        out["sym_source_confidence"] = float(task_context.metadata.get("source_confidence", 0.0))
         if net_loss_dict:
             out["net_aux"] = float(net_loss_dict.get("net_aux", 0.0))
             out["net_vocab_pen"] = float(net_loss_dict.get("net_vocab_pen", 0.0))
@@ -5471,6 +5858,7 @@ class OMENScale(nn.Module):
           і залишається фіксованим протягом всієї генерації.
           Швидший, але без динамічного «розуміння».
         """
+        self._clear_row_runtime_cache()
         ctx = nullcontext() if self._generation_online_learning_active() else torch.no_grad()
         with ctx:
             return self._generate_symbolic(

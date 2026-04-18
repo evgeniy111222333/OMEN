@@ -122,7 +122,8 @@ class LlamaAttention(nn.Module):
                 x: torch.Tensor,
                 context: Optional[torch.Tensor] = None,
                 attn_mask: Optional[torch.Tensor] = None,
-                need_weights: bool = False):
+                need_weights: bool = False,
+                average_attn_weights: bool = False):
         B, T, _ = x.shape
 
         q = self.q_proj(x).view(B, T, self.h, self.dh).transpose(1, 2)
@@ -158,6 +159,8 @@ class LlamaAttention(nn.Module):
             attn = F.dropout(weights, p=self.drop, training=self.training)
             out = torch.matmul(attn, v)
             out = self.o_proj(out.transpose(1, 2).contiguous().view(B, T, -1))
+            if average_attn_weights:
+                return out, weights.mean(dim=1)
             return out, weights
 
         # F.scaled_dot_product_attention: FlashAttention якщо доступна
@@ -188,9 +191,18 @@ class LlamaDecoderBlock(nn.Module):
         self.norm2 = RMSNorm(d)
         self.ffn   = SwiGLUFFN(d, dropout=dropout)
 
-    def forward(self, x: torch.Tensor, need_weights: bool = False):
+    def forward(
+        self,
+        x: torch.Tensor,
+        need_weights: bool = False,
+        average_attn_weights: bool = False,
+    ):
         if need_weights:
-            attn_out, attn_weights = self.attn(self.norm1(x), need_weights=True)
+            attn_out, attn_weights = self.attn(
+                self.norm1(x),
+                need_weights=True,
+                average_attn_weights=average_attn_weights,
+            )
             x = x + attn_out
             x = x + self.ffn(self.norm2(x))
             return x, attn_weights

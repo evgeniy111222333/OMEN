@@ -74,6 +74,10 @@ class OSFConfig:
     # Gumbel tau
     gumbel_tau:     float = 1.0
 
+    # Training-fast execution gate: keep early high-CE steps on the
+    # cheap OSF route, then fall back to full strategy selection later.
+    fast_ce_threshold: float = 4.5
+
     dropout:        float = 0.1
 
 
@@ -226,6 +230,31 @@ class OSFSynthesizer(nn.Module):
             plan_loss=plan.plan_loss,
         )
 
+    @staticmethod
+    def _verify_summary(verify_result) -> Tuple[float, float, int]:
+        return (
+            float(verify_result.goal_progress.mean().item()),
+            float(verify_result.l_verify.item()),
+            int(verify_result.mismatch_mask.sum().item()),
+        )
+
+    @staticmethod
+    def _verify_score(summary: Tuple[float, float, int]) -> Tuple[float, float, int]:
+        goal_progress, l_verify, mismatch_count = summary
+        return (goal_progress, -l_verify, -mismatch_count)
+
+    @staticmethod
+    def _verify_is_perfect(summary: Tuple[float, float, int]) -> bool:
+        goal_progress, l_verify, mismatch_count = summary
+        return mismatch_count == 0 and goal_progress + 1e-6 >= 1.0 and l_verify <= 1e-6
+
+    @staticmethod
+    def _sim_summary(sim_result) -> Tuple[float, int]:
+        return (
+            float(sim_result.l_sim.item()),
+            int(sim_result.mismatch_mask.sum().item()),
+        )
+
     def _repair_plan_symbolically(
         self,
         intent_state: IntentState,
@@ -242,6 +271,7 @@ class OSFSynthesizer(nn.Module):
         best_plan = current_plan
         if best_verify is None:
             best_verify = self.symbolic_verifier(current_plan, batch_size=batch_size, device=device)
+        best_summary = self._verify_summary(best_verify)
         seen = {(strategy_id, plan_depth_use)}
         tried = 0
         candidate_specs = [
@@ -264,24 +294,14 @@ class OSFSynthesizer(nn.Module):
             )
             candidate_verify = self.symbolic_verifier(candidate_plan, batch_size=batch_size, device=device)
             tried += 1
-            cand_score = (
-                float(candidate_verify.goal_progress.mean().item()),
-                -float(candidate_verify.l_verify.item()),
-                -int(candidate_verify.mismatch_mask.sum().item()),
-            )
-            best_score = (
-                float(best_verify.goal_progress.mean().item()),
-                -float(best_verify.l_verify.item()),
-                -int(best_verify.mismatch_mask.sum().item()),
-            )
+            cand_summary = self._verify_summary(candidate_verify)
+            cand_score = self._verify_score(cand_summary)
+            best_score = self._verify_score(best_summary)
             if cand_score > best_score:
                 best_plan = candidate_plan
                 best_verify = candidate_verify
-                if (
-                    int(best_verify.mismatch_mask.sum().item()) == 0
-                    and float(best_verify.goal_progress.mean().item()) + 1e-6 >= 1.0
-                    and float(best_verify.l_verify.item()) <= 1e-6
-                ):
+                best_summary = cand_summary
+                if self._verify_is_perfect(best_summary):
                     break
         return best_plan, best_verify, tried
 
@@ -299,6 +319,7 @@ class OSFSynthesizer(nn.Module):
         prover=None,
         symbolic_goal=None,
         symbolic_facts=None,
+        fast_mode: bool = False,
     ) -> Tuple[torch.Tensor, Dict]:
         """
         Returns:
@@ -321,8 +342,20 @@ class OSFSynthesizer(nn.Module):
         entropy_meta   = torch.tensor(0.0, device=device)
         strategy_id    = STRATEGY_CAREFUL
         strategy_tau   = 0.5
+        fast_execution_forced = (
+            fast_mode
+            and self.training
+            and ce_loss >= float(getattr(cfg_used, "fast_ce_threshold", 4.5))
+        )
 
-        if cfg_used.use_meta:
+        if fast_execution_forced:
+            strat_cfg = STRATEGY_CONFIGS[STRATEGY_FAST]
+            strategy_id = strat_cfg.strategy_id
+            plan_depth_use = strat_cfg.plan_depth
+            n_reflections = 0
+            sim_steps = strat_cfg.sim_steps
+            strategy_tau = strat_cfg.confidence_tau
+        elif cfg_used.use_meta:
             strat_cfg, log_prob_meta, value_meta, entropy_meta = self.meta_ctrl.select_strategy(
                 gap_norm=gap_norm, ce_loss=ce_loss,
                 plan_depth=cfg_used.max_plan_depth,
@@ -366,8 +399,8 @@ class OSFSynthesizer(nn.Module):
         sim_plan = self._truncate_plan(plan, sim_steps)
         verify_result = self.symbolic_verifier(plan, batch_size=B, device=device)
         l_verify = verify_result.l_verify
-        symbolic_goal_progress = float(verify_result.goal_progress.mean().item())
-        symbolic_mismatch_before = int(verify_result.mismatch_mask.sum().item())
+        verify_summary = self._verify_summary(verify_result)
+        symbolic_goal_progress, _, symbolic_mismatch_before = verify_summary
         symbolic_mismatch_after = symbolic_mismatch_before
         mismatch_before = symbolic_mismatch_before
         mismatch_after = symbolic_mismatch_after
@@ -377,7 +410,7 @@ class OSFSynthesizer(nn.Module):
             symbolic_mismatch_before > 0
             or symbolic_goal_progress + 1e-6 < max(float(plan.goal_progress), strategy_tau)
         )
-        if cfg_used.use_reflection and symbolic_failed:
+        if cfg_used.use_reflection and not fast_execution_forced and symbolic_failed:
             repaired_plan, repaired_verify, symbolic_repairs = self._repair_plan_symbolically(
                 intent_state,
                 plan,
@@ -396,30 +429,24 @@ class OSFSynthesizer(nn.Module):
                     float(symbolic_repairs),
                     device=device,
                 )
-            repaired_score = (
-                float(repaired_verify.goal_progress.mean().item()),
-                -float(repaired_verify.l_verify.item()),
-                -int(repaired_verify.mismatch_mask.sum().item()),
-            )
-            current_score = (
-                symbolic_goal_progress,
-                -float(l_verify.item()),
-                -symbolic_mismatch_before,
-            )
+            repaired_summary = self._verify_summary(repaired_verify)
+            repaired_score = self._verify_score(repaired_summary)
+            current_score = self._verify_score(verify_summary)
             if repaired_score > current_score:
                 plan = repaired_plan
                 verify_result = repaired_verify
                 l_verify = verify_result.l_verify
-                symbolic_goal_progress = float(verify_result.goal_progress.mean().item())
-                symbolic_mismatch_after = int(verify_result.mismatch_mask.sum().item())
+                verify_summary = repaired_summary
+                symbolic_goal_progress, _, symbolic_mismatch_after = verify_summary
                 mismatch_after = symbolic_mismatch_after
                 sim_plan = self._truncate_plan(plan, sim_steps)
 
         if cfg_used.use_simulation and strategy_id != STRATEGY_FAST:
             sim_result = self.simulator(z_reflected, sim_plan, world_rnn)
             l_sim = sim_result.l_sim
-            mismatch_before = max(mismatch_before, int(sim_result.mismatch_mask.sum().item()))
-            mismatch_after = max(mismatch_after, int(sim_result.mismatch_mask.sum().item()))
+            sim_summary = self._sim_summary(sim_result)
+            mismatch_before = max(mismatch_before, sim_summary[1])
+            mismatch_after = max(mismatch_after, sim_summary[1])
 
             # ── Рефлексія з повторним simulation+verification ───────────────
             needs_latent_reflection = (
@@ -432,7 +459,9 @@ class OSFSynthesizer(nn.Module):
             )
             if needs_latent_reflection:
                 best_sim = sim_result
+                best_sim_summary = sim_summary
                 best_verify = verify_result
+                best_verify_summary = verify_summary
                 best_z = z_reflected
                 best_plan = plan
                 best_sim_plan = sim_plan
@@ -449,9 +478,10 @@ class OSFSynthesizer(nn.Module):
                     candidate_verify = self.symbolic_verifier(
                         candidate_plan, batch_size=B, device=device
                     )
+                    candidate_verify_summary = self._verify_summary(candidate_verify)
                     if (
-                        int(candidate_verify.mismatch_mask.sum().item()) > 0
-                        or float(candidate_verify.goal_progress.mean().item()) + 1e-6 < strategy_tau
+                        candidate_verify_summary[2] > 0
+                        or candidate_verify_summary[0] + 1e-6 < strategy_tau
                     ):
                         candidate_plan, candidate_verify, repair_tries = self._repair_plan_symbolically(
                             candidate_intent,
@@ -472,32 +502,36 @@ class OSFSynthesizer(nn.Module):
                                 float(repair_tries),
                                 device=device,
                             )
+                        candidate_verify_summary = self._verify_summary(candidate_verify)
                     candidate_sim_plan = self._truncate_plan(candidate_plan, sim_steps)
                     candidate_sim = self.simulator(candidate_z, candidate_sim_plan, world_rnn)
+                    candidate_sim_summary = self._sim_summary(candidate_sim)
                     refl_iters += 1
                     l_refl = l_refl + patch.l_refl
                     cand_score = (
-                        float(candidate_verify.goal_progress.mean().item()),
-                        -int(candidate_verify.mismatch_mask.sum().item()),
-                        -(float(candidate_verify.l_verify.item()) + 0.25 * float(candidate_sim.l_sim.item())),
+                        candidate_verify_summary[0],
+                        -candidate_verify_summary[2],
+                        -(candidate_verify_summary[1] + 0.25 * candidate_sim_summary[0]),
                     )
                     best_score = (
-                        float(best_verify.goal_progress.mean().item()),
-                        -int(best_verify.mismatch_mask.sum().item()),
-                        -(float(best_verify.l_verify.item()) + 0.25 * float(best_sim.l_sim.item())),
+                        best_verify_summary[0],
+                        -best_verify_summary[2],
+                        -(best_verify_summary[1] + 0.25 * best_sim_summary[0]),
                     )
                     if cand_score > best_score:
                         best_z = candidate_z
                         best_plan = candidate_plan
                         best_sim_plan = candidate_sim_plan
                         best_sim = candidate_sim
+                        best_sim_summary = candidate_sim_summary
                         best_verify = candidate_verify
-                        symbolic_mismatch_after = int(candidate_verify.mismatch_mask.sum().item())
+                        best_verify_summary = candidate_verify_summary
+                        symbolic_mismatch_after = candidate_verify_summary[2]
                         mismatch_after = max(
-                            int(candidate_sim.mismatch_mask.sum().item()),
+                            candidate_sim_summary[1],
                             symbolic_mismatch_after,
                         )
-                        symbolic_goal_progress = float(candidate_verify.goal_progress.mean().item())
+                        symbolic_goal_progress = candidate_verify_summary[0]
                     if (
                         symbolic_mismatch_after == 0
                         and mismatch_after == 0
@@ -511,6 +545,7 @@ class OSFSynthesizer(nn.Module):
                 verify_result = best_verify
                 l_sim = sim_result.l_sim
                 l_verify = verify_result.l_verify
+                verify_summary = best_verify_summary
                 mismatch_after = max(mismatch_after, symbolic_mismatch_after)
 
         # ── H3+H4: Hierarchical Decoder ──────────────────────────────────────
@@ -603,6 +638,7 @@ class OSFSynthesizer(nn.Module):
             "osf_goal_confidence": decode_goal_confidence,
             "osf_plan_rl":     plan_rl_loss.item() if self.training else 0.0,
             "osf_plan_loss":   plan.plan_loss.item(),
+            "osf_fast_forced": 1.0 if fast_execution_forced else 0.0,
         }
 
         if cfg_used.use_meta and hasattr(self, "meta_ctrl"):
