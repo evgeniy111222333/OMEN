@@ -1,24 +1,9 @@
 """
-omen_prolog.py — ∂-Prolog: Диференційований Theorem Prover
-===========================================================
-Замінює GNN-based S-Core на реальну логіку першого порядку.
+omen_prolog.py: first-order symbolic runtime for OMEN.
 
-Структура:
-  HornAtom       : (pred_id, args) — атом Хорнівського диз'юнкта
-  HornClause     : head :- body  (факт = clause без body)
-  KnowledgeBase  : факти + правила з Forward Chaining
-  ProofPolicyNet : π_θ(Action|State) — навчає стратегію пошуку доведення
-  AbductionHead  : нейромережевий генератор кандидатів-правил
-  DifferentiableProver : інтегратор; повертає proof_loss через REINFORCE
-
-Математика:
-  L_sym = -E_{τ~π_θ}[R(τ)] + α·Length(τ)
-
-  R(τ) = 1 якщо ціль доведена, 0 інакше
-  Length(τ) = кількість кроків (заохочуємо короткі докази)
-
-  Це REINFORCE-оновлення PolicyNetwork, де «розуміння» —
-  здатність знайти найкоротший логічний ланцюжок.
+This module provides Horn terms, unification, the knowledge base, proof policy,
+abduction utilities, continuous symbolic learning, and the differentiable prover
+used by the canonical OMEN stack.
 """
 
 from __future__ import annotations
@@ -27,7 +12,7 @@ import enum
 import math
 import random
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple, Union
 
 import torch
@@ -455,14 +440,113 @@ SEQ_DECODER_SURPRISE_PRED = 479
 
 @dataclass
 class SymbolicTaskContext:
+    """
+    Canonical symbolic context with first-class fact provenance buckets.
+
+    `observed_facts` remains the backward-compatible aggregate, while the
+    source-specific fields preserve whether facts were observed now, recalled
+    from memory, derived from saliency, derived from NET, attached as world
+    context, or materialized as abductive/creative support.
+    """
     observed_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
+    observed_now_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
+    memory_derived_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
+    saliency_derived_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
+    net_derived_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
+    world_context_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
+    abduced_support_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
     goal: Optional[HornAtom] = None
     target_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
     execution_trace: Optional[SymbolicExecutionTraceBundle] = None
     provenance: str = "heuristic"
     trigger_abduction: bool = False
     hot_dims: Tuple[int, ...] = field(default_factory=tuple)
+    world_context_summary: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        def _freeze_atoms(values: Any) -> FrozenSet[HornAtom]:
+            if not values:
+                return frozenset()
+            if isinstance(values, frozenset):
+                return values
+            return frozenset(values)
+
+        self.observed_facts = _freeze_atoms(self.observed_facts)
+        self.observed_now_facts = _freeze_atoms(self.observed_now_facts)
+        self.memory_derived_facts = _freeze_atoms(self.memory_derived_facts)
+        self.saliency_derived_facts = _freeze_atoms(self.saliency_derived_facts)
+        self.net_derived_facts = _freeze_atoms(self.net_derived_facts)
+        self.world_context_facts = _freeze_atoms(self.world_context_facts)
+        self.abduced_support_facts = _freeze_atoms(self.abduced_support_facts)
+        self.target_facts = _freeze_atoms(self.target_facts)
+        self.hot_dims = tuple(int(dim) for dim in self.hot_dims)
+        self.world_context_summary = dict(self.world_context_summary)
+        self.metadata = dict(self.metadata)
+
+        if not self.observed_now_facts and self.observed_facts:
+            self.observed_now_facts = self.observed_facts
+
+        merged = set(self.observed_facts)
+        merged.update(self.observed_now_facts)
+        merged.update(self.memory_derived_facts)
+        merged.update(self.saliency_derived_facts)
+        merged.update(self.net_derived_facts)
+        merged.update(self.world_context_facts)
+        merged.update(self.abduced_support_facts)
+        self.observed_facts = frozenset(merged)
+
+    @property
+    def recalled_facts(self) -> FrozenSet[HornAtom]:
+        return self.memory_derived_facts
+
+    def source_fact_records(
+        self,
+        *,
+        include_goal: bool = False,
+        include_targets: bool = False,
+    ) -> Tuple[Tuple[str, HornAtom], ...]:
+        records: List[Tuple[str, HornAtom]] = []
+        seen: Set[int] = set()
+        source_groups = (
+            ("observed_now", self.observed_now_facts),
+            ("memory", self.memory_derived_facts),
+            ("saliency", self.saliency_derived_facts),
+            ("net", self.net_derived_facts),
+            ("world_context", self.world_context_facts),
+            ("abduced", self.abduced_support_facts),
+        )
+        for label, facts in source_groups:
+            for atom in sorted(facts, key=repr):
+                atom_hash = hash(atom)
+                if atom_hash in seen:
+                    continue
+                seen.add(atom_hash)
+                records.append((label, atom))
+        if include_goal and self.goal is not None:
+            goal_hash = hash(self.goal)
+            if goal_hash not in seen:
+                seen.add(goal_hash)
+                records.append(("goal", self.goal))
+        if include_targets:
+            for atom in sorted(self.target_facts, key=repr):
+                atom_hash = hash(atom)
+                if atom_hash in seen:
+                    continue
+                seen.add(atom_hash)
+                records.append(("target", atom))
+        return tuple(records)
+
+    def source_counts(self) -> Dict[str, float]:
+        return {
+            "observed_now_facts": float(len(self.observed_now_facts)),
+            "memory_derived_facts": float(len(self.memory_derived_facts)),
+            "saliency_derived_facts": float(len(self.saliency_derived_facts)),
+            "net_derived_facts": float(len(self.net_derived_facts)),
+            "world_context_facts": float(len(self.world_context_facts)),
+            "abduced_support_facts": float(len(self.abduced_support_facts)),
+            "target_facts": float(len(self.target_facts)),
+        }
 
 
 def _const_int_term(term: Term) -> Optional[int]:
@@ -3109,6 +3193,8 @@ class DifferentiableProver(nn.Module):
         self._world_rnn: Optional[Any] = None          # WorldRNN | None
         self._last_z: Optional[torch.Tensor] = None    # (B, d) — знімок з останнього forward()
         self._world_rnn_vocab: int = 0                 # кешована vocab_size для clamp
+        self._world_graph_context: Optional[torch.Tensor] = None
+        self._world_target_state: Optional[torch.Tensor] = None
         self.hypothesis_token_head: Optional[nn.Module] = None
         self.continuous_cycle_enabled: bool = True
         self.continuous_cycle_eval_enabled: bool = True
@@ -3118,11 +3204,12 @@ class DifferentiableProver(nn.Module):
         self.continuous_cycle_accept_threshold: float = 0.55
         self.continuous_cycle_verify_threshold: float = 0.75
         self.continuous_cycle_contradict_threshold: float = 0.15
-        self.continuous_cycle_symbolic_weight: float = 0.45
-        self.continuous_cycle_world_weight: float = 0.25
-        self.continuous_cycle_token_weight: float = 0.30
+        self.continuous_cycle_symbolic_weight: float = 0.30
+        self.continuous_cycle_world_weight: float = 0.55
+        self.continuous_cycle_token_weight: float = 0.15
         self.continuous_cycle_trace_weight: float = 0.20
         self.continuous_cycle_counterexample_weight: float = 0.15
+        self.continuous_cycle_world_reject_threshold: float = 0.75
         self.continuous_cycle_soft_symbolic_weight: float = 0.45
         self.continuous_cycle_policy_weight: float = 0.25
         self.continuous_cycle_policy_baseline_momentum: float = 0.90
@@ -3132,6 +3219,8 @@ class DifferentiableProver(nn.Module):
         self.continuous_cycle_max_repairs: int = 2
         self.continuous_cycle_max_trace_candidates: int = 4
         self._cycle_reward_baseline: float = 0.5
+        self.sym_cycle_loss_weight: float = 0.10
+        self.sym_abduction_loss_weight: float = 0.05
         self.allow_latent_goal_fallback: bool = True
         self.graph_reasoning_enabled: bool = True
         self.graph_reasoning_top_k_facts: int = 12
@@ -3139,6 +3228,11 @@ class DifferentiableProver(nn.Module):
         self.graph_reasoning_attention_threshold: float = 0.02
         self.graph_reasoning_tau: float = 0.5
         self.graph_reasoning_full_scan_cutoff: int = 64
+        self.world_rule_symbolic_weight: float = 0.25
+        self.world_rule_world_weight: float = 0.75
+        self.world_abduction_symbolic_weight: float = 0.20
+        self.world_abduction_trace_weight: float = 0.15
+        self.world_abduction_world_weight: float = 0.65
         self._graph_reasoning_stats: Dict[str, float] = {
             "calls": 0.0,
             "guided_calls": 0.0,
@@ -3161,6 +3255,8 @@ class DifferentiableProver(nn.Module):
     def clear_task_context(self) -> None:
         self.task_context = None
         self._working_memory_facts = frozenset()
+        self._world_graph_context = None
+        self._world_target_state = None
         self._reset_graph_reasoning_stats()
 
     _atoms_conflict = staticmethod(_atoms_conflict)
@@ -3188,6 +3284,19 @@ class DifferentiableProver(nn.Module):
             ).to(next(self.parameters()).device)
         else:
             self.hypothesis_token_head = None
+
+    def set_world_context(
+        self,
+        *,
+        graph_context: Optional[torch.Tensor] = None,
+        target_state: Optional[torch.Tensor] = None,
+    ) -> None:
+        self._world_graph_context = (
+            None if graph_context is None else graph_context.detach()
+        )
+        self._world_target_state = (
+            None if target_state is None else target_state.detach()
+        )
 
     def configure_creative_cycle(
         self,
@@ -3301,6 +3410,65 @@ class DifferentiableProver(nn.Module):
             if isinstance(goal, HornAtom)
         )
 
+    def focus_intrinsic_goal(self) -> Optional[HornAtom]:
+        intrinsic_goal = self.current_intrinsic_goal()
+        if intrinsic_goal is None:
+            return None
+        intrinsic_value = self.current_intrinsic_value()
+        if self.task_context is None:
+            self.set_task_context(
+                SymbolicTaskContext(
+                    observed_facts=frozenset(),
+                    goal=intrinsic_goal,
+                    target_facts=frozenset({intrinsic_goal}),
+                    provenance="intrinsic",
+                    trigger_abduction=True,
+                    metadata={
+                        "emc_intrinsic_focus": 1.0,
+                        "intrinsic_goal_active": 1.0,
+                        "intrinsic_value": intrinsic_value,
+                        "intrinsic_goal_repr": repr(intrinsic_goal),
+                    },
+                )
+            )
+            return intrinsic_goal
+
+        metadata = dict(self.task_context.metadata)
+        previous_goal = self.task_context.goal
+        metadata.update(
+            {
+                "emc_intrinsic_focus": 1.0,
+                "intrinsic_goal_active": 1.0,
+                "intrinsic_value": intrinsic_value,
+                "intrinsic_goal_repr": repr(intrinsic_goal),
+                "primary_goal_repr": repr(previous_goal) if previous_goal is not None else "",
+                "primary_provenance": self.task_context.provenance,
+            }
+        )
+        targets = set(self.task_context.target_facts)
+        targets.add(intrinsic_goal)
+        if previous_goal is not None:
+            targets.add(previous_goal)
+        focused = replace(
+            self.task_context,
+            goal=intrinsic_goal,
+            target_facts=frozenset(targets),
+            provenance="intrinsic",
+            trigger_abduction=True,
+            metadata=metadata,
+        )
+        self.set_task_context(focused)
+        return intrinsic_goal
+
+    def configure_loss_weights(
+        self,
+        *,
+        cycle_loss_weight: float = 0.10,
+        abduction_loss_weight: float = 0.05,
+    ) -> None:
+        self.sym_cycle_loss_weight = float(max(cycle_loss_weight, 0.0))
+        self.sym_abduction_loss_weight = float(max(abduction_loss_weight, 0.0))
+
     def configure_hypothesis_cycle(
         self,
         *,
@@ -3317,6 +3485,7 @@ class DifferentiableProver(nn.Module):
         token_weight: float = 0.30,
         trace_weight: float = 0.20,
         counterexample_weight: float = 0.15,
+        world_reject_threshold: float = 0.75,
         soft_symbolic_weight: float = 0.45,
         policy_weight: float = 0.25,
         policy_baseline_momentum: float = 0.90,
@@ -3343,6 +3512,9 @@ class DifferentiableProver(nn.Module):
         self.continuous_cycle_token_weight = float(token_weight) / total_weight
         self.continuous_cycle_trace_weight = float(max(trace_weight, 0.0))
         self.continuous_cycle_counterexample_weight = float(max(counterexample_weight, 0.0))
+        self.continuous_cycle_world_reject_threshold = float(
+            max(0.0, min(1.0, world_reject_threshold))
+        )
         self.continuous_cycle_soft_symbolic_weight = float(max(0.0, min(1.0, soft_symbolic_weight)))
         self.continuous_cycle_policy_weight = float(max(policy_weight, 0.0))
         self.continuous_cycle_policy_baseline_momentum = float(
@@ -3370,6 +3542,76 @@ class DifferentiableProver(nn.Module):
         self.graph_reasoning_attention_threshold = float(max(attention_threshold, 0.0))
         self.graph_reasoning_tau = float(max(tau, 1e-3))
         self.graph_reasoning_full_scan_cutoff = max(int(full_scan_cutoff), 0)
+
+    def configure_world_reasoning(
+        self,
+        *,
+        rule_symbolic_weight: float = 0.25,
+        rule_world_weight: float = 0.75,
+        abduction_symbolic_weight: float = 0.20,
+        abduction_trace_weight: float = 0.15,
+        abduction_world_weight: float = 0.65,
+    ) -> None:
+        rule_total = max(float(rule_symbolic_weight) + float(rule_world_weight), 1e-6)
+        abduction_total = max(
+            float(abduction_symbolic_weight)
+            + float(abduction_trace_weight)
+            + float(abduction_world_weight),
+            1e-6,
+        )
+        self.world_rule_symbolic_weight = float(max(rule_symbolic_weight, 0.0)) / rule_total
+        self.world_rule_world_weight = float(max(rule_world_weight, 0.0)) / rule_total
+        self.world_abduction_symbolic_weight = (
+            float(max(abduction_symbolic_weight, 0.0)) / abduction_total
+        )
+        self.world_abduction_trace_weight = (
+            float(max(abduction_trace_weight, 0.0)) / abduction_total
+        )
+        self.world_abduction_world_weight = (
+            float(max(abduction_world_weight, 0.0)) / abduction_total
+        )
+
+    @staticmethod
+    def _clamp_reasoning_error(value: float) -> float:
+        return float(max(0.0, min(1.0, value)))
+
+    def _rule_prediction_error_score(
+        self,
+        symbolic_error: float,
+        world_error: Optional[float],
+    ) -> float:
+        symbolic_error = self._clamp_reasoning_error(symbolic_error)
+        if world_error is None:
+            return symbolic_error
+        world_error = self._clamp_reasoning_error(world_error)
+        combined = (
+            self.world_rule_symbolic_weight * symbolic_error
+            + self.world_rule_world_weight * world_error
+        )
+        if world_error >= self.continuous_cycle_world_reject_threshold:
+            combined = max(combined, world_error)
+        return self._clamp_reasoning_error(combined)
+
+    def _abduction_prediction_error_score(
+        self,
+        symbolic_error: float,
+        trace_error: float,
+        world_error: Optional[float],
+    ) -> float:
+        symbolic_error = self._clamp_reasoning_error(symbolic_error)
+        trace_error = self._clamp_reasoning_error(trace_error)
+        if world_error is None:
+            world_error = max(symbolic_error, trace_error)
+        else:
+            world_error = self._clamp_reasoning_error(world_error)
+        combined = (
+            self.world_abduction_symbolic_weight * symbolic_error
+            + self.world_abduction_trace_weight * trace_error
+            + self.world_abduction_world_weight * world_error
+        )
+        if world_error >= self.continuous_cycle_world_reject_threshold:
+            combined = max(combined, world_error)
+        return self._clamp_reasoning_error(combined)
 
     def _reset_graph_reasoning_stats(self) -> None:
         self._graph_reasoning_stats = {
@@ -3673,15 +3915,48 @@ class DifferentiableProver(nn.Module):
         score = torch.exp(-scale * energy).clamp(0.0, 1.0)
         return score, energy
 
-    def _world_transition(
+    def _world_transition_with_diagnostics(
         self,
         z_state: torch.Tensor,
         *,
         action_token: Optional[int] = None,
         action_probs: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        target_state_override: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+        base_error = torch.full((), 0.5, device=z_state.device, dtype=z_state.dtype)
+        base_align = torch.full((), 0.5, device=z_state.device, dtype=z_state.dtype)
         if self._world_rnn is None:
-            return z_state, None
+            return z_state, None, base_error, base_align
+        graph_context = self._world_graph_context
+        if graph_context is not None:
+            graph_context = graph_context[: z_state.size(0)].to(device=z_state.device, dtype=z_state.dtype)
+        target_state = target_state_override
+        if target_state is None and self._world_target_state is not None:
+            target_state = self._world_target_state[: z_state.size(0)].to(
+                device=z_state.device,
+                dtype=z_state.dtype,
+            )
+        if hasattr(self._world_rnn, "transition"):
+            try:
+                result = self._world_rnn.transition(
+                    z_state,
+                    action=None if action_token is None else torch.tensor(
+                        [action_token],
+                        device=z_state.device,
+                        dtype=torch.long,
+                    ),
+                    action_probs=action_probs,
+                    graph_context=graph_context,
+                    target_state=target_state,
+                )
+                return (
+                    result.z_next,
+                    result.hidden,
+                    result.causal_error.mean(),
+                    result.graph_alignment.mean(),
+                )
+            except Exception:
+                pass
         if action_probs is not None and hasattr(self._world_rnn, "act_emb"):
             try:
                 emb_layer = self._world_rnn.act_emb
@@ -3697,15 +3972,62 @@ class DifferentiableProver(nn.Module):
                 if all(hasattr(self._world_rnn, attr) for attr in ("gru", "out", "h0")):
                     h = self._world_rnn.h0.expand(z_state.size(0), -1)
                     h2 = self._world_rnn.gru(torch.cat([z_state, act], dim=-1), h)
-                    return self._world_rnn.out(h2), h2
+                    z_next = self._world_rnn.out(h2)
+                    if target_state is not None:
+                        align = (
+                            F.cosine_similarity(z_next, target_state, dim=-1)
+                            .clamp(-1.0, 1.0)
+                            .add(1.0)
+                            .mul(0.5)
+                            .mean()
+                        )
+                        err = (1.0 - align).clamp(0.0, 1.0)
+                        return z_next, h2, err, align
+                    return z_next, h2, base_error, base_align
                 if hasattr(self._world_rnn, "proj"):
-                    return torch.tanh(self._world_rnn.proj(torch.cat([z_state, act], dim=-1))), None
+                    z_next = torch.tanh(self._world_rnn.proj(torch.cat([z_state, act], dim=-1)))
+                    if target_state is not None:
+                        align = (
+                            F.cosine_similarity(z_next, target_state, dim=-1)
+                            .clamp(-1.0, 1.0)
+                            .add(1.0)
+                            .mul(0.5)
+                            .mean()
+                        )
+                        err = (1.0 - align).clamp(0.0, 1.0)
+                        return z_next, None, err, align
+                    return z_next, None, base_error, base_align
             except Exception:
                 pass
         if action_token is None:
-            return z_state, None
+            return z_state, None, base_error, base_align
         action_t = torch.tensor([action_token], device=z_state.device, dtype=torch.long)
-        return self._world_rnn(z_state, action_t)
+        z_next, hidden = self._world_rnn(z_state, action_t)
+        if target_state is not None:
+            align = (
+                F.cosine_similarity(z_next, target_state, dim=-1)
+                .clamp(-1.0, 1.0)
+                .add(1.0)
+                .mul(0.5)
+                .mean()
+            )
+            err = (1.0 - align).clamp(0.0, 1.0)
+            return z_next, hidden, err, align
+        return z_next, hidden, base_error, base_align
+
+    def _world_transition(
+        self,
+        z_state: torch.Tensor,
+        *,
+        action_token: Optional[int] = None,
+        action_probs: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        z_next, hidden, _causal_error, _graph_align = self._world_transition_with_diagnostics(
+            z_state,
+            action_token=action_token,
+            action_probs=action_probs,
+        )
+        return z_next, hidden
 
     def _task_observed_facts(self) -> FrozenSet[HornAtom]:
         if self.task_context is None:
@@ -3724,6 +4046,54 @@ class DifferentiableProver(nn.Module):
         if self.task_context is None:
             return None
         return self.task_context.execution_trace
+
+    def _world_expected_state(
+        self,
+        derived: Optional[HornAtom],
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        target_facts: Set[HornAtom] = set()
+        if derived is not None and derived.is_ground():
+            target_facts.add(derived)
+        if self.task_context is not None:
+            if self.task_context.goal is not None:
+                target_facts.add(self.task_context.goal)
+            target_facts.update(list(self.task_context.target_facts)[:4])
+        if target_facts:
+            expected = self.ground(frozenset(target_facts), device)[:1]
+            if self._world_target_state is not None:
+                target_state = self._world_target_state[:1].to(device=device, dtype=expected.dtype)
+                expected = 0.7 * expected + 0.3 * target_state
+            return expected
+        if self._world_target_state is not None:
+            return self._world_target_state[:1].to(device=device)
+        return None
+
+    def _world_rule_prediction_error(
+        self,
+        clause: "HornClause",
+        derived: Optional[HornAtom],
+        *,
+        device: torch.device,
+        action_probs: Optional[torch.Tensor] = None,
+    ) -> Optional[float]:
+        if self._world_rnn is None or self._last_z is None or self._world_rnn_vocab <= 0:
+            return None
+        if derived is None or not derived.is_ground():
+            return None
+        try:
+            z_anchor = self._last_z[:1].to(device=device)
+            action_token = min(int(clause.head.pred), self._world_rnn_vocab - 1)
+            target_state = self._world_expected_state(derived, device)
+            _z_next, _hidden, causal_error_t, _align_t = self._world_transition_with_diagnostics(
+                z_anchor,
+                action_token=action_token,
+                action_probs=action_probs,
+                target_state_override=target_state,
+            )
+            return float(causal_error_t.detach().clamp(0.0, 1.0).item())
+        except Exception:
+            return None
 
     @staticmethod
     def _trace_fact_priority(atom: HornAtom) -> int:
@@ -4825,23 +5195,18 @@ class DifferentiableProver(nn.Module):
 
             world_success_t = torch.tensor(0.5, device=device, dtype=z.dtype)
             world_error_t = torch.tensor(0.5, device=device, dtype=z.dtype)
+            world_graph_align_t = torch.tensor(0.5, device=device, dtype=z.dtype)
             z_next_world = z[:1]
             action_token = self._rule_action_token(clause, predicted_facts)
             action_probs = relaxed_spec.head_pred_probs if relaxed_spec is not None else None
-            if self._world_rnn is not None and z_target is not None and action_token is not None:
-                z_next_world, _ = self._world_transition(
+            if self._world_rnn is not None and action_token is not None:
+                z_next_world, _, causal_error_t, world_graph_align_t = self._world_transition_with_diagnostics(
                     z[:1],
                     action_token=action_token,
                     action_probs=action_probs,
                 )
-                world_success_t = (
-                    F.cosine_similarity(z_next_world, z_target, dim=-1)
-                    .clamp(-1.0, 1.0)
-                    .add(1.0)
-                    .mul(0.5)
-                    .mean()
-                )
-                world_error_t = 1.0 - world_success_t
+                world_error_t = causal_error_t.clamp(0.0, 1.0)
+                world_success_t = (1.0 - world_error_t).clamp(0.0, 1.0)
 
             token_success_t = torch.tensor(0.5, device=device, dtype=z.dtype)
             token_ce_t = zero
@@ -4869,6 +5234,14 @@ class DifferentiableProver(nn.Module):
                     utility_t
                     - self.continuous_cycle_counterexample_weight * counterexample_error_t
                 ).clamp(0.0, 1.0)
+            world_reject_t = (
+                world_error_t >= self.continuous_cycle_world_reject_threshold
+            )
+            if bool(world_reject_t.detach().item()):
+                utility_t = torch.minimum(
+                    utility_t,
+                    torch.tensor(0.05, device=device, dtype=z.dtype),
+                )
             if conflict:
                 utility_t = torch.minimum(
                     utility_t,
@@ -4878,12 +5251,13 @@ class DifferentiableProver(nn.Module):
             candidate_loss = (
                 (1.0 - utility_t)
                 + 0.25 * token_ce_t
-                + 0.10 * world_error_t
+                + 0.35 * world_error_t
                 + 0.08 * (1.0 - soft_symbolic_t)
                 + 0.05 * (1.0 - relaxed_body_t)
                 + 0.05 * (1.0 - relaxed_head_t)
                 + 0.10 * trace_error_t
                 + 0.12 * counterexample_error_t
+                + 0.04 * (1.0 - world_graph_align_t)
                 + 0.02 * entropy_penalty_t
             )
             candidate_losses.append(candidate_loss)
@@ -4945,6 +5319,7 @@ class DifferentiableProver(nn.Module):
                 conflict
                 or utility <= self.continuous_cycle_contradict_threshold
                 or float(counterexample_error_t.detach().item()) >= 0.75
+                or float(world_error_t.detach().item()) >= self.continuous_cycle_world_reject_threshold
             ):
                 record = self._rule_record(clause)
                 if record is not None:
@@ -5369,6 +5744,13 @@ class DifferentiableProver(nn.Module):
         except Exception:
             pred_error = 0.0
 
+        world_pred_error = self._world_rule_prediction_error(
+            rule,
+            derived,
+            device=device,
+        )
+        return self._rule_prediction_error_score(pred_error, world_pred_error), derived
+
         # ── WorldRNN latent-space Prediction Error (Дедукція, розділ 2) ─────
         # Концепція: «WorldRNN отримує на вхід z та дію (правило) і передбачає
         # наступний стан z_next.  Якщо z_next ≠ символьно-очікуваний стан →
@@ -5691,15 +6073,29 @@ class DifferentiableProver(nn.Module):
             trace_targets.update(trace_bundle.target_facts)
         if not observed_facts and not trace_targets:
             return 1.0
+        trace_pred_error = self._trace_prediction_error_for_rule(clause, trace_bundle)
+        reasoning_device = self._reasoning_device(self._last_z)
         if not clause.body:
             # Pure facts are useful if they match either the trace or the current targets.
+            symbolic_error = 1.0
             for fact in observed_facts:
                 if unify(clause.head, fact) is not None:
-                    return 0.0
+                    symbolic_error = 0.0
+                    break
             for target in trace_targets:
                 if unify(clause.head, target) is not None:
-                    return 0.0
-            return 1.0
+                    symbolic_error = 0.0
+                    break
+            world_error = self._world_rule_prediction_error(
+                clause,
+                clause.head if clause.head.is_ground() else None,
+                device=reasoning_device,
+            )
+            return self._abduction_prediction_error_score(
+                symbolic_error,
+                trace_pred_error,
+                world_error,
+            )
 
         # Рахуємо, скільки фактів входять у «пояснену зону» правила
         # (тобто беруть участь як підстановки у body)
@@ -5713,6 +6109,7 @@ class DifferentiableProver(nn.Module):
             observed_facts,
             max_solutions=16,
         )
+        world_errors: List[float] = []
         for sigma in subs:
             # Факти, що задовольнили тіло правила — «пояснені»
             for b_atom in fresh.body:
@@ -5729,6 +6126,13 @@ class DifferentiableProver(nn.Module):
                 for target in trace_targets:
                     if unify(derived, target) is not None:
                         explained_targets.add(target)
+                world_error = self._world_rule_prediction_error(
+                    clause,
+                    derived,
+                    device=reasoning_device,
+                )
+                if world_error is not None:
+                    world_errors.append(world_error)
 
         observed_coverage = len(explained_atoms) / float(total_facts)
         if trace_targets:
@@ -5737,9 +6141,16 @@ class DifferentiableProver(nn.Module):
         else:
             coverage = observed_coverage
 
-        trace_pred_error = self._trace_prediction_error_for_rule(clause, trace_bundle)
-        if trace_bundle is not None and trace_bundle.transitions:
-            coverage = 0.55 * coverage + 0.45 * (1.0 - trace_pred_error)
+        symbolic_error = 1.0 - min(max(coverage, 0.0), 1.0)
+        world_error = (
+            float(sum(world_errors) / len(world_errors))
+            if world_errors else None
+        )
+        return self._abduction_prediction_error_score(
+            symbolic_error,
+            trace_pred_error,
+            world_error,
+        )
 
         # ── WorldRNN latent-space component (Абдукція, розділ 6) ──────────────
         # Концепція: PredError(R, Trace) має включати не лише символьне покриття,
@@ -6031,6 +6442,8 @@ class DifferentiableProver(nn.Module):
         )
         proof_loss = controller_result.proof_loss
         vem_hinge = controller_result.vem_hinge
+        cycle_aux = controller_result.cycle_loss
+        abduction_aux = controller_result.abduction_loss
         abductor_aux = controller_result.abductor_aux
         vem_self_loss = controller_result.vem_self_loss
         mean_utility = controller_result.mean_utility
@@ -6045,6 +6458,11 @@ class DifferentiableProver(nn.Module):
             creative_targets,
             device,
         )
+        if self.task_context is not None:
+            self.task_context = self.creative_cycle.materialize_report_into_context(
+                self.task_context,
+                creative_report,
+            )
         scheduled_intrinsic_goals = tuple(self.scheduled_intrinsic_goals())
         background_intrinsic_goals = tuple()
         background_intrinsic_total = 0
@@ -6085,7 +6503,8 @@ class DifferentiableProver(nn.Module):
                        + 0.1  * coverage_loss
                        + 0.1  * proof_loss
                        + 0.01 * vem_hinge
-                       + 0.05 * abductor_aux
+                       + self.sym_cycle_loss_weight * cycle_aux
+                       + self.sym_abduction_loss_weight * abduction_aux
                        + 0.01 * vem_self_loss)
 
         self.last_goal = goal
@@ -6137,6 +6556,11 @@ class DifferentiableProver(nn.Module):
               "cycle_graph_energy": float(cycle_stats.get("mean_graph_energy", 0.0)),
               "cycle_policy_loss": float(cycle_stats.get("policy_loss", 0.0)),
               "cycle_loss": float(cycle_stats.get("loss", 0.0)),
+              "cycle_loss_aux": float(cycle_aux.detach().item()),
+              "cycle_loss_weight": float(self.sym_cycle_loss_weight),
+              "abduction_loss": float(abduction_aux.detach().item()),
+              "abduction_loss_weight": float(self.sym_abduction_loss_weight),
+              "abductor_aux_total": float(abductor_aux.detach().item()),
               "graph_reasoning_calls": float(self._graph_reasoning_stats.get("calls", 0.0)),
               "graph_reasoning_guided_calls": float(self._graph_reasoning_stats.get("guided_calls", 0.0)),
               "graph_reasoning_fallbacks": float(self._graph_reasoning_stats.get("fallbacks", 0.0)),
@@ -6161,6 +6585,7 @@ class DifferentiableProver(nn.Module):
               ),
               "creative_ame_total_candidates": float(creative_report.metrics.get("ame_total_candidates", 0.0)),
               "creative_ontology_candidates": float(creative_report.metrics.get("ontology_candidates", 0.0)),
+              "creative_cycle_active": float(creative_report.metrics.get("cycle_active", 0.0)),
               "creative_ontology_feedback_accepted": float(
                   creative_report.metrics.get("ontology_feedback_accepted", 0.0)
               ),
@@ -6183,7 +6608,28 @@ class DifferentiableProver(nn.Module):
                   creative_report.metrics.get("oee_online_train_steps", 0.0)
               ),
               "creative_selected_rules": float(creative_report.metrics.get("selected_rules", 0.0)),
+              "creative_validated_selected_rules": float(
+                  creative_report.metrics.get("validated_selected_rules", 0.0)
+              ),
               "creative_selected_mean_utility": float(creative_report.metrics.get("selected_mean_utility", 0.0)),
+              "creative_validated_support_facts": float(
+                  creative_report.metrics.get("validated_support_facts", 0.0)
+              ),
+              "creative_target_support_before": float(
+                  creative_report.metrics.get("target_support_before", 0.0)
+              ),
+              "creative_target_support_after": float(
+                  creative_report.metrics.get("target_support_after", 0.0)
+              ),
+              "creative_target_support_gain": float(
+                  creative_report.metrics.get("target_support_gain", 0.0)
+              ),
+              "creative_gap_before": float(creative_report.metrics.get("gap_before", 0.0)),
+              "creative_gap_after": float(creative_report.metrics.get("gap_after", 0.0)),
+              "creative_gap_reduction": float(creative_report.metrics.get("gap_reduction", 0.0)),
+              "creative_compression_gain": float(
+                  creative_report.metrics.get("compression_gain", 0.0)
+              ),
               "creative_intrinsic_value": float(creative_report.metrics.get("intrinsic_value", 0.0)),
               "creative_intrinsic_goal_queue_size": float(
                   creative_report.metrics.get("intrinsic_goal_queue_size", 0.0)

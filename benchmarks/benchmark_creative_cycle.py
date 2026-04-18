@@ -22,7 +22,7 @@ def rule(head: HornAtom, *body: HornAtom) -> HornClause:
     return HornClause(head=head, body=tuple(body))
 
 
-def build_prover() -> DifferentiableProver:
+def build_prover(*, creative_enabled: bool) -> DifferentiableProver:
     prover = DifferentiableProver(
         d_latent=16,
         sym_vocab=64,
@@ -32,7 +32,7 @@ def build_prover() -> DifferentiableProver:
     )
     prover.eval()
     prover.configure_creative_cycle(
-        enabled=True,
+        enabled=creative_enabled,
         cycle_every=1,
         max_selected_rules=2,
         tau_analogy=0.10,
@@ -68,24 +68,40 @@ def build_prover() -> DifferentiableProver:
 
 def main() -> None:
     device = torch.device("cpu")
-    prover = build_prover().to(device)
     z = torch.randn(1, 16, device=device)
     world_error = torch.tensor(0.0, device=device)
 
-    timings_ms = []
-    for _ in range(5):
-        start = time.perf_counter()
-        prover(z, world_error)
-        timings_ms.append((time.perf_counter() - start) * 1_000.0)
+    reports = {}
+    for label, enabled in (("creative_on", True), ("creative_off", False)):
+        prover = build_prover(creative_enabled=enabled).to(device)
+        timings_ms = []
+        for _ in range(5):
+            start = time.perf_counter()
+            prover(z, world_error)
+            timings_ms.append((time.perf_counter() - start) * 1_000.0)
+        reports[label] = {
+            "timings_ms": timings_ms,
+            "metrics": {
+                key: prover.last_forward_info[key]
+                for key in sorted(prover.last_forward_info)
+                if key.startswith("creative_")
+            },
+        }
 
     print("creative-cycle benchmark")
-    print(f"runs={len(timings_ms)}")
-    print(f"mean_ms={statistics.mean(timings_ms):.3f}")
-    print(f"median_ms={statistics.median(timings_ms):.3f}")
-    print(f"max_ms={max(timings_ms):.3f}")
-    for key in sorted(prover.last_forward_info):
-        if key.startswith("creative_"):
-            print(f"{key}={prover.last_forward_info[key]}")
+    for label, payload in reports.items():
+        timings_ms = payload["timings_ms"]
+        print(f"{label}.runs={len(timings_ms)}")
+        print(f"{label}.mean_ms={statistics.mean(timings_ms):.3f}")
+        print(f"{label}.median_ms={statistics.median(timings_ms):.3f}")
+        print(f"{label}.max_ms={max(timings_ms):.3f}")
+        for key, value in payload["metrics"].items():
+            print(f"{label}.{key}={value}")
+    creative_on = reports["creative_on"]["metrics"]
+    creative_off = reports["creative_off"]["metrics"]
+    for key in sorted(set(creative_on) | set(creative_off)):
+        delta = float(creative_on.get(key, 0.0)) - float(creative_off.get(key, 0.0))
+        print(f"delta.{key}={delta}")
 
 
 if __name__ == "__main__":

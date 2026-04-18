@@ -11,6 +11,8 @@ import torch
 class LatentControllerResult:
     proof_loss: torch.Tensor
     vem_hinge: torch.Tensor
+    cycle_loss: torch.Tensor
+    abduction_loss: torch.Tensor
     abductor_aux: torch.Tensor
     vem_self_loss: torch.Tensor
     mean_utility: float = 0.0
@@ -76,6 +78,8 @@ def run_latent_reasoning_controller(
     result = LatentControllerResult(
         proof_loss=zero,
         vem_hinge=zero,
+        cycle_loss=zero,
+        abduction_loss=zero,
         abductor_aux=zero,
         vem_self_loss=zero,
         mean_utility=0.0,
@@ -137,6 +141,7 @@ def run_latent_reasoning_controller(
             effective_targets,
             device,
         )
+        result.cycle_loss = result.cycle_loss + cycle["loss_tensor"]
         result.abductor_aux = result.abductor_aux + cycle["loss_tensor"]
         result.mean_utility = float(cycle.get("mean_utility", 0.0))
         result.abduced_rules = int(cycle.get("added_rules", 0))
@@ -173,6 +178,7 @@ def run_latent_reasoning_controller(
         prev_utility = prev_added * float(result.mean_utility)
         result.abduced_rules = int(result.abduced_rules + int(added))
         result.vem_hinge = result.vem_hinge + vem_hinge
+        result.abduction_loss = result.abduction_loss + abductor_aux
         result.abductor_aux = result.abductor_aux + abductor_aux
         total_added = max(prev_added + float(added), 1.0)
         result.mean_utility = float((prev_utility + float(added) * float(mean_utility)) / total_added)

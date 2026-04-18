@@ -43,17 +43,15 @@ class SymbolicStateIntegrator(nn.Module):
             nn.GELU(),
             nn.Linear(d_latent, d_latent),
         )
-        self.graph_state_gate = nn.Sequential(
+        self.graph_state_proj = nn.Sequential(
             nn.Linear(d_latent * 4, d_latent),
             nn.GELU(),
             nn.Linear(d_latent, d_latent),
-            nn.Sigmoid(),
         )
-        self.program_state_gate = nn.Sequential(
+        self.program_state_proj = nn.Sequential(
             nn.Linear(d_latent * 3, d_latent),
             nn.GELU(),
             nn.Linear(d_latent, d_latent),
-            nn.Sigmoid(),
         )
 
     def pre_symbolic(
@@ -62,7 +60,7 @@ class SymbolicStateIntegrator(nn.Module):
         v_mem: torch.Tensor,
     ) -> torch.Tensor:
         mem_gate = self.pre_mem_gate(torch.cat([z_concept, v_mem], dim=-1))
-        return z_concept + mem_gate * v_mem
+        return v_mem + mem_gate * (z_concept - v_mem)
 
     def post_symbolic(
         self,
@@ -71,19 +69,18 @@ class SymbolicStateIntegrator(nn.Module):
         v_mem: torch.Tensor,
     ) -> torch.Tensor:
         mem_gate = self.post_mem_gate(torch.cat([z_concept, z_symbolic, v_mem], dim=-1))
-        base_state = z_concept + mem_gate * v_mem
+        base_state = v_mem + mem_gate * (z_concept - v_mem)
         sym_gate = self.sym_override_gate(
             torch.cat([base_state, z_symbolic, z_symbolic - base_state], dim=-1)
         )
         return base_state + sym_gate * (z_symbolic - base_state)
 
-    def graph_centered(
+    def _graph_attention(
         self,
         z_query: torch.Tensor,
         graphs: Sequence[WorldGraphState],
         *,
         program_state: Optional[torch.Tensor] = None,
-        graph_mix: float = 0.55,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if not graphs:
             zeros = torch.zeros_like(z_query)
@@ -92,31 +89,31 @@ class SymbolicStateIntegrator(nn.Module):
                 device=z_query.device,
                 dtype=z_query.dtype,
             )
-            return z_query, zeros, anchor
+            return zeros, zeros, anchor
 
         if program_state is None:
             program_state = torch.zeros_like(z_query)
-            use_program_state = False
         else:
             program_state = program_state.to(device=z_query.device, dtype=z_query.dtype)
-            use_program_state = True
 
         graph_readouts = []
+        pooled_states = []
         graph_anchors = []
         scale = math.sqrt(float(z_query.size(-1)))
         for idx in range(z_query.size(0)):
             graph = graphs[min(idx, len(graphs) - 1)]
             nodes = graph.node_states.to(device=z_query.device, dtype=z_query.dtype)
             pooled = graph.pooled_state.to(device=z_query.device, dtype=z_query.dtype)
+            pooled_states.append(pooled)
             if nodes.dim() == 1:
                 nodes = nodes.unsqueeze(0)
             query = self.graph_query(
                 torch.cat(
                     [
-                        z_query[idx],
                         pooled,
                         program_state[idx],
-                        z_query[idx] - pooled,
+                        pooled - program_state[idx],
+                        pooled + program_state[idx],
                     ],
                     dim=-1,
                 )
@@ -126,22 +123,43 @@ class SymbolicStateIntegrator(nn.Module):
             graph_readouts.append(torch.sum(attn_weights.unsqueeze(-1) * nodes, dim=0))
             graph_anchors.append(attn_weights.max())
 
-        graph_readout = torch.stack(graph_readouts, dim=0)
-        graph_anchor = torch.stack(graph_anchors, dim=0)
-        graph_gate = self.graph_state_gate(
+        return (
+            torch.stack(graph_readouts, dim=0),
+            torch.stack(pooled_states, dim=0),
+            torch.stack(graph_anchors, dim=0),
+        )
+
+    def graph_centered(
+        self,
+        z_query: torch.Tensor,
+        graphs: Sequence[WorldGraphState],
+        *,
+        program_state: Optional[torch.Tensor] = None,
+        graph_mix: float = 0.55,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del graph_mix
+        graph_readout, pooled_states, graph_anchor = self._graph_attention(
+            z_query,
+            graphs,
+            program_state=program_state,
+        )
+        if not graphs:
+            return z_query, graph_readout, graph_anchor
+
+        graph_centered_state = self.graph_state_proj(
             torch.cat(
                 [
-                    z_query,
                     graph_readout,
-                    program_state,
-                    z_query - graph_readout,
+                    pooled_states,
+                    graph_readout - pooled_states,
+                    pooled_states - graph_readout,
                 ],
                 dim=-1,
             )
         )
-        graph_centered_state = z_query + float(graph_mix) * graph_gate * (graph_readout - z_query)
-        if use_program_state:
-            program_gate = self.program_state_gate(
+        if program_state is not None:
+            program_state = program_state.to(device=z_query.device, dtype=z_query.dtype)
+            graph_centered_state = self.program_state_proj(
                 torch.cat(
                     [
                         graph_centered_state,
@@ -150,8 +168,5 @@ class SymbolicStateIntegrator(nn.Module):
                     ],
                     dim=-1,
                 )
-            )
-            graph_centered_state = graph_centered_state + program_gate * (
-                program_state - graph_centered_state
             )
         return graph_centered_state, graph_readout, graph_anchor

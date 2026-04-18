@@ -17,9 +17,9 @@ External scripts, benchmarks, and future integrations should import the runtime 
 - `omen_scale_config.py`
 - `omen_canonical.py`
 
-These files define the active architecture described by `concept.md`: world-graph-grounded latent state, execution-trace-first supervision, and an eval-capable symbolic online cycle.
+These files define the active architecture described by `concept.md`: graph-native perception, graph-primary world state, context-enriched graph-derived dense views, graph-native world transitions, execution-trace-first supervision, and an eval-capable symbolic online cycle.
 
-The canonical `z` contract is now graph-first:
+The canonical `z` contract is now graph-primary:
 
 - `out["z"]` is the structured `CanonicalWorldState`
 - `out["z_dense"]` is the dense decoder readout derived from that graph state
@@ -41,11 +41,20 @@ The following modules are part of the canonical stack but are not separate compe
 - `omen_symbolic/integration.py`
 - `omen_symbolic/memory_index.py`
 - `omen_symbolic/universal_bits.py`
+- `omen_symbolic/creative_cycle.py`
+- `omen_symbolic/creative_types.py`
+- `omen_symbolic/analogy_engine.py`
+- `omen_symbolic/counterfactual_engine.py`
+- `omen_symbolic/aesthetic_engine.py`
+- `omen_symbolic/ontology_engine.py`
+- `omen_symbolic/intrinsic_engine.py`
+- `omen_symbolic/rule_graph.py`
+- `omen_symbolic/hypergraph_gnn.py`
 
 ## Legacy and research layers
 
 - `omen_v2.py` and `omen_tensor_unify.py` are legacy reference modules.
-- Creative and ontology-oriented modules under `omen_symbolic/` are research extensions, not alternative repository canons.
+- Creative and ontology-oriented modules under `omen_symbolic/` are part of the canonical support stack, not alternative runtimes.
 
 ## Repository rule
 

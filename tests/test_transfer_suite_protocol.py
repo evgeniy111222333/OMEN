@@ -20,6 +20,7 @@ from omen_train_code import load_text_corpus
 
 def _transfer_test_config() -> OMENScaleConfig:
     cfg = OMENScaleConfig.demo()
+    cfg.allow_noncanonical_ablation = True
     cfg.vocab_size = 256
     cfg.d_tok = 64
     cfg.n_heads_tok = 4
@@ -140,6 +141,27 @@ class TransferSuiteProtocolTest(unittest.TestCase):
             for path in files:
                 if os.path.exists(path):
                     os.remove(path)
+
+    def test_transfer_suite_runs_noncode_observation_tasks(self) -> None:
+        cfg = _transfer_test_config()
+        all_tasks = build_transfer_tasks(cfg, synthetic_samples=4)
+        tasks = {name: all_tasks[name] for name in ("observation_text", "observation_structured")}
+
+        report = run_transfer_suite(
+            cfg,
+            tasks=tasks,
+            source_task="observation_text",
+            adapt_steps=0,
+            eval_batches=2,
+            batch_size=1,
+        )
+
+        self.assertEqual(report["n_tasks"], 2)
+        summaries = report["task_summaries"]
+        self.assertGreaterEqual(summaries["observation_text"].get("world_graph_trace_steps", 0.0), 1.0)
+        self.assertGreaterEqual(summaries["observation_structured"].get("world_graph_trace_steps", 0.0), 1.0)
+        self.assertGreaterEqual(summaries["observation_text"].get("sym_ast_lang_other", 0.0), 0.5)
+        self.assertGreaterEqual(summaries["observation_structured"].get("sym_ast_lang_other", 0.0), 0.5)
 
 
 if __name__ == "__main__":

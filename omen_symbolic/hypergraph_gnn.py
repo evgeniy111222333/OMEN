@@ -58,6 +58,7 @@ Public API
 from __future__ import annotations
 
 from dataclasses import dataclass
+import pickle
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -705,6 +706,45 @@ class HypergraphContrastiveLearner:
             n_layers=self.n_gnn_layers,
             dropout=self.dropout,
         )
+
+    def export_state(self) -> Dict[str, object]:
+        return {
+            "gnn_in_dim": int(self._gnn_in_dim),
+            "gnn_state": None if self._gnn is None else self._gnn.state_dict(),
+            "optimizer_state": (
+                None if self._optimizer is None else self._optimizer.state_dict()
+            ),
+            "last_rule_hash": self._last_rule_hash,
+            "last_result": (
+                None if self._last_result is None else pickle.dumps(self._last_result)
+            ),
+        }
+
+    def load_state(self, state: Optional[Dict[str, object]]) -> None:
+        state = state or {}
+        gnn_state = state.get("gnn_state")
+        gnn_in_dim = int(state.get("gnn_in_dim", 0) or 0)
+        if gnn_state is not None and gnn_in_dim > 0:
+            self._gnn = self._make_gnn(gnn_in_dim)
+            self._gnn_in_dim = gnn_in_dim
+            self._optimizer = torch.optim.Adam(
+                self._gnn.parameters(), lr=self.lr, weight_decay=1e-5
+            )
+            self._gnn.load_state_dict(gnn_state)
+            optimizer_state = state.get("optimizer_state")
+            if optimizer_state is not None and self._optimizer is not None:
+                self._optimizer.load_state_dict(optimizer_state)
+            self._gnn.eval()
+        else:
+            self._gnn = None
+            self._gnn_in_dim = 0
+            self._optimizer = None
+        self._last_rule_hash = state.get("last_rule_hash")
+        last_result = state.get("last_result")
+        if isinstance(last_result, bytes):
+            self._last_result = pickle.loads(last_result)
+        else:
+            self._last_result = last_result
 
     def _rule_set_hash(self, rules: Sequence) -> int:
         return hash(tuple(hash(r) for r in rules))

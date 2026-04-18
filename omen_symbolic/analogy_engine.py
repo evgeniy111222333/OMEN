@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+import pickle
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -92,6 +93,21 @@ class AnalogyMetaphorEngine:
 
     def clone(self) -> "AnalogyMetaphorEngine":
         return type(self)(**self._config)
+
+    def export_state(self) -> Dict[str, Any]:
+        return {
+            "learner": self._learner.export_state(),
+            "state": pickle.dumps(self.state),
+        }
+
+    def load_state(self, state: Optional[Dict[str, Any]]) -> None:
+        state = state or {}
+        self._learner.load_state(state.get("learner"))
+        state_blob = state.get("state")
+        if isinstance(state_blob, bytes):
+            self.state = pickle.loads(state_blob)
+        elif state_blob is not None:
+            self.state = state_blob
 
     @staticmethod
     def _shared_signature(signatures: Dict[int, Tuple[str, ...]], left: int, right: int) -> bool:

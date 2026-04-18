@@ -1,32 +1,9 @@
 """
-omen_osf.py — OMEN Synthesis Framework: повний синтезатор
-=========================================================
-Інтегрує всі компоненти OSF та замінює TokenDecoder в OMENScale.
+omen_osf.py: OMEN Synthesis Framework.
 
-Ієрархічна генерація (4 рівні):
-  H1: IntentEncoder     z_final → symbolic goal
-  H2: SymbolicPlanner   goal    → operator sequence
-  H3: TemplateGenerator ops     → expression templates
-  H4: HierarchicalDecoder templ → token logits
-
-Цикл рефлексії:
-  WorldSimulator  → trace ≈ plan
-  ReflectionModule → мінімальний патч Δ*
-
-Мета-контролер:
-  SynthesisMetaController → σ ∈ {Fast, Careful, Exploratory}
-
-Повний функціонал J_OSF:
-  J_OSF = E[−logP(code*|spec)]                 ← L_ce (accuracy)
-        + λ_plan · E[L_plan(plan, code)]        ← план-код консистентність
-        + λ_sim  · E[||Sim(code)−ExpTrace||²]  ← точність симуляції
-        + λ_refl · E[min_Δ Cost(Δ)|Verify]     ← здатність до самовиправлення
-        + λ_meta · E[−R(σ) + β·Cost(σ)]        ← оптимізація стратегії
-
-Інтеграція з OMENScale:
-  OMENScale.osf_synthesizer = OSFSynthesizer(cfg)
-  logits, osf_info = model.osf_synthesizer(h_tok, z_final, tgt, plan_data)
-  total_loss += cfg.lambda_osf * osf_info["j_osf"]
+OSF is the hierarchical generation stack that can replace the plain token
+decoder with intent, planning, template, simulation, reflection, and
+meta-control stages.
 """
 
 from __future__ import annotations

@@ -25,6 +25,7 @@ aesthetic_engine.py — Aesthetic Evolution Engine (AEE)
 from __future__ import annotations
 
 from collections import Counter
+import pickle
 import random
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -195,6 +196,21 @@ class AestheticEvolutionEngine:
 
         # Персистентний gene pool між викликами evolve()
         self._gene_pool: List[RuleCandidate] = []
+
+    def export_state(self) -> Dict[str, Any]:
+        return {"gene_pool": pickle.dumps(list(self._gene_pool))}
+
+    def load_state(self, state: Optional[Dict[str, Any]]) -> None:
+        state = state or {}
+        gene_pool_blob = state.get("gene_pool")
+        if gene_pool_blob is None:
+            self._gene_pool = []
+            return
+        if isinstance(gene_pool_blob, bytes):
+            gene_pool = list(pickle.loads(gene_pool_blob))
+        else:
+            gene_pool = list(gene_pool_blob)
+        self._gene_pool = gene_pool[: self.gene_pool_size]
 
     # ─── Естетична функція A(R) ───────────────────────────────────────────────
 

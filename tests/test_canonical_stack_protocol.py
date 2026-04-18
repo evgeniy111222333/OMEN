@@ -37,6 +37,35 @@ class CanonicalStackProtocolTest(unittest.TestCase):
         self.assertIsInstance(model, OMEN)
         self.assertIsInstance(model, OMENScale)
         self.assertEqual(model.canonical_architecture(), CANONICAL_OMEN_SPEC)
+        self.assertTrue(model.net_enabled)
+        self.assertTrue(model.osf_enabled)
+        self.assertTrue(model.emc_enabled)
+        self.assertTrue(model.prover.creative_cycle.enabled)
+        self.assertTrue(model.canonical_stack_forced)
+
+    def test_canonical_forcing_does_not_mutate_caller_config(self) -> None:
+        cfg = OMENConfig.demo()
+        cfg.net_enabled = False
+        cfg.osf_enabled = False
+        cfg.emc_enabled = False
+        cfg.creative_cycle_enabled = False
+        cfg.continuous_cycle_enabled = False
+        cfg.continuous_cycle_eval_enabled = False
+
+        model = OMENScale(cfg)
+
+        self.assertFalse(cfg.net_enabled)
+        self.assertFalse(cfg.osf_enabled)
+        self.assertFalse(cfg.emc_enabled)
+        self.assertFalse(cfg.creative_cycle_enabled)
+        self.assertFalse(cfg.continuous_cycle_enabled)
+        self.assertFalse(cfg.continuous_cycle_eval_enabled)
+        self.assertTrue(model.net_enabled)
+        self.assertTrue(model.osf_enabled)
+        self.assertTrue(model.emc_enabled)
+        self.assertTrue(model.prover.creative_cycle.enabled)
+        self.assertTrue(model.prover.continuous_cycle_enabled)
+        self.assertTrue(model.prover.continuous_cycle_eval_enabled)
 
     def test_repository_axis_classifies_modules(self) -> None:
         axis = repository_axis()
@@ -44,7 +73,8 @@ class CanonicalStackProtocolTest(unittest.TestCase):
         self.assertEqual(axis.module_role("omen_scale.py"), "canonical_surface")
         self.assertEqual(module_role("omen_v2.py"), "legacy_reference")
         self.assertEqual(module_role("omen_symbolic/world_graph.py"), "canonical_support")
-        self.assertEqual(module_role("omen_symbolic/aesthetic_engine.py"), "research_extension")
+        self.assertEqual(module_role("omen_symbolic/aesthetic_engine.py"), "canonical_support")
+        self.assertEqual(module_role("omen_symbolic/creative_cycle.py"), "canonical_support")
 
 
 if __name__ == "__main__":

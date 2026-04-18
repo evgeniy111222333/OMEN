@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import torch
@@ -11,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from omen_prolog import Const, DifferentiableProver, HornAtom, SymbolicTaskContext
+from omen_prolog import Const, DifferentiableProver, HornAtom, HornClause, SymbolicTaskContext
 
 
 class _DummyWorld(nn.Module):
@@ -80,6 +81,9 @@ class SymbolicCycleEvalTest(unittest.TestCase):
         self.assertEqual(prover.last_forward_info.get("cycle_learning_active", 0.0), 1.0)
         self.assertGreaterEqual(prover.last_forward_info.get("cycle_checked", 0.0), 1.0)
         self.assertGreaterEqual(prover.last_forward_info.get("cycle_candidate_budget", 0.0), 1.0)
+        self.assertGreaterEqual(prover.last_forward_info.get("cycle_loss_aux", 0.0), 0.0)
+        self.assertEqual(prover.last_forward_info.get("cycle_loss_weight", 0.0), 0.10)
+        self.assertEqual(prover.last_forward_info.get("abduction_loss_weight", 0.0), 0.05)
 
     def test_eval_cycle_stays_off_when_disabled(self) -> None:
         prover = self._make_prover(eval_enabled=False)
@@ -110,6 +114,25 @@ class SymbolicCycleEvalTest(unittest.TestCase):
         )
         self.assertEqual(cycle_learn["stats"].get("learning_active", 0.0), 1.0)
         self.assertTrue(cycle_learn["loss_tensor"].requires_grad)
+
+    def test_mental_simulation_prioritizes_world_prediction_error(self) -> None:
+        prover = self._make_prover(eval_enabled=True)
+        rule = HornClause(
+            head=self.goal,
+            body=(
+                HornAtom(pred=5, args=(Const(1), Const(2))),
+                HornAtom(pred=6, args=(Const(2), Const(3))),
+            ),
+        )
+
+        with mock.patch.object(prover, "_world_rule_prediction_error", return_value=0.05):
+            low_error, derived = prover._mental_simulate_rule(rule, self.observed, self.device)
+        with mock.patch.object(prover, "_world_rule_prediction_error", return_value=0.95):
+            high_error, _ = prover._mental_simulate_rule(rule, self.observed, self.device)
+
+        self.assertEqual(derived, self.goal)
+        self.assertGreater(high_error, low_error)
+        self.assertGreaterEqual(high_error, 0.70)
 
 
 if __name__ == "__main__":

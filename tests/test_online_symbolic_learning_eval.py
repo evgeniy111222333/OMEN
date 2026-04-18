@@ -26,6 +26,7 @@ class OnlineSymbolicLearningEvalTest(unittest.TestCase):
 
     def test_eval_forward_can_run_symbolic_online_learning(self) -> None:
         cfg = OMENConfig.demo()
+        cfg.allow_noncanonical_ablation = True
         cfg.net_enabled = False
         cfg.osf_enabled = False
         cfg.emc_enabled = False
@@ -54,6 +55,7 @@ class OnlineSymbolicLearningEvalTest(unittest.TestCase):
 
     def test_eval_forward_updates_world_model_weights(self) -> None:
         cfg = OMENConfig.demo()
+        cfg.allow_noncanonical_ablation = True
         cfg.net_enabled = False
         cfg.osf_enabled = False
         cfg.emc_enabled = False
@@ -80,6 +82,7 @@ class OnlineSymbolicLearningEvalTest(unittest.TestCase):
 
     def test_generation_can_run_eval_world_self_update(self) -> None:
         cfg = OMENConfig.demo()
+        cfg.allow_noncanonical_ablation = True
         cfg.net_enabled = False
         cfg.osf_enabled = False
         cfg.emc_enabled = False

@@ -12,13 +12,19 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from benchmarks.benchmark_omen_scale_eval import run_benchmark, run_corpus_protocol
+from benchmarks.benchmark_omen_scale_eval import (
+    build_transfer_tasks,
+    run_benchmark,
+    run_corpus_protocol,
+    run_creative_ablation_suite,
+)
 from omen_scale_config import OMENScaleConfig
 from omen_train_code import load_text_corpus, make_synthetic_dataset
 
 
 def _benchmark_test_config() -> OMENScaleConfig:
     cfg = OMENScaleConfig.demo()
+    cfg.allow_noncanonical_ablation = True
     cfg.vocab_size = 256
     cfg.d_tok = 64
     cfg.n_heads_tok = 4
@@ -74,6 +80,8 @@ class BenchmarkProtocolTest(unittest.TestCase):
         for key in (
             "program_anchor",
             "program_target_facts",
+            "world_causal_error",
+            "world_alignment",
             "sym_cycle_active",
             "sym_cycle_checked",
             "sym_cycle_eval_active",
@@ -85,8 +93,19 @@ class BenchmarkProtocolTest(unittest.TestCase):
             "world_graph_hidden_fallback_steps",
             "world_graph_hidden_teacher_applied",
             "world_graph_neutral_prior_applied",
+            "world_graph_context_facts",
+            "world_graph_memory_facts",
+            "world_graph_net_facts",
+            "world_graph_semantic_graph_enriched",
+            "z_posterior_graph_native",
+            "z_posterior_perceiver_fallback",
+            "world_graph_transition_native",
+            "sym_world_context_facts",
+            "sym_observed_now_facts",
             "eval_world_self_update_applied",
             "creative_oee_online_train_applied",
+            "creative_cycle_active",
+            "creative_gap_reduction",
             "sal_named_role_preds",
             "sal_named_role_rel_preds",
         ):
@@ -224,6 +243,30 @@ class BenchmarkProtocolTest(unittest.TestCase):
                     os.remove(path)
             if manifest_path and os.path.exists(manifest_path):
                 os.remove(manifest_path)
+
+    def test_creative_ablation_suite_reports_enabled_disabled_deltas(self) -> None:
+        cfg = _benchmark_test_config()
+        tasks = build_transfer_tasks(cfg, synthetic_samples=4)
+        tasks = {name: tasks[name] for name in ("python", "observation_text", "observation_structured")}
+
+        report = run_creative_ablation_suite(
+            cfg,
+            tasks=tasks,
+            source_task="python",
+            adapt_steps=0,
+            eval_batches=1,
+            batch_size=1,
+            seed=13,
+        )
+
+        self.assertEqual(report["n_tasks"], 3)
+        self.assertEqual(report["canonical_stack"], "omen_scale_world_graph")
+        self.assertEqual(report["canonical_public_module"], "omen.OMEN")
+        self.assertEqual(report["protocol_seed"], 13)
+        self.assertIn("creative_cycle_active_delta", report["aggregate_delta"])
+        self.assertIn("python", report["task_deltas"])
+        self.assertIn("observation_text", report["task_deltas"])
+        self.assertEqual(report["aggregate_disabled_summary"].get("creative_cycle_active", 0.0), 0.0)
 
 
 if __name__ == "__main__":

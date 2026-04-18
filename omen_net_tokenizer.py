@@ -1,27 +1,8 @@
 """
-omen_net_tokenizer.py — Neural Epistemic Tokenizer (NET)
-=========================================================
-Замінює GPT-2 BPE нейро-символьним компресором.
+omen_net_tokenizer.py: Neural Epistemic Tokenizer (NET).
 
-Математика (MDL для токенізації):
-  Tokenization = argmin_V [ Length(Z) + Distortion(X, X̂) + Complexity(V) ]
-
-  L_NET = L_vq                                    ← commitment loss (∼ L_code)
-        + L_rec                                    ← byte reconstruction
-        + λ_voc · Σ_{v∈V} (||e_v||² + Complexity(v))  ← MDL словника
-
-Компоненти:
-  ByteContextEncoder  (f_θ) : токени → контекстні d_tok-вектори
-  EpistemicQuantizer  (Q)   : d_tok-вектори → дискретні концепти (EMA + STE)
-  ByteDecoder         (g_φ) : концепти + z_final → відновлення токенів
-  NETLoss                   : збирає всі три терміни
-  NeuralEpistemicTokenizer  : оркеструє f_θ → Q → g_φ
-
-Інтеграція:
-  J_OMEN+NET = J_OMEN + η_tok · L_NET
-
-  h_tok, vq_info = net.encode(src)         # замість tok_encoder(src)
-  logits, l_rec  = net.decode(tgt, z_final, h_tok)  # замість tok_decoder
+NET replaces fixed subword tokenization with byte-level contextual encoding,
+discrete concept formation, and MDL-aware reconstruction.
 """
 
 from __future__ import annotations

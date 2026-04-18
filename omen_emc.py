@@ -41,7 +41,7 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -59,8 +59,9 @@ ACTION_STOP   = 0   # Зупинитись — повернути поточни
 ACTION_RECALL = 1   # Зчитати з M-Core, збагатити z
 ACTION_FC     = 2   # Один крок Forward Chaining (застосувати правила → нові факти)
 ACTION_ABDUCE = 3   # Абдукція: згенерувати нові правила через AbductionHead + VeM
+ACTION_INTRINSIC = 4   # Переключити активну ціль на внутрішню ICE-ціль
 
-N_ACTIONS = 4
+N_ACTIONS = 5
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -88,6 +89,16 @@ class TrajectoryStats:
     action_costs:      list  = field(default_factory=list)  # C(a_t)
     r_intermediates:   list  = field(default_factory=list)  # R_int_t
     action_histogram:  list  = field(default_factory=list)
+    gap_world_norms:   list  = field(default_factory=list)
+    gap_grounded_norms:list  = field(default_factory=list)
+    gap_reliefs:       list  = field(default_factory=list)
+    memory_residuals:  list  = field(default_factory=list)
+    memory_alignments: list  = field(default_factory=list)
+    memory_pressures:  list  = field(default_factory=list)
+    gap_deltas:        list  = field(default_factory=list)
+    recall_gap_deltas: list  = field(default_factory=list)
+    recall_gap_reliefs:list  = field(default_factory=list)
+    recall_effective_steps: float = 0.0
     stop_reason: str         = "max_steps"  # "bellman"|"fixpoint"|"max_steps"|"action_stop"
 
 
@@ -127,6 +138,7 @@ class StoppingUtility(nn.Module):
                 gap_norm:  torch.Tensor,       # (B,) або scalar
                 mdl_cost:  float = 0.0,
                 t_elapsed: int   = 0,          # кількість виконаних кроків міркування
+                memory_penalty: float = 0.0,
                 ) -> torch.Tensor:             # → (B,) U_stop
         """
         Обчислює U_stop(s) відповідно до розширеної формули MDL:
@@ -161,11 +173,16 @@ class StoppingUtility(nn.Module):
             self.lambda_time * float(t_elapsed),
             dtype=r_task.dtype, device=r_task.device,
         ).clamp(min=0.0)
+        memory_pen = torch.tensor(
+            float(memory_penalty),
+            dtype=r_task.dtype, device=r_task.device,
+        ).clamp(min=0.0)
 
         u_stop = (r_task
                   + self.eta_int * r_int
                   - self.lambda_gap  * gn
                   - mdl_pen
+                  - memory_pen
                   - time_pen)
         return u_stop   # (B,)
 
@@ -229,8 +246,8 @@ class EMCStateEncoder(nn.Module):
                  use_action_hist: bool = True):
         super().__init__()
         self.use_action_hist = use_action_hist
-        # z + goal + WM summary + 6 scalar features + action histogram.
-        d_in = d_latent * 3 + 6 + (N_ACTIONS if use_action_hist else 0)
+        # z + goal + WM summary + 10 scalar features + action histogram.
+        d_in = d_latent * 3 + 10 + (N_ACTIONS if use_action_hist else 0)
         self.z_proj = nn.Linear(d_latent, d_latent, bias=False)
         self.goal_proj = nn.Linear(d_latent, d_latent, bias=False)
         self.wm_proj = nn.Linear(d_latent, d_latent, bias=False)
@@ -246,6 +263,11 @@ class EMCStateEncoder(nn.Module):
                 depth_norm:  torch.Tensor,
                 nfacts_norm: torch.Tensor,
                 nrules_norm: torch.Tensor,
+                gap_world:   Optional[torch.Tensor] = None,
+                gap_grounded: Optional[torch.Tensor] = None,
+                gap_relief:  Optional[torch.Tensor] = None,
+                gap_residual: Optional[torch.Tensor] = None,
+                gap_alignment: Optional[torch.Tensor] = None,
                 goal_embed:  Optional[torch.Tensor] = None,
                 wm_embed:    Optional[torch.Tensor] = None,
                 trigger_flag: Optional[torch.Tensor] = None,
@@ -253,7 +275,7 @@ class EMCStateEncoder(nn.Module):
                 action_hist: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         z           : (B, d_latent)
-        *_norm      : () або (B,) — скалярні ознаки в [0,1]
+        *_norm      : () або (B,) — скалярні ознаки; gap_relief може бути в [-1,1]
         action_hist : (B, N_ACTIONS) або None — one-hot агрегат попередніх дій
         Returns     : (B, d_latent) — стан для Actor/Critic
         """
@@ -261,6 +283,15 @@ class EMCStateEncoder(nn.Module):
         z_enc = self.z_proj(z)
         goal_enc = self.goal_proj(goal_embed if goal_embed is not None else torch.zeros_like(z))
         wm_enc = self.wm_proj(wm_embed if wm_embed is not None else torch.zeros_like(z))
+        grounded_gap = gap_grounded if gap_grounded is not None else gap_norm
+        world_gap = gap_world if gap_world is not None else grounded_gap
+        relief_gap = gap_relief if gap_relief is not None else (world_gap - grounded_gap)
+        residual_gap = gap_residual if gap_residual is not None else grounded_gap
+        alignment = (
+            gap_alignment
+            if gap_alignment is not None
+            else torch.zeros((), device=z.device, dtype=z.dtype)
+        )
 
         def _as_col(t: torch.Tensor) -> torch.Tensor:
             """() або (B,) → (B, 1)"""
@@ -269,13 +300,17 @@ class EMCStateEncoder(nn.Module):
             return t.unsqueeze(-1) if t.dim() == 1 else t
 
         scalars = torch.cat([
-            _as_col(gap_norm),
+            _as_col(world_gap),
+            _as_col(grounded_gap),
+            _as_col(relief_gap),
+            _as_col(residual_gap),
+            _as_col(alignment),
             _as_col(depth_norm),
             _as_col(nfacts_norm),
             _as_col(nrules_norm),
             _as_col(trigger_flag if trigger_flag is not None else torch.zeros((), device=z.device, dtype=z.dtype)),
             _as_col(hot_ratio if hot_ratio is not None else torch.zeros((), device=z.device, dtype=z.dtype)),
-        ], dim=-1)                                              # (B, 6)
+        ], dim=-1)                                              # (B, 10)
 
         if self.use_action_hist:
             if action_hist is not None:
@@ -365,6 +400,7 @@ class EfficientMetaController(nn.Module):
         ACTION_RECALL: 0.01,   # дешево: O(d²) операцій
         ACTION_FC:     0.05,   # середньо: перебір правил × фактів
         ACTION_ABDUCE: 0.10,   # дорого: AbductionHead + VeM + нові правила
+        ACTION_INTRINSIC: 0.03,
     }
 
     def __init__(self, cfg):
@@ -399,11 +435,14 @@ class EfficientMetaController(nn.Module):
         self.entropy_beta = getattr(cfg, 'emc_entropy_beta',   0.01)
         self.lambda_time  = getattr(cfg, 'emc_lambda_time',    0.05)   # штраф за крок
         self.lambda_gap   = getattr(cfg, 'emc_lambda_gap',     0.05)   # штраф за GapNorm
+        self.lambda_memory_residual = getattr(cfg, 'emc_lambda_memory_residual', 0.02)
+        self.lambda_memory_misalignment = getattr(cfg, 'emc_lambda_memory_misalignment', 0.02)
         self.lambda_mdl   = getattr(cfg, 'emc_lambda_mdl',     0.01)   # штраф за MDL(proof)
         self.eta_int      = getattr(cfg, 'emc_eta_int',        0.10)   # бонус за нові факти
         self.c_recall     = getattr(cfg, 'emc_c_recall',       0.01)
         self.c_fc         = getattr(cfg, 'emc_c_fc',           0.05)
         self.c_abduce     = getattr(cfg, 'emc_c_abduce',       0.10)
+        self.c_intrinsic  = getattr(cfg, 'emc_c_intrinsic',    0.03)
 
         # GAE (Generalized Advantage Estimation)
         self.use_gae     = getattr(cfg, 'emc_use_gae',        True)
@@ -420,7 +459,19 @@ class EfficientMetaController(nn.Module):
             ACTION_RECALL: self.c_recall,
             ACTION_FC:     self.c_fc,
             ACTION_ABDUCE: self.c_abduce,
+            ACTION_INTRINSIC: self.c_intrinsic,
         }.get(a, 0.0)
+
+    @staticmethod
+    def _goal_match(left, right) -> bool:
+        if left is None or right is None:
+            return False
+        try:
+            from omen_prolog import unify
+
+            return unify(left, right) is not None
+        except Exception:
+            return hash(left) == hash(right)
 
     def _fact_utility(self, prover, facts) -> float:
         """
@@ -461,11 +512,27 @@ class EfficientMetaController(nn.Module):
 
     def _action_mask(self,
                      device: torch.device,
-                     allow_abduction: bool) -> torch.Tensor:
+                     allow_abduction: bool,
+                     allow_intrinsic: bool = True) -> torch.Tensor:
         mask = torch.zeros(N_ACTIONS, dtype=torch.bool, device=device)
         if not allow_abduction:
             mask[ACTION_ABDUCE] = True
+        if not allow_intrinsic:
+            mask[ACTION_INTRINSIC] = True
         return mask
+
+    @staticmethod
+    def _mask_action_logits(logits: torch.Tensor, action_mask: torch.Tensor) -> torch.Tensor:
+        mask_value = torch.finfo(logits.dtype).min
+        return logits.masked_fill(action_mask, mask_value)
+
+    def _task_estimator_bce_loss(self, task_state: torch.Tensor, goal_proved: bool) -> torch.Tensor:
+        device_type = task_state.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            task_state_fp32 = task_state.float()
+            r_pred = self.stopping_utility.task_estimator(task_state_fp32).squeeze(-1)
+            bce_tgt = torch.full_like(r_pred, float(goal_proved))
+            return F.binary_cross_entropy(r_pred.clamp(1e-6, 1.0 - 1e-6), bce_tgt)
 
     def _encode_state(self,
                       z:           torch.Tensor,
@@ -473,6 +540,7 @@ class EfficientMetaController(nn.Module):
                       depth:       int,
                       n_facts:     int,
                       n_rules:     int,
+                      gap_features: Optional[Dict[str, float]] = None,
                       goal_embed:  Optional[torch.Tensor] = None,
                       wm_embed:    Optional[torch.Tensor] = None,
                       trigger_flag: float = 0.0,
@@ -487,8 +555,12 @@ class EfficientMetaController(nn.Module):
         max_d = float(max(self.max_steps, 1))
         max_f = float(max(getattr(self.cfg, 'sym_max_facts', 64), 1))
         max_r = float(max(getattr(self.cfg, 'ltm_max_rules', 256), 1))
-
-        gn_val = gap_norm.mean().clamp(0.0, 5.0) / 5.0
+        gap_info = self._coerce_gap_features(gap_norm, gap_features)
+        world_gap_val = max(min(gap_info["gap_world_only"], 5.0), 0.0) / 5.0
+        grounded_gap_val = max(min(gap_info["gap_memory_grounded"], 5.0), 0.0) / 5.0
+        relief_gap_val = max(min(gap_info["gap_memory_relief"] / 5.0, 1.0), -1.0)
+        residual_gap_val = max(min(gap_info["gap_memory_residual"], 5.0), 0.0) / 5.0
+        alignment_val = max(min(gap_info["gap_memory_alignment"], 1.0), -1.0)
 
         def _s(v) -> torch.Tensor:
             return torch.tensor(v, device=dev, dtype=dtype)
@@ -506,10 +578,15 @@ class EfficientMetaController(nn.Module):
 
         return self.state_enc(
             z,
-            gn_val,
+            _s(grounded_gap_val),
             _s(depth / max_d),
             _s(min(n_facts, max_f) / max_f),
             _s(min(n_rules, max_r) / max_r),
+            gap_world=_s(world_gap_val),
+            gap_grounded=_s(grounded_gap_val),
+            gap_relief=_s(relief_gap_val),
+            gap_residual=_s(residual_gap_val),
+            gap_alignment=_s(alignment_val),
             goal_embed=goal_embed,
             wm_embed=wm_embed,
             trigger_flag=_s(trigger_flag),
@@ -540,6 +617,124 @@ class EfficientMetaController(nn.Module):
                 return 1.0
         return 0.0
 
+    @staticmethod
+    def _coerce_gap_features(
+        gap_norm: torch.Tensor,
+        gap_features: Optional[Dict[str, float]] = None,
+        prior_features: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, float]:
+        grounded_gap_default = (
+            float(gap_norm.mean().item()) if torch.is_tensor(gap_norm) else float(gap_norm)
+        )
+        features = dict(prior_features or {})
+        features.update(gap_features or {})
+        grounded_gap = float(features.get("gap_memory_grounded", grounded_gap_default))
+        world_gap = float(features.get("gap_world_only", grounded_gap))
+        relief_gap = float(features.get("gap_memory_relief", world_gap - grounded_gap))
+        residual_gap = float(features.get("gap_memory_residual", grounded_gap))
+        alignment = float(features.get("gap_memory_alignment", 0.0))
+        return {
+            "gap_world_only": world_gap,
+            "gap_memory_grounded": grounded_gap,
+            "gap_memory_relief": relief_gap,
+            "gap_memory_residual": residual_gap,
+            "gap_memory_alignment": alignment,
+        }
+
+    def _apply_recall_gap_feedback(
+        self,
+        z_query: torch.Tensor,
+        gap_norm: torch.Tensor,
+        v_mem_step: torch.Tensor,
+        gap_feedback: Optional[
+            Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, Dict[str, float]]]
+        ] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        fallback_gap = gap_norm.detach().to(device=z_query.device, dtype=z_query.dtype)
+        if gap_feedback is not None:
+            try:
+                next_gap, stats = gap_feedback(z_query.detach(), v_mem_step.detach())
+            except Exception:
+                next_gap, stats = None, {}
+        else:
+            next_gap, stats = None, {}
+
+        if not torch.is_tensor(next_gap):
+            next_gap = (fallback_gap * 0.9).clamp(0.0, 5.0)
+        else:
+            next_gap = next_gap.detach().to(device=z_query.device, dtype=z_query.dtype)
+            if next_gap.dim() == 0:
+                next_gap = next_gap.reshape(1).expand_as(fallback_gap)
+            elif next_gap.shape != fallback_gap.shape:
+                if next_gap.numel() == fallback_gap.numel():
+                    next_gap = next_gap.reshape_as(fallback_gap)
+                else:
+                    next_gap = next_gap.mean().reshape(1).expand_as(fallback_gap)
+            next_gap = next_gap.clamp(0.0, 5.0)
+
+        info = dict(stats or {})
+        gap_before = float(info.get("gap_world_only", fallback_gap.mean().item()))
+        gap_after = float(info.get("gap_memory_grounded", next_gap.mean().item()))
+        gap_delta = float(info.get("gap_delta", gap_before - gap_after))
+        gap_relief = float(info.get("gap_memory_relief", gap_delta))
+        info.update({
+            "gap_world_only": gap_before,
+            "gap_memory_grounded": gap_after,
+            "gap_delta": gap_delta,
+            "gap_memory_relief": gap_relief,
+            "gap_effective": 1.0 if gap_delta > 1e-6 else 0.0,
+        })
+        return next_gap, info
+
+    def _measure_gap_feedback_state(
+        self,
+        z_state: torch.Tensor,
+        gap_fallback: torch.Tensor,
+        signal: torch.Tensor,
+        gap_feedback: Optional[
+            Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, Dict[str, float]]]
+        ] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        fallback_gap = gap_fallback.detach().to(device=z_state.device, dtype=z_state.dtype)
+        if gap_feedback is not None:
+            try:
+                next_gap, stats = gap_feedback(z_state.detach(), signal.detach())
+            except Exception:
+                next_gap, stats = None, {}
+        else:
+            next_gap, stats = None, {}
+
+        if not torch.is_tensor(next_gap):
+            next_gap = fallback_gap
+        else:
+            next_gap = next_gap.detach().to(device=z_state.device, dtype=z_state.dtype)
+            if next_gap.dim() == 0:
+                next_gap = next_gap.reshape(1).expand_as(fallback_gap)
+            elif next_gap.shape != fallback_gap.shape:
+                if next_gap.numel() == fallback_gap.numel():
+                    next_gap = next_gap.reshape_as(fallback_gap)
+                else:
+                    next_gap = next_gap.mean().reshape(1).expand_as(fallback_gap)
+            next_gap = next_gap.clamp(0.0, 5.0)
+
+        info = dict(stats or {})
+        info.setdefault("gap_world_only", float(next_gap.mean().item()))
+        info.setdefault("gap_memory_grounded", float(next_gap.mean().item()))
+        return next_gap, info
+
+    def _memory_control_penalty(
+        self,
+        gap_features: Optional[Dict[str, float]] = None,
+    ) -> float:
+        features = gap_features or {}
+        residual = max(min(float(features.get("gap_memory_residual", 0.0)), 5.0), 0.0) / 5.0
+        alignment = max(min(float(features.get("gap_memory_alignment", 0.0)), 1.0), -1.0)
+        misalignment = (1.0 - alignment) / 2.0
+        return (
+            self.lambda_memory_residual * residual
+            + self.lambda_memory_misalignment * misalignment
+        )
+
     # ── Головний цикл ─────────────────────────────────────────────────────────
 
     def run_episode(self,
@@ -550,6 +745,10 @@ class EfficientMetaController(nn.Module):
                     memory,                        # AsyncTensorProductMemory
                     world_err: torch.Tensor,
                     device:    torch.device,
+                    gap_features: Optional[Dict[str, float]] = None,
+                    gap_feedback: Optional[
+                        Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, Dict[str, float]]]
+                    ] = None,
                     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
                                torch.Tensor, 'TrajectoryStats']:
         """
@@ -607,6 +806,7 @@ class EfficientMetaController(nn.Module):
         z_cur        = z.clone()
         v_mem_out    = torch.zeros_like(z)
         gap_norm_cur = gap_norm.clone()   # оновлюється після кожної дії
+        current_gap_features = self._coerce_gap_features(gap_norm_cur, gap_features)
 
         # VoC criterion reset for new episode
         self.voc.reset()
@@ -625,9 +825,11 @@ class EfficientMetaController(nn.Module):
         action_counts: List[int] = [0] * N_ACTIONS
         # Реальні (rule, substitution) кроки доведення для MDL(proof)
         proof_derivations: List[Tuple[object, Optional[object]]] = []
-        goal_embed = self._goal_embed(prover, goal, B, device)
-
         for step in range(self.max_steps):
+            goal = prover.current_goal(z_cur)
+            goal_embed = self._goal_embed(prover, goal, B, device)
+            intrinsic_goal = getattr(prover, "current_intrinsic_goal", lambda: None)()
+            intrinsic_goal_available = intrinsic_goal is not None and not self._goal_match(goal, intrinsic_goal)
             # MDL(proof) поточного стану
             proof_mdl_cur = self._proof_mdl(
                 prover, proof_derivations, action_count=len(traj.actions)
@@ -639,11 +841,19 @@ class EfficientMetaController(nn.Module):
             state_vec = self._encode_state(
                 z_cur, gap_norm_cur, step,
                 len(working_facts), len(prover.kb),
+                gap_features=current_gap_features,
                 goal_embed=goal_embed,
                 wm_embed=wm_embed,
                 trigger_flag=trigger_flag,
                 hot_ratio=hot_ratio,
                 action_counts=action_counts)
+            traj.gap_world_norms.append(float(current_gap_features["gap_world_only"]))
+            traj.gap_grounded_norms.append(float(current_gap_features["gap_memory_grounded"]))
+            traj.gap_reliefs.append(float(current_gap_features["gap_memory_relief"]))
+            traj.memory_residuals.append(float(current_gap_features["gap_memory_residual"]))
+            traj.memory_alignments.append(float(current_gap_features["gap_memory_alignment"]))
+            memory_pressure = self._memory_control_penalty(current_gap_features)
+            traj.memory_pressures.append(memory_pressure)
 
             # ── Critic: V(s) ─────────────────────────────────────────────────
             val = self.critic(state_vec).mean()   # scalar
@@ -655,7 +865,8 @@ class EfficientMetaController(nn.Module):
             u_stop = self.stopping_utility(
                 state_vec, r_int_cumulative, gap_norm_cur,
                 mdl_cost=mdl_cost_cur,
-                t_elapsed=step)                                # ← λ_time·T_elapsed
+                t_elapsed=step,
+                memory_penalty=memory_pressure)                                # ← λ_time·T_elapsed
             u_stop_scalar = u_stop.mean().item()
             u_stop_list.append(u_stop_scalar)
 
@@ -672,9 +883,15 @@ class EfficientMetaController(nn.Module):
                 break
 
             # ── Actor: π_meta(a|s) ───────────────────────────────────────────
-            action_logits = self.actor(state_vec)            # (B, 4)
-            mean_logits   = action_logits.mean(0)            # (4,)
-            dist          = Categorical(logits=mean_logits)
+            action_logits = self.actor(state_vec)
+            mean_logits   = action_logits.mean(0)
+            action_mask = self._action_mask(
+                device,
+                allow_abduction=True,
+                allow_intrinsic=intrinsic_goal_available,
+            )
+            masked_logits = self._mask_action_logits(mean_logits, action_mask)
+            dist          = Categorical(logits=masked_logits)
             action        = dist.sample()
             log_p         = dist.log_prob(action)
             # Справжня ентропія H(π) = -Σ_a π(a|s)·log π(a|s) (скалярна)
@@ -700,14 +917,32 @@ class EfficientMetaController(nn.Module):
             # ── Виконуємо дію та обчислюємо R_int ────────────────────────────
             r_int    = 0.0
             cost_a   = self._action_cost(a)
+            gap_delta = 0.0
 
             if a == ACTION_RECALL:
-                v_mem_step = memory.read(z_cur)
-                z_cur      = (z_cur + v_mem_step).clamp(-20.0, 20.0)
+                z_before = z_cur
+                v_mem_step = memory.read(z_before)
+                gap_norm_cur, recall_gap = self._apply_recall_gap_feedback(
+                    z_before,
+                    gap_norm_cur,
+                    v_mem_step,
+                    gap_feedback=gap_feedback,
+                )
+                z_cur      = (z_before + v_mem_step).clamp(-20.0, 20.0)
                 v_mem_out  = v_mem_step
-                r_int      = v_mem_step.norm(dim=-1).mean().item() / (z.shape[-1] ** 0.5 + 1e-6)
-                # GapNorm зменшується після recall (пам'ять закриває прогалину)
-                gap_norm_cur = (gap_norm_cur * 0.9).clamp(0.0, 5.0)
+                gap_delta = float(recall_gap.get("gap_delta", 0.0))
+                r_int      = (
+                    v_mem_step.norm(dim=-1).mean().item() / (z.shape[-1] ** 0.5 + 1e-6)
+                    + gap_delta
+                )
+                traj.recall_gap_deltas.append(gap_delta)
+                traj.recall_gap_reliefs.append(float(recall_gap.get("gap_memory_relief", gap_delta)))
+                traj.recall_effective_steps += float(recall_gap.get("gap_effective", 0.0))
+                current_gap_features = self._coerce_gap_features(
+                    gap_norm_cur,
+                    recall_gap,
+                    prior_features=current_gap_features,
+                )
 
             elif a == ACTION_FC:
                 # FIX Bug-FC: forward_chain() повертає frozenset але НЕ додає факти в KB.
@@ -721,9 +956,40 @@ class EfficientMetaController(nn.Module):
                 r_int = self._fact_utility(prover, new_facts)
                 if n_added_fc > 0:
                     r_int = max(r_int, float(n_added_fc) / max(n_facts_init + 1, 1))
-                # GapNorm може зменшитись якщо нові факти проясняють ситуацію
+                # GapNorm має оцінюватися за новим grounded symbolic-state, а не через фіксований shrink.
                 if n_added_fc > 0:
-                    gap_norm_cur = (gap_norm_cur * 0.95).clamp(0.0, 5.0)
+                    z_before = z_cur
+                    z_cur = prover.ground(working_facts, device).expand(B, -1)
+                    if gap_feedback is not None:
+                        zero_signal = torch.zeros_like(z_before)
+                        gap_before_t, before_stats = self._measure_gap_feedback_state(
+                            z_before,
+                            gap_norm_cur,
+                            zero_signal,
+                            gap_feedback=gap_feedback,
+                        )
+                        gap_after_t, after_stats = self._measure_gap_feedback_state(
+                            z_cur,
+                            gap_before_t,
+                            zero_signal,
+                            gap_feedback=gap_feedback,
+                        )
+                        gap_norm_cur = gap_after_t
+                        gap_delta = float(
+                            before_stats.get("gap_memory_grounded", float(gap_before_t.mean().item()))
+                            - after_stats.get("gap_memory_grounded", float(gap_after_t.mean().item()))
+                        )
+                    else:
+                        gap_before = float(gap_norm_cur.mean().item())
+                        gap_norm_cur = (gap_norm_cur * 0.95).clamp(0.0, 5.0)
+                        gap_delta = gap_before - float(gap_norm_cur.mean().item())
+                        after_stats = {}
+                    current_gap_features = self._coerce_gap_features(
+                        gap_norm_cur,
+                        after_stats,
+                        prior_features=current_gap_features,
+                    )
+                    r_int += gap_delta
 
             elif a == ACTION_ABDUCE:
                 err_val = world_err.item() if torch.is_tensor(world_err) else float(world_err)
@@ -731,6 +997,7 @@ class EfficientMetaController(nn.Module):
                 r_int   = max(float(n_added) / max(getattr(self.cfg, 'n_proof_cands', 8), 1),
                               mean_utility)
                 if n_added > 0:
+                    z_before = z_cur
                     induction_stats = prover._induce_proposed_rules_locally(
                         working_facts,
                         (
@@ -740,13 +1007,55 @@ class EfficientMetaController(nn.Module):
                         ),
                         device,
                     )
-                # Абдукція може суттєво зменшити GapNorm
-                if n_added > 0:
-                    gap_norm_cur = (gap_norm_cur * 0.85).clamp(0.0, 5.0)
+                    refined_facts = prover.forward_chain_reasoned(
+                        prover.max_depth,
+                        starting_facts=working_facts,
+                        only_verified=True,
+                        device=device,
+                    )
+                    z_cur = prover.ground(refined_facts or working_facts, device).expand(B, -1)
+                    if gap_feedback is not None:
+                        zero_signal = torch.zeros_like(z_before)
+                        gap_before_t, before_stats = self._measure_gap_feedback_state(
+                            z_before,
+                            gap_norm_cur,
+                            zero_signal,
+                            gap_feedback=gap_feedback,
+                        )
+                        gap_after_t, after_stats = self._measure_gap_feedback_state(
+                            z_cur,
+                            gap_before_t,
+                            zero_signal,
+                            gap_feedback=gap_feedback,
+                        )
+                        gap_norm_cur = gap_after_t
+                        gap_delta = float(
+                            before_stats.get("gap_memory_grounded", float(gap_before_t.mean().item()))
+                            - after_stats.get("gap_memory_grounded", float(gap_after_t.mean().item()))
+                        )
+                    else:
+                        gap_before = float(gap_norm_cur.mean().item())
+                        gap_norm_cur = (gap_norm_cur * 0.85).clamp(0.0, 5.0)
+                        gap_delta = gap_before - float(gap_norm_cur.mean().item())
+                        after_stats = {}
+                    current_gap_features = self._coerce_gap_features(
+                        gap_norm_cur,
+                        after_stats,
+                        prior_features=current_gap_features,
+                    )
+                    r_int += gap_delta
+
+            elif a == ACTION_INTRINSIC:
+                focused_goal = getattr(prover, "focus_intrinsic_goal", lambda: None)()
+                if focused_goal is not None:
+                    goal = prover.current_goal(z_cur)
+                    goal_embed = self._goal_embed(prover, goal, B, device)
+                    r_int = max(float(getattr(prover, "current_intrinsic_value", lambda: 0.0)()), 0.0)
 
             r_int_cumulative += r_int
             traj.action_costs.append(cost_a)
             traj.r_intermediates.append(r_int)
+            traj.gap_deltas.append(gap_delta)
             traj.gap_norms.append(gap_norm_cur.mean().item()
                                   if gap_norm_cur.dim() > 0
                                   else float(gap_norm_cur))
@@ -756,6 +1065,7 @@ class EfficientMetaController(nn.Module):
             instant = (self.eta_int * r_int
                        - cost_a
                        - self.lambda_gap * min(gn_val, 5.0)
+                       - memory_pressure
                        - self.lambda_time
                        - self.lambda_mdl * float(cost_a))   # MDL(proof) штраф за крок
             rewards_list.append(instant)
@@ -991,9 +1301,7 @@ class EfficientMetaController(nn.Module):
                 hot_ratio=float(hot_dims.float().mean().item()) if hot_dims is not None else 0.0,
                 action_counts=action_counts,
             )
-            r_pred    = self.stopping_utility.task_estimator(task_sv).squeeze(-1)  # (B,)
-            bce_tgt   = torch.full_like(r_pred, float(goal_proved))
-            l_task    = F.binary_cross_entropy(r_pred.clamp(1e-6, 1.0 - 1e-6), bce_tgt)
+            l_task = self._task_estimator_bce_loss(task_sv, goal_proved=goal_proved)
             meta_loss = meta_loss + 0.1 * l_task
 
         prover.last_goal = goal
@@ -1066,7 +1374,54 @@ class EfficientMetaController(nn.Module):
               "background_intrinsic_goals": float(background_intrinsic_total),
               "background_intrinsic_coverage": float(background_intrinsic_coverage),
               "creative_intrinsic_task_active": 1.0 if intrinsic_task_active else 0.0,
+              "emc_intrinsic_actions": float(action_counts[ACTION_INTRINSIC]),
+              "emc_intrinsic_goal_active": 1.0 if intrinsic_task_active else 0.0,
+              "emc_background_intrinsic_goals": float(background_intrinsic_total),
               "creative_analogy_projector_loss": float(creative_report.metrics.get("analogy_projector_loss", 0.0)),
+            "emc_gap_delta_mean": (
+                float(sum(traj.gap_deltas) / len(traj.gap_deltas))
+                if traj.gap_deltas else 0.0
+            ),
+            "emc_state_steps": float(len(traj.gap_world_norms)),
+            "emc_state_gap_world": (
+                float(sum(traj.gap_world_norms) / len(traj.gap_world_norms))
+                if traj.gap_world_norms else 0.0
+            ),
+            "emc_state_gap_grounded": (
+                float(sum(traj.gap_grounded_norms) / len(traj.gap_grounded_norms))
+                if traj.gap_grounded_norms else 0.0
+            ),
+            "emc_state_gap_relief": (
+                float(sum(traj.gap_reliefs) / len(traj.gap_reliefs))
+                if traj.gap_reliefs else 0.0
+            ),
+            "emc_state_memory_residual": (
+                float(sum(traj.memory_residuals) / len(traj.memory_residuals))
+                if traj.memory_residuals else 0.0
+            ),
+            "emc_state_memory_alignment": (
+                float(sum(traj.memory_alignments) / len(traj.memory_alignments))
+                if traj.memory_alignments else 0.0
+            ),
+            "emc_state_memory_pressure": (
+                float(sum(traj.memory_pressures) / len(traj.memory_pressures))
+                if traj.memory_pressures else 0.0
+            ),
+            "emc_gap_events": float(len(traj.gap_deltas)),
+            "emc_recall_steps": float(len(traj.recall_gap_deltas)),
+            "emc_recall_gap_delta": (
+                float(sum(traj.recall_gap_deltas) / len(traj.recall_gap_deltas))
+                if traj.recall_gap_deltas else 0.0
+            ),
+            "emc_recall_gap_relief": (
+                float(sum(traj.recall_gap_reliefs) / len(traj.recall_gap_reliefs))
+                if traj.recall_gap_reliefs else 0.0
+            ),
+            "emc_recall_effective_steps": float(traj.recall_effective_steps),
+            "emc_recall_effective_ratio": (
+                float(traj.recall_effective_steps) / float(len(traj.recall_gap_deltas))
+                if traj.recall_gap_deltas else 0.0
+            ),
             "provenance": (
                 prover.task_context.provenance
                 if getattr(prover, "task_context", None) is not None else "latent"
@@ -1085,6 +1440,10 @@ class EfficientMetaController(nn.Module):
                          prover,                       # DifferentiableProver
                          memory,                       # AsyncTensorProductMemory
                          device:   torch.device,
+                         gap_features: Optional[Dict[str, float]] = None,
+                         gap_feedback: Optional[
+                             Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, Dict[str, float]]]
+                         ] = None,
                          ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Eval-mode Bellman adaptive reasoning (без обчислення loss).
@@ -1115,6 +1474,7 @@ class EfficientMetaController(nn.Module):
         z_cur        = z.clone()
         v_mem_out    = torch.zeros_like(z)
         gap_norm_cur = gap_norm.clone()
+        current_gap_features = self._coerce_gap_features(gap_norm_cur, gap_features)
         self.voc.reset()
 
         action_counts: List[int] = [0] * N_ACTIONS
@@ -1128,9 +1488,21 @@ class EfficientMetaController(nn.Module):
             "matched_predictions": 0.0,
             "mean_score": 0.0,
         }
-        goal_embed = self._goal_embed(prover, goal, B, device)
-
+        gap_deltas: List[float] = []
+        gap_world_norms: List[float] = []
+        gap_grounded_norms: List[float] = []
+        gap_reliefs: List[float] = []
+        memory_residuals: List[float] = []
+        memory_alignments: List[float] = []
+        memory_pressures: List[float] = []
+        recall_gap_deltas: List[float] = []
+        recall_gap_reliefs: List[float] = []
+        recall_effective_steps = 0.0
         for step in range(self.max_steps):
+            goal = prover.current_goal(z_cur)
+            goal_embed = self._goal_embed(prover, goal, B, device)
+            intrinsic_goal = getattr(prover, "current_intrinsic_goal", lambda: None)()
+            intrinsic_goal_available = intrinsic_goal is not None and not self._goal_match(goal, intrinsic_goal)
             proof_mdl_cur = self._proof_mdl(
                 prover, proof_derivations, action_count=sum(action_counts)
             )
@@ -1138,18 +1510,27 @@ class EfficientMetaController(nn.Module):
             state_vec = self._encode_state(
                 z_cur, gap_norm_cur, step,
                 len(working_facts), len(prover.kb),
+                gap_features=current_gap_features,
                 goal_embed=goal_embed,
                 wm_embed=wm_embed,
                 trigger_flag=self._rule_trigger_flag(prover, facts=working_facts),
                 hot_ratio=float(hot_dims.float().mean().item()) if hot_dims is not None else 0.0,
                 action_counts=action_counts)
+            gap_world_norms.append(float(current_gap_features["gap_world_only"]))
+            gap_grounded_norms.append(float(current_gap_features["gap_memory_grounded"]))
+            gap_reliefs.append(float(current_gap_features["gap_memory_relief"]))
+            memory_residuals.append(float(current_gap_features["gap_memory_residual"]))
+            memory_alignments.append(float(current_gap_features["gap_memory_alignment"]))
+            memory_pressure = self._memory_control_penalty(current_gap_features)
+            memory_pressures.append(memory_pressure)
 
             val    = self.critic(state_vec).mean()
             mdl_cost_cur = self.lambda_mdl * proof_mdl_cur
             u_stop = self.stopping_utility(
                 state_vec, r_int_cumulative, gap_norm_cur,
                 mdl_cost=mdl_cost_cur,
-                t_elapsed=step)
+                t_elapsed=step,
+                memory_penalty=memory_pressure)
 
             # Bellman + VoC зупинка
             bellman_stop = self.stopping_utility.bellman_should_stop(
@@ -1161,7 +1542,13 @@ class EfficientMetaController(nn.Module):
             # Greedy action selection (argmax, не sample — eval mode)
             action_logits = self.actor(state_vec)
             mean_logits   = action_logits.mean(0)
-            a = mean_logits.argmax().item()
+            action_mask = self._action_mask(
+                device,
+                allow_abduction=True,
+                allow_intrinsic=intrinsic_goal_available,
+            )
+            masked_logits = self._mask_action_logits(mean_logits, action_mask)
+            a = masked_logits.argmax().item()
 
             action_counts[a] = action_counts[a] + 1
 
@@ -1171,11 +1558,26 @@ class EfficientMetaController(nn.Module):
             n_before = prover.kb.n_facts()
 
             if a == ACTION_RECALL:
-                v_mem_step = memory.read(z_cur)
-                z_cur      = (z_cur + v_mem_step).clamp(-20.0, 20.0)
+                z_before = z_cur
+                v_mem_step = memory.read(z_before)
+                gap_norm_cur, recall_gap = self._apply_recall_gap_feedback(
+                    z_before,
+                    gap_norm_cur,
+                    v_mem_step,
+                    gap_feedback=gap_feedback,
+                )
+                z_cur      = (z_before + v_mem_step).clamp(-20.0, 20.0)
                 v_mem_out  = v_mem_step
                 r_int      = v_mem_step.norm(dim=-1).mean().item() / (z.shape[-1] ** 0.5 + 1e-6)
-                gap_norm_cur = (gap_norm_cur * 0.9).clamp(0.0, 5.0)
+                gap_deltas.append(float(recall_gap.get("gap_delta", 0.0)))
+                recall_gap_deltas.append(float(recall_gap.get("gap_delta", 0.0)))
+                recall_gap_reliefs.append(float(recall_gap.get("gap_memory_relief", 0.0)))
+                recall_effective_steps += float(recall_gap.get("gap_effective", 0.0))
+                current_gap_features = self._coerce_gap_features(
+                    gap_norm_cur,
+                    recall_gap,
+                    prior_features=current_gap_features,
+                )
 
             elif a == ACTION_FC:
                 # FIX Bug-FC: forward_chain() не змінює KB. forward_chain_step() персистує.
@@ -1185,7 +1587,39 @@ class EfficientMetaController(nn.Module):
                 proof_derivations.extend(fc_trace)
                 r_int    = float(n_added_fc) / max(len(working_facts) + 1, 1)
                 if n_added_fc > 0:
-                    gap_norm_cur = (gap_norm_cur * 0.95).clamp(0.0, 5.0)
+                    z_before = z_cur
+                    z_cur = prover.ground(working_facts, device).expand(B, -1)
+                    if gap_feedback is not None:
+                        zero_signal = torch.zeros_like(z_before)
+                        gap_before_t, before_stats = self._measure_gap_feedback_state(
+                            z_before,
+                            gap_norm_cur,
+                            zero_signal,
+                            gap_feedback=gap_feedback,
+                        )
+                        gap_after_t, after_stats = self._measure_gap_feedback_state(
+                            z_cur,
+                            gap_before_t,
+                            zero_signal,
+                            gap_feedback=gap_feedback,
+                        )
+                        gap_norm_cur = gap_after_t
+                        gap_deltas.append(
+                            float(
+                                before_stats.get("gap_memory_grounded", float(gap_before_t.mean().item()))
+                                - after_stats.get("gap_memory_grounded", float(gap_after_t.mean().item()))
+                            )
+                        )
+                    else:
+                        gap_before = float(gap_norm_cur.mean().item())
+                        gap_norm_cur = (gap_norm_cur * 0.95).clamp(0.0, 5.0)
+                        gap_deltas.append(gap_before - float(gap_norm_cur.mean().item()))
+                        after_stats = {}
+                    current_gap_features = self._coerce_gap_features(
+                        gap_norm_cur,
+                        after_stats,
+                        prior_features=current_gap_features,
+                    )
 
             elif a == ACTION_ABDUCE:
                 n_added, _, _, mean_utility = prover.abduce_and_learn(
@@ -1196,6 +1630,7 @@ class EfficientMetaController(nn.Module):
                     mean_utility,
                 )
                 if n_added > 0:
+                    z_before = z_cur
                     induction_stats = prover._induce_proposed_rules_locally(
                         working_facts,
                         (
@@ -1205,7 +1640,51 @@ class EfficientMetaController(nn.Module):
                         ),
                         device,
                     )
-                    gap_norm_cur = (gap_norm_cur * 0.85).clamp(0.0, 5.0)
+                    refined_facts = prover.forward_chain_reasoned(
+                        prover.max_depth,
+                        starting_facts=working_facts,
+                        only_verified=True,
+                        device=device,
+                    )
+                    z_cur = prover.ground(refined_facts or working_facts, device).expand(B, -1)
+                    if gap_feedback is not None:
+                        zero_signal = torch.zeros_like(z_before)
+                        gap_before_t, before_stats = self._measure_gap_feedback_state(
+                            z_before,
+                            gap_norm_cur,
+                            zero_signal,
+                            gap_feedback=gap_feedback,
+                        )
+                        gap_after_t, after_stats = self._measure_gap_feedback_state(
+                            z_cur,
+                            gap_before_t,
+                            zero_signal,
+                            gap_feedback=gap_feedback,
+                        )
+                        gap_norm_cur = gap_after_t
+                        gap_deltas.append(
+                            float(
+                                before_stats.get("gap_memory_grounded", float(gap_before_t.mean().item()))
+                                - after_stats.get("gap_memory_grounded", float(gap_after_t.mean().item()))
+                            )
+                        )
+                    else:
+                        gap_before = float(gap_norm_cur.mean().item())
+                        gap_norm_cur = (gap_norm_cur * 0.85).clamp(0.0, 5.0)
+                        gap_deltas.append(gap_before - float(gap_norm_cur.mean().item()))
+                        after_stats = {}
+                    current_gap_features = self._coerce_gap_features(
+                        gap_norm_cur,
+                        after_stats,
+                        prior_features=current_gap_features,
+                    )
+
+            elif a == ACTION_INTRINSIC:
+                focused_goal = getattr(prover, "focus_intrinsic_goal", lambda: None)()
+                if focused_goal is not None:
+                    goal = prover.current_goal(z_cur)
+                    goal_embed = self._goal_embed(prover, goal, B, device)
+                    r_int = max(float(getattr(prover, "current_intrinsic_value", lambda: 0.0)()), 0.0)
 
             r_int_cumulative += r_int
 
@@ -1320,7 +1799,54 @@ class EfficientMetaController(nn.Module):
               "background_intrinsic_goals": float(background_intrinsic_total),
               "background_intrinsic_coverage": float(background_intrinsic_coverage),
               "creative_intrinsic_task_active": 1.0 if intrinsic_task_active else 0.0,
+              "emc_intrinsic_actions": float(action_counts[ACTION_INTRINSIC]),
+              "emc_intrinsic_goal_active": 1.0 if intrinsic_task_active else 0.0,
+              "emc_background_intrinsic_goals": float(background_intrinsic_total),
               "creative_analogy_projector_loss": float(creative_report.metrics.get("analogy_projector_loss", 0.0)),
+            "emc_gap_delta_mean": (
+                float(sum(gap_deltas) / len(gap_deltas))
+                if gap_deltas else 0.0
+            ),
+            "emc_state_steps": float(len(gap_world_norms)),
+            "emc_state_gap_world": (
+                float(sum(gap_world_norms) / len(gap_world_norms))
+                if gap_world_norms else 0.0
+            ),
+            "emc_state_gap_grounded": (
+                float(sum(gap_grounded_norms) / len(gap_grounded_norms))
+                if gap_grounded_norms else 0.0
+            ),
+            "emc_state_gap_relief": (
+                float(sum(gap_reliefs) / len(gap_reliefs))
+                if gap_reliefs else 0.0
+            ),
+            "emc_state_memory_residual": (
+                float(sum(memory_residuals) / len(memory_residuals))
+                if memory_residuals else 0.0
+            ),
+            "emc_state_memory_alignment": (
+                float(sum(memory_alignments) / len(memory_alignments))
+                if memory_alignments else 0.0
+            ),
+            "emc_state_memory_pressure": (
+                float(sum(memory_pressures) / len(memory_pressures))
+                if memory_pressures else 0.0
+            ),
+            "emc_gap_events": float(len(gap_deltas)),
+            "emc_recall_steps": float(len(recall_gap_deltas)),
+            "emc_recall_gap_delta": (
+                float(sum(recall_gap_deltas) / len(recall_gap_deltas))
+                if recall_gap_deltas else 0.0
+            ),
+            "emc_recall_gap_relief": (
+                float(sum(recall_gap_reliefs) / len(recall_gap_reliefs))
+                if recall_gap_reliefs else 0.0
+            ),
+            "emc_recall_effective_steps": float(recall_effective_steps),
+            "emc_recall_effective_ratio": (
+                float(recall_effective_steps) / float(len(recall_gap_deltas))
+                if recall_gap_deltas else 0.0
+            ),
             "provenance": (
                 prover.task_context.provenance
                 if getattr(prover, "task_context", None) is not None else "latent"

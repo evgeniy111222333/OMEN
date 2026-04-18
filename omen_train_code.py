@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import math
 import random
+import sys
 import time
 from collections import defaultdict, deque
 from pathlib import Path
@@ -66,6 +67,32 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # AMP доступний тільки на CUDA (на CPU — no-op через enabled=False)
 _AMP_AVAILABLE = torch.cuda.is_available()
+
+if DEVICE.type == "cuda":
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = True
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+
+
+def _configure_stdio() -> None:
+    """Avoid console-encoding crashes on non-UTF8 terminals."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            continue
+
+
+_configure_stdio()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -164,15 +191,28 @@ def build_loader(dataset_obj: Dataset,
     Будує DataLoader з pin_memory (якщо CUDA) і prefetch_factor.
     num_workers=0 — безпечно з будь-яким GPU/CPU, >0 лише якщо CUDA і стабільно.
     """
+    loader_kwargs = {
+        "dataset": dataset_obj,
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "pin_memory": (DEVICE.type == "cuda"),
+        "num_workers": num_workers,
+        "drop_last": True,
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = 2
+        loader_kwargs["persistent_workers"] = True
     return DataLoader(
-        dataset_obj,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        pin_memory=(DEVICE.type == "cuda"),
-        num_workers=num_workers,
-        prefetch_factor=(2 if num_workers > 0 else None),
-        drop_last=True,
+        **loader_kwargs,
     )
+
+
+def _finite_metric(value: object, default: float = 0.0) -> float:
+    try:
+        scalar = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return scalar if math.isfinite(scalar) else float(default)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -240,7 +280,9 @@ def pretrain_net(model: OMEN,
     for step in range(1, n_steps + 1):
         batch    = sample_examples(dataset, batch_size)
         src, tgt = collate(batch)
-        src, tgt = src.to(DEVICE), tgt.to(DEVICE)
+        non_blocking = DEVICE.type == "cuda"
+        src = src.to(DEVICE, non_blocking=non_blocking)
+        tgt = tgt.to(DEVICE, non_blocking=non_blocking)
 
         opt.zero_grad(set_to_none=True)
 
@@ -308,7 +350,8 @@ def joint_train(model: OMEN,
                 use_amp: bool = False,
                 grad_accum: int = 1,
                 num_workers: int = 0,
-                opt_state: Optional[dict] = None) -> List[Dict]:
+                resume_state: Optional[dict] = None,
+                start_epoch: int = 0) -> List[Dict]:
     """
     Stage 2: спільне навчання OMEN-Scale.
     NET має менший LR (0.3x) щоб не зруйнувати Stage-1 кодбук.
@@ -344,6 +387,8 @@ def joint_train(model: OMEN,
     n_total_batches = len(loader)
     _max_bat = max_batches_per_epoch if max_batches_per_epoch is not None else n_total_batches
     _max_bat = min(_max_bat, n_total_batches)
+    start_epoch = max(int(start_epoch), 0)
+    target_epoch = max(int(n_epochs), start_epoch)
 
     effective_batch = batch_size * grad_accum
     print(f"  batches/epoch : {_max_bat}  ({_max_bat * batch_size} samples)")
@@ -351,6 +396,11 @@ def joint_train(model: OMEN,
     print(f"  AMP: {'✓ FP16' if use_amp else '✗ FP32'}  "
           f"pin_memory: {'✓' if DEVICE.type=='cuda' else '✗'}  "
           f"workers: {num_workers}")
+    if start_epoch > 0:
+        print(f"  [resume] continuing Stage 2 from epoch {start_epoch} to epoch {target_epoch}")
+    if target_epoch <= start_epoch:
+        print("  [resume] requested target epoch already reached; skipping Stage 2")
+        return []
 
     net_params   = [p for n, p in model.named_parameters() if "net." in n]
     other_params = [p for n, p in model.named_parameters() if "net." not in n]
@@ -360,16 +410,16 @@ def joint_train(model: OMEN,
         {"params": other_params, "lr": lr,        "weight_decay": weight_decay},
     ])
     # Bug fix: відновлюємо optimizer state (Adam m1/m2) після resume
-    if opt_state:
+    if resume_state and resume_state.get("optimizer"):
         try:
-            opt.load_state_dict(opt_state)
-            print("  [resume] Optimizer state відновлено ✓")
+            opt.load_state_dict(resume_state["optimizer"])
+            print("  [resume] optimizer state restored")
         except Exception as e:
-            print(f"  [resume] Optimizer state не вдалось відновити: {e} — продовжуємо з нуля")
+            print(f"  [resume] optimizer state restore failed: {e} — starting with a fresh optimizer")
 
-    # FIX ❸: CosineAnnealingWarmRestarts(T_0=10) → LR-спайк на epoch 11 (PPL=1454).
-    _warmup_ep = min(2, n_epochs)
-    _decay_ep  = max(n_epochs - _warmup_ep, 1)
+    # Keep the scheduler aligned with the total Stage-2 epoch count.
+    _warmup_ep = min(2, target_epoch)
+    _decay_ep  = max(target_epoch - _warmup_ep, 1)
     warmup_sched = LinearLR(opt, start_factor=0.1, end_factor=1.0,
                             total_iters=_warmup_ep)
     decay_sched  = CosineAnnealingLR(opt, T_max=_decay_ep, eta_min=lr * 0.01)
@@ -377,16 +427,46 @@ def joint_train(model: OMEN,
                          milestones=[_warmup_ep])
 
     # AMP GradScaler (no-op якщо use_amp=False)
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    if resume_state and resume_state.get("scheduler"):
+        try:
+            sched.load_state_dict(resume_state["scheduler"])
+            print("  [resume] scheduler state restored")
+        except Exception as e:
+            print(f"  [resume] scheduler state restore failed: {e} — using a fresh scheduler")
+    if resume_state and resume_state.get("scaler"):
+        try:
+            scaler.load_state_dict(resume_state["scaler"])
+            print("  [resume] AMP scaler state restored")
+        except Exception as e:
+            print(f"  [resume] AMP scaler state restore failed: {e} — using a fresh scaler")
 
     hdr = (f"{'Ep':>4} {'CE':>7} {'World':>7} {'LScale':>7} "
            f"{'NetL':>7} {'Voc':>4} {'KBf':>4} {'PPL':>8} {'ms/b':>6} {'tok/s':>7}")
     print(f"\n  {hdr}")
     print("  " + "─" * len(hdr))
 
+    def _optimizer_step() -> Dict[str, float]:
+        scaler.unscale_(opt)
+        gnorm_net = _finite_metric(torch.nn.utils.clip_grad_norm_(net_params, 0.5))
+        gnorm_other = _finite_metric(torch.nn.utils.clip_grad_norm_(other_params, 1.0))
+        prev_scale = float(scaler.get_scale()) if use_amp else 1.0
+        scaler.step(opt)
+        scaler.update()
+        next_scale = float(scaler.get_scale()) if use_amp else prev_scale
+        opt.zero_grad(set_to_none=True)
+        model.memory.maybe_flush()
+        overflow = 1.0 if use_amp and next_scale < prev_scale else 0.0
+        return {
+            "gnorm_net": gnorm_net,
+            "gnorm_other": gnorm_other,
+            "amp_overflow_steps": overflow,
+            "optimizer_steps": 1.0,
+        }
+
     results: List[Dict] = []
 
-    for epoch in range(1, n_epochs + 1):
+    for epoch in range(start_epoch + 1, target_epoch + 1):
         model.train()
         t0_epoch = time.perf_counter()
         agg: Dict[str, float] = defaultdict(float)
@@ -408,7 +488,11 @@ def joint_train(model: OMEN,
             # ── Forward (з AMP якщо use_amp) ─────────────────────────────────
             t1 = time.perf_counter()
             with _amp_ctx():
-                out = model(src, tgt)
+                out = model(
+                    src,
+                    tgt,
+                    metric_profile="train_fast" if DEVICE.type == "cuda" else "full",
+                )
 
             # ── NaN/Inf guard з покомпонентною діагностикою ───────────────────
             if torch.isnan(out["total"]) or torch.isinf(out["total"]):
@@ -443,16 +527,9 @@ def joint_train(model: OMEN,
             # ── Optimizer step кожні grad_accum кроків ───────────────────────
             if n_bat % grad_accum == 0:
                 t3 = time.perf_counter()
-                scaler.unscale_(opt)
-                # Вимірюємо grad norm ДО кліпу для діагностики
-                gnorm_net   = torch.nn.utils.clip_grad_norm_(net_params,   0.5)
-                gnorm_other = torch.nn.utils.clip_grad_norm_(other_params, 1.0)
-                agg["gnorm_net"]   += float(gnorm_net)
-                agg["gnorm_other"] += float(gnorm_other)
-                scaler.step(opt)
-                scaler.update()
-                opt.zero_grad(set_to_none=True)
-                model.memory.maybe_flush()
+                step_stats = _optimizer_step()
+                for key, value in step_stats.items():
+                    agg[key] += value
                 t_opt += time.perf_counter() - t3
 
             # ── Прогрес-лічильник ─────────────────────────────────────────────
@@ -474,13 +551,9 @@ def joint_train(model: OMEN,
 
         # Final flush якщо залишились акумульовані градієнти
         if n_bat % grad_accum != 0:
-            scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(net_params,   0.5)
-            torch.nn.utils.clip_grad_norm_(other_params, 1.0)
-            scaler.step(opt)
-            scaler.update()
-            opt.zero_grad(set_to_none=True)
-            model.memory.maybe_flush()
+            step_stats = _optimizer_step()
+            for key, value in step_stats.items():
+                agg[key] += value
 
         sched.step()
 
@@ -488,14 +561,16 @@ def joint_train(model: OMEN,
             continue
 
         epoch_time = time.perf_counter() - t0_epoch
-        n_opt_steps = max(n_bat // grad_accum, 1)
+        n_opt_steps = max(int(agg.get("optimizer_steps", 0.0)), 1)
         avg = {k: v / n_bat for k, v in agg.items()}
         # grad norms усереднені по кількості optimizer steps
         avg["gnorm_net"]   = agg.get("gnorm_net",   0.0) / n_opt_steps
         avg["gnorm_other"] = agg.get("gnorm_other", 0.0) / n_opt_steps
+        avg["amp_overflow_steps"] = agg.get("amp_overflow_steps", 0.0)
         avg["ppl"]       = math.exp(min(avg.get("ce", 10), 10))
         avg["ms"]        = (epoch_time / n_bat) * 1000
         avg["tok_s"]     = total_tokens / epoch_time
+        avg["epoch"]     = float(epoch)
         avg["net_vocab"] = model.net.quantizer.current_size.item() if model.net_enabled else 0
         avg["kb_facts"]  = model.prover.kb.n_facts()
         avg["lr"]        = opt.param_groups[-1]["lr"]  # LR основної групи
@@ -552,7 +627,8 @@ def joint_train(model: OMEN,
               f"cur={avg.get('curiosity',0):.3f} "
               f"|∇net|={avg.get('gnorm_net',0):.3f} "
               f"|∇oth|={avg.get('gnorm_other',0):.3f} "
-              f"lr={avg.get('lr',0):.2e}")
+              f"lr={avg.get('lr',0):.2e} "
+              f"amp_of={avg.get('amp_overflow_steps',0):.0f}")
 
         # ── EMC рядок (якщо ввімкнено) ────────────────────────────────────────
         if getattr(model.cfg, 'emc_enabled', False):
@@ -598,8 +674,8 @@ def joint_train(model: OMEN,
 
         results.append(avg)
 
-        if checkpoint_dir and (epoch % 2 == 0 or epoch == n_epochs):
-            _save_ckpt(model, opt, epoch, avg, checkpoint_dir)
+        if checkpoint_dir and (epoch % 2 == 0 or epoch == target_epoch):
+            _save_ckpt(model, opt, sched, scaler, epoch, avg, checkpoint_dir)
 
     print("  " + "─" * len(hdr))
     if results:
@@ -646,7 +722,7 @@ def _restore_kb(model, kb_state: dict, device) -> None:
     print(f"    [restore] KB: {n_f} facts, {kb_state['n_rules']} rules")
 
 
-def _save_ckpt(model, optimizer, epoch, metrics, save_dir):
+def _save_ckpt(model, optimizer, scheduler, scaler, epoch, metrics, save_dir):
     Path(save_dir).mkdir(parents=True, exist_ok=True)
     path = str(Path(save_dir) / f"omen_epoch{epoch:04d}.pt")
 
@@ -654,8 +730,8 @@ def _save_ckpt(model, optimizer, epoch, metrics, save_dir):
     kb_state = _serialize_kb(model.prover.kb)
 
     # ── Memory cache: episodic recall (Bug 3 fix) ───────────────────────────────
-    mem_cache = [(s.cpu().clone(), v.cpu().clone())
-                 for s, v in model.memory.cache]
+    runtime_state = model.export_runtime_state()
+    mem_cache = list(runtime_state.get("memory", {}).get("cache", ()))
 
     # ── EMC: мета-статистика (Actor/Critic/StoppingUtility weights — у model.state_dict())
     # EfficientMetaController є nn.Module зареєстрованим як self.emc → його ваги
@@ -684,11 +760,14 @@ def _save_ckpt(model, optimizer, epoch, metrics, save_dir):
         "epoch":     epoch,
         "model":     model.state_dict(),
         "optimizer": optimizer.state_dict() if optimizer else {},
+        "scheduler": scheduler.state_dict() if scheduler else {},
+        "scaler":    scaler.state_dict() if scaler else {},
         "metrics":   metrics,
         "net_vocab": model.net.quantizer.current_size.item() if model.net_enabled else 0,
         "net_tau":   float(model.net.quantizer.tau) if model.net_enabled else None,
         "kb_facts":  kb_state["n_facts"],    # для швидкого перегляду
         "kb_state":  kb_state,               # повний стан KB
+        "runtime_state": runtime_state,
         "mem_cache": mem_cache,              # episodic recall cache
         "emc_meta":  emc_meta,              # EMC гіперпараметри + param counts (weights у model)
         # OSF: зберігаємо running CE estimate, щоб мета-контролер відновлював
@@ -853,24 +932,31 @@ def main():
         train_ds = dataset[:split]
 
     model = build_omen(cfg, device=DEVICE)
-    _resume_opt_state = None
+    _resume_training_state = None
+    _resume_epoch = 0
     if args.resume:
         ckpt = torch.load(args.resume, map_location=DEVICE, weights_only=False)
         model.load_state_dict(ckpt["model"])
+        _resume_epoch = int(ckpt.get("epoch", 0) or 0)
         # Bug 4 fix: відновлюємо KB та memory cache
         if "kb_state" in ckpt:
             _restore_kb(model, ckpt["kb_state"], DEVICE)
-        if "mem_cache" in ckpt:
+        if "runtime_state" in ckpt:
+            model.load_runtime_state(ckpt["runtime_state"], device=DEVICE)
+        elif "mem_cache" in ckpt:
             model.memory.cache.extend(
                 [(s.to(DEVICE), v.to(DEVICE)) for s, v in ckpt["mem_cache"]]
             )
         # Bug fix: відновлюємо net_tau (Python float — не входить у state_dict)
         if "net_tau" in ckpt and ckpt["net_tau"] is not None and model.net_enabled:
             model.net.quantizer.tau = float(ckpt["net_tau"])
-        # Bug fix: відновлюємо optimizer state для відновлення у joint_train
-        _resume_opt_state = ckpt.get("optimizer") or None
-        # OSF: відновлюємо running CE estimate (не у state_dict)
-        if "osf_running_ce" in ckpt and getattr(model, 'osf_enabled', False):
+        _resume_training_state = {
+            "optimizer": ckpt.get("optimizer") or None,
+            "scheduler": ckpt.get("scheduler") or None,
+            "scaler": ckpt.get("scaler") or None,
+        }
+        # Backward compatibility for checkpoints that predate runtime_state.
+        if "runtime_state" not in ckpt and "osf_running_ce" in ckpt and getattr(model, 'osf_enabled', False):
             model._osf_running_ce = float(ckpt["osf_running_ce"])
 
         # ── Перевірка EMC state відновлення ──────────────────────────────────
@@ -887,14 +973,19 @@ def main():
             print(f"  [resume] EMC weights restored {status} "
                   f"(actor={ok_actor} critic={ok_critic} stoputil={ok_stop})")
 
-        print(f"  [resume] Завантажено epoch={ckpt.get('epoch', '?')}  "
+        runtime_cache = 0
+        if "runtime_state" in ckpt:
+            runtime_cache = len(ckpt["runtime_state"].get("memory", {}).get("cache", ()))
+        else:
+            runtime_cache = len(ckpt.get("mem_cache", []))
+        print(f"  [resume] loaded epoch={ckpt.get('epoch', '?')}  "
               f"KB={ckpt.get('kb_facts', '?')} facts  "
-              f"cache={len(ckpt.get('mem_cache', []))}  "
+              f"cache={runtime_cache}  "
               f"tau={ckpt.get('net_tau', '?')}")
 
     # Stage 1: пропускаємо якщо resume (NET відновлено з checkpoint)
     if args.resume:
-        print("  [resume] Stage 1 пропущено — NET відновлено з checkpoint")
+        print("  [resume] Stage 1 skipped because NET state was restored from the checkpoint")
     else:
         pretrain_net(model, train_ds, n_steps=args.stage1_steps,
                      batch_size=args.batch_size)
@@ -908,12 +999,12 @@ def main():
                 use_amp=args.amp,
                 grad_accum=args.grad_accum,
                 num_workers=args.num_workers,
-                opt_state=_resume_opt_state)
+                resume_state=_resume_training_state,
+                start_epoch=_resume_epoch)
     print(model.memory_report())
 
 
 if __name__ == "__main__":
-    import sys
     if len(sys.argv) > 1:
         main()
     else:

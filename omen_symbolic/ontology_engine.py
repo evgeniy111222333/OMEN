@@ -31,6 +31,7 @@ import math
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from itertools import combinations_with_replacement, product
+import pickle
 from typing import Any, Deque, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 import torch
@@ -1228,6 +1229,112 @@ class OntologyExpansionEngine:
         # Статистика прийнятих предикатів
         self._accepted_pred_ids: List[int] = []
         self._predicate_vocab: Dict[int, PredicateVocabEntry] = {}
+
+    def export_state(self) -> Dict[str, Any]:
+        feedback_buffer = [
+            {
+                "context_input": record.context_input.detach().cpu().clone(),
+                "gap_norm": float(record.gap_norm),
+                "accepted": bool(record.accepted),
+            }
+            for record in self._feedback_buffer
+        ]
+        return {
+            "next_predicate_id": int(self._next_predicate_id),
+            "cluster_pressure": pickle.dumps(dict(self._cluster_pressure)),
+            "cluster_counts": pickle.dumps(dict(self._cluster_counts)),
+            "last_cluster_key": tuple(int(dim) for dim in self._last_cluster_key),
+            "latent_model_embed_dim": int(self._latent_model_embed_dim),
+            "latent_model_state": (
+                None if self._latent_model is None else self._latent_model.state_dict()
+            ),
+            "optimizer_state": (
+                None if self._optimizer is None else self._optimizer.state_dict()
+            ),
+            "feedback_buffer": feedback_buffer,
+            "call_count": int(self._call_count),
+            "online_train_steps": int(self._online_train_steps),
+            "last_online_train_applied": float(self._last_online_train_applied),
+            "last_online_train_loss": float(self._last_online_train_loss),
+            "last_online_train_buffer_size": float(self._last_online_train_buffer_size),
+            "last_context_input": (
+                None
+                if self._last_context_input is None
+                else self._last_context_input.detach().cpu().clone()
+            ),
+            "last_gap_norm": float(self._last_gap_norm),
+            "last_pred_ids": list(self._last_pred_ids),
+            "last_h": None if self._last_h is None else self._last_h.detach().cpu().clone(),
+            "accepted_pred_ids": list(self._accepted_pred_ids),
+            "predicate_vocab": pickle.dumps(dict(self._predicate_vocab)),
+            "sampler_last_beam_states": int(self._sampler._last_beam_states),
+            "sampler_last_beam_best_size": int(self._sampler._last_beam_best_size),
+            "sampler_last_beam_best_score": float(self._sampler._last_beam_best_score),
+        }
+
+    def load_state(self, state: Optional[Dict[str, Any]]) -> None:
+        state = state or {}
+        self._next_predicate_id = int(state.get("next_predicate_id", self._next_predicate_id))
+        cluster_pressure = state.get("cluster_pressure")
+        if isinstance(cluster_pressure, bytes):
+            cluster_pressure = pickle.loads(cluster_pressure)
+        cluster_counts = state.get("cluster_counts")
+        if isinstance(cluster_counts, bytes):
+            cluster_counts = pickle.loads(cluster_counts)
+        self._cluster_pressure = defaultdict(float, dict(cluster_pressure or {}))
+        self._cluster_counts = defaultdict(float, dict(cluster_counts or {}))
+        self._last_cluster_key = tuple(int(dim) for dim in state.get("last_cluster_key", ()))
+
+        self._feedback_buffer = deque(
+            (
+                _FeedbackRecord(
+                    context_input=entry["context_input"].detach().cpu().clone(),
+                    gap_norm=float(entry["gap_norm"]),
+                    accepted=bool(entry["accepted"]),
+                )
+                for entry in state.get("feedback_buffer", ())
+            ),
+            maxlen=self.feedback_buffer_size,
+        )
+        self._call_count = int(state.get("call_count", 0))
+        self._online_train_steps = int(state.get("online_train_steps", 0))
+        self._last_online_train_applied = float(state.get("last_online_train_applied", 0.0))
+        self._last_online_train_loss = float(state.get("last_online_train_loss", 0.0))
+        self._last_online_train_buffer_size = float(
+            state.get("last_online_train_buffer_size", 0.0)
+        )
+        last_context_input = state.get("last_context_input")
+        self._last_context_input = (
+            None
+            if last_context_input is None
+            else last_context_input.detach().cpu().clone()
+        )
+        self._last_gap_norm = float(state.get("last_gap_norm", 0.0))
+        self._last_pred_ids = [int(pred_id) for pred_id in state.get("last_pred_ids", ())]
+        last_h = state.get("last_h")
+        self._last_h = None if last_h is None else last_h.detach().cpu().clone()
+        self._accepted_pred_ids = [int(pred_id) for pred_id in state.get("accepted_pred_ids", ())]
+        predicate_vocab = state.get("predicate_vocab")
+        if isinstance(predicate_vocab, bytes):
+            predicate_vocab = pickle.loads(predicate_vocab)
+        self._predicate_vocab = dict(predicate_vocab or {})
+        self._sampler._last_beam_states = int(state.get("sampler_last_beam_states", 0))
+        self._sampler._last_beam_best_size = int(state.get("sampler_last_beam_best_size", 1))
+        self._sampler._last_beam_best_score = float(state.get("sampler_last_beam_best_score", 0.0))
+
+        latent_model_state = state.get("latent_model_state")
+        embed_dim = int(state.get("latent_model_embed_dim", 0) or 0)
+        if latent_model_state is not None and embed_dim > 0:
+            model = self._ensure_model(embed_dim)
+            model.load_state_dict(latent_model_state)
+            optimizer_state = state.get("optimizer_state")
+            if optimizer_state is not None and self._optimizer is not None:
+                self._optimizer.load_state_dict(optimizer_state)
+            model.eval()
+        else:
+            self._latent_model = None
+            self._latent_model_embed_dim = 0
+            self._optimizer = None
 
     # ─── Ініціалізація моделі ─────────────────────────────────────────────────
 

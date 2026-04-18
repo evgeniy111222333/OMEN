@@ -38,6 +38,8 @@ DEFAULT_METRIC_KEYS = [
     "total",
     "ce_bits",
     "world_nll",
+    "world_causal_error",
+    "world_alignment",
     "program_anchor",
     "program_target_facts",
     "sym_target_coverage",
@@ -56,6 +58,18 @@ DEFAULT_METRIC_KEYS = [
     "world_graph_hidden_fallback_steps",
     "world_graph_hidden_teacher_applied",
     "world_graph_neutral_prior_applied",
+    "world_graph_signature_encoder_active",
+    "world_graph_context_facts",
+    "world_graph_memory_facts",
+    "world_graph_net_facts",
+    "world_graph_abduced_support_facts",
+    "world_graph_observed_now_facts",
+    "world_graph_semantic_graph_enriched",
+    "z_posterior_graph_native",
+    "z_posterior_perceiver_fallback",
+    "world_graph_transition_native",
+    "world_graph_graph_dense_view_derived",
+    "world_graph_neural_residual_used",
     "eval_world_self_update_applied",
     "eval_world_self_update_loss",
     "creative_oee_online_train_applied",
@@ -64,15 +78,48 @@ DEFAULT_METRIC_KEYS = [
     "sal_named_role_preds",
     "sal_named_role_rel_preds",
     "creative_analogy_candidates",
+    "creative_cycle_active",
     "creative_selected_rules",
+    "creative_validated_selected_rules",
+    "creative_validated_support_facts",
+    "creative_target_support_before",
+    "creative_target_support_after",
+    "creative_target_support_gain",
+    "creative_gap_before",
+    "creative_gap_after",
+    "creative_gap_reduction",
+    "creative_compression_gain",
     "creative_analogy_projector_loss",
     "creative_analogy_embedding_source",
+    "sym_observed_now_facts",
+    "sym_memory_derived_facts",
+    "sym_saliency_derived_facts",
+    "sym_net_derived_facts",
+    "sym_world_context_facts",
+    "sym_abduced_support_facts",
+    "sym_world_context_summary_entries",
     "sym_ast_lang_python",
     "sym_ast_lang_javascript",
     "sym_ast_lang_rust",
     "sym_ast_lang_other",
     "n_rules",
 ]
+
+CREATIVE_ABLATION_KEYS = (
+    "ce_bits",
+    "world_nll",
+    "sym_target_coverage",
+    "world_graph_trace_steps",
+    "sym_world_context_facts",
+    "creative_cycle_active",
+    "creative_selected_rules",
+    "creative_validated_selected_rules",
+    "creative_validated_support_facts",
+    "creative_target_support_after",
+    "creative_target_support_gain",
+    "creative_gap_reduction",
+    "creative_compression_gain",
+)
 
 
 def _set_protocol_seed(seed: int | None) -> int | None:
@@ -98,9 +145,40 @@ def build_config(name: str) -> OMENScaleConfig:
     raise ValueError(f"Unknown config: {name}")
 
 
+def _encode_text_examples(texts: Iterable[str], seq_len: int) -> List[torch.Tensor]:
+    samples: List[torch.Tensor] = []
+    for text in texts:
+        encoded = list(text.encode("utf-8", errors="ignore"))[:seq_len]
+        if len(encoded) < seq_len:
+            encoded = encoded + [0] * (seq_len - len(encoded))
+        samples.append(torch.tensor(encoded, dtype=torch.long))
+    return samples
+
+
+def make_observation_text(seq_len: int, n: int = 96) -> List[torch.Tensor]:
+    templates = [
+        "weather is rain. rain becomes flood. however flood is not safe.",
+        "signal is amber. amber becomes red. target evacuation must start.",
+        "sensor is hot. hot causes alarm. alarm leads to shutdown.",
+        "market is open. volume becomes high. however spread is not stable.",
+    ]
+    return _encode_text_examples((templates[idx % len(templates)] for idx in range(max(int(n), 1))), seq_len)
+
+
+def make_observation_structured(seq_len: int, n: int = 96) -> List[torch.Tensor]:
+    templates = [
+        "step1: weather=rain, road=wet\nstep2: road=closed, alert=yellow\ntarget evacuation=safe_exit",
+        '{"step":1,"tank":"full","valve":"closed"}\n{"step":2,"valve":"open","flow":"high"}\n{"goal":"pressure","value":"stable"}',
+        "state: user=guest, access=limited\nnext: user=admin, access=full\ngoal access=audited",
+        "1) sensor=temp_high, fan=off\n2) fan=on, temp=drop\n3) target status=stable",
+    ]
+    return _encode_text_examples((templates[idx % len(templates)] for idx in range(max(int(n), 1))), seq_len)
+
+
 def build_dataset(args, cfg: OMENScaleConfig):
     if args.real_text:
         return load_text_corpus(args.real_text, cfg.seq_len, max_samples=args.max_samples)
+    _set_protocol_seed(getattr(args, "seed", None))
     return make_synthetic_dataset(cfg, n=args.synthetic_samples)
 
 
@@ -396,6 +474,8 @@ def build_transfer_tasks(
         "rust": make_rust(synthetic_samples, cfg.seq_len),
         "rule_transfer": make_rule_transfer(synthetic_samples, cfg.seq_len),
         "multilingual": make_multilingual_code(synthetic_samples, cfg.seq_len),
+        "observation_text": make_observation_text(cfg.seq_len, synthetic_samples),
+        "observation_structured": make_observation_structured(cfg.seq_len, synthetic_samples),
     }
     for name, path in (real_corpora or {}).items():
         tasks[str(name)] = load_text_corpus(path, cfg.seq_len, max_samples=real_max_samples)
@@ -581,10 +661,17 @@ def run_transfer_suite(
         "sym_target_coverage",
         "program_anchor",
         "world_graph_trace_steps",
+        "world_graph_execution_steps",
+        "sym_world_context_facts",
         "creative_analogy_embedding_source",
+        "creative_cycle_active",
+        "creative_validated_selected_rules",
+        "creative_target_support_gain",
+        "creative_gap_reduction",
         "sym_ast_lang_python",
         "sym_ast_lang_javascript",
         "sym_ast_lang_rust",
+        "sym_ast_lang_other",
     )
     for name, summary in task_summaries.items():
         if name == source_task:
@@ -617,6 +704,118 @@ def run_transfer_suite(
     }
     if active_seed is not None:
         report["protocol_seed"] = int(active_seed)
+    return _stamp_canonical_report(report, include_repository_axis=True)
+
+
+def _aggregate_selected_metrics(summary: Mapping[str, float], keys: Iterable[str]) -> Dict[str, float]:
+    return {
+        key: float(summary[key])
+        for key in keys
+        if key in summary
+    }
+
+
+def _creative_task_deltas(
+    enabled_summaries: Mapping[str, Dict[str, float]],
+    disabled_summaries: Mapping[str, Dict[str, float]],
+    keys: Iterable[str],
+) -> Dict[str, Dict[str, float]]:
+    deltas: Dict[str, Dict[str, float]] = {}
+    for task_name, enabled_summary in enabled_summaries.items():
+        disabled_summary = disabled_summaries.get(task_name, {})
+        task_delta: Dict[str, float] = {}
+        for key in keys:
+            if key in enabled_summary or key in disabled_summary:
+                task_delta[f"{key}_delta"] = float(enabled_summary.get(key, 0.0) - disabled_summary.get(key, 0.0))
+        deltas[task_name] = task_delta
+    return deltas
+
+
+def run_creative_ablation_suite(
+    cfg: OMENScaleConfig,
+    tasks: Dict[str, object] | None = None,
+    *,
+    source_task: str = "python",
+    adapt_steps: int = 1,
+    eval_batches: int = 1,
+    batch_size: int = 1,
+    lr: float = 3e-4,
+    checkpoint: str | None = None,
+    device: torch.device = DEVICE,
+    metric_keys: Iterable[str] = DEFAULT_METRIC_KEYS,
+    seed: int | None = None,
+    time_budget_sec: float | None = None,
+) -> Dict[str, object]:
+    started_at = time.perf_counter()
+    task_map = tasks or build_transfer_tasks(cfg)
+
+    enabled_cfg = deepcopy(cfg)
+    enabled_cfg.creative_cycle_enabled = True
+    enabled_cfg.creative_cycle_every = 1
+
+    disabled_cfg = deepcopy(cfg)
+    disabled_cfg.creative_cycle_enabled = False
+
+    enabled_report = run_transfer_suite(
+        enabled_cfg,
+        tasks=task_map,
+        source_task=source_task,
+        adapt_steps=adapt_steps,
+        eval_batches=eval_batches,
+        batch_size=batch_size,
+        lr=lr,
+        checkpoint=checkpoint,
+        device=device,
+        force_creative_cycle=True,
+        metric_keys=metric_keys,
+        seed=seed,
+        time_budget_sec=time_budget_sec,
+    )
+    disabled_report = run_transfer_suite(
+        disabled_cfg,
+        tasks=task_map,
+        source_task=source_task,
+        adapt_steps=adapt_steps,
+        eval_batches=eval_batches,
+        batch_size=batch_size,
+        lr=lr,
+        checkpoint=checkpoint,
+        device=device,
+        force_creative_cycle=False,
+        metric_keys=metric_keys,
+        seed=seed,
+        time_budget_sec=time_budget_sec,
+    )
+
+    enabled_summary = _aggregate_selected_metrics(enabled_report.get("aggregate_summary", {}), CREATIVE_ABLATION_KEYS)
+    disabled_summary = _aggregate_selected_metrics(disabled_report.get("aggregate_summary", {}), CREATIVE_ABLATION_KEYS)
+    aggregate_delta = {
+        f"{key}_delta": float(enabled_summary.get(key, 0.0) - disabled_summary.get(key, 0.0))
+        for key in CREATIVE_ABLATION_KEYS
+        if key in enabled_summary or key in disabled_summary
+    }
+    report = {
+        "creative_enabled": enabled_report,
+        "creative_disabled": disabled_report,
+        "aggregate_enabled_summary": enabled_summary,
+        "aggregate_disabled_summary": disabled_summary,
+        "aggregate_delta": aggregate_delta,
+        "task_deltas": _creative_task_deltas(
+            enabled_report.get("task_summaries", {}),
+            disabled_report.get("task_summaries", {}),
+            CREATIVE_ABLATION_KEYS,
+        ),
+        "n_tasks": int(enabled_report.get("n_tasks", 0)),
+        "device": str(device),
+        "wall_time_sec": float(time.perf_counter() - started_at),
+        "time_budget_sec": _normalize_time_budget(time_budget_sec),
+        "timed_out": bool(enabled_report.get("timed_out", False) or disabled_report.get("timed_out", False)),
+        "stop_reason": "completed",
+    }
+    if report["timed_out"]:
+        report["stop_reason"] = "time_budget_exhausted"
+    if seed is not None:
+        report["protocol_seed"] = int(seed)
     return _stamp_canonical_report(report, include_repository_axis=True)
 
 
@@ -699,6 +898,11 @@ def main() -> None:
     parser.add_argument("--batches", type=int, default=8)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--adapt_steps", type=int, default=1)
+    parser.add_argument(
+        "--creative_ablation",
+        action="store_true",
+        help="Run creative-enabled vs creative-disabled transfer ablation on the current task set.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--time_budget_sec",
@@ -739,6 +943,41 @@ def main() -> None:
         print(f"languages={','.join(report['protocol_languages'])}")
         print(f"families={','.join(report['protocol_families'])}")
         for key, value in sorted(report["aggregate_summary"].items()):
+            print(f"{key}={value:.6f}")
+        return
+
+    if args.creative_ablation:
+        if args.real_text:
+            tasks = {
+                "real_text": load_text_corpus(args.real_text, cfg.seq_len, max_samples=args.max_samples),
+                "observation_text": make_observation_text(cfg.seq_len, max(args.batch_size * args.batches, 4)),
+                "observation_structured": make_observation_structured(cfg.seq_len, max(args.batch_size * args.batches, 4)),
+            }
+        else:
+            tasks = build_transfer_tasks(cfg, synthetic_samples=args.synthetic_samples)
+        report = run_creative_ablation_suite(
+            cfg,
+            tasks=tasks,
+            source_task=next(iter(tasks.keys())) if tasks else "python",
+            adapt_steps=args.adapt_steps,
+            eval_batches=args.batches,
+            batch_size=args.batch_size,
+            checkpoint=args.checkpoint,
+            device=DEVICE,
+            seed=args.seed,
+            time_budget_sec=args.time_budget_sec,
+        )
+        print("omen-scale creative ablation")
+        print(f"device={report['device']}")
+        print(f"config={args.config}")
+        print(f"tasks={report['n_tasks']}")
+        print(f"seed={report.get('protocol_seed', args.seed)}")
+        print(f"timed_out={int(report['timed_out'])}")
+        print(f"stop_reason={report['stop_reason']}")
+        print(f"wall_time_sec={report['wall_time_sec']:.3f}")
+        if report.get("time_budget_sec") is not None:
+            print(f"time_budget_sec={report['time_budget_sec']:.3f}")
+        for key, value in sorted(report["aggregate_delta"].items()):
             print(f"{key}={value:.6f}")
         return
 

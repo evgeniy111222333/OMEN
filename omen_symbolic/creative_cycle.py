@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import math
+import pickle
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -112,6 +113,51 @@ class CreativeCycleCoordinator:
         self.last_report = CreativeCycleReport()
         self.rule_origins: Dict[int, str] = {}
 
+    @staticmethod
+    def _cpu_report(report: CreativeCycleReport) -> CreativeCycleReport:
+        return replace(
+            report,
+            predicate_embeddings={
+                int(pred_id): emb.detach().cpu().clone()
+                for pred_id, emb in dict(report.predicate_embeddings).items()
+            },
+        )
+
+    def export_state(self) -> Dict[str, Any]:
+        return {
+            "enabled": bool(self.enabled),
+            "cycle_every": int(self.cycle_every),
+            "max_selected_rules": int(self.max_selected_rules),
+            "last_report": pickle.dumps(self._cpu_report(self.last_report)),
+            "rule_origins": dict(self.rule_origins),
+            "analogy_engine": self.analogy_engine.export_state(),
+            "aesthetic_engine": self.aesthetic_engine.export_state(),
+            "ontology_engine": self.ontology_engine.export_state(),
+            "intrinsic_engine": self.intrinsic_engine.export_state(),
+        }
+
+    def load_state(self, state: Optional[Dict[str, Any]]) -> None:
+        state = state or {}
+        self.enabled = bool(state.get("enabled", self.enabled))
+        self.cycle_every = max(int(state.get("cycle_every", self.cycle_every)), 1)
+        self.max_selected_rules = max(
+            int(state.get("max_selected_rules", self.max_selected_rules)),
+            1,
+        )
+        self.rule_origins = {
+            int(rule_hash): str(origin)
+            for rule_hash, origin in dict(state.get("rule_origins", {})).items()
+        }
+        last_report = state.get("last_report")
+        if isinstance(last_report, bytes):
+            self.last_report = pickle.loads(last_report)
+        elif last_report is not None:
+            self.last_report = last_report
+        self.analogy_engine.load_state(state.get("analogy_engine"))
+        self.aesthetic_engine.load_state(state.get("aesthetic_engine"))
+        self.ontology_engine.load_state(state.get("ontology_engine"))
+        self.intrinsic_engine.load_state(state.get("intrinsic_engine"))
+
     def configure(self, **kwargs: Any) -> None:
         if "enabled" in kwargs:
             self.enabled = bool(kwargs["enabled"])
@@ -139,13 +185,124 @@ class CreativeCycleCoordinator:
     def scheduled_intrinsic_goals(self) -> Tuple[Any, ...]:
         return tuple(goal.goal for goal in self.intrinsic_engine.scheduled_goals() if goal.goal is not None)
 
+    @staticmethod
+    def _dedupe_facts(facts: Sequence[Any]) -> List[Any]:
+        unique: List[Any] = []
+        seen: set[int] = set()
+        for fact in facts:
+            fact_hash = hash(fact)
+            if fact_hash in seen:
+                continue
+            seen.add(fact_hash)
+            unique.append(fact)
+        return unique
+
+    @staticmethod
+    def _report_support_facts(report: Optional[CreativeCycleReport]) -> Tuple[Any, ...]:
+        if report is None:
+            return tuple()
+        support: List[Any] = []
+        seen: set[int] = set()
+        for candidate in list(report.selected_rules)[:4]:
+            head = getattr(getattr(candidate, "clause", None), "head", None)
+            if head is None:
+                continue
+            head_hash = hash(head)
+            if head_hash in seen:
+                continue
+            seen.add(head_hash)
+            support.append(head)
+        for fact in list(getattr(report, "counterfactual_novel_facts", ()))[:4]:
+            fact_hash = hash(fact)
+            if fact_hash in seen:
+                continue
+            seen.add(fact_hash)
+            support.append(fact)
+        for fact in list(getattr(report, "validated_support_facts", ()))[:4]:
+            fact_hash = hash(fact)
+            if fact_hash in seen:
+                continue
+            seen.add(fact_hash)
+            support.append(fact)
+        intrinsic_goal = getattr(getattr(report, "intrinsic_goal", None), "goal", None)
+        if intrinsic_goal is not None:
+            intrinsic_hash = hash(intrinsic_goal)
+            if intrinsic_hash not in seen:
+                support.append(intrinsic_goal)
+        return tuple(support)
+
+    @staticmethod
+    def _report_summary(report: Optional[CreativeCycleReport]) -> Dict[str, float]:
+        if report is None:
+            return {}
+        metrics = {
+            (
+                key if str(key).startswith("creative_")
+                else f"creative_{key}"
+            ): float(value)
+            for key, value in dict(getattr(report, "metrics", {})).items()
+        }
+        metrics.setdefault("creative_selected_rules", float(len(getattr(report, "selected_rules", ()))))
+        metrics.setdefault(
+            "creative_counterfactual_novel_facts",
+            float(len(getattr(report, "counterfactual_novel_facts", ()))),
+        )
+        metrics.setdefault(
+            "creative_counterfactual_contradictions",
+            float(len(getattr(report, "counterfactual_contradictions", ()))),
+        )
+        metrics.setdefault(
+            "creative_validated_support_facts",
+            float(len(getattr(report, "validated_support_facts", ()))),
+        )
+        metrics.setdefault(
+            "creative_coverage_gained_targets",
+            float(len(getattr(report, "coverage_gained_targets", ()))),
+        )
+        if getattr(report, "intrinsic_goal", None) is not None:
+            metrics.setdefault("creative_intrinsic_value", float(report.intrinsic_goal.value))
+        return metrics
+
+    def materialize_report_into_context(
+        self,
+        context: Any,
+        report: Optional[CreativeCycleReport] = None,
+    ) -> Any:
+        if context is None:
+            return context
+        report = self.last_report if report is None else report
+        support_facts = self._report_support_facts(report)
+        report_summary = self._report_summary(report)
+        if not support_facts and not report_summary:
+            return context
+        metadata = dict(getattr(context, "metadata", {}))
+        metadata.update(report_summary)
+        world_summary = dict(getattr(context, "world_context_summary", {}))
+        world_summary.update(report_summary)
+        abduced_support = set(getattr(context, "abduced_support_facts", frozenset()))
+        abduced_support.update(support_facts)
+        abduced_support.update(getattr(report, "validated_support_facts", ()))
+        world_context = set(getattr(context, "world_context_facts", frozenset()))
+        world_context.update(getattr(report, "counterfactual_novel_facts", ()))
+        world_context.update(getattr(report, "coverage_gained_targets", ()))
+        intrinsic_goal = getattr(getattr(report, "intrinsic_goal", None), "goal", None)
+        if intrinsic_goal is not None:
+            world_context.add(intrinsic_goal)
+        return replace(
+            context,
+            metadata=metadata,
+            world_context_summary=world_summary,
+            abduced_support_facts=frozenset(abduced_support),
+            world_context_facts=frozenset(world_context),
+        )
+
     def enrich_task_context(self, context: Any) -> Any:
         if context is None:
             return context
         queued = list(self.intrinsic_engine.scheduled_goals())
         pending = self.intrinsic_engine.pending_goal or (queued[0] if queued else None)
         if pending is None:
-            return context
+            return self.materialize_report_into_context(context)
         if not queued:
             queued = [pending]
         metadata = dict(getattr(context, "metadata", {}))
@@ -170,7 +327,8 @@ class CreativeCycleCoordinator:
         }
         if getattr(context, "goal", None) is None and pending.goal is not None:
             updates["goal"] = pending.goal
-        return replace(context, **updates)
+        enriched = replace(context, **updates)
+        return self.materialize_report_into_context(enriched)
 
     def _utility_batch(self, prover: Any, clauses: Sequence[Any], device: torch.device) -> List[float]:
         if not clauses:
@@ -214,6 +372,43 @@ class CreativeCycleCoordinator:
             except Exception:
                 continue
         return False
+
+    def _supported_targets(
+        self,
+        target_facts: Sequence[Any],
+        facts: Sequence[Any],
+    ) -> List[Any]:
+        return [
+            target
+            for target in target_facts
+            if self._goal_supported(target, facts)
+        ]
+
+    @staticmethod
+    def _fact_description_bits(fact: Any) -> float:
+        return float(4 + 2 * len(tuple(getattr(fact, "args", ()))))
+
+    def _compression_gain(
+        self,
+        baseline_facts: Sequence[Any],
+        post_facts: Sequence[Any],
+        target_facts: Sequence[Any],
+        selected_rules: Sequence[Any],
+    ) -> float:
+        if not target_facts or not selected_rules:
+            return 0.0
+        unresolved_before = [
+            target for target in target_facts
+            if not self._goal_supported(target, baseline_facts)
+        ]
+        unresolved_after = [
+            target for target in target_facts
+            if not self._goal_supported(target, post_facts)
+        ]
+        mdl_before = sum(self._fact_description_bits(fact) for fact in unresolved_before)
+        mdl_after = sum(float(rule.description_length_bits()) for rule in selected_rules)
+        mdl_after += sum(self._fact_description_bits(fact) for fact in unresolved_after)
+        return float(mdl_before - mdl_after)
 
     def _task_gap(
         self,
@@ -512,6 +707,12 @@ class CreativeCycleCoordinator:
         report = CreativeCycleReport()
         if not self.enabled or prover._step % self.cycle_every != 0:
             self.intrinsic_engine.update_state(z)
+            queued_goals = self.intrinsic_engine.scheduled_goals()
+            report.metrics = {
+                "cycle_active": 0.0,
+                "intrinsic_goal_queue_size": float(len(queued_goals)),
+                "intrinsic_background_goals": float(max(len(queued_goals) - 1, 0)),
+            }
             self.last_report = report
             return report
 
@@ -545,6 +746,8 @@ class CreativeCycleCoordinator:
             world_surprise_fn=self._world_counterfactual_surprise(prover, current_facts),
         )
         report.counterfactual_candidates = list(counterfactual.candidates)
+        report.counterfactual_novel_facts = tuple(counterfactual.novel_facts)
+        report.counterfactual_contradictions = tuple(counterfactual.contradictions)
         (
             report.counterfactual_analogy_candidates,
             report.counterfactual_metaphor_candidates,
@@ -606,6 +809,7 @@ class CreativeCycleCoordinator:
             device,
             report.predicate_embeddings,
         )
+        attempted_selected = list(selected_rules[: self.max_selected_rules])
         added = 0
         selected_utility = 0.0
         ontology_accepted = False
@@ -641,6 +845,33 @@ class CreativeCycleCoordinator:
                     selected_utility += utility
                     accepted_selected.append(candidate)
         report.selected_rules = accepted_selected
+        post_facts = baseline_facts
+        if accepted_selected:
+            try:
+                post_facts = prover.kb.forward_chain(
+                    max(int(getattr(prover, "max_depth", 1)), 1),
+                    starting_facts=frozenset(current_facts),
+                    only_verified=False,
+                )
+            except Exception:
+                post_facts = frozenset(current_facts)
+        supported_before = self._supported_targets(target_facts, baseline_facts)
+        supported_after = self._supported_targets(target_facts, post_facts)
+        gained_targets = self._dedupe_facts(
+            [
+                target for target in supported_after
+                if not self._goal_supported(target, baseline_facts)
+            ]
+        )
+        validated_support = list(gained_targets)
+        for candidate in accepted_selected:
+            head = getattr(getattr(candidate, "clause", None), "head", None)
+            if head is None:
+                continue
+            if self._goal_supported(head, post_facts):
+                validated_support.append(head)
+        report.validated_support_facts = tuple(self._dedupe_facts(validated_support))
+        report.coverage_gained_targets = tuple(gained_targets)
         if report.ontology_candidates:
             post_gap = self._task_gap(prover, current_facts, target_facts) if target_facts else gap_norm
             self.ontology_engine.record_feedback(
@@ -685,7 +916,18 @@ class CreativeCycleCoordinator:
         )
         gene_pool_stats = self.aesthetic_engine.gene_pool_stats()
         oee_stats = self.ontology_engine.stats()
+        target_total = float(max(len(target_facts), 1))
+        target_support_before = float(len(supported_before)) / target_total if target_facts else 0.0
+        target_support_after = float(len(supported_after)) / target_total if target_facts else 0.0
+        gap_after = self._task_gap(prover, current_facts, target_facts) if target_facts else gap_norm
+        compression_gain = self._compression_gain(
+            baseline_facts,
+            post_facts,
+            target_facts,
+            [candidate.clause for candidate in accepted_selected],
+        )
         report.metrics = {
+            "cycle_active": 1.0,
             "abduction_candidates": float(len(report.abduction_candidates)),
             "analogy_candidates": float(len(report.analogy_candidates)),
             "metaphor_candidates": float(len(report.metaphor_candidates)),
@@ -729,9 +971,20 @@ class CreativeCycleCoordinator:
             ),
             **oee_stats,
             "selected_rules": float(added),
+            "validated_selected_rules": float(len(accepted_selected)),
+            "selected_rule_acceptance_ratio": float(len(accepted_selected)) / float(max(len(attempted_selected), 1)),
             "selected_mean_utility": float(selected_utility / max(added, 1)),
             "ontology_feedback_accepted": 1.0 if ontology_accepted else 0.0,
             "ontology_fixed_predicates": float(len(report.ontology_fixations)),
+            "validated_support_facts": float(len(report.validated_support_facts)),
+            "coverage_gained_targets": float(len(report.coverage_gained_targets)),
+            "target_support_before": float(target_support_before),
+            "target_support_after": float(target_support_after),
+            "target_support_gain": float(max(target_support_after - target_support_before, 0.0)),
+            "gap_before": float(gap_norm),
+            "gap_after": float(gap_after),
+            "gap_reduction": float(max(gap_norm - gap_after, 0.0)),
+            "compression_gain": float(compression_gain),
             "intrinsic_value": float(report.intrinsic_goal.value if report.intrinsic_goal is not None else 0.0),
             "intrinsic_goal_queue_size": float(len(self.intrinsic_engine.scheduled_goals())),
             "intrinsic_background_goals": float(max(len(self.intrinsic_engine.scheduled_goals()) - 1, 0)),

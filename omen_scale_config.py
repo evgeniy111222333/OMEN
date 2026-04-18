@@ -1,13 +1,9 @@
 """
-omen_scale_config.py — Конфігурація OMEN-Scale
-================================================
-Три рівні абстракції:
-  Fine     : d_tok  = 1024, V = 50k, seq_len = 4096
-  Coarse   : d_latent = 256, n_latents = 64  (Perceiver Resampler)
-  Symbolic : ∂-Prolog KnowledgeBase (розмір не обмежений)
+omen_scale_config.py: configuration surface for the canonical OMEN runtime.
 
-MDL-принцип:
-  min_{θ,Γ} { Complexity(θ) + Complexity(Γ) + E_World[Surprise(Data|θ,Γ)] }
+The config spans byte/token perception, graph-native world modeling, symbolic
+reasoning, memory, saliency, NET, EMC, creative cycle modules, and evaluation
+protocol controls.
 """
 
 from __future__ import annotations
@@ -16,6 +12,8 @@ from dataclasses import dataclass, field
 
 @dataclass
 class OMENScaleConfig:
+    allow_noncanonical_ablation: bool = False
+
     # ─── Рівень 1: Token-level (Fine) ─────────────────────────────────────────
     vocab_size:      int   = 256      # NET працює на сирих байтах UTF-8 [0..255]
     d_tok:           int   = 1_024    # Розмірність токен-рівня  (≥1024)
@@ -49,6 +47,9 @@ class OMENScaleConfig:
     world_graph_execution_driven: bool = True
     world_graph_hidden_mix: float = 0.15
     world_graph_trace_pad_with_first: bool = True
+    world_state_anchor_mix: float = 1.0
+    world_graph_context_limit: int = 32
+    world_graph_transition_mix: float = 0.2
 
     # ─── M-Core (async updates) ───────────────────────────────────────────────
     mem_heads:        int   = 16
@@ -76,9 +77,10 @@ class OMENScaleConfig:
     continuous_cycle_accept_threshold: float = 0.55
     continuous_cycle_verify_threshold: float = 0.75
     continuous_cycle_contradict_threshold: float = 0.15
-    continuous_cycle_symbolic_weight: float = 0.45
-    continuous_cycle_world_weight: float = 0.25
-    continuous_cycle_token_weight: float = 0.30
+    continuous_cycle_symbolic_weight: float = 0.30
+    continuous_cycle_world_weight: float = 0.55
+    continuous_cycle_token_weight: float = 0.15
+    continuous_cycle_world_reject_threshold: float = 0.75
     continuous_cycle_soft_symbolic_weight: float = 0.45
     continuous_cycle_policy_weight: float = 0.25
     continuous_cycle_policy_baseline_momentum: float = 0.90
@@ -91,6 +93,12 @@ class OMENScaleConfig:
     eval_world_self_update_lr: float = 1e-3
     eval_world_self_update_clip: float = 1.0
     eval_world_self_update_program_weight: float = 0.05
+    world_rule_symbolic_weight: float = 0.25
+    world_rule_world_weight: float = 0.75
+    world_abduction_symbolic_weight: float = 0.20
+    world_abduction_trace_weight: float = 0.15
+    world_abduction_world_weight: float = 0.65
+    world_causal_weight: float = 0.35
     creative_cycle_enabled: bool = True
     creative_cycle_every: int = 4
     creative_max_selected_rules: int = 2
@@ -132,6 +140,7 @@ class OMENScaleConfig:
     # ─── Epistemic / Curiosity ────────────────────────────────────────────────
     epistemic_tau:    float = 0.3
     epistemic_exact_grad: bool = False
+    epistemic_memory_mix: float = 1.0
     n_counterfactual: int   = 2
     symbolic_context_max_facts: int = 96
     symbolic_ast_max_facts: int = 48
@@ -152,6 +161,8 @@ class OMENScaleConfig:
     sym_decoder_surprise_enabled: bool = True
     sym_decoder_surprise_lambda: float = 0.05
     sym_decoder_surprise_threshold: float = 0.35
+    sym_cycle_loss_weight: float = 0.10
+    sym_abduction_loss_weight: float = 0.05
     program_anchor_enabled: bool = True
     program_anchor_weight: float = 0.10
     program_decoder_weight: float = 0.05
@@ -262,10 +273,13 @@ class OMENScaleConfig:
     emc_entropy_beta:  float = 0.01    # β: вага ентропії (exploration bonus)
     emc_lambda_time:   float = 0.05    # штраф за кожен зайвий крок міркування
     emc_lambda_gap:    float = 0.05    # штраф за GapNorm (незнання)
+    emc_lambda_memory_residual: float = 0.02   # штраф за memory residual у meta-control
+    emc_lambda_memory_misalignment: float = 0.02  # штраф за memory misalignment у meta-control
     emc_eta_int:       float = 0.10    # бонус за нові факти/правила (R_int)
     emc_c_recall:      float = 0.01    # вартість дії RecallMCore
     emc_c_fc:          float = 0.05    # вартість дії ForwardChainStep
     emc_c_abduce:      float = 0.10    # вартість дії Abduce
+    emc_c_intrinsic:   float = 0.03    # вартість дії FocusIntrinsicGoal
     omega_meta:        float = 0.05    # ω_meta: вага meta_loss у загальному J
     loss_aux_warmup:   int   = 500     # розігрів auxiliary loss-ів, щоб CE не домінував вічно
 

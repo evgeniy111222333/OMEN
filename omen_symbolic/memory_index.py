@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections import deque
-from typing import Deque, Iterable, List, Optional, Sequence, Set, Tuple
+import pickle
+from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -15,6 +16,41 @@ class SymbolicMemoryIndex:
 
     def __len__(self) -> int:
         return len(self._entries)
+
+    def export_state(self) -> Dict[str, Any]:
+        facts = [fact for fact, _ in self._entries]
+        embeddings = [emb.detach().cpu().clone() for _, emb in self._entries]
+        if embeddings:
+            stacked = torch.stack(embeddings, dim=0)
+        else:
+            stacked = torch.zeros(0, dtype=torch.float32)
+        return {
+            "max_entries": int(self._entries.maxlen or 0),
+            "facts": pickle.dumps(facts),
+            "embeddings": stacked,
+        }
+
+    def load_state(self, state: Optional[Dict[str, Any]]) -> None:
+        state = state or {}
+        max_entries = max(int(state.get("max_entries", self._entries.maxlen or 1)), 1)
+        facts_blob = state.get("facts")
+        if facts_blob is None:
+            facts: List[object] = []
+        elif isinstance(facts_blob, bytes):
+            facts = list(pickle.loads(facts_blob))
+        else:
+            facts = list(facts_blob)
+        embeddings = state.get("embeddings")
+        if embeddings is None or not isinstance(embeddings, torch.Tensor) or embeddings.numel() == 0:
+            restored: List[Tuple[object, torch.Tensor]] = []
+        else:
+            if embeddings.dim() == 1:
+                embeddings = embeddings.unsqueeze(0)
+            restored = [
+                (fact, emb.detach().cpu().clone())
+                for fact, emb in zip(facts, embeddings)
+            ]
+        self._entries = deque(restored[-max_entries:], maxlen=max_entries)
 
     def write(
         self,

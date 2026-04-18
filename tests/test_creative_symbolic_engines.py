@@ -24,7 +24,7 @@ from omen_prolog import (
 from omen_symbolic.aesthetic_engine import AestheticEvolutionEngine
 from omen_symbolic.analogy_engine import AnalogyMetaphorEngine
 from omen_symbolic.counterfactual_engine import CounterfactualWorldEngine
-from omen_symbolic.creative_types import IntrinsicGoal
+from omen_symbolic.creative_types import CreativeCycleReport, IntrinsicGoal, RuleCandidate
 from omen_symbolic.intrinsic_engine import IntrinsicCuriosityEngine
 from omen_symbolic.ontology_engine import OntologyExpansionEngine, RuleHypothesisSampler
 from omen_symbolic.rule_graph import build_predicate_graph_view
@@ -637,7 +637,13 @@ class CreativeSymbolicEnginesTest(unittest.TestCase):
         self.assertIn("creative_counterfactual_analogy_candidates", prover.last_forward_info)
         self.assertIn("creative_counterfactual_metaphor_candidates", prover.last_forward_info)
         self.assertIn("creative_ontology_fixed_predicates", prover.last_forward_info)
+        self.assertIn("creative_cycle_active", prover.last_forward_info)
         self.assertIn("creative_intrinsic_value", prover.last_forward_info)
+        self.assertIn("creative_validated_selected_rules", prover.last_forward_info)
+        self.assertIn("creative_validated_support_facts", prover.last_forward_info)
+        self.assertIn("creative_target_support_after", prover.last_forward_info)
+        self.assertIn("creative_gap_reduction", prover.last_forward_info)
+        self.assertIn("creative_compression_gain", prover.last_forward_info)
         self.assertIn("background_intrinsic_goals", prover.last_forward_info)
         self.assertGreaterEqual(prover.last_forward_info["background_intrinsic_goals"], 1.0)
 
@@ -727,6 +733,57 @@ class CreativeSymbolicEnginesTest(unittest.TestCase):
         )
         self.assertEqual(prover.current_goal(), external_goal)
         self.assertEqual(prover.scheduled_intrinsic_goals(), (intrinsic_goal,))
+
+    def test_task_context_materializes_creative_report_as_first_class_context(self) -> None:
+        prover = DifferentiableProver(
+            d_latent=8,
+            sym_vocab=32,
+            max_rules=16,
+            max_depth=2,
+            n_cands=2,
+        )
+        creative_head = atom(501, Var("X"))
+        novel_fact = atom(777, Const(3))
+        intrinsic_goal = atom(888, Const(4))
+        validated_support = atom(909, Const(1))
+        prover.creative_cycle.last_report = CreativeCycleReport(
+            selected_rules=[
+                RuleCandidate(
+                    clause=rule(creative_head, atom(101, Var("X"))),
+                    source="analogy",
+                    score=0.9,
+                    utility=0.8,
+                )
+            ],
+            counterfactual_novel_facts=(novel_fact,),
+            validated_support_facts=(validated_support,),
+            intrinsic_goal=IntrinsicGoal(
+                goal=intrinsic_goal,
+                value=0.7,
+                kind="explore_structure",
+                provenance="test",
+            ),
+            metrics={"selected_rules": 1.0, "counterfactual_candidates": 1.0},
+        )
+        base_goal = atom(42, Const(1))
+        prover.set_task_context(
+            SymbolicTaskContext(
+                observed_facts=frozenset({atom(1, Const(1))}),
+                goal=base_goal,
+                target_facts=frozenset({base_goal}),
+                provenance="test",
+            )
+        )
+        self.assertIsNotNone(prover.task_context)
+        self.assertIn(creative_head, prover.task_context.abduced_support_facts)
+        self.assertIn(validated_support, prover.task_context.abduced_support_facts)
+        self.assertIn(novel_fact, prover.task_context.world_context_facts)
+        self.assertIn(intrinsic_goal, prover.task_context.world_context_facts)
+        self.assertIn(creative_head, prover.task_context.observed_facts)
+        self.assertGreaterEqual(
+            float(prover.task_context.world_context_summary.get("creative_selected_rules", 0.0)),
+            1.0,
+        )
 
 
 if __name__ == "__main__":

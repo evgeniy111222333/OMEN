@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from collections import deque
 import math
-from typing import Any, Deque, Optional, Sequence, Tuple
+import pickle
+from typing import Any, Deque, Dict, Optional, Sequence, Tuple
 
 import torch
 
@@ -28,6 +29,36 @@ class IntrinsicCuriosityEngine:
         self.analogy_weight = float(max(analogy_weight, 0.0))
         self.pending_goal: Optional[IntrinsicGoal] = None
         self._goal_queue: Deque[IntrinsicGoal] = deque(maxlen=max(int(state_history), 8))
+
+    def export_state(self) -> Dict[str, Any]:
+        return {
+            "history": [state.detach().cpu().clone() for state in self._history],
+            "pending_goal": (
+                None if self.pending_goal is None else pickle.dumps(self.pending_goal)
+            ),
+            "goal_queue": pickle.dumps(list(self._goal_queue)),
+        }
+
+    def load_state(self, state: Optional[Dict[str, Any]]) -> None:
+        state = state or {}
+        history = [tensor.detach().cpu().clone() for tensor in state.get("history", ())]
+        self._history = deque(history[-self._history.maxlen :], maxlen=self._history.maxlen)
+        queue_blob = state.get("goal_queue")
+        if isinstance(queue_blob, bytes):
+            queued_goals = list(pickle.loads(queue_blob))
+        else:
+            queued_goals = list(queue_blob or ())
+        self._goal_queue = deque(
+            queued_goals[-self._goal_queue.maxlen :],
+            maxlen=self._goal_queue.maxlen,
+        )
+        pending_blob = state.get("pending_goal")
+        if isinstance(pending_blob, bytes):
+            self.pending_goal = pickle.loads(pending_blob)
+        else:
+            self.pending_goal = pending_blob
+        if self.pending_goal is None and self._goal_queue:
+            self.pending_goal = self._goal_queue[0]
 
     def update_state(self, z: Optional[torch.Tensor]) -> None:
         if z is None or z.numel() == 0:

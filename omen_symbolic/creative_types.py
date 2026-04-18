@@ -54,9 +54,13 @@ class CreativeCycleReport:
     counterfactual_analogy_candidates: List[RuleCandidate] = field(default_factory=list)
     counterfactual_metaphor_candidates: List[RuleCandidate] = field(default_factory=list)
     counterfactual_candidates: List[RuleCandidate] = field(default_factory=list)
+    counterfactual_novel_facts: Tuple[Any, ...] = field(default_factory=tuple)
+    counterfactual_contradictions: Tuple[Tuple[Any, Any], ...] = field(default_factory=tuple)
     ontology_candidates: List[RuleCandidate] = field(default_factory=list)
     ontology_fixations: List[OntologyPredicateState] = field(default_factory=list)
     selected_rules: List[RuleCandidate] = field(default_factory=list)
+    validated_support_facts: Tuple[Any, ...] = field(default_factory=tuple)
+    coverage_gained_targets: Tuple[Any, ...] = field(default_factory=tuple)
     intrinsic_goal: Optional[IntrinsicGoal] = None
     predicate_embeddings: Dict[int, torch.Tensor] = field(default_factory=dict)
     metrics: Dict[str, float] = field(default_factory=dict)

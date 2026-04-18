@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import ast
+import json
 import math
+import re
 import zlib
 from dataclasses import dataclass
-from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 
 
 TRACE_STATE_VALUE_PRED = 480
@@ -20,6 +22,11 @@ TRACE_CALL_EVENT_PRED = 489
 TRACE_COUNTEREXAMPLE_PRED = 490
 TRACE_PRIMARY_PRED = 491
 TRACE_COMPARE_EVENT_PRED = 492
+TRACE_TEXT_TOKEN_PRED = 493
+TRACE_TEXT_RELATION_PRED = 494
+TRACE_TEXT_NEGATION_PRED = 495
+TRACE_TEXT_STATE_PRED = 496
+TRACE_TEXT_GOAL_PRED = 497
 
 
 @dataclass(frozen=True)
@@ -98,6 +105,10 @@ def _op_symbol(name: str) -> int:
 
 def _error_symbol(name: str) -> int:
     return 700_000 + (_stable_hash(f"err:{name}") % 100_000)
+
+
+def _lexeme_symbol(name: str) -> int:
+    return 800_000 + (_stable_hash(f"lex:{name}") % 100_000)
 
 
 def _step_symbol(trace_key: str, step_idx: int) -> int:
@@ -1156,18 +1167,359 @@ class _PythonTraceBuilder:
         return HornAtom(pred=pred, args=tuple(Const(int(arg)) for arg in args))
 
 
+class _ObservationTraceBuilder:
+    _RELATION_PATTERNS = (
+        re.compile(
+            r"\b(?P<left>[A-Za-z0-9_.-]+)\s*(?P<rel>=|:|->|=>|is|are|was|were|has|have|becomes|become|contains)\s*(?P<right>[A-Za-z0-9_.-]+)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?P<left>[A-Za-z0-9_.-]+)\s+(?P<rel>causes|cause|triggers|trigger|leads\s+to|results\s+in|because)\s+(?P<right>[A-Za-z0-9_.-]+)\b",
+            re.IGNORECASE,
+        ),
+    )
+    _STATE_PATTERNS = (
+        re.compile(
+            r"\b(?P<key>[A-Za-z][A-Za-z0-9_.-]*)\s*(?P<op>=|:)\s*(?P<value>[A-Za-z0-9_.-]+)\b",
+            re.IGNORECASE,
+        ),
+    )
+    _GOAL_PATTERN = re.compile(
+        r"\b(?:goal|target|desired|expect|expected|should|must|need|needs|want|wants|aim|aims)\b"
+        r"(?:\s+(?:to|be|become|is))?\s+(?P<goal>[A-Za-z0-9_.-]+)"
+        r"(?:\s*(?:=|:|is|becomes?)\s*(?P<value>[A-Za-z0-9_.-]+))?",
+        re.IGNORECASE,
+    )
+    _NEGATION_MARKERS = (" not ", " never ", " no ", " without ", " however ", " but ", " failed ")
+    _GOAL_KEYS = frozenset({"goal", "target", "desired", "expect", "expected"})
+
+    def __init__(self, *, language: str, max_steps: int = 24, max_counterexamples: int = 4):
+        self.language = language or "text"
+        self.max_steps = max(1, int(max_steps))
+        self.max_counterexamples = max(0, int(max_counterexamples))
+
+    def build(self, text: str) -> Optional[SymbolicExecutionTraceBundle]:
+        segments = self._segments(text)
+        if not segments:
+            return None
+        if (
+            len(segments) < 2
+            and not self._relations(text)
+            and not self._structured_pairs(text)
+            and not self._goal_pairs(text)
+            and not self._is_counterexample(text)
+        ):
+            return None
+
+        transitions: List[TraceTransitionFacts] = []
+        counterexamples: List[TraceTransitionFacts] = []
+        observed_facts: Set[Any] = set()
+        target_facts: Set[Any] = set()
+        previous_after = frozenset()
+
+        for step_idx, segment in enumerate(segments[: self.max_steps]):
+            after_facts, targetable_facts = self._segment_facts(segment, step_idx)
+            if not after_facts:
+                continue
+            transition = TraceTransitionFacts(
+                before_facts=previous_after,
+                after_facts=after_facts,
+                label=f"{self.language}:{step_idx}",
+                counterexample=self._is_counterexample(segment),
+            )
+            observed_facts.update(previous_after)
+            observed_facts.update(after_facts)
+            observed_facts.add(self._atom(TRACE_PRIMARY_PRED, _step_symbol(self.language, step_idx)))
+            if step_idx > 0:
+                observed_facts.add(
+                    self._atom(
+                        TRACE_TRANSITION_PRED,
+                        _step_symbol(self.language, step_idx - 1),
+                        _step_symbol(self.language, step_idx),
+                    )
+                )
+            transitions.append(transition)
+            target_facts.update(targetable_facts)
+            if transition.counterexample and len(counterexamples) < self.max_counterexamples:
+                counterexamples.append(
+                    TraceTransitionFacts(
+                        before_facts=transition.before_facts,
+                        after_facts=transition.after_facts,
+                        label=transition.label,
+                        counterexample=True,
+                    )
+                )
+            previous_after = after_facts
+
+        if not transitions:
+            return None
+
+        if not target_facts:
+            target_facts.update(transitions[-1].after_facts)
+        if counterexamples:
+            target_facts.update(counterexamples[-1].after_facts)
+        return SymbolicExecutionTraceBundle(
+            language=self.language,
+            source_text=text,
+            observed_facts=frozenset(observed_facts),
+            target_facts=frozenset(target_facts),
+            transitions=tuple(transitions),
+            counterexamples=tuple(counterexamples),
+        )
+
+    def _segments(self, text: str) -> List[str]:
+        lines = [self._normalize_segment(line) for line in text.splitlines() if line.strip()]
+        if len(lines) >= 2:
+            return lines[: self.max_steps]
+        normalized = text.replace("\r", "\n").strip()
+        if not normalized:
+            return []
+        sentence_like = [
+            self._normalize_segment(chunk)
+            for chunk in re.split(r"(?<=[.!?;])\s+|\n+", normalized)
+            if chunk.strip()
+        ]
+        if sentence_like:
+            return sentence_like[: self.max_steps]
+        return [self._normalize_segment(normalized[:256])]
+
+    @staticmethod
+    def _normalize_segment(segment: str) -> str:
+        return re.sub(r"^\s*(?:step\s*\d+[:.)-]*|\d+[:.)-]*)\s*", "", segment.strip(), flags=re.IGNORECASE)
+
+    def _segment_facts(self, segment: str, step_idx: int) -> Tuple[FrozenSet[Any], FrozenSet[Any]]:
+        facts: List[Any] = []
+        targetable: List[Any] = []
+        step_symbol = _step_symbol(self.language, step_idx)
+        scope_symbol = _scope_symbol(f"{self.language}:observation")
+        facts.append(self._atom(TRACE_SCOPE_PRED, step_symbol, scope_symbol))
+        facts.append(self._atom(TRACE_PRIMARY_PRED, step_symbol))
+
+        tokens = self._tokens(segment)
+        for token in tokens[:8]:
+            lex_symbol = _lexeme_symbol(token)
+            facts.append(self._atom(TRACE_TEXT_TOKEN_PRED, step_symbol, lex_symbol))
+            facts.append(self._atom(TRACE_STATE_VALUE_PRED, step_symbol, lex_symbol, _value_symbol(token)))
+            facts.append(self._atom(TRACE_STATE_TYPE_PRED, step_symbol, lex_symbol, _type_symbol("token")))
+
+        for key, value in self._structured_pairs(segment):
+            key_symbol = _lexeme_symbol(key)
+            value_symbol = _value_symbol(value)
+            state_fact = self._atom(
+                TRACE_TEXT_STATE_PRED,
+                step_symbol,
+                key_symbol,
+                value_symbol,
+            )
+            facts.append(state_fact)
+            targetable.append(state_fact)
+            assign_fact = self._atom(
+                TRACE_ASSIGN_EVENT_PRED,
+                step_symbol,
+                key_symbol,
+                value_symbol,
+            )
+            facts.append(assign_fact)
+            targetable.append(assign_fact)
+
+        for left, rel, right in self._relations(segment):
+            relation_fact = self._atom(
+                TRACE_TEXT_RELATION_PRED,
+                step_symbol,
+                _lexeme_symbol(left),
+                _op_symbol(rel.lower()),
+                _lexeme_symbol(right),
+            )
+            facts.append(relation_fact)
+            targetable.append(relation_fact)
+            assign_fact = self._atom(
+                TRACE_ASSIGN_EVENT_PRED,
+                step_symbol,
+                _lexeme_symbol(left),
+                _value_symbol(right),
+            )
+            facts.append(assign_fact)
+            targetable.append(assign_fact)
+
+        for goal_name, goal_value in self._goal_pairs(segment):
+            goal_fact = self._atom(
+                TRACE_TEXT_GOAL_PRED,
+                step_symbol,
+                _lexeme_symbol(goal_name),
+                _value_symbol(goal_value),
+            )
+            facts.append(goal_fact)
+            targetable.append(goal_fact)
+
+        if self._is_counterexample(segment):
+            negation_fact = self._atom(TRACE_TEXT_NEGATION_PRED, step_symbol, _value_symbol(segment.lower()[:64]))
+            facts.append(negation_fact)
+            targetable.append(negation_fact)
+
+        return frozenset(facts), frozenset(targetable)
+
+    @classmethod
+    def _tokens(cls, segment: str) -> List[str]:
+        tokens = re.findall(r"[A-Za-z0-9_]+", segment.lower())
+        deduped: List[str] = []
+        seen: Set[str] = set()
+        for token in tokens:
+            if token in seen:
+                continue
+            seen.add(token)
+            deduped.append(token)
+        return deduped
+
+    @classmethod
+    def _normalize_symbol_text(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip().lower()
+        if not text:
+            return None
+        text = re.sub(r"[^a-z0-9_]+", "_", text)
+        text = text.strip("_")
+        return text[:64] if text else None
+
+    @classmethod
+    def _flatten_payload(cls, payload: Any, prefix: str = "") -> List[Tuple[str, str]]:
+        pairs: List[Tuple[str, str]] = []
+        if isinstance(payload, dict):
+            for key, value in list(payload.items())[:8]:
+                normalized_key = cls._normalize_symbol_text(key)
+                if not normalized_key:
+                    continue
+                child_prefix = normalized_key if not prefix else f"{prefix}_{normalized_key}"
+                pairs.extend(cls._flatten_payload(value, child_prefix))
+            return pairs
+        if isinstance(payload, (list, tuple)):
+            for idx, value in enumerate(list(payload)[:6]):
+                child_prefix = prefix or f"item_{idx}"
+                pairs.extend(cls._flatten_payload(value, child_prefix))
+            return pairs
+        normalized_key = cls._normalize_symbol_text(prefix or "value")
+        normalized_value = cls._normalize_symbol_text(payload)
+        if normalized_key and normalized_value:
+            pairs.append((normalized_key, normalized_value))
+        return pairs
+
+    @classmethod
+    def _structured_pairs(cls, segment: str) -> List[Tuple[str, str]]:
+        pairs: List[Tuple[str, str]] = []
+        seen: Set[Tuple[str, str]] = set()
+        stripped = segment.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                payload = json.loads(stripped)
+            except Exception:
+                payload = None
+            if payload is not None:
+                for key, value in cls._flatten_payload(payload):
+                    pair = (key, value)
+                    if pair in seen:
+                        continue
+                    seen.add(pair)
+                    pairs.append(pair)
+        for pattern in cls._STATE_PATTERNS:
+            for match in pattern.finditer(segment):
+                key = cls._normalize_symbol_text(match.group("key"))
+                value = cls._normalize_symbol_text(match.group("value"))
+                if key is None or value is None:
+                    continue
+                pair = (key, value)
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                pairs.append(pair)
+        return pairs
+
+    @classmethod
+    def _relations(cls, segment: str) -> List[Tuple[str, str, str]]:
+        relations: List[Tuple[str, str, str]] = []
+        seen: Set[Tuple[str, str, str]] = set()
+        for pattern in cls._RELATION_PATTERNS:
+            for match in pattern.finditer(segment):
+                left = cls._normalize_symbol_text(match.group("left"))
+                rel = cls._normalize_symbol_text(match.group("rel"))
+                right = cls._normalize_symbol_text(match.group("right"))
+                if left is None or rel is None or right is None:
+                    continue
+                relation = (left, rel, right)
+                if relation in seen:
+                    continue
+                seen.add(relation)
+                relations.append(relation)
+        chain_parts = [
+            cls._normalize_symbol_text(part)
+            for part in re.split(r"\s*(?:->|=>|then)\s*", segment)
+            if part.strip()
+        ]
+        chain_parts = [part for part in chain_parts if part]
+        if len(chain_parts) >= 2:
+            for left, right in zip(chain_parts, chain_parts[1:]):
+                relation = (left, "transition", right)
+                if relation in seen:
+                    continue
+                seen.add(relation)
+                relations.append(relation)
+        return relations
+
+    @classmethod
+    def _goal_pairs(cls, segment: str) -> List[Tuple[str, str]]:
+        goals: List[Tuple[str, str]] = []
+        seen: Set[Tuple[str, str]] = set()
+        for key, value in cls._structured_pairs(segment):
+            if key not in cls._GOAL_KEYS:
+                continue
+            pair = (key, value)
+            if pair in seen:
+                continue
+            seen.add(pair)
+            goals.append(pair)
+        for match in cls._GOAL_PATTERN.finditer(segment):
+            goal_name = cls._normalize_symbol_text(match.group("goal"))
+            goal_value = cls._normalize_symbol_text(match.group("value") or match.group("goal"))
+            if goal_name is None or goal_value is None:
+                continue
+            pair = (goal_name, goal_value)
+            if pair in seen:
+                continue
+            seen.add(pair)
+            goals.append(pair)
+        return goals
+
+    @classmethod
+    def _is_counterexample(cls, segment: str) -> bool:
+        lowered = f" {segment.lower()} "
+        return any(marker in lowered for marker in cls._NEGATION_MARKERS)
+
+    @staticmethod
+    def _atom(pred: int, *args: int) -> Any:
+        from omen_prolog import Const, HornAtom
+
+        return HornAtom(pred=pred, args=tuple(Const(int(arg)) for arg in args))
+
+
 def build_symbolic_trace_bundle(
     code: str,
     lang_hint: str = "python",
     max_steps: int = 24,
     max_counterexamples: int = 4,
 ) -> Optional[SymbolicExecutionTraceBundle]:
-    if lang_hint.lower() != "python":
-        return None
+    normalized_hint = (lang_hint or "python").lower()
     if not code.strip():
         return None
-    builder = _PythonTraceBuilder(
+    if normalized_hint == "python":
+        builder = _PythonTraceBuilder(
+            max_steps=max_steps,
+            max_counterexamples=max_counterexamples,
+        )
+        bundle = builder.build(code)
+        if bundle is not None:
+            return bundle
+    observation_builder = _ObservationTraceBuilder(
+        language=normalized_hint,
         max_steps=max_steps,
         max_counterexamples=max_counterexamples,
     )
-    return builder.build(code)
+    return observation_builder.build(code)

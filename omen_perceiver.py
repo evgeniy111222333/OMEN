@@ -1,21 +1,8 @@
 """
-omen_perceiver.py — Ієрархічне кодування: Token → Concept
-==========================================================
-Компоненти:
+omen_perceiver.py: token-to-concept encoding primitives for OMEN.
 
-  RMSNorm            : Стабілізація без зміщення  (LLaMA-стиль)
-  RotaryEmbedding    : RoPE позиційне кодування  (без обмежень на довжину)
-  SwiGLUFFN          : Ефективна FFN з активацією SwiGLU
-  LlamaAttention     : MHA + RoPE + опціональний FlashAttention
-  LlamaDecoderBlock  : Блок трансформера (норма → attn → норма → FFN)
-  PerceiverResampler : Token (B,T,d_tok) → Concept (B,n,d_lat)
-  l_scale_penalty    : MDL-регуляризатор Σ||z||² для рівнів
-
-Математика:
-  L_scale = λ_tok·(1/T)·Σ_t ||z_t||² + λ_conc·(1/|C|)·Σ_c ||c||²
-
-  Це не дає моделі "розмазати" інформацію по всьому вектору —
-  вона змушена кластеризувати знання в концепти.
+Includes the LLaMA-style attention blocks, normalization layers, SwiGLU FFNs,
+and the Perceiver resampler that compresses token states into concept latents.
 """
 
 from __future__ import annotations
