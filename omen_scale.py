@@ -2091,8 +2091,9 @@ class OMENScale(nn.Module):
         )
         source_metric_sums: Dict[str, float] = {key: 0.0 for key in source_metric_keys}
         max_pairs = max(int(getattr(self.cfg, "world_graph_max_nodes", 128)) // 2, 8)
+        src_cpu = src.detach().to(device="cpu")
         for batch_idx in range(src.size(0)):
-            src_row = src[batch_idx].detach().cpu()
+            src_row = src_cpu[batch_idx]
             pair_cap = min(max(src_row.numel() - 1, 0), max_pairs)
             start_idx = max(src_row.numel() - pair_cap - 1, 0)
             graph_facts: List[HornAtom] = []
@@ -4194,6 +4195,8 @@ class OMENScale(nn.Module):
           Classic (net_enabled=False): src → TokenEncoder → Perceiver → ... → TokenDecoder
         """
         fast_metrics = metric_profile == "train_fast"
+        if self.world_graph_enabled:
+            self.world_graph.clear_runtime_caches()
         if self.training:
             self._train_step.add_(1)
             self._seen_tokens.add_(int(max(tgt[:, 1:].ne(0).sum().item(), 1)))
@@ -4674,48 +4677,9 @@ class OMENScale(nn.Module):
 
         sym_stats = getattr(self.prover, "last_forward_info", {})
         if fast_metrics:
-            out["sym_goal_proved"] = float(sym_stats.get("goal_proved", 0.0))
-            out["sym_cycle_active"] = float(sym_stats.get("cycle_active", 0.0))
-            out["sym_trace_steps"] = float(sym_stats.get("trace_steps", 0.0))
-            out["creative_cycle_active"] = float(sym_stats.get("creative_cycle_active", 0.0))
-            out["creative_validated_selected_rules"] = float(
-                sym_stats.get("creative_validated_selected_rules", 0.0)
-            )
-            out["creative_validated_support_facts"] = float(
-                sym_stats.get("creative_validated_support_facts", 0.0)
-            )
-            out["creative_target_support_gain"] = float(
-                sym_stats.get("creative_target_support_gain", 0.0)
-            )
-            out["creative_gap_reduction"] = float(sym_stats.get("creative_gap_reduction", 0.0))
-            out["net_symbolic_active"] = float(task_context.metadata.get("net_symbolic_active", 0.0))
-            out["net_symbolic_facts"] = float(task_context.metadata.get("net_symbolic_facts", 0.0))
-            out["sym_mem_recalled"] = float(len(recalled_memory_facts))
-            out["sym_mem_written"] = float(sym_mem_written)
-            out["sym_world_context_facts"] = float(len(task_context.world_context_facts))
-            out["decoder_mode"] = decoder_mode
-            out["decoder_path_osf"] = 1.0 if decoder_mode.startswith("osf_decoder") else 0.0
-            out["decoder_path_net"] = 1.0 if decoder_mode == "net_decoder" else 0.0
-            out["decoder_path_token"] = 1.0 if decoder_mode == "token_decoder" else 0.0
-            out["decoder_uses_net_encoder"] = decoder_uses_net_encoder
-            out["decoder_osf_replaces_net"] = 1.0 if decoder_mode == "osf_decoder_with_net_encoder" else 0.0
             out["world_graph_nodes"] = float(world_graph_batch.metadata.get("mean_nodes", 0.0))
-            out["world_graph_edges"] = float(world_graph_batch.metadata.get("mean_edges", 0.0))
-            out["world_graph_trace_steps"] = float(world_graph_batch.metadata.get("trace_supervised_steps", 0.0))
-            out["world_graph_execution_steps"] = float(
-                world_graph_batch.metadata.get("execution_supervised_steps", 0.0)
-            )
-            out["world_graph_context_facts"] = float(world_graph_batch.metadata.get("mean_context_facts", 0.0))
-            out["canonical_stack_forced"] = 1.0 if self.canonical_stack_forced else 0.0
-            out["canonical_ablation_mode"] = 1.0 if self.allow_noncanonical_ablation else 0.0
-            out["n_rules"] = len(self.prover)
-            out["n_writes"] = self.memory.n_writes
-            out["pend_writes"] = len(self.memory._buf_s)
-            out["unknown_ex"] = self.curiosity.unknown_flag_count
-            out["teacher_forcing"] = teacher_forcing_ratio
             if traj_stats is not None:
                 out["emc_steps"] = traj_stats.n_steps
-                out["emc_stop"] = traj_stats.stop_reason
                 out["emc_proved"] = int(traj_stats.goal_proved)
                 out["emc_traj_r"] = traj_stats.trajectory_reward
                 out["emc_mdl"] = traj_stats.proof_mdl
@@ -4726,14 +4690,6 @@ class OMENScale(nn.Module):
                     out["emc_a_recall"] = hist[1] / total_a
                     out["emc_a_fc"] = hist[2] / total_a
                     out["emc_a_abduce"] = hist[3] / total_a
-            if self.net_enabled:
-                out["net_vocab"] = net_loss_dict.get("net_vocab_size", 0)
-                out["net_entropy"] = net_loss_dict.get("net_entropy", 0.0)
-                out["net_mean_sim"] = net_loss_dict.get("net_mean_sim", 0.0)
-                out["net_semantic"] = net_loss_dict.get("net_semantic", 0.0)
-            out["vem_pen"] = out.get("vem_pen", 0.0)
-            out["n_proposed"] = self.prover.kb.n_proposed
-            out["n_verified"] = self.prover.kb.n_verified
             if self.ce_reinforce_enabled and (
                 self.training or self.ce_reinforce_eval_enabled
             ):

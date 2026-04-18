@@ -427,7 +427,12 @@ def joint_train(model: OMEN,
                          milestones=[_warmup_ep])
 
     # AMP GradScaler (no-op якщо use_amp=False)
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=use_amp,
+        init_scale=2.0 ** 10,
+        growth_interval=512,
+    )
     if resume_state and resume_state.get("scheduler"):
         try:
             sched.load_state_dict(resume_state["scheduler"])

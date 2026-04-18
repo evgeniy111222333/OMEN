@@ -774,6 +774,8 @@ class EfficientMetaController(nn.Module):
           traj_stats : TrajectoryStats — деталі траєкторії (для 7-го члена J_OMEN+EMC:
                          ω_meta · Σ_t (R_task + η_int·R_int − λ_gap·GapNorm − C(a_t)))
         """
+        if hasattr(prover, "_clear_runtime_caches"):
+            prover._clear_runtime_caches()
         B = z.shape[0]
         traj = TrajectoryStats()
         induction_stats = {
@@ -1462,6 +1464,8 @@ class EfficientMetaController(nn.Module):
           z_sym     : (B, d) — символьне представлення після адаптивного міркування
           v_mem_out : (B, d) — результат останнього M-Core recall (або нулі)
         """
+        if hasattr(prover, "_clear_runtime_caches"):
+            prover._clear_runtime_caches()
         B = z.shape[0]
 
         # Perception: z → fact → KB (без модифікації prover._step)

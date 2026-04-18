@@ -127,12 +127,47 @@ class SymbolicCycleEvalTest(unittest.TestCase):
 
         with mock.patch.object(prover, "_world_rule_prediction_error", return_value=0.05):
             low_error, derived = prover._mental_simulate_rule(rule, self.observed, self.device)
+        prover._clear_runtime_caches()
         with mock.patch.object(prover, "_world_rule_prediction_error", return_value=0.95):
             high_error, _ = prover._mental_simulate_rule(rule, self.observed, self.device)
 
         self.assertEqual(derived, self.goal)
         self.assertGreater(high_error, low_error)
         self.assertGreaterEqual(high_error, 0.70)
+
+    def test_runtime_caches_reuse_ground_and_prediction_error_within_episode(self) -> None:
+        prover = self._make_prover(eval_enabled=True)
+        rule = HornClause(
+            head=self.goal,
+            body=(
+                HornAtom(pred=5, args=(Const(1), Const(2))),
+                HornAtom(pred=6, args=(Const(2), Const(3))),
+            ),
+        )
+        prover._last_z = torch.randn(1, 32, device=self.device)
+        prover._clear_runtime_caches()
+
+        with mock.patch.object(prover.term_emb, "forward", wraps=prover.term_emb.forward) as term_forward:
+            ground_a = prover.ground(self.observed, self.device)
+            ground_b = prover.ground(self.observed, self.device)
+            self.assertTrue(torch.allclose(ground_a, ground_b))
+            self.assertEqual(term_forward.call_count, 1)
+            prover._clear_runtime_caches()
+            _ = prover.ground(self.observed, self.device)
+            self.assertEqual(term_forward.call_count, 2)
+
+        prover._clear_runtime_caches()
+        with mock.patch.object(
+            prover,
+            "_world_rule_prediction_error",
+            wraps=prover._world_rule_prediction_error,
+        ) as world_error:
+            score_a = prover._pred_error_for_rule(rule, self.observed, lam=0.5)
+            calls_after_first = world_error.call_count
+            score_b = prover._pred_error_for_rule(rule, self.observed, lam=0.5)
+            self.assertAlmostEqual(score_a, score_b)
+            self.assertGreater(calls_after_first, 0)
+            self.assertEqual(world_error.call_count, calls_after_first)
 
 
 if __name__ == "__main__":

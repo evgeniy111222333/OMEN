@@ -122,7 +122,9 @@ class TrainingCheckpointProtocolTest(unittest.TestCase):
         src = torch.randint(0, cfg.vocab_size, (1, cfg.seq_len - 1))
         tgt = torch.randint(0, cfg.vocab_size, (1, cfg.seq_len - 1))
 
+        torch.manual_seed(1)
         full = model(src, tgt)
+        torch.manual_seed(1)
         fast = model(src, tgt, metric_profile="train_fast")
 
         self.assertIn("total", fast)

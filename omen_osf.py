@@ -237,9 +237,11 @@ class OSFSynthesizer(nn.Module):
         symbolic_goal=None,
         symbolic_facts=None,
         prover=None,
+        best_verify=None,
     ) -> Tuple[PlanSequence, object, int]:
         best_plan = current_plan
-        best_verify = self.symbolic_verifier(current_plan, batch_size=batch_size, device=device)
+        if best_verify is None:
+            best_verify = self.symbolic_verifier(current_plan, batch_size=batch_size, device=device)
         seen = {(strategy_id, plan_depth_use)}
         tried = 0
         candidate_specs = [
@@ -275,6 +277,12 @@ class OSFSynthesizer(nn.Module):
             if cand_score > best_score:
                 best_plan = candidate_plan
                 best_verify = candidate_verify
+                if (
+                    int(best_verify.mismatch_mask.sum().item()) == 0
+                    and float(best_verify.goal_progress.mean().item()) + 1e-6 >= 1.0
+                    and float(best_verify.l_verify.item()) <= 1e-6
+                ):
+                    break
         return best_plan, best_verify, tried
 
     # ── Основний forward ────────────────────────────────────────────────────
@@ -301,7 +309,8 @@ class OSFSynthesizer(nn.Module):
         B, T   = tgt.shape
 
         # ── Вибір стратегії σ ─────────────────────────────────────────────────
-        intent_state = self.intent_encoder(z_final)              # IntentState
+
+        intent_state = self.intent_encoder(z_final)
         goal_entropy = float(intent_state.goal_entropy.mean().item())
         goal_confidence = float(intent_state.goal_probs.max(dim=-1).values.mean().item())
         latent_norm = float(z_final.norm(dim=-1).mean().item() / math.sqrt(max(self.d_latent, 1)))
@@ -334,11 +343,6 @@ class OSFSynthesizer(nn.Module):
             sim_steps      = 4
 
         # ── H1: Intent ────────────────────────────────────────────────────────
-        intent_state = self.intent_encoder(z_final)              # IntentState
-        goal_entropy = float(intent_state.goal_entropy.mean().item())
-        goal_confidence = float(intent_state.goal_probs.max(dim=-1).values.mean().item())
-        latent_norm = float(z_final.norm(dim=-1).mean().item() / math.sqrt(max(self.d_latent, 1)))
-
         # ── H2: Plan ─────────────────────────────────────────────────────────
         plan = self._plan_with_strategy(
             intent_state, strategy_id, plan_depth_use,
@@ -384,6 +388,7 @@ class OSFSynthesizer(nn.Module):
                 symbolic_goal=symbolic_goal,
                 symbolic_facts=symbolic_facts,
                 prover=prover,
+                best_verify=verify_result,
             )
             if symbolic_repairs > 0:
                 refl_iters += symbolic_repairs
@@ -458,6 +463,7 @@ class OSFSynthesizer(nn.Module):
                             symbolic_goal=symbolic_goal,
                             symbolic_facts=symbolic_facts,
                             prover=prover,
+                            best_verify=candidate_verify,
                         )
                         if repair_tries > 0:
                             symbolic_repairs += repair_tries

@@ -71,6 +71,51 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertEqual(graph.transition_states.shape, graph.transition_targets.shape)
         self.assertGreaterEqual(graph.summary()["trace_steps"], 1.0)
 
+    def test_world_graph_runtime_cache_reuses_atom_signature_encoding_within_forward(self) -> None:
+        encoder = WorldGraphEncoder(
+            d_latent=16,
+            max_nodes=16,
+            max_edges=32,
+            max_transitions=4,
+        )
+        atom = HornAtom(pred=17, args=(1, 2, 3))
+
+        with mock.patch.object(
+            encoder,
+            "_encode_text_signature",
+            wraps=encoder._encode_text_signature,
+        ) as encode_text:
+            first = encoder._encode_atom(atom, torch.device("cpu"))
+            second = encoder._encode_atom(atom, torch.device("cpu"))
+            self.assertTrue(torch.allclose(first, second))
+            self.assertEqual(encode_text.call_count, 3)
+            encoder.clear_runtime_caches()
+            _ = encoder._encode_atom(atom, torch.device("cpu"))
+            self.assertEqual(encode_text.call_count, 6)
+
+    def test_world_graph_batch_atom_encoding_matches_scalar_path(self) -> None:
+        encoder = WorldGraphEncoder(
+            d_latent=16,
+            max_nodes=16,
+            max_edges=32,
+            max_transitions=4,
+        )
+        atoms = [
+            HornAtom(pred=17, args=(1, 2, 3)),
+            HornAtom(pred=18, args=(2, 3)),
+            HornAtom(pred=19, args=(3,)),
+        ]
+
+        encoder.clear_runtime_caches()
+        batch_states = encoder._encode_atom_batch(atoms, torch.device("cpu"))
+        encoder.clear_runtime_caches()
+        scalar_states = torch.stack(
+            [encoder._encode_atom(atom, torch.device("cpu")) for atom in atoms],
+            dim=0,
+        )
+
+        self.assertTrue(torch.allclose(batch_states, scalar_states, atol=1e-6, rtol=1e-5))
+
     def test_observation_trace_builder_supports_plain_text_sequences(self) -> None:
         text = "weather is rain. rain becomes flood. however flood is not safe."
         bundle = build_symbolic_trace_bundle(text, lang_hint="text", max_steps=8, max_counterexamples=2)

@@ -30,7 +30,6 @@ from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Categorical
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -121,6 +120,8 @@ class PlanPolicyNet(nn.Module):
 
         self.depth_embed = nn.Embedding(32, 16)  # до 32 кроків
 
+        self.register_buffer("_depth_ids", torch.arange(32, dtype=torch.long), persistent=False)
+
         self.actor = nn.Sequential(
             nn.Linear(d_in, d_plan * 2),
             nn.GELU(),
@@ -142,9 +143,19 @@ class PlanPolicyNet(nn.Module):
         wm_emb:   torch.Tensor,   # (1, d_plan)
         depth:    int,
     ) -> torch.Tensor:
-        d_emb = self.depth_embed(
-            torch.tensor([min(depth, 31)], device=z_intent.device))   # (1, 16)
+        depth_idx = self._depth_ids[min(depth, 31)].to(device=z_intent.device).view(1)
+        d_emb = self.depth_embed(depth_idx)   # (1, 16)
         return torch.cat([z_intent, z_ctx, wm_emb, d_emb], dim=-1)   # (1, d_in)
+
+    def evaluate(
+        self,
+        z_intent: torch.Tensor,
+        z_ctx:    torch.Tensor,
+        wm_emb:   torch.Tensor,
+        depth:    int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        s = self._state_vec(z_intent, z_ctx, wm_emb, depth)
+        return self.actor(s), self.critic(s).squeeze(-1)
 
     def action_logits(
         self,
@@ -153,8 +164,8 @@ class PlanPolicyNet(nn.Module):
         wm_emb:   torch.Tensor,
         depth:    int,
     ) -> torch.Tensor:
-        s = self._state_vec(z_intent, z_ctx, wm_emb, depth)
-        return self.actor(s)   # (1, n_operators)
+        logits, _ = self.evaluate(z_intent, z_ctx, wm_emb, depth)
+        return logits   # (1, n_operators)
 
     def value(
         self,
@@ -163,8 +174,8 @@ class PlanPolicyNet(nn.Module):
         wm_emb:   torch.Tensor,
         depth:    int,
     ) -> torch.Tensor:
-        s = self._state_vec(z_intent, z_ctx, wm_emb, depth)
-        return self.critic(s).squeeze(-1)   # (1,)
+        _, value = self.evaluate(z_intent, z_ctx, wm_emb, depth)
+        return value   # (1,)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -303,10 +314,16 @@ class SymbolicPlanner(nn.Module):
         output = PlanFact(306, goal_id)
 
         lib: List[PlanOperator] = []
-        for op_id in range(self.n_operators):
-            op_idx = torch.tensor([op_id], device=device)
-            op_emb = self.op_embeddings(op_idx)
-            _, aux_add, aux_del = self._gen_op_effects(z_intent, op_emb)
+        op_ids = torch.arange(self.n_operators, device=device)
+        op_embs = self.op_embeddings(op_ids)
+        _, aux_add_batch, aux_del_batch = self._gen_op_effects_batch(z_intent, op_embs)
+        goal_mode = goal_id % 3
+        for op_id, op_emb, aux_add, aux_del in zip(
+            range(self.n_operators),
+            op_embs.unbind(0),
+            aux_add_batch,
+            aux_del_batch,
+        ):
             op_type = self.OP_TYPES[op_id % len(self.OP_TYPES)]
 
             if op_type == "define":
@@ -325,10 +342,10 @@ class SymbolicPlanner(nn.Module):
                 if op_type == "import":
                     pre = (start,)
                     add = (declared,)
-                elif goal_id % 3 == 0:
+                elif goal_mode == 0:
                     pre = (declared,)
                     add = (satisfied,)
-                elif goal_id % 3 == 1:
+                elif goal_mode == 1:
                     pre = (composed,)
                     add = (satisfied,)
                 else:
@@ -343,7 +360,7 @@ class SymbolicPlanner(nn.Module):
                 preconditions=pre,
                 add_effects=add_all,
                 del_effects=del_all,
-                embedding=op_emb.squeeze(0),
+                embedding=op_emb,
             ))
         return lib
 
@@ -411,6 +428,35 @@ class SymbolicPlanner(nn.Module):
             )
 
         return to_facts(params[0]), to_facts(params[1]), to_facts(params[2])
+
+    @staticmethod
+    def _decode_plan_facts(indices: torch.Tensor) -> Tuple[PlanFact, ...]:
+        facts: List[PlanFact] = []
+        for pred_idx, arg_idx in indices.tolist():
+            if pred_idx > 0:
+                facts.append(PlanFact(int(pred_idx), int(arg_idx)))
+        return tuple(dict.fromkeys(facts))
+
+    @torch.no_grad()
+    def _gen_op_effects_batch(
+        self,
+        z_intent: torch.Tensor,
+        op_embs: torch.Tensor,
+    ) -> Tuple[List[Tuple[PlanFact, ...]], List[Tuple[PlanFact, ...]], List[Tuple[PlanFact, ...]]]:
+        if op_embs.dim() == 1:
+            op_embs = op_embs.unsqueeze(0)
+        z_batch = z_intent.expand(op_embs.size(0), -1)
+        inp = torch.cat([z_batch, op_embs], dim=-1)
+        params = self.op_param_gen(inp).view(-1, 3, 4, 2)
+        indices = params.abs().mul(128).long() % 128
+        pre_list: List[Tuple[PlanFact, ...]] = []
+        add_list: List[Tuple[PlanFact, ...]] = []
+        del_list: List[Tuple[PlanFact, ...]] = []
+        for op_idx in range(indices.size(0)):
+            pre_list.append(self._decode_plan_facts(indices[op_idx, 0]))
+            add_list.append(self._decode_plan_facts(indices[op_idx, 1]))
+            del_list.append(self._decode_plan_facts(indices[op_idx, 2]))
+        return pre_list, add_list, del_list
 
     # ── Основний метод: побудова плану ───────────────────────────────────────
     def forward(
@@ -482,31 +528,34 @@ class SymbolicPlanner(nn.Module):
                     continue
 
                 wm_emb = self._wm_embed(wm, device)
-                logits = self.policy.action_logits(z_intent, state["ctx"], wm_emb, step).squeeze(0)
-                value = self.policy.value(z_intent, state["ctx"], wm_emb, step).squeeze()
+                logits, value = self.policy.evaluate(z_intent, state["ctx"], wm_emb, step)
+                logits = logits.squeeze(0)
+                value = value.squeeze()
 
                 applicable = [i for i, op in enumerate(operator_lib) if op.applicable(wm)]
                 if not applicable:
                     expanded.append({**state, "score": state["score"] - 1.0})
                     continue
 
-                masked_logits = logits[applicable]
-                probs = masked_logits.softmax(dim=-1)
-                dist = Categorical(probs=probs)
+                applicable_idx = torch.tensor(applicable, device=device, dtype=torch.long)
+                masked_logits = logits.index_select(0, applicable_idx)
+                masked_log_probs = F.log_softmax(masked_logits, dim=-1)
                 topk = min(self.beam_width, len(applicable))
-                _, top_idx = probs.topk(topk)
+                top_idx = masked_logits.topk(topk).indices
+                value_score = float(value.detach().item())
+                next_depth_penalty = self.alpha_plan * (len(state["operators"]) + 1)
 
                 for local_idx in top_idx.tolist():
                     op = operator_lib[applicable[local_idx]]
                     op_emb = op.embedding.unsqueeze(0)
                     new_wm = op.apply(wm)
                     new_progress = self._goal_progress(new_wm, goal_facts)
-                    log_prob = dist.log_prob(torch.tensor(local_idx, device=device))
+                    log_prob = masked_log_probs[local_idx]
                     new_ctx = self.ctx_gru(op_emb, state["ctx"])
                     heuristic = (
                         2.5 * new_progress
-                        + 0.2 * float(value.item())
-                        - self.alpha_plan * (len(state["operators"]) + 1)
+                        + 0.2 * value_score
+                        - next_depth_penalty
                     )
                     expanded.append({
                         "wm": new_wm,

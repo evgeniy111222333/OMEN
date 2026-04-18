@@ -3182,6 +3182,10 @@ class DifferentiableProver(nn.Module):
         self.last_used_rules: List[HornClause] = []
         self._last_used_rule_hashes: Set[int] = set()
         self._rule_utility_history: Dict[int, List[float]] = defaultdict(list)
+        self._ground_cache: Dict[Tuple[str, FrozenSet[HornAtom]], torch.Tensor] = {}
+        self._mental_rule_cache: Dict[Tuple[int, FrozenSet[HornAtom], str], Tuple[float, Optional[HornAtom]]] = {}
+        self._pred_error_cache: Dict[Tuple[int, FrozenSet[HornAtom]], float] = {}
+        self._world_rule_error_cache: Dict[Tuple[int, Optional[HornAtom], str], Optional[float]] = {}
         # fc_cache видалено: TensorKnowledgeBase.forward_chain виконується
         # за ~0.1–0.5 ms/батч через GPU broadcast — кешування не потрібне.
 
@@ -3251,6 +3255,7 @@ class DifferentiableProver(nn.Module):
         self.task_context = context
         self._working_memory_facts = frozenset()
         self._reset_graph_reasoning_stats()
+        self._clear_runtime_caches()
 
     def clear_task_context(self) -> None:
         self.task_context = None
@@ -3258,6 +3263,13 @@ class DifferentiableProver(nn.Module):
         self._world_graph_context = None
         self._world_target_state = None
         self._reset_graph_reasoning_stats()
+        self._clear_runtime_caches()
+
+    def _clear_runtime_caches(self) -> None:
+        self._ground_cache.clear()
+        self._mental_rule_cache.clear()
+        self._pred_error_cache.clear()
+        self._world_rule_error_cache.clear()
 
     _atoms_conflict = staticmethod(_atoms_conflict)
 
@@ -3297,6 +3309,7 @@ class DifferentiableProver(nn.Module):
         self._world_target_state = (
             None if target_state is None else target_state.detach()
         )
+        self._clear_runtime_caches()
 
     def configure_creative_cycle(
         self,
@@ -4077,9 +4090,14 @@ class DifferentiableProver(nn.Module):
         device: torch.device,
         action_probs: Optional[torch.Tensor] = None,
     ) -> Optional[float]:
+        cache_key = (hash(clause), derived, str(device))
+        if cache_key in self._world_rule_error_cache:
+            return self._world_rule_error_cache[cache_key]
         if self._world_rnn is None or self._last_z is None or self._world_rnn_vocab <= 0:
+            self._world_rule_error_cache[cache_key] = None
             return None
         if derived is None or not derived.is_ground():
+            self._world_rule_error_cache[cache_key] = None
             return None
         try:
             z_anchor = self._last_z[:1].to(device=device)
@@ -4091,8 +4109,11 @@ class DifferentiableProver(nn.Module):
                 action_probs=action_probs,
                 target_state_override=target_state,
             )
-            return float(causal_error_t.detach().clamp(0.0, 1.0).item())
+            error = float(causal_error_t.detach().clamp(0.0, 1.0).item())
+            self._world_rule_error_cache[cache_key] = error
+            return error
         except Exception:
+            self._world_rule_error_cache[cache_key] = None
             return None
 
     @staticmethod
@@ -5624,10 +5645,16 @@ class DifferentiableProver(nn.Module):
         """
         if not facts:
             return torch.zeros(1, self.d, device=device)
+        cache_key = (str(device), facts)
+        cached = self._ground_cache.get(cache_key)
+        if cached is not None:
+            return cached
         facts_list = list(facts)
         # TermEmbedder враховує структуру кожного атому
         embs = self.term_emb(facts_list, device)              # (|facts|, d)
-        return self.out_proj(embs.mean(0, keepdim=True))      # (1, d)
+        grounded = self.out_proj(embs.mean(0, keepdim=True))  # (1, d)
+        self._ground_cache[cache_key] = grounded
+        return grounded
 
     def forward_chain_step(
         self,
@@ -5713,19 +5740,29 @@ class DifferentiableProver(nn.Module):
           0.0 = правило консистентне з фактами
           1.0 = правило конфліктує або не уніфікується
         """
+        cache_key = (hash(rule), current_facts, str(device))
+        cached = self._mental_rule_cache.get(cache_key)
+        if cached is not None:
+            return cached
         if not rule.body:
-            return 0.0, rule.head if rule.head.is_ground() else None
+            result = (0.0, rule.head if rule.head.is_ground() else None)
+            self._mental_rule_cache[cache_key] = result
+            return result
 
         fresh = freshen_vars(rule)
         sigma = self._guided_unify_body(fresh.body, current_facts, device=device)
 
         if sigma is None:
             # Тіло не уніфікується → prediction_error максимальна
-            return 1.0, None
+            result = (1.0, None)
+            self._mental_rule_cache[cache_key] = result
+            return result
 
         derived = sigma.apply_atom(fresh.head)
         if not derived.is_ground():
-            return 0.5, None
+            result = (0.5, None)
+            self._mental_rule_cache[cache_key] = result
+            return result
 
         # Перевіряємо суперечності з відомими фактами
         for known in current_facts:
@@ -5749,7 +5786,9 @@ class DifferentiableProver(nn.Module):
             derived,
             device=device,
         )
-        return self._rule_prediction_error_score(pred_error, world_pred_error), derived
+        result = (self._rule_prediction_error_score(pred_error, world_pred_error), derived)
+        self._mental_rule_cache[cache_key] = result
+        return result
 
         # ── WorldRNN latent-space Prediction Error (Дедукція, розділ 2) ─────
         # Концепція: «WorldRNN отримує на вхід z та дію (правило) і передбачає
@@ -6063,6 +6102,10 @@ class DifferentiableProver(nn.Module):
         Для pure-fact-правил (body=[]) — перевіряємо, чи голова є у фактах.
         Для правил з тілом — рахуємо кількість успішних уніфікацій тіла.
         """
+        cache_key = (hash(clause), observed_facts)
+        cached = self._pred_error_cache.get(cache_key)
+        if cached is not None:
+            return cached
         trace_bundle = self._task_execution_trace()
         trace_targets: Set[HornAtom] = set()
         if self.task_context is not None:
@@ -6072,6 +6115,7 @@ class DifferentiableProver(nn.Module):
         if trace_bundle is not None:
             trace_targets.update(trace_bundle.target_facts)
         if not observed_facts and not trace_targets:
+            self._pred_error_cache[cache_key] = 1.0
             return 1.0
         trace_pred_error = self._trace_prediction_error_for_rule(clause, trace_bundle)
         reasoning_device = self._reasoning_device(self._last_z)
@@ -6091,11 +6135,13 @@ class DifferentiableProver(nn.Module):
                 clause.head if clause.head.is_ground() else None,
                 device=reasoning_device,
             )
-            return self._abduction_prediction_error_score(
+            score = self._abduction_prediction_error_score(
                 symbolic_error,
                 trace_pred_error,
                 world_error,
             )
+            self._pred_error_cache[cache_key] = score
+            return score
 
         # Рахуємо, скільки фактів входять у «пояснену зону» правила
         # (тобто беруть участь як підстановки у body)
@@ -6146,11 +6192,13 @@ class DifferentiableProver(nn.Module):
             float(sum(world_errors) / len(world_errors))
             if world_errors else None
         )
-        return self._abduction_prediction_error_score(
+        score = self._abduction_prediction_error_score(
             symbolic_error,
             trace_pred_error,
             world_error,
         )
+        self._pred_error_cache[cache_key] = score
+        return score
 
         # ── WorldRNN latent-space component (Абдукція, розділ 6) ──────────────
         # Концепція: PredError(R, Trace) має включати не лише символьне покриття,
@@ -6374,6 +6422,7 @@ class DifferentiableProver(nn.Module):
         KB tick + консолідація кожні consolidate_every кроків.
         """
         B, device = z.shape[0], z.device
+        self._clear_runtime_caches()
         self._step += 1
         self.last_used_rules = []
         self._last_used_rule_hashes.clear()

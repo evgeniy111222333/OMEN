@@ -250,8 +250,22 @@ class WorldGraphEncoder(nn.Module):
             nn.GELU(),
             nn.Linear(d_latent, d_latent),
         )
+        self._text_signature_cache: Dict[Tuple[str, bool, str], torch.Tensor] = {}
+        self._atom_encoding_cache: Dict[Tuple[str, bool, str], torch.Tensor] = {}
+
+    @staticmethod
+    def _runtime_cache_key(device: torch.device) -> Tuple[str, bool]:
+        return (f"{device.type}:{device.index if device.index is not None else -1}", torch.is_autocast_enabled())
+
+    def clear_runtime_caches(self) -> None:
+        self._text_signature_cache.clear()
+        self._atom_encoding_cache.clear()
 
     def _encode_text_signature(self, text: str, device: torch.device) -> torch.Tensor:
+        cache_key = (*self._runtime_cache_key(device), text)
+        cached = self._text_signature_cache.get(cache_key)
+        if cached is not None:
+            return cached
         byte_values = list(text.encode("utf-8")[: self.max_signature_bytes])
         if not byte_values:
             return self.empty_term
@@ -261,11 +275,71 @@ class WorldGraphEncoder(nn.Module):
         pooled_mean = byte_states.mean(dim=0)
         pooled_max = byte_states.max(dim=0).values
         pooled_first = byte_states[0]
-        return self.signature_norm(
+        encoded = self.signature_norm(
             self.signature_text_proj(torch.cat([pooled_mean, pooled_max, pooled_first], dim=-1))
         )
+        self._text_signature_cache[cache_key] = encoded
+        return encoded
+
+    def _encode_text_signature_batch(
+        self,
+        texts: Sequence[str],
+        device: torch.device,
+    ) -> List[torch.Tensor]:
+        if not texts:
+            return []
+        cache_prefix = self._runtime_cache_key(device)
+        outputs: List[Optional[torch.Tensor]] = [None] * len(texts)
+        unique_misses: Dict[str, List[int]] = {}
+        for idx, text in enumerate(texts):
+            cache_key = (*cache_prefix, text)
+            cached = self._text_signature_cache.get(cache_key)
+            if cached is not None:
+                outputs[idx] = cached
+            else:
+                unique_misses.setdefault(text, []).append(idx)
+
+        nonempty_texts = [text for text in unique_misses if text]
+        if nonempty_texts:
+            byte_rows = [list(text.encode("utf-8")[: self.max_signature_bytes]) for text in nonempty_texts]
+            max_len = max(len(row) for row in byte_rows)
+            byte_tensor = torch.zeros(len(nonempty_texts), max_len, device=device, dtype=torch.long)
+            mask = torch.zeros(len(nonempty_texts), max_len, device=device, dtype=torch.bool)
+            for row_idx, row in enumerate(byte_rows):
+                row_len = len(row)
+                byte_tensor[row_idx, :row_len] = torch.tensor(row, device=device, dtype=torch.long)
+                mask[row_idx, :row_len] = True
+            pos_tensor = torch.arange(max_len, device=device, dtype=torch.long).unsqueeze(0)
+            byte_states = self.byte_emb(byte_tensor) + self.byte_pos_emb(pos_tensor)
+            mask_f = mask.unsqueeze(-1)
+            lengths = mask.sum(dim=1, keepdim=True).clamp(min=1)
+            pooled_mean = (byte_states * mask_f).sum(dim=1) / lengths.to(dtype=byte_states.dtype)
+            fill_value = torch.finfo(byte_states.dtype).min
+            pooled_max = byte_states.masked_fill(~mask_f, fill_value).max(dim=1).values
+            pooled_first = byte_states[:, 0]
+            encoded_batch = self.signature_norm(
+                self.signature_text_proj(torch.cat([pooled_mean, pooled_max, pooled_first], dim=-1))
+            )
+            for row_idx, text in enumerate(nonempty_texts):
+                encoded = encoded_batch[row_idx]
+                self._text_signature_cache[(*cache_prefix, text)] = encoded
+                for out_idx in unique_misses[text]:
+                    outputs[out_idx] = encoded
+
+        for text, indices in unique_misses.items():
+            if text:
+                continue
+            cached = self._text_signature_cache.setdefault((*cache_prefix, text), self.empty_term)
+            for out_idx in indices:
+                outputs[out_idx] = cached
+
+        return [tensor if tensor is not None else self.empty_term for tensor in outputs]
 
     def _encode_atom(self, atom: Any, device: torch.device) -> torch.Tensor:
+        atom_key = (*self._runtime_cache_key(device), _atom_signature(atom))
+        cached = self._atom_encoding_cache.get(atom_key)
+        if cached is not None:
+            return cached
         pred_bucket = _stable_bucket(f"pred:{_atom_pred(atom)}", self.pred_buckets)
         args = _atom_args(atom)
         arity_bucket = min(len(args), self.max_arity)
@@ -289,7 +363,92 @@ class WorldGraphEncoder(nn.Module):
             torch.cat([pred_signature, arg_signature, atom_signature], dim=-1)
         )
         bucket_state = pred_vec + arity_vec + arg_vec
-        return self.atom_norm(signature_state + 0.25 * bucket_state)
+        encoded = self.atom_norm(signature_state + 0.25 * bucket_state)
+        self._atom_encoding_cache[atom_key] = encoded
+        return encoded
+
+    def _encode_atom_batch(
+        self,
+        atoms: Sequence[Any],
+        device: torch.device,
+    ) -> torch.Tensor:
+        if not atoms:
+            return self.empty_state.new_zeros((0, self.d_latent))
+        cache_prefix = self._runtime_cache_key(device)
+        outputs: List[Optional[torch.Tensor]] = [None] * len(atoms)
+        missing_atoms: List[Any] = []
+        missing_indices: List[int] = []
+        missing_keys: List[Tuple[str, bool, str]] = []
+        for idx, atom in enumerate(atoms):
+            atom_sig = _atom_signature(atom)
+            cache_key = (*cache_prefix, atom_sig)
+            cached = self._atom_encoding_cache.get(cache_key)
+            if cached is not None:
+                outputs[idx] = cached
+                continue
+            missing_atoms.append(atom)
+            missing_indices.append(idx)
+            missing_keys.append(cache_key)
+
+        if missing_atoms:
+            pred_buckets = torch.tensor(
+                [_stable_bucket(f"pred:{_atom_pred(atom)}", self.pred_buckets) for atom in missing_atoms],
+                device=device,
+                dtype=torch.long,
+            )
+            arity_buckets = torch.tensor(
+                [min(len(_atom_args(atom)), self.max_arity) for atom in missing_atoms],
+                device=device,
+                dtype=torch.long,
+            )
+            pred_vec = self.pred_emb(pred_buckets)
+            arity_vec = self.arity_emb(arity_buckets)
+
+            arg_vec = self.empty_term.unsqueeze(0).expand(len(missing_atoms), -1).clone()
+            arg_bucket_values: List[int] = []
+            arg_owner: List[int] = []
+            pred_texts: List[str] = []
+            arg_texts: List[str] = []
+            atom_texts: List[str] = []
+            for owner_idx, atom in enumerate(missing_atoms):
+                args = _atom_args(atom)
+                arg_terms = [_term_signature(arg) for arg in args]
+                pred_texts.append(f"pred:{_atom_pred(atom)}")
+                arg_texts.append("|".join(arg_terms) or "<empty>")
+                atom_texts.append(_atom_signature(atom))
+                for term in arg_terms:
+                    arg_bucket_values.append(_stable_bucket(term, self.term_buckets))
+                    arg_owner.append(owner_idx)
+            if arg_bucket_values:
+                owner_idx_t = torch.tensor(arg_owner, device=device, dtype=torch.long)
+                arg_emb = self.term_emb(torch.tensor(arg_bucket_values, device=device, dtype=torch.long))
+                arg_sum = torch.zeros(len(missing_atoms), self.d_latent, device=device, dtype=arg_emb.dtype)
+                arg_count = torch.zeros(len(missing_atoms), 1, device=device, dtype=arg_emb.dtype)
+                arg_sum.index_add_(0, owner_idx_t, arg_emb)
+                arg_count.index_add_(
+                    0,
+                    owner_idx_t,
+                    torch.ones(owner_idx_t.numel(), 1, device=device, dtype=arg_emb.dtype),
+                )
+                nonzero = arg_count.squeeze(-1) > 0
+                arg_vec[nonzero] = arg_sum[nonzero] / arg_count[nonzero]
+
+            pred_signature = torch.stack(self._encode_text_signature_batch(pred_texts, device), dim=0)
+            arg_signature = torch.stack(self._encode_text_signature_batch(arg_texts, device), dim=0)
+            atom_signature = torch.stack(self._encode_text_signature_batch(atom_texts, device), dim=0)
+            signature_state = self.signature_atom_proj(
+                torch.cat([pred_signature, arg_signature, atom_signature], dim=-1)
+            )
+            bucket_state = pred_vec + arity_vec + arg_vec
+            encoded_batch = self.atom_norm(signature_state + 0.25 * bucket_state)
+            for out_idx, cache_key, encoded in zip(missing_indices, missing_keys, encoded_batch.unbind(0)):
+                self._atom_encoding_cache[cache_key] = encoded
+                outputs[out_idx] = encoded
+
+        return torch.stack(
+            [tensor if tensor is not None else self.empty_term for tensor in outputs],
+            dim=0,
+        )
 
     def _dedupe_records(
         self,
@@ -428,7 +587,7 @@ class WorldGraphEncoder(nn.Module):
         atoms = [atom for _, atom in deduped]
         node_keys = tuple(_atom_signature(atom) for atom in atoms)
         node_index = {key: idx for idx, key in enumerate(node_keys)}
-        node_states = torch.stack([self._encode_atom(atom, device) for atom in atoms], dim=0)
+        node_states = self._encode_atom_batch(atoms, device)
         edges = self._pairwise_edges(node_types, atoms)
         if trace_bundle is not None:
             transition_edges = self._transition_edges(
@@ -454,18 +613,29 @@ class WorldGraphEncoder(nn.Module):
     def _encode_transition_sets(
         self,
         transitions: Sequence[Any],
-        device: torch.device,
-        prefix: str,
+        node_index: Dict[str, int],
+        node_states: torch.Tensor,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         if not transitions:
             return None, None
         state_vectors: List[torch.Tensor] = []
         target_vectors: List[torch.Tensor] = []
+        empty = self.empty_state.to(device=node_states.device, dtype=node_states.dtype)
+
+        def _pool_atoms(atoms: Iterable[Any]) -> torch.Tensor:
+            indices = [
+                node_index[sig]
+                for sig in (_atom_signature(atom) for atom in atoms)
+                if sig in node_index
+            ]
+            if not indices:
+                return empty
+            subset = node_states[torch.tensor(indices, device=node_states.device, dtype=torch.long)]
+            return self.pool(torch.cat([subset.mean(dim=0), subset.max(dim=0).values], dim=-1))
+
         for transition in transitions[: self.max_transitions]:
-            before_records = [(f"{prefix}_before", atom) for atom in getattr(transition, "before_facts", ())]
-            after_records = [(f"{prefix}_after", atom) for atom in getattr(transition, "after_facts", ())]
-            _, _, _, _, _, before_state = self._encode_fact_records(before_records, None, device)
-            _, _, _, _, _, after_state = self._encode_fact_records(after_records, None, device)
+            before_state = _pool_atoms(getattr(transition, "before_facts", ()))
+            after_state = _pool_atoms(getattr(transition, "after_facts", ()))
             state_vectors.append(before_state)
             target_vectors.append(after_state)
         if not state_vectors:
@@ -537,11 +707,19 @@ class WorldGraphEncoder(nn.Module):
         base_index = {key: idx for idx, key in enumerate(base_graph.node_keys)}
         base_states = base_graph.node_states.to(device=device)
         node_states_list: List[torch.Tensor] = []
+        missing_atoms: List[Any] = []
+        missing_positions: List[int] = []
         for key, atom in zip(node_keys, atoms):
             if key in base_index:
                 node_states_list.append(base_states[base_index[key]])
             else:
-                node_states_list.append(self._encode_atom(atom, device))
+                node_states_list.append(base_states.new_zeros(base_states.size(-1)))
+                missing_atoms.append(atom)
+                missing_positions.append(len(node_states_list) - 1)
+        if missing_atoms:
+            encoded_missing = self._encode_atom_batch(missing_atoms, device)
+            for pos, state in zip(missing_positions, encoded_missing.unbind(0)):
+                node_states_list[pos] = state
         node_states = torch.stack(node_states_list, dim=0)
 
         edges = list(base_graph.edges)
@@ -604,8 +782,8 @@ class WorldGraphEncoder(nn.Module):
         )
         transition_states, transition_targets = self._encode_transition_sets(
             list(getattr(trace_bundle, "transitions", ())[: self.max_transitions]) if trace_bundle is not None else [],
-            device,
-            prefix="trace",
+            {key: idx for idx, key in enumerate(node_keys)},
+            node_states,
         )
         metadata = {
             "nodes": float(len(node_keys)),
