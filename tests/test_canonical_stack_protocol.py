@@ -4,6 +4,8 @@ import sys
 import unittest
 from pathlib import Path
 
+import torch
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -75,6 +77,17 @@ class CanonicalStackProtocolTest(unittest.TestCase):
         self.assertEqual(module_role("omen_symbolic/world_graph.py"), "canonical_support")
         self.assertEqual(module_role("omen_symbolic/aesthetic_engine.py"), "canonical_support")
         self.assertEqual(module_role("omen_symbolic/creative_cycle.py"), "canonical_support")
+
+    def test_public_model_call_accepts_src_only(self) -> None:
+        cfg = OMENConfig.demo()
+        model = build_omen(cfg, eval_mode=True)
+        encoded = list(b"def add(a, b):\n    return a + b\n")[: cfg.seq_len]
+        encoded += [0] * (cfg.seq_len - len(encoded))
+        src = torch.tensor([encoded], dtype=torch.long)
+        with torch.no_grad():
+            out = model(src)
+        self.assertIs(out["z"], out["world_state"])
+        self.assertEqual(tuple(out["logits"].shape[:2]), tuple(src.shape))
 
 
 if __name__ == "__main__":

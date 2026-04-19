@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import math
 import random
+import re
 import sys
 import time
 from collections import defaultdict, deque
@@ -135,6 +136,164 @@ class StackedDataset(Dataset):
         return self.src[i], self.tgt[i]
 
 
+_CODE_LANGUAGE_HINTS = frozenset({
+    "python",
+    "javascript",
+    "typescript",
+    "java",
+    "c",
+    "cpp",
+    "rust",
+    "go",
+    "bash",
+    "lua",
+})
+
+_LANGUAGE_HINT_ALIASES = {
+    "py": "python",
+    "js": "javascript",
+    "ts": "typescript",
+    "golang": "go",
+    "shell": "bash",
+    "sh": "bash",
+    "cxx": "cpp",
+    "cc": "cpp",
+}
+
+_CODE_ALIGNMENT_MARKERS = {
+    "python": (
+        b"def ",
+        b"class ",
+        b"import ",
+        b"from ",
+        b"@",
+        b"if ",
+        b"for ",
+        b"while ",
+        b"try:",
+        b"with ",
+        b"async ",
+        b"return ",
+        b"raise ",
+    ),
+    "javascript": (
+        b"function ",
+        b"const ",
+        b"let ",
+        b"var ",
+        b"class ",
+        b"import ",
+        b"export ",
+        b"if ",
+        b"for ",
+        b"while ",
+        b"return ",
+    ),
+    "typescript": (
+        b"function ",
+        b"const ",
+        b"let ",
+        b"class ",
+        b"interface ",
+        b"type ",
+        b"import ",
+        b"export ",
+    ),
+    "java": (
+        b"public ",
+        b"private ",
+        b"protected ",
+        b"class ",
+        b"interface ",
+        b"import ",
+        b"package ",
+        b"return ",
+    ),
+    "rust": (
+        b"fn ",
+        b"let ",
+        b"pub ",
+        b"impl ",
+        b"use ",
+        b"struct ",
+        b"enum ",
+        b"trait ",
+        b"match ",
+    ),
+    "go": (
+        b"package ",
+        b"func ",
+        b"import ",
+        b"type ",
+        b"var ",
+        b"const ",
+        b"return ",
+    ),
+    "bash": (
+        b"#!/",
+        b"function ",
+        b"if ",
+        b"for ",
+        b"while ",
+        b"case ",
+        b"export ",
+    ),
+    "lua": (
+        b"function ",
+        b"local ",
+        b"if ",
+        b"for ",
+        b"while ",
+        b"return ",
+    ),
+    "c": (
+        b"#include",
+        b"typedef ",
+        b"struct ",
+        b"int ",
+        b"void ",
+        b"char ",
+        b"return ",
+    ),
+    "cpp": (
+        b"#include",
+        b"template ",
+        b"class ",
+        b"struct ",
+        b"namespace ",
+        b"int ",
+        b"void ",
+        b"return ",
+    ),
+}
+
+_GENERIC_CODE_ALIGNMENT_MARKERS = tuple(
+    marker
+    for language in ("python", "javascript", "typescript", "java", "rust", "go", "bash", "lua", "c", "cpp")
+    for marker in _CODE_ALIGNMENT_MARKERS[language]
+)
+
+
+def _normalize_language_hint(language_hint: object) -> Optional[str]:
+    if not isinstance(language_hint, str):
+        return None
+    normalized = language_hint.strip().lower()
+    if not normalized:
+        return None
+    normalized = _LANGUAGE_HINT_ALIASES.get(normalized, normalized)
+    return normalized
+
+
+def _infer_language_hint_from_path(path: Union[str, Path]) -> Optional[str]:
+    name = Path(path).stem.lower()
+    tokens = [token for token in re.split(r"[^a-z0-9]+", name) if token]
+    for token in tokens:
+        normalized = _normalize_language_hint(token)
+        if normalized in _CODE_LANGUAGE_HINTS:
+            return normalized
+    return None
+
+
 class StreamingTextDataset(Dataset):
     """
     File-backed UTF-8 byte dataset.
@@ -143,7 +302,15 @@ class StreamingTextDataset(Dataset):
     byte window from disk. It is not an IterableDataset in the narrow sense, but
     for training it solves the main problem: the corpus scales without full preload.
     """
-    def __init__(self, path: Union[str, Path], seq_len: int, max_samples: int = 50_000):
+    def __init__(
+        self,
+        path: Union[str, Path],
+        seq_len: int,
+        max_samples: int = 50_000,
+        *,
+        language_hint: Optional[str] = None,
+        sample_alignment: str = "raw",
+    ):
         self.path = Path(path)
         self.seq_len = int(seq_len)
         self.stride = max(1, self.seq_len // 2)
@@ -152,16 +319,102 @@ class StreamingTextDataset(Dataset):
         n_samples = 0 if usable <= 0 else (usable // self.stride) + 1
         self.n_samples = min(int(max_samples), int(n_samples))
         self.file_size = int(file_size)
+        requested_alignment = str(sample_alignment).strip().lower() or "raw"
+        if requested_alignment not in {"raw", "auto", "code"}:
+            raise ValueError(f"Unsupported sample_alignment: {sample_alignment}")
+        normalized_hint = _normalize_language_hint(language_hint)
+        inferred_hint = _infer_language_hint_from_path(self.path)
+        resolved_hint = normalized_hint or inferred_hint
+        if requested_alignment == "raw":
+            self._alignment_language = None
+        elif requested_alignment == "auto":
+            self._alignment_language = resolved_hint if resolved_hint in _CODE_LANGUAGE_HINTS else None
+        else:
+            self._alignment_language = resolved_hint if resolved_hint in _CODE_LANGUAGE_HINTS else "generic"
+        alignment_desc = "raw"
+        if self._alignment_language is not None:
+            alignment_desc = f"code:{self._alignment_language}"
         print(f"  [StreamingTextDataset] {self.path}: {self.n_samples:,} samples x {self.seq_len} bytes "
-              f"(file={self.file_size/1e6:.1f} MB, stride={self.stride})")
+              f"(file={self.file_size/1e6:.1f} MB, stride={self.stride}, alignment={alignment_desc})")
 
     def __len__(self) -> int:
         return self.n_samples
 
+    def _code_alignment_markers(self) -> Tuple[bytes, ...]:
+        if self._alignment_language is None:
+            return ()
+        if self._alignment_language == "generic":
+            return _GENERIC_CODE_ALIGNMENT_MARKERS
+        return _CODE_ALIGNMENT_MARKERS.get(self._alignment_language, _GENERIC_CODE_ALIGNMENT_MARKERS)
+
+    def _iter_line_starts(self, probe: bytes) -> List[int]:
+        starts = [0]
+        idx = 0
+        limit = len(probe)
+        while idx < limit:
+            byte = probe[idx]
+            if byte == 13:
+                idx += 1
+                if idx < limit and probe[idx] == 10:
+                    idx += 1
+                if idx < limit:
+                    starts.append(idx)
+                continue
+            if byte == 10:
+                idx += 1
+                if idx < limit:
+                    starts.append(idx)
+                continue
+            idx += 1
+        return starts
+
+    def _align_sample_start(self, start: int) -> int:
+        if self._alignment_language is None:
+            return start
+        max_start = max(self.file_size - self.seq_len - 1, 0)
+        start = max(0, min(int(start), max_start))
+        search_back = min(max(self.seq_len * 2, 128), start)
+        search_forward = min(max(self.seq_len, 128), max_start - start)
+        probe_start = max(0, start - search_back)
+        probe_stop = min(self.file_size, start + self.seq_len + 1 + search_forward)
+        with self.path.open("rb") as fh:
+            fh.seek(probe_start)
+            probe = fh.read(probe_stop - probe_start)
+        if len(probe) <= self.seq_len:
+            return start
+
+        markers = self._code_alignment_markers()
+        line_starts = self._iter_line_starts(probe)
+        anchor_candidates: List[Tuple[int, int, int, int]] = []
+        fallback_candidates: List[Tuple[int, int, int]] = []
+        for rel_start in line_starts:
+            abs_start = probe_start + rel_start
+            if abs_start > max_start:
+                continue
+            next_break = len(probe)
+            for probe_idx in range(rel_start, len(probe)):
+                if probe[probe_idx] in (10, 13):
+                    next_break = probe_idx
+                    break
+            stripped = probe[rel_start:next_break].lstrip(b" \t")
+            if not stripped:
+                continue
+            is_before = 1 if abs_start <= start else 0
+            distance = abs(abs_start - start)
+            fallback_candidates.append((is_before, -distance, abs_start))
+            if any(stripped.startswith(marker) for marker in markers):
+                anchor_candidates.append((2, is_before, -distance, abs_start))
+
+        if anchor_candidates:
+            return max(anchor_candidates)[3]
+        if fallback_candidates:
+            return max(fallback_candidates)[2]
+        return start
+
     def __getitem__(self, i: int) -> Tuple[torch.Tensor, torch.Tensor]:
         if i < 0 or i >= self.n_samples:
             raise IndexError(i)
-        start = i * self.stride
+        start = self._align_sample_start(i * self.stride)
         with self.path.open("rb") as fh:
             fh.seek(start)
             chunk = fh.read(self.seq_len + 1)
@@ -220,15 +473,27 @@ def _finite_metric(value: object, default: float = 0.0) -> float:
 # 1. DATA
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_text_corpus(path: str, seq_len: int,
-                     max_samples: int = 50_000) -> StreamingTextDataset:
+def load_text_corpus(
+    path: str,
+    seq_len: int,
+    max_samples: int = 50_000,
+    *,
+    language_hint: Optional[str] = None,
+    sample_alignment: str = "raw",
+) -> StreamingTextDataset:
     """
     Load real text as byte sequences.
 
     UTF-8 text -> int bytes [0..255] -> (src, tgt) pairs.
     Stride = seq_len//2 for 50% overlap between neighboring examples.
     """
-    return StreamingTextDataset(path, seq_len=seq_len, max_samples=max_samples)
+    return StreamingTextDataset(
+        path,
+        seq_len=seq_len,
+        max_samples=max_samples,
+        language_hint=language_hint,
+        sample_alignment=sample_alignment,
+    )
 
 
 def make_synthetic_dataset(cfg: OMENScaleConfig,

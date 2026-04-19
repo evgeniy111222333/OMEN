@@ -320,7 +320,8 @@ def _infer_source_routing(
         )
 
     lower = stripped.lower()
-    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    raw_lines = [line for line in stripped.splitlines() if line.strip()]
+    lines = [line.strip() for line in raw_lines]
     probe = lines[: min(len(lines), 8)]
     supported = tuple(sorted(set(supported_languages) | set(_ROUTER_LANGUAGE_MARKERS.keys())))
     language_scores: Dict[str, float] = {
@@ -336,7 +337,7 @@ def _infer_source_routing(
         language_scores["python"] = language_scores.get("python", 0.0) + 1.2
     if "print(" in lower:
         language_scores["python"] = language_scores.get("python", 0.0) + 0.8
-    if any(line.endswith(":") for line in probe) and any(line.startswith(("    ", "\t")) for line in lines[1:]):
+    if any(line.endswith(":") for line in probe) and any(line.startswith(("    ", "\t")) for line in raw_lines[1:]):
         language_scores["python"] = language_scores.get("python", 0.0) + 1.0
     if re.search(r"^\s*class\s+\w+\s*\{", stripped, flags=re.MULTILINE):
         language_scores["javascript"] = language_scores.get("javascript", 0.0) + 0.8
@@ -354,7 +355,7 @@ def _infer_source_routing(
         general_code_score += 0.8
     if any(line.startswith(("def ", "class ", "fn ", "function ", "package ", "#include")) for line in probe):
         general_code_score += 1.0
-    if any(line.startswith(("    ", "\t")) for line in lines[1:]):
+    if any(line.startswith(("    ", "\t")) for line in raw_lines[1:]):
         general_code_score += 0.5
 
     structured_score = 0.0
@@ -385,7 +386,7 @@ def _infer_source_routing(
     parser_supported = parser_lang if isinstance(parser_lang, str) and parser_lang in language_scores else None
     code_score = top_score + general_code_score
     if parser_supported is not None:
-        code_score = max(code_score, language_scores.get(parser_supported, 0.0) + general_code_score + 0.2)
+        code_score = max(code_score, language_scores.get(parser_supported, 0.0) + general_code_score + 0.4)
 
     domain_scores = {
         "code": code_score,
@@ -3843,23 +3844,20 @@ class OMENScale(nn.Module):
         return unique
 
     @staticmethod
-    def _row_runtime_cache_token(src_row: torch.Tensor) -> Tuple[int, int, int]:
-        return (
-            int(src_row.data_ptr()),
-            int(src_row.storage_offset()),
-            int(src_row.numel()),
-        )
-
-    def _row_runtime_info(self, src_row: torch.Tensor) -> Dict[str, Any]:
-        token = self._row_runtime_cache_token(src_row)
-        cached = self._row_runtime_cache.get(token)
-        if cached is not None:
-            return cached
+    def _row_runtime_cache_token(src_row: torch.Tensor) -> Tuple[str, bytes]:
         row = src_row.detach()
         if row.device.type != "cpu" or row.dtype != torch.uint8:
             row = row.to(device="cpu", dtype=torch.uint8)
         row = row.contiguous()
         raw_full = row.numpy().tobytes()
+        import hashlib
+        return hashlib.sha1(raw_full).hexdigest(), raw_full
+
+    def _row_runtime_info(self, src_row: torch.Tensor) -> Dict[str, Any]:
+        token, raw_full = self._row_runtime_cache_token(src_row)
+        cached = self._row_runtime_cache.get(token)
+        if cached is not None:
+            return cached
         cached = {
             "raw_full": raw_full,
         }
@@ -5510,7 +5508,7 @@ class OMENScale(nn.Module):
     def forward(
         self,
         src: torch.Tensor,
-        tgt: torch.Tensor,
+        tgt: Optional[torch.Tensor] = None,
         *,
         metric_profile: str = "full",
     ) -> Dict:
@@ -5523,6 +5521,8 @@ class OMENScale(nn.Module):
                                         Perceiver  ...  ByteDecoder
           Classic (net_enabled=False): src  TokenEncoder  Perceiver  ...  TokenDecoder
         """
+        if tgt is None:
+            tgt = src
         fast_metrics = metric_profile == "train_fast"
         if self.world_graph_enabled:
             self.world_graph.clear_runtime_caches()

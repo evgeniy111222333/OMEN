@@ -65,6 +65,62 @@ def _benchmark_test_config() -> OMENScaleConfig:
 
 
 class BenchmarkProtocolTest(unittest.TestCase):
+    def test_code_alignment_reanchors_mid_docstring_windows(self) -> None:
+        raw_dataset = None
+        aligned_dataset = None
+        corpus_path = None
+        try:
+            content = (
+                "def outer():\n"
+                "    \"\"\"\n"
+                "    This is a deliberately long docstring line that should catch the raw stride.\n"
+                "    Another long docstring line keeps the second raw window inside prose.\n"
+                "    \"\"\"\n"
+                "    return 1\n"
+            )
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".txt") as fh:
+                corpus_path = fh.name
+                fh.write(content)
+            raw_dataset = load_text_corpus(corpus_path, seq_len=64, max_samples=2)
+            aligned_dataset = load_text_corpus(
+                corpus_path,
+                seq_len=64,
+                max_samples=2,
+                language_hint="python",
+                sample_alignment="auto",
+            )
+
+            raw_text = bytes(raw_dataset[1][0].tolist()).decode("utf-8", errors="ignore")
+            aligned_text = bytes(aligned_dataset[1][0].tolist()).decode("utf-8", errors="ignore")
+
+            self.assertIn("docstring", raw_text.lower())
+            self.assertTrue(aligned_text.lstrip().startswith("def outer"))
+        finally:
+            if corpus_path and os.path.exists(corpus_path):
+                os.remove(corpus_path)
+
+    def test_path_hint_inference_supports_python_named_corpus(self) -> None:
+        dataset = None
+        corpus_path = None
+        try:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix="_python.txt") as fh:
+                corpus_path = fh.name
+                fh.write("def add(a, b):\n    return a + b\n")
+            dataset = load_text_corpus(
+                corpus_path,
+                seq_len=32,
+                max_samples=1,
+                sample_alignment="auto",
+            )
+
+            src, tgt = dataset[0]
+
+            self.assertEqual(tuple(src.shape), (32,))
+            self.assertEqual(tuple(tgt.shape), (32,))
+        finally:
+            if corpus_path and os.path.exists(corpus_path):
+                os.remove(corpus_path)
+
     def test_synthetic_protocol_emits_canonical_metrics(self) -> None:
         cfg = _benchmark_test_config()
         dataset = make_synthetic_dataset(cfg, n=12)

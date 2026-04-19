@@ -177,7 +177,12 @@ def make_observation_structured(seq_len: int, n: int = 96) -> List[torch.Tensor]
 
 def build_dataset(args, cfg: OMENScaleConfig):
     if args.real_text:
-        return load_text_corpus(args.real_text, cfg.seq_len, max_samples=args.max_samples)
+        return load_text_corpus(
+            args.real_text,
+            cfg.seq_len,
+            max_samples=args.max_samples,
+            sample_alignment="auto",
+        )
     _set_protocol_seed(getattr(args, "seed", None))
     return make_synthetic_dataset(cfg, n=args.synthetic_samples)
 
@@ -536,7 +541,12 @@ def build_transfer_tasks(
         "observation_structured": make_observation_structured(cfg.seq_len, synthetic_samples),
     }
     for name, path in (real_corpora or {}).items():
-        tasks[str(name)] = load_text_corpus(path, cfg.seq_len, max_samples=real_max_samples)
+        tasks[str(name)] = load_text_corpus(
+            path,
+            cfg.seq_len,
+            max_samples=real_max_samples,
+            sample_alignment="auto",
+        )
     return tasks
 
 
@@ -555,7 +565,13 @@ def build_real_transfer_tasks(
     protocol_entries = coerce_corpus_protocol(protocol)
     tasks: Dict[str, object] = {}
     for name, spec in protocol_entries.items():
-        tasks[str(name)] = load_text_corpus(str(spec["path"]), cfg.seq_len, max_samples=max_samples)
+        tasks[str(name)] = load_text_corpus(
+            str(spec["path"]),
+            cfg.seq_len,
+            max_samples=max_samples,
+            language_hint=str(spec.get("language", "")),
+            sample_alignment="auto",
+        )
     return tasks
 
 
@@ -1012,7 +1028,12 @@ def main() -> None:
     if args.creative_ablation:
         if args.real_text:
             tasks = {
-                "real_text": load_text_corpus(args.real_text, cfg.seq_len, max_samples=args.max_samples),
+                "real_text": load_text_corpus(
+                    args.real_text,
+                    cfg.seq_len,
+                    max_samples=args.max_samples,
+                    sample_alignment="auto",
+                ),
                 "observation_text": make_observation_text(cfg.seq_len, max(args.batch_size * args.batches, 4)),
                 "observation_structured": make_observation_structured(cfg.seq_len, max(args.batch_size * args.batches, 4)),
             }

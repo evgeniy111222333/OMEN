@@ -31,7 +31,12 @@ def _worker(
     report_path: str,
 ) -> None:
     cfg = build_config(config)
-    dataset = load_text_corpus(real_text, cfg.seq_len, max_samples=max_samples)
+    dataset = load_text_corpus(
+        real_text,
+        cfg.seq_len,
+        max_samples=max_samples,
+        sample_alignment="auto",
+    )
     run_benchmark(
         cfg,
         dataset,

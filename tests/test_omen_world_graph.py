@@ -221,6 +221,35 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertGreater(js_routing.confidence, 0.5)
         self.assertGreater(structured_routing.confidence, 0.5)
 
+    def test_ast_language_router_handles_indented_python_body_chunks(self) -> None:
+        cfg = OMENScaleConfig.demo()
+        cfg.allow_noncanonical_ablation = True
+        cfg.net_enabled = False
+        cfg.osf_enabled = False
+        cfg.emc_enabled = False
+        cfg.saliency_enabled = False
+        cfg.continuous_cycle_enabled = False
+        cfg.creative_cycle_enabled = False
+        model = OMENScale(cfg)
+
+        def encode_row(text: str) -> torch.Tensor:
+            encoded = [ord(ch) for ch in text.encode("ascii", errors="ignore").decode("ascii")]
+            encoded = encoded[: cfg.seq_len]
+            if len(encoded) < cfg.seq_len:
+                encoded = encoded + [0] * (cfg.seq_len - len(encoded))
+            return torch.tensor(encoded[:-1], dtype=torch.long)
+
+        body_row = encode_row(
+            "        raise ValueError('{} set(s) found with id {}'.format(len(found_sets), set_id))\n"
+            "    found_terms = [term for term in found_sets]\n"
+        )
+
+        routing = model._source_routing_from_bytes(body_row)
+
+        self.assertEqual(model._ast_lang_from_bytes(body_row), "python")
+        self.assertEqual(routing.domain, "code")
+        self.assertGreater(routing.confidence, 0.6)
+
     def test_row_runtime_cache_keeps_full_tokens_but_strips_decode_padding(self) -> None:
         cfg = OMENScaleConfig.demo()
         cfg.allow_noncanonical_ablation = True
