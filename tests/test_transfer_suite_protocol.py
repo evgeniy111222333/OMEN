@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 import random
 import os
 import sys
@@ -162,6 +163,73 @@ class TransferSuiteProtocolTest(unittest.TestCase):
         self.assertGreaterEqual(summaries["observation_structured"].get("world_graph_trace_steps", 0.0), 1.0)
         self.assertGreaterEqual(summaries["observation_text"].get("sym_ast_lang_other", 0.0), 0.5)
         self.assertGreaterEqual(summaries["observation_structured"].get("sym_ast_lang_other", 0.0), 0.5)
+
+    def test_transfer_suite_is_order_invariant_under_eval_online_updates(self) -> None:
+        cfg = _transfer_test_config()
+        files: list[str] = []
+        try:
+            corpora = {
+                "python_real": "def add(a, b):\n    return a + b\n" * 8,
+                "observation_real": (
+                    "weather is rain. rain becomes flood. however flood is not safe.\n" * 8
+                ),
+            }
+            datasets = {}
+            for name, content in corpora.items():
+                with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".txt") as fh:
+                    fh.write(content)
+                    fh.flush()
+                    files.append(fh.name)
+                    datasets[name] = load_text_corpus(fh.name, cfg.seq_len, max_samples=4)
+
+            tasks_ab = OrderedDict(
+                [
+                    ("python_real", datasets["python_real"]),
+                    ("observation_real", datasets["observation_real"]),
+                ]
+            )
+            tasks_ba = OrderedDict(
+                [
+                    ("observation_real", datasets["observation_real"]),
+                    ("python_real", datasets["python_real"]),
+                ]
+            )
+
+            report_ab = run_transfer_suite(
+                cfg,
+                tasks=tasks_ab,
+                source_task="python_real",
+                adapt_steps=0,
+                eval_batches=2,
+                batch_size=1,
+                seed=123,
+                device=torch.device("cpu"),
+            )
+            report_ba = run_transfer_suite(
+                cfg,
+                tasks=tasks_ba,
+                source_task="python_real",
+                adapt_steps=0,
+                eval_batches=2,
+                batch_size=1,
+                seed=123,
+                device=torch.device("cpu"),
+            )
+
+            summary_ab = report_ab["task_summaries"]["python_real"]
+            summary_ba = report_ba["task_summaries"]["python_real"]
+            self.assertEqual(summary_ab.get("eval_world_self_update_applied", 0.0), 1.0)
+            self.assertEqual(summary_ba.get("eval_world_self_update_applied", 0.0), 1.0)
+            for key in ("ce_bits", "world_nll", "program_anchor", "sym_target_coverage"):
+                self.assertAlmostEqual(
+                    summary_ab.get(key, 0.0),
+                    summary_ba.get(key, 0.0),
+                    places=6,
+                )
+        finally:
+            for path in files:
+                if os.path.exists(path):
+                    os.remove(path)
 
 
 if __name__ == "__main__":

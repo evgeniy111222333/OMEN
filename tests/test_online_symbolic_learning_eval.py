@@ -53,6 +53,30 @@ class OnlineSymbolicLearningEvalTest(unittest.TestCase):
         self.assertIsInstance(out["z"], CanonicalWorldState)
         self.assertTrue(torch.allclose(out["z_world"], out["z_dense"]))
 
+    def test_eval_forward_respects_trace_candidate_budget_from_config(self) -> None:
+        cfg = OMENConfig.demo()
+        cfg.allow_noncanonical_ablation = True
+        cfg.net_enabled = False
+        cfg.osf_enabled = False
+        cfg.emc_enabled = False
+        cfg.saliency_enabled = False
+        cfg.creative_cycle_enabled = False
+        cfg.continuous_cycle_trace_candidates = 1
+        model = build_omen(cfg)
+        model.eval()
+
+        self.assertEqual(model.prover.continuous_cycle_max_trace_candidates, 1)
+
+        src, tgt = self._encode_example(
+            cfg,
+            "def add(a, b):\n    total = a + b\n    return total\n",
+        )
+
+        out = model(src, tgt)
+
+        self.assertGreaterEqual(out["sym_cycle_checked"], 1.0)
+        self.assertLessEqual(out["sym_cycle_trace_candidates"], 1.0)
+
     def test_eval_forward_updates_world_model_weights(self) -> None:
         cfg = OMENConfig.demo()
         cfg.allow_noncanonical_ablation = True

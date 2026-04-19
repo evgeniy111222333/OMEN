@@ -1905,6 +1905,7 @@ class OMENScale(nn.Module):
             enabled=getattr(cfg, "continuous_cycle_enabled", True),
             eval_enabled=getattr(cfg, "continuous_cycle_eval_enabled", True),
             eval_learning_enabled=getattr(cfg, "continuous_cycle_eval_learning_enabled", True),
+            max_trace_candidates=getattr(cfg, "continuous_cycle_trace_candidates", 4),
             max_contextual=getattr(cfg, "continuous_cycle_contextual", 4),
             max_neural=getattr(cfg, "continuous_cycle_neural", 4),
             accept_threshold=getattr(cfg, "continuous_cycle_accept_threshold", 0.55),

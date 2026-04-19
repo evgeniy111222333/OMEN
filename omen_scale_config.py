@@ -72,6 +72,7 @@ class OMENScaleConfig:
     sym_gnn_layers:   int   = 2       # compatibility with OMENv2
     continuous_cycle_enabled: bool = True
     continuous_cycle_eval_enabled: bool = True
+    continuous_cycle_trace_candidates: int = 4
     continuous_cycle_contextual: int = 4
     continuous_cycle_neural: int = 4
     continuous_cycle_accept_threshold: float = 0.55
@@ -371,6 +372,7 @@ class OMENScaleConfig:
             sym_vocab=64,       sym_embed_dim=32,    max_proof_depth=3,
             n_proof_cands=8,    ltm_max_rules=256,   sym_max_facts=32,
             abduct_candidates=8, n_heads=4, n_layers=2, d_model=256,
+            continuous_cycle_trace_candidates=2,
             # NET: small vocabulary for fast CPU/GPU testing
             net_enabled=True,   net_byte_layers=1,   net_dec_layers=1,
             net_init_vocab=32,  net_max_vocab=512,   net_tau=0.85,

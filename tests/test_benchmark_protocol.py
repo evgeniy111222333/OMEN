@@ -111,6 +111,16 @@ class BenchmarkProtocolTest(unittest.TestCase):
         ):
             self.assertIn(key, summary)
 
+    def test_benchmark_eval_preserves_eval_world_self_update(self) -> None:
+        cfg = _benchmark_test_config()
+        dataset = make_synthetic_dataset(cfg, n=12)
+        report = run_benchmark(cfg, dataset, batches=1, batch_size=1, seed=17)
+
+        self.assertEqual(report["n_batches"], 1)
+        summary = report["summary"]
+        self.assertEqual(summary["eval_world_self_update_applied"], 1.0)
+        self.assertGreater(summary["eval_world_self_update_loss"], 0.0)
+
     def test_real_text_protocol_runs_on_local_corpus(self) -> None:
         cfg = _benchmark_test_config()
         corpus_path = None

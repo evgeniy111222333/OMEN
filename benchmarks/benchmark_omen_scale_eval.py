@@ -278,41 +278,40 @@ def _evaluate_model(
     stop_reason = "completed"
 
     model.eval()
-    with torch.inference_mode():
-        for _ in range(requested_batches):
-            if _budget_expired(deadline):
-                stop_reason = "time_budget_exhausted"
-                break
-            batch = sample_examples(dataset, batch_size)
-            if not batch:
-                stop_reason = "dataset_exhausted"
-                break
-            src, tgt = collate(batch)
-            src = src.to(device)
-            tgt = tgt.to(device)
-            t0 = time.perf_counter()
-            out = model(src, tgt)
-            timings_ms.append((time.perf_counter() - t0) * 1000.0)
-            metric_rows.append(_collect_metrics(out, metric_keys))
-            timed_out_after_batch = _budget_expired(deadline)
-            if timed_out_after_batch:
-                stop_reason = "time_budget_exhausted"
-            if progress_callback is not None:
-                progress_callback(
-                    {
-                        "summary": aggregate(metric_rows),
-                        "timings_ms": list(timings_ms),
-                        "metric_rows": list(metric_rows),
-                        "metric_keys": list(metric_keys),
-                        "n_batches": len(metric_rows),
-                        "requested_batches": requested_batches,
-                        "timed_out": timed_out_after_batch,
-                        "stop_reason": "time_budget_exhausted" if timed_out_after_batch else "running",
-                        "device": str(device),
-                    }
-                )
-            if timed_out_after_batch:
-                break
+    for _ in range(requested_batches):
+        if _budget_expired(deadline):
+            stop_reason = "time_budget_exhausted"
+            break
+        batch = sample_examples(dataset, batch_size)
+        if not batch:
+            stop_reason = "dataset_exhausted"
+            break
+        src, tgt = collate(batch)
+        src = src.to(device)
+        tgt = tgt.to(device)
+        t0 = time.perf_counter()
+        out = model(src, tgt)
+        timings_ms.append((time.perf_counter() - t0) * 1000.0)
+        metric_rows.append(_collect_metrics(out, metric_keys))
+        timed_out_after_batch = _budget_expired(deadline)
+        if timed_out_after_batch:
+            stop_reason = "time_budget_exhausted"
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "summary": aggregate(metric_rows),
+                    "timings_ms": list(timings_ms),
+                    "metric_rows": list(metric_rows),
+                    "metric_keys": list(metric_keys),
+                    "n_batches": len(metric_rows),
+                    "requested_batches": requested_batches,
+                    "timed_out": timed_out_after_batch,
+                    "stop_reason": "time_budget_exhausted" if timed_out_after_batch else "running",
+                    "device": str(device),
+                }
+            )
+        if timed_out_after_batch:
+            break
 
     return {
         "summary": aggregate(metric_rows),
@@ -325,6 +324,44 @@ def _evaluate_model(
         "stop_reason": stop_reason,
         "device": str(device),
     }
+
+
+def _capture_model_snapshot(model: OMEN) -> Dict[str, object]:
+    snapshot: Dict[str, object] = {
+        "model_state": deepcopy(model.state_dict()),
+        "training": bool(model.training),
+        "python_rng_state": random.getstate(),
+        "torch_rng_state": torch.get_rng_state().clone(),
+    }
+    if torch.cuda.is_available():
+        snapshot["cuda_rng_state"] = [state.clone() for state in torch.cuda.get_rng_state_all()]
+    if hasattr(model, "export_runtime_state"):
+        snapshot["runtime_state"] = deepcopy(model.export_runtime_state())
+    return snapshot
+
+
+def _restore_model_snapshot(
+    model: OMEN,
+    snapshot: Mapping[str, object],
+    *,
+    device: torch.device,
+) -> None:
+    model.load_state_dict(snapshot["model_state"], strict=False)
+    if hasattr(model, "load_runtime_state"):
+        model.load_runtime_state(deepcopy(snapshot.get("runtime_state", {})), device)
+    if bool(snapshot.get("training", False)):
+        model.train()
+    else:
+        model.eval()
+    if hasattr(model, "_clear_row_runtime_cache"):
+        model._clear_row_runtime_cache()
+    if getattr(model, "world_graph_enabled", False) and hasattr(model, "world_graph"):
+        model.world_graph.clear_runtime_caches()
+    random.setstate(snapshot["python_rng_state"])
+    torch.set_rng_state(snapshot["torch_rng_state"])
+    cuda_states = snapshot.get("cuda_rng_state")
+    if cuda_states is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_states)
 
 
 def _stamp_canonical_report(
@@ -649,11 +686,13 @@ def run_transfer_suite(
     task_summaries: Dict[str, Dict[str, float]] = {}
     timed_out = bool(adapt_report["timed_out"])
     stop_reason = str(adapt_report["stop_reason"])
+    eval_snapshot = _capture_model_snapshot(model)
     for name, dataset in task_map.items():
         if _budget_expired(deadline):
             timed_out = True
             stop_reason = "time_budget_exhausted"
             break
+        _restore_model_snapshot(model, eval_snapshot, device=device)
         report = _evaluate_model(
             model,
             dataset,
