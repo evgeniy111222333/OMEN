@@ -454,16 +454,37 @@ class WorldGraphEncoder(nn.Module):
         self,
         fact_records: Sequence[Tuple[str, Any]],
     ) -> List[Tuple[str, Any]]:
-        unique: List[Tuple[str, Any]] = []
-        seen: set[str] = set()
-        for node_type, atom in fact_records:
+        type_priority = {
+            "goal": 9,
+            "target": 8,
+            "trace_target": 7,
+            "observed_now": 6,
+            "abduced": 5,
+            "memory": 4,
+            "saliency": 4,
+            "net": 4,
+            "world_context": 3,
+            "observed": 2,
+            "context": 1,
+        }
+        best_by_signature: Dict[str, Tuple[int, int, Tuple[str, Any]]] = {}
+        for idx, (node_type, atom) in enumerate(fact_records):
             signature = _atom_signature(atom)
-            if signature in seen:
-                continue
-            seen.add(signature)
-            unique.append((node_type, atom))
-            if len(unique) >= self.max_nodes:
-                break
+            rank = type_priority.get(node_type, 0)
+            existing = best_by_signature.get(signature)
+            if existing is None or rank > existing[1]:
+                first_idx = idx if existing is None else existing[0]
+                best_by_signature[signature] = (first_idx, rank, (node_type, atom))
+        selected = list(best_by_signature.values())
+        if len(selected) > self.max_nodes:
+            selected = sorted(
+                selected,
+                key=lambda item: (-item[1], item[0]),
+            )[: self.max_nodes]
+        unique = [
+            record
+            for _, _, record in sorted(selected, key=lambda item: item[0])
+        ]
         return unique
 
     @staticmethod

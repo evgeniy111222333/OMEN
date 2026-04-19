@@ -7,12 +7,13 @@ from pathlib import Path
 from unittest import mock
 
 import torch
+import torch.nn.functional as F
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from omen_net_tokenizer import ByteDecoder, SemanticFeedbackLoss
+from omen_net_tokenizer import ByteContextEncoder, ByteDecoder, SemanticFeedbackLoss
 from omen_prolog import HornAtom
 from omen_scale import (
     NET_CONTEXT_PRED,
@@ -23,7 +24,15 @@ from omen_scale import (
     SEQ_PREDICT_NEXT_PRED,
     SymbolicQueryGenerator,
 )
+from omen_net_tokenizer import (
+    _masked_sequence_cross_entropy as net_masked_sequence_cross_entropy,
+    _sequence_valid_mask_from_trailing_padding as net_valid_mask_from_trailing_padding,
+)
 from omen_scale_config import OMENScaleConfig
+from omen_scale import (
+    _masked_sequence_cross_entropy as scale_masked_sequence_cross_entropy,
+    _sequence_valid_mask_from_trailing_padding as scale_valid_mask_from_trailing_padding,
+)
 
 
 def _net_symbolic_config() -> OMENScaleConfig:
@@ -202,6 +211,49 @@ class NetSymbolicProtocolTest(unittest.TestCase):
         expected = -0.5 * ((expected_cos * 1.0) + (expected_cos * 0.25)) / 2.0
         self.assertAlmostEqual(float(loss), expected, places=6)
 
+    def test_bytes_to_text_preserves_internal_nul_bytes(self) -> None:
+        byte_ids = torch.tensor([97, 0, 98, 0, 0], dtype=torch.long)
+
+        text = ByteContextEncoder.bytes_to_text(byte_ids)
+
+        self.assertEqual(text, "a\x00b")
+
+    def test_trailing_pad_mask_preserves_internal_zero_bytes(self) -> None:
+        tokens = torch.tensor(
+            [
+                [5, 0, 7, 0, 0],
+                [0, 0, 0, 0, 0],
+            ],
+            dtype=torch.long,
+        )
+        expected = torch.tensor(
+            [
+                [True, True, True, False, False],
+                [False, False, False, False, False],
+            ],
+            dtype=torch.bool,
+        )
+
+        self.assertTrue(torch.equal(net_valid_mask_from_trailing_padding(tokens), expected))
+        self.assertTrue(torch.equal(scale_valid_mask_from_trailing_padding(tokens), expected))
+
+    def test_masked_sequence_cross_entropy_keeps_internal_zero_targets(self) -> None:
+        targets = torch.tensor([[5, 0, 7, 0]], dtype=torch.long)
+        logits = torch.full((1, 4, 8), -12.0, dtype=torch.float32)
+        logits[0, 0, 5] = 12.0
+        logits[0, 1, 1] = 12.0
+        logits[0, 2, 7] = 12.0
+        logits[0, 3, 0] = 12.0
+        valid_mask = net_valid_mask_from_trailing_padding(targets)
+
+        net_loss = net_masked_sequence_cross_entropy(logits, targets, valid_mask)
+        scale_loss = scale_masked_sequence_cross_entropy(logits, targets, valid_mask)
+        legacy_loss = F.cross_entropy(logits.transpose(1, 2), targets, ignore_index=0)
+
+        self.assertGreater(float(net_loss.item()), 1.0)
+        self.assertAlmostEqual(float(net_loss.item()), float(scale_loss.item()), places=6)
+        self.assertLess(float(legacy_loss.item()), 1e-4)
+
     def test_net_encode_can_return_head_summarized_attention(self) -> None:
         cfg = _net_symbolic_config()
         model = OMENScale(cfg)
@@ -295,7 +347,8 @@ class NetSymbolicProtocolTest(unittest.TestCase):
              mock.patch.object(model, "_ast_lang_from_bytes", return_value=""):
             generated = model.generate(prompt, max_new=1, temperature=1.0, dynamic_reasoning=False)
 
-        self.assertEqual(int(generated[0, -1].item()), 7)
+        last_tokens, _valid_rows, _last_idx = model._batch_last_content_tokens(generated)
+        self.assertEqual(int(last_tokens[0].item()), 7)
         self.assertGreaterEqual(len(generation_contexts), 2)
         self.assertTrue(all(ctx.provenance == "net" for ctx in generation_contexts))
         self.assertTrue(all(ctx.goal.pred == NET_MEANS_PRED for ctx in generation_contexts[:2]))

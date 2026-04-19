@@ -21,6 +21,7 @@ from omen_train_code import (
     _finite_metric,
     _restore_kb,
     _save_ckpt,
+    _serialize_kb,
     build_loader,
     joint_train,
     make_synthetic_dataset,
@@ -312,6 +313,25 @@ class TrainingCheckpointProtocolTest(unittest.TestCase):
         self.assertEqual(int(restored_oee.stats()["oee_feedback_buffer_size"]), 1)
         self.assertTrue(torch.allclose(next(restored_oee._latent_model.parameters()), original_oee_param))
         self.assertIn("checkpoint_metric", restored.prover.last_creative_report.metrics)
+
+    def test_restore_kb_rebuilds_structural_rule_set_from_legacy_hash_state(self) -> None:
+        cfg = tiny_cfg(creative_enabled=False)
+        model = build_omen(cfg, device=torch.device("cpu"))
+
+        x = Var("X")
+        kb_rule = rule(atom(211, x), atom(111, x, Const(2)))
+        initial_rules = len(model.prover.kb.rules)
+        self.assertTrue(model.prover.kb.add_rule(kb_rule))
+        expected_rules = initial_rules + 1
+
+        kb_state = _serialize_kb(model.prover.kb)
+        kb_state["rule_hash_set"] = {hash(kb_rule)}
+
+        restored = build_omen(cfg, device=torch.device("cpu"))
+        _restore_kb(restored, kb_state, torch.device("cpu"))
+
+        self.assertFalse(restored.prover.kb.add_rule(kb_rule))
+        self.assertEqual(len(restored.prover.kb.rules), expected_rules)
 
     def test_joint_train_resume_uses_total_target_epoch(self) -> None:
         cfg = tiny_cfg(creative_enabled=False)

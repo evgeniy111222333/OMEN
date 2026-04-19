@@ -147,7 +147,7 @@ class CreativeCycleCoordinator:
             goal_threshold=ice_goal_threshold,
         )
         self.last_report = CreativeCycleReport()
-        self.rule_origins: Dict[int, str] = {}
+        self.rule_origins: Dict[str, str] = {}
         self._runtime_derived_facts_cache: Optional[Dict[Tuple[int, Tuple[int, ...]], Any]] = None
         self._runtime_task_gap_cache: Optional[Dict[Tuple[int, Tuple[int, ...], Tuple[int, ...]], float]] = None
 
@@ -183,8 +183,8 @@ class CreativeCycleCoordinator:
             1,
         )
         self.rule_origins = {
-            int(rule_hash): str(origin)
-            for rule_hash, origin in dict(state.get("rule_origins", {})).items()
+            str(rule_key): str(origin)
+            for rule_key, origin in dict(state.get("rule_origins", {})).items()
         }
         last_report = state.get("last_report")
         if isinstance(last_report, bytes):
@@ -228,22 +228,21 @@ class CreativeCycleCoordinator:
         self._runtime_task_gap_cache = None
 
     @staticmethod
-    def _runtime_rule_key(extra_rules: Sequence[Any]) -> Tuple[int, ...]:
-        return tuple(sorted(hash(rule) for rule in extra_rules))
+    def _runtime_rule_key(extra_rules: Sequence[Any]) -> Tuple[str, ...]:
+        return tuple(sorted(repr(rule) for rule in extra_rules))
 
     @staticmethod
-    def _runtime_target_key(target_facts: Sequence[Any]) -> Tuple[int, ...]:
-        return tuple(sorted(hash(target) for target in target_facts))
+    def _runtime_target_key(target_facts: Sequence[Any]) -> Tuple[str, ...]:
+        return tuple(sorted(repr(target) for target in target_facts))
 
     @staticmethod
     def _dedupe_facts(facts: Sequence[Any]) -> List[Any]:
         unique: List[Any] = []
-        seen: set[int] = set()
+        seen: set[Any] = set()
         for fact in facts:
-            fact_hash = hash(fact)
-            if fact_hash in seen:
+            if fact in seen:
                 continue
-            seen.add(fact_hash)
+            seen.add(fact)
             unique.append(fact)
         return unique
 
@@ -252,32 +251,28 @@ class CreativeCycleCoordinator:
         if report is None:
             return tuple()
         support: List[Any] = []
-        seen: set[int] = set()
+        seen: set[Any] = set()
         for candidate in list(report.selected_rules)[:4]:
             head = getattr(getattr(candidate, "clause", None), "head", None)
             if head is None:
                 continue
-            head_hash = hash(head)
-            if head_hash in seen:
+            if head in seen:
                 continue
-            seen.add(head_hash)
+            seen.add(head)
             support.append(head)
         for fact in list(getattr(report, "counterfactual_novel_facts", ()))[:4]:
-            fact_hash = hash(fact)
-            if fact_hash in seen:
+            if fact in seen:
                 continue
-            seen.add(fact_hash)
+            seen.add(fact)
             support.append(fact)
         for fact in list(getattr(report, "validated_support_facts", ()))[:4]:
-            fact_hash = hash(fact)
-            if fact_hash in seen:
+            if fact in seen:
                 continue
-            seen.add(fact_hash)
+            seen.add(fact)
             support.append(fact)
         intrinsic_goal = getattr(getattr(report, "intrinsic_goal", None), "goal", None)
         if intrinsic_goal is not None:
-            intrinsic_hash = hash(intrinsic_goal)
-            if intrinsic_hash not in seen:
+            if intrinsic_goal not in seen:
                 support.append(intrinsic_goal)
         return tuple(support)
 
@@ -286,12 +281,11 @@ class CreativeCycleCoordinator:
         if limit <= 0:
             return tuple()
         unique: List[Any] = []
-        seen: set[int] = set()
+        seen: set[Any] = set()
         for fact in facts:
-            fact_hash = hash(fact)
-            if fact_hash in seen:
+            if fact in seen:
                 continue
-            seen.add(fact_hash)
+            seen.add(fact)
             unique.append(fact)
             if len(unique) >= limit:
                 break
@@ -474,13 +468,12 @@ class CreativeCycleCoordinator:
             return []
         utility_history = getattr(prover, "_rule_utility_history", {})
         candidates: List[RuleCandidate] = []
-        seen: set[int] = set()
+        seen: set[Any] = set()
         for clause in clauses:
-            clause_hash = hash(clause)
-            if clause_hash in seen:
+            if clause in seen:
                 continue
-            seen.add(clause_hash)
-            history = list(utility_history.get(clause_hash, ()))
+            seen.add(clause)
+            history = list(utility_history.get(clause, utility_history.get(hash(clause), ())))
             prior_utility = float(sum(history) / len(history)) if history else 0.5
             candidates.append(
                 RuleCandidate(
@@ -689,7 +682,7 @@ class CreativeCycleCoordinator:
         augmented_rules = list(rules) + list(modified_rules)
         augmented_engine = self.analogy_engine.clone()
         augmented_engine.fit(augmented_rules)
-        modified_hash_text = {str(hash(rule)) for rule in modified_rules}
+        modified_rule_keys = {repr(rule) for rule in modified_rules}
         modified_pred_ids = {
             int(pred)
             for rule in modified_rules
@@ -697,15 +690,15 @@ class CreativeCycleCoordinator:
         }
         analogy_candidates = augmented_engine.generate_candidates(
             augmented_rules,
-            existing_hashes=[hash(rule) for rule in rules],
+            existing_hashes=rules,
         )
         metaphor_candidates = augmented_engine.generate_metaphor_candidates(
             augmented_rules,
-            existing_hashes=[hash(rule) for rule in rules],
+            existing_hashes=rules,
         )
         routed_analogy: List[RuleCandidate] = []
         for candidate in analogy_candidates:
-            if str(candidate.metadata.get("source_rule_hash_text", "")) not in modified_hash_text:
+            if str(candidate.metadata.get("source_rule_key_text", "")) not in modified_rule_keys:
                 continue
             routed_analogy.append(
                 RuleCandidate(
@@ -726,7 +719,7 @@ class CreativeCycleCoordinator:
             source_pred = int(candidate.metadata.get("source_pred", -1.0))
             target_pred = int(candidate.metadata.get("target_pred", -1.0))
             if (
-                str(candidate.metadata.get("source_rule_hash_text", "")) not in modified_hash_text
+                str(candidate.metadata.get("source_rule_key_text", "")) not in modified_rule_keys
                 and source_pred not in modified_pred_ids
                 and target_pred not in modified_pred_ids
             ):
@@ -792,7 +785,7 @@ class CreativeCycleCoordinator:
     ) -> List[RuleCandidate]:
         if not seed_candidates:
             return []
-        compression_cache: Dict[Tuple[int, Tuple[int, ...]], float] = {}
+        compression_cache: Dict[Tuple[str, Tuple[str, ...]], float] = {}
 
         def _fact_bits(fact: Any) -> float:
             return float(4 + 2 * len(tuple(getattr(fact, "args", ()))))
@@ -800,7 +793,7 @@ class CreativeCycleCoordinator:
         def _compression_delta(rule: Any, target_subset: Sequence[Any]) -> float:
             if not target_subset:
                 return 0.0
-            cache_key = (hash(rule), self._runtime_target_key(target_subset))
+            cache_key = (repr(rule), self._runtime_target_key(target_subset))
             cached = compression_cache.get(cache_key)
             if cached is not None:
                 return float(cached)
@@ -826,7 +819,7 @@ class CreativeCycleCoordinator:
             compression_cache[cache_key] = gain
             return gain
 
-        selected: Dict[int, RuleCandidate] = {}
+        selected: Dict[Any, RuleCandidate] = {}
         situations = list(unresolved_targets) if unresolved_targets else [None]
         for situation in situations:
             if situation is None:
@@ -854,9 +847,9 @@ class CreativeCycleCoordinator:
                 compression_fn=compression_fn,
             )
             for candidate in evolved:
-                current = selected.get(hash(candidate.clause))
+                current = selected.get(candidate.clause)
                 if current is None or candidate.score > current.score:
-                    selected[hash(candidate.clause)] = candidate
+                    selected[candidate.clause] = candidate
 
         ranked = sorted(selected.values(), key=lambda item: item.score, reverse=True)
         return ranked[: max(self.max_selected_rules, 1)]
@@ -893,11 +886,11 @@ class CreativeCycleCoordinator:
         report.predicate_embeddings = dict(analogy_state.graph_view.embeddings)
         report.analogy_candidates = self.analogy_engine.generate_candidates(
             rules,
-            existing_hashes=[hash(rule) for rule in rules],
+            existing_hashes=rules,
         )
         report.metaphor_candidates = self.analogy_engine.generate_metaphor_candidates(
             rules,
-            existing_hashes=[hash(rule) for rule in rules],
+            existing_hashes=rules,
         )
 
         base_task_gap = self._task_gap(prover, current_facts, target_facts)
@@ -930,9 +923,9 @@ class CreativeCycleCoordinator:
 
         paradox_facts: List[Any] = list(counterfactual.novel_facts)
         for left, right in counterfactual.contradictions:
-            if not any(hash(left) == hash(item) for item in paradox_facts):
+            if left not in paradox_facts:
                 paradox_facts.append(left)
-            if not any(hash(right) == hash(item) for item in paradox_facts):
+            if right not in paradox_facts:
                 paradox_facts.append(right)
 
         goal = prover.current_goal(z) if hasattr(prover, "current_goal") else None
@@ -1008,7 +1001,7 @@ class CreativeCycleCoordinator:
                     prover.vem.record_outcome(candidate.clause, utility_target=utility, device=device)
                     prover._record_rule_utility(candidate.clause, utility)
                     prover._extend_recent_abduced_rules([candidate.clause])
-                    self.rule_origins[hash(candidate.clause)] = candidate.source
+                    self.rule_origins[repr(candidate.clause)] = candidate.source
                     if candidate.source == "ontology":
                         ontology_accepted = True
                         pred_id = int(candidate.metadata.get("invented_predicate", 0.0))

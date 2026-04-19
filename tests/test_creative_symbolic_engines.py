@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -24,9 +25,17 @@ from omen_prolog import (
     _atoms_conflict,
 )
 from omen_symbolic.aesthetic_engine import AestheticEvolutionEngine
+from omen_symbolic.abduction_search import rank_goal_directed_bodies
 from omen_symbolic.analogy_engine import AnalogyMetaphorEngine
-from omen_symbolic.counterfactual_engine import COMPLEMENT_OFFSET, CounterfactualWorldEngine
+from omen_symbolic.counterfactual_engine import (
+    COMPLEMENT_OFFSET,
+    CounterfactualWorldEngine,
+    _Transform,
+    _collect_pool_atoms,
+)
+from omen_symbolic.creative_cycle import CreativeCycleCoordinator
 from omen_symbolic.creative_types import CounterfactualResult, CreativeCycleReport, IntrinsicGoal, RuleCandidate
+from omen_symbolic.hypergraph_gnn import HypergraphContrastiveLearner
 from omen_symbolic.intrinsic_engine import IntrinsicCuriosityEngine
 from omen_symbolic.ontology_engine import OntologyExpansionEngine, RuleHypothesisSampler
 from omen_symbolic.rule_graph import build_predicate_graph_view
@@ -41,6 +50,337 @@ def rule(head: HornAtom, *body: HornAtom) -> HornClause:
 
 
 class CreativeSymbolicEnginesTest(unittest.TestCase):
+    def test_horn_clause_equality_is_structural_under_hash_collision(self) -> None:
+        x = Var("X")
+        left = rule(atom(1, x), atom(2, x))
+        right = rule(atom(3, x), atom(4, x))
+
+        with mock.patch.object(HornClause, "__hash__", return_value=1):
+            self.assertNotEqual(left, right)
+
+    def test_creative_cycle_runtime_keys_survive_hash_collision(self) -> None:
+        coordinator = CreativeCycleCoordinator(enabled=False)
+        fact_a = atom(10, Const(1))
+        fact_b = atom(11, Const(2))
+        rule_a = rule(atom(20, Var("X")), atom(21, Var("X")))
+        rule_b = rule(atom(30, Var("X")), atom(31, Var("X")))
+
+        with mock.patch.object(HornAtom, "__hash__", return_value=1), \
+             mock.patch.object(HornClause, "__hash__", return_value=1):
+            target_key_a = coordinator._runtime_target_key((fact_a,))
+            target_key_b = coordinator._runtime_target_key((fact_b,))
+            rule_key_a = coordinator._runtime_rule_key((rule_a,))
+            rule_key_b = coordinator._runtime_rule_key((rule_b,))
+
+        self.assertNotEqual(target_key_a, target_key_b)
+        self.assertNotEqual(rule_key_a, rule_key_b)
+
+    def test_creative_cycle_support_fact_dedup_survives_hash_collision(self) -> None:
+        head_a = atom(40, Const(1))
+        head_b = atom(41, Const(2))
+        novel = atom(42, Const(3))
+        validated = atom(43, Const(4))
+        intrinsic = IntrinsicGoal(
+            goal=atom(44, Const(5)),
+            value=0.7,
+            kind="novelty",
+            provenance="test",
+        )
+        report = CreativeCycleReport(
+            selected_rules=(
+                RuleCandidate(clause=rule(head_a), source="test", score=1.0),
+                RuleCandidate(clause=rule(head_b), source="test", score=0.9),
+            ),
+            counterfactual_novel_facts=(novel,),
+            validated_support_facts=(validated,),
+            intrinsic_goal=intrinsic,
+        )
+
+        with mock.patch.object(HornAtom, "__hash__", return_value=1):
+            support = CreativeCycleCoordinator._report_support_facts(report)
+            limited = CreativeCycleCoordinator._limit_unique_facts((head_a, head_b, head_a), limit=4)
+
+        self.assertEqual(
+            {repr(fact) for fact in support},
+            {repr(head_a), repr(head_b), repr(novel), repr(validated), repr(intrinsic.goal)},
+        )
+        self.assertEqual(limited, (head_a, head_b))
+
+    def test_ontology_cache_keys_survive_hash_collision(self) -> None:
+        sampler = RuleHypothesisSampler()
+        goal = atom(50, Const(1))
+        target = atom(51, Const(2))
+        rule_a = rule(atom(60, Var("X")), atom(61, Var("X")))
+        rule_b = rule(atom(70, Var("X")), atom(71, Var("X")))
+
+        with mock.patch.object(HornAtom, "__hash__", return_value=1), \
+             mock.patch.object(HornClause, "__hash__", return_value=1):
+            target_key_goal = sampler._target_facts_cache_key((goal,))
+            target_key_target = sampler._target_facts_cache_key((target,))
+            consistency_a = sampler._consistency_cache_key((rule_a,), (goal,))
+            consistency_b = sampler._consistency_cache_key((rule_b,), (goal,))
+
+        self.assertNotEqual(target_key_goal, target_key_target)
+        self.assertNotEqual(consistency_a, consistency_b)
+
+    def test_counterfactual_pool_atom_collection_survives_hash_collision(self) -> None:
+        x = Var("X")
+        atom_a = atom(80, x)
+        atom_b = atom(81, x)
+        rules = (
+            rule(atom(82, x), atom_a),
+            rule(atom(83, x), atom_b),
+        )
+
+        with mock.patch.object(HornAtom, "__hash__", return_value=1):
+            pool = _collect_pool_atoms(rules)
+
+        self.assertEqual(pool, [atom_a, atom_b])
+
+    def test_aesthetic_gene_pool_survives_hash_collision(self) -> None:
+        engine = AestheticEvolutionEngine(gene_pool_size=4)
+        candidate_a = RuleCandidate(
+            clause=rule(atom(84, Var("X")), atom(85, Var("X"))),
+            source="test",
+            score=1.0,
+        )
+        candidate_b = RuleCandidate(
+            clause=rule(atom(86, Var("X")), atom(87, Var("X"))),
+            source="test",
+            score=0.8,
+        )
+
+        with mock.patch.object(HornClause, "__hash__", return_value=1):
+            engine._update_gene_pool([candidate_a, candidate_b])
+
+        self.assertEqual([candidate.clause for candidate in engine._gene_pool], [candidate_a.clause, candidate_b.clause])
+
+    def test_ame_existing_rule_filter_survives_hash_collision(self) -> None:
+        x, y, z = Var("X"), Var("Y"), Var("Z")
+        rules = [
+            rule(atom(1, x, y, z), atom(1, y, x, z)),
+            rule(atom(101, x, z), atom(1, x, y, z)),
+            rule(atom(2, x, y, z), atom(202, x, y, z)),
+            rule(atom(102, x, z), atom(2, x, y, z)),
+        ]
+        engine = AnalogyMetaphorEngine(
+            embedding_dim=12,
+            tau_analogy=0.10,
+            contrastive_steps=0,
+            max_pairs=4,
+        )
+        engine.fit(rules)
+
+        with mock.patch.object(HornClause, "__hash__", return_value=1):
+            candidates = engine.generate_candidates(rules, existing_hashes=[rules[0]])
+
+        self.assertTrue(candidates)
+
+    def test_ame_legacy_int_hash_filter_does_not_drop_colliding_candidates(self) -> None:
+        x, y, z = Var("X"), Var("Y"), Var("Z")
+        rules = [
+            rule(atom(1, x, y, z), atom(1, y, x, z)),
+            rule(atom(101, x, z), atom(1, x, y, z)),
+            rule(atom(2, x, y, z), atom(202, x, y, z)),
+            rule(atom(102, x, z), atom(2, x, y, z)),
+        ]
+        engine = AnalogyMetaphorEngine(
+            embedding_dim=12,
+            tau_analogy=0.10,
+            contrastive_steps=0,
+            max_pairs=4,
+        )
+        engine.fit(rules)
+
+        with mock.patch.object(HornClause, "__hash__", return_value=1):
+            candidates = engine.generate_candidates(rules, existing_hashes=[1])
+
+        self.assertTrue(candidates)
+
+    def test_abduction_body_ranking_survives_hash_collision(self) -> None:
+        head = atom(100, Const(1), Const(3))
+        facts = [
+            atom(10, Const(1), Const(2)),
+            atom(11, Const(2), Const(3)),
+            atom(12, Const(1), Const(4)),
+            atom(13, Const(4), Const(3)),
+        ]
+
+        def _term_const_values(term):
+            return {int(term.val)} if hasattr(term, "val") else set()
+
+        with mock.patch.object(HornAtom, "__hash__", return_value=1):
+            ranked = rank_goal_directed_bodies(
+                head,
+                facts,
+                _term_const_values,
+                max_body_atoms=3,
+                max_fact_scan=14,
+            )
+
+        self.assertGreater(len(ranked), 2)
+
+    def test_hypergraph_embed_cache_survives_hash_collision(self) -> None:
+        x = Var("X")
+        rules_a = [rule(atom(1, x), atom(2, x))]
+        rules_b = [rule(atom(1, x), atom(3, x))]
+        learner = HypergraphContrastiveLearner(embed_dim=8, hidden_dim=16, n_steps=0)
+
+        with mock.patch.object(HornClause, "__hash__", return_value=1):
+            result_a = learner.embed(rules_a, (1, 2, 3), {1: 1, 2: 1, 3: 1})
+            result_b = learner.embed(rules_b, (1, 2, 3), {1: 1, 2: 1, 3: 1})
+
+        self.assertFalse(torch.allclose(result_a.embeddings, result_b.embeddings))
+
+    def test_counterfactual_exact_search_survives_rule_hash_collision(self) -> None:
+        engine = CounterfactualWorldEngine(max_rule_mods=2, max_candidates=4)
+        kb = KnowledgeBase(max_rules=8)
+        rule_a = rule(atom(1, Var("X")), atom(2, Var("X")))
+        rule_b = rule(atom(3, Var("Y")), atom(4, Var("Y")))
+        transforms = [
+            _Transform(
+                original=rule_a,
+                result=rule(atom(10, Var("X")), atom(2, Var("X"))),
+                op="swap_head_pred",
+                mdl_cost=1.0,
+            ),
+            _Transform(
+                original=rule_b,
+                result=rule(atom(11, Var("Y")), atom(4, Var("Y"))),
+                op="swap_head_pred",
+                mdl_cost=1.0,
+            ),
+        ]
+
+        def fake_eval(
+            _kb,
+            gamma_mod,
+            _baseline,
+            _baseline_list,
+            _baseline_index,
+            _starting_facts,
+            _max_depth,
+            _conflict_fn,
+            world_surprise_fn=None,
+        ):
+            del world_surprise_fn
+            return -float(len(gamma_mod)), tuple(), [], 0.0
+
+        engine._evaluate_subset = fake_eval  # type: ignore[method-assign]
+        with mock.patch.object(HornClause, "__hash__", return_value=1):
+            gamma_mod, best_score, _novel, _contras, _world_surprise, evaluated_subsets = engine._bounded_exact_search(
+                kb,
+                transforms,
+                frozenset(),
+                frozenset(),
+                1,
+                lambda _a, _b: False,
+            )
+
+        self.assertEqual(evaluated_subsets, 3)
+        self.assertEqual(len(gamma_mod), 2)
+        self.assertEqual(best_score, -2.0)
+
+    def test_oee_sampler_selection_survives_hash_collision(self) -> None:
+        kb = KnowledgeBase(max_rules=16)
+        current_facts = [
+            atom(10, Const(1), Const(2)),
+            atom(11, Const(2), Const(3)),
+            atom(12, Const(3), Const(4)),
+        ]
+        for fact in current_facts:
+            kb.add_fact(fact)
+        sampler = RuleHypothesisSampler(max_hypotheses=16)
+
+        with mock.patch.object(HornClause, "__hash__", return_value=1):
+            hypotheses = sampler.sample(
+                pred_id=900123,
+                arity=2,
+                interaction_preds=[10, 11, 12],
+                interaction_scores=[0.9, 0.8, 0.7],
+                current_facts=current_facts,
+                kb=kb,
+                goal=atom(70, Var("A"), Var("B")),
+                target_facts=[atom(71, Var("A"), Var("B")), atom(72, Var("A"), Var("B"))],
+            )
+
+        self.assertEqual(len(hypotheses), 16)
+        self.assertGreater(len(hypotheses), len({hyp.template for hyp in hypotheses}))
+
+    def test_recent_abduction_candidates_use_structural_utility_history(self) -> None:
+        coordinator = CreativeCycleCoordinator(enabled=False)
+        clause = rule(atom(1, Var("X")), atom(2, Var("X")))
+        prover = SimpleNamespace(
+            last_abduced_rules=[clause],
+            _rule_utility_history={clause: [0.2, 0.8, 1.0]},
+        )
+
+        candidates = coordinator._recent_abduction_candidates(prover)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertAlmostEqual(candidates[0].score, 2.0 / 3.0, places=6)
+        self.assertAlmostEqual(candidates[0].utility, 2.0 / 3.0, places=6)
+
+    def test_oee_feedback_preserves_structural_supporting_rules_under_hash_collision(self) -> None:
+        engine = OntologyExpansionEngine(gap_threshold=0.2, contradiction_threshold=1)
+        pred_id = 900777
+        left = rule(atom(80, Var("X")), atom(81, Var("X")))
+        right = rule(atom(82, Var("X")), atom(83, Var("X")))
+        engine._register_predicate(pred_id, arity=1, confidence=0.5)
+
+        with mock.patch.object(HornClause, "__hash__", return_value=1):
+            engine.record_feedback(
+                accepted=True,
+                accepted_pred_ids=[pred_id],
+                gap_before=0.9,
+                gap_after=0.2,
+                supporting_rules=[left, right],
+            )
+
+        entry = engine.predicate_vocab()[pred_id]
+        self.assertEqual(entry.supporting_rules, (left, right))
+
+    def test_kb_rule_records_survive_hash_collision(self) -> None:
+        factories = (
+            lambda: KnowledgeBase(max_rules=8),
+            lambda: TensorKnowledgeBase(max_rules=8, max_facts=32, device=torch.device("cpu")),
+        )
+        left = rule(atom(90, Var("X")), atom(91, Var("X")))
+        right = rule(atom(92, Var("X")), atom(93, Var("X")))
+
+        with mock.patch.object(HornClause, "__hash__", return_value=1):
+            for build_kb in factories:
+                kb = build_kb()
+                self.assertTrue(kb.add_rule(left, status=EpistemicStatus.proposed))
+                self.assertTrue(kb.add_rule(right, status=EpistemicStatus.proposed))
+                kb.mark_rule_verified(left)
+
+                self.assertEqual(len(kb.rules), 2)
+                self.assertEqual(len(kb._records), 2)
+                self.assertEqual(kb._records[left].status, EpistemicStatus.verified)
+                self.assertEqual(kb._records[right].status, EpistemicStatus.proposed)
+
+    def test_counterfactual_clone_preserves_distinct_rule_records_under_hash_collision(self) -> None:
+        factories = (
+            lambda: KnowledgeBase(max_rules=8),
+            lambda: TensorKnowledgeBase(max_rules=8, max_facts=32, device=torch.device("cpu")),
+        )
+        left = rule(atom(94, Var("X")), atom(95, Var("X")))
+        right = rule(atom(96, Var("X")), atom(97, Var("X")))
+
+        with mock.patch.object(HornClause, "__hash__", return_value=1):
+            for build_kb in factories:
+                kb = build_kb()
+                kb.add_rule(left, status=EpistemicStatus.verified)
+                kb.add_rule(right, status=EpistemicStatus.proposed)
+
+                clone = CounterfactualWorldEngine._clone_kb(kb)
+
+                self.assertEqual(len(clone.rules), 2)
+                self.assertEqual(len(clone._records), 2)
+                self.assertEqual(clone._records[left].status, EpistemicStatus.verified)
+                self.assertEqual(clone._records[right].status, EpistemicStatus.proposed)
+
     def test_aee_symmetry_prefers_argument_permutation_invariant_rule(self) -> None:
         x, y = Var("X"), Var("Y")
         engine = AestheticEvolutionEngine()
@@ -110,6 +450,27 @@ class CreativeSymbolicEnginesTest(unittest.TestCase):
                 for candidate in candidates
             )
         )
+
+    def test_ame_legacy_int_hash_filter_does_not_drop_metaphor_candidates(self) -> None:
+        x, y, z = Var("X"), Var("Y"), Var("Z")
+        rules = [
+            rule(atom(1, x, y, z), atom(101, x, z)),
+            rule(atom(2, x, y), atom(202, x)),
+        ]
+        engine = AnalogyMetaphorEngine(
+            embedding_dim=12,
+            tau_analogy=0.10,
+            tau_metaphor=0.0,
+            contrastive_steps=0,
+            max_pairs=4,
+        )
+        engine.fit(rules)
+
+        with mock.patch.object(HornClause, "__hash__", return_value=1):
+            candidates = engine.generate_metaphor_candidates(rules, existing_hashes=[1])
+
+        self.assertTrue(candidates)
+        self.assertTrue(any(candidate.source == "metaphor" for candidate in candidates))
 
     def test_cwe_surfaces_contradiction(self) -> None:
         kb = KnowledgeBase(max_rules=8)
@@ -516,41 +877,42 @@ class CreativeSymbolicEnginesTest(unittest.TestCase):
         ]
         target = atom(70, Const(2), Const(3))
 
-        direct = sampler._consistency_score_direct(
-            kb,
-            rules,
-            baseline,
-            starting_facts,
-            target_facts=[target],
-        )
-
-        singleton_cache = {}
-        for single_rule in rules:
-            tiny = sampler._build_empty_sandbox(kb, max_rules=32)
-            tiny.add_rule(single_rule)
-            singleton_cache[hash(single_rule)] = frozenset(
-                tiny.forward_chain(
-                    1,
-                    starting_facts=starting_facts,
-                    only_verified=False,
-                    track_epistemic=False,
-                ) - starting_facts
+        with mock.patch.object(HornClause, "__hash__", return_value=1):
+            direct = sampler._consistency_score_direct(
+                kb,
+                rules,
+                baseline,
+                starting_facts,
+                target_facts=[target],
             )
 
-        sampler._consistency_fast_context = {
-            "kb_id": id(kb),
-            "starting_facts": starting_facts,
-            "baseline": baseline,
-            "first_step_facts": first_step,
-            "singleton_first_step_delta_by_rule": singleton_cache,
-        }
-        cached = sampler._consistency_score(
-            kb,
-            rules,
-            baseline,
-            starting_facts,
-            target_facts=[target],
-        )
+            singleton_cache = {}
+            for single_rule in rules:
+                tiny = sampler._build_empty_sandbox(kb, max_rules=32)
+                tiny.add_rule(single_rule)
+                singleton_cache[single_rule] = frozenset(
+                    tiny.forward_chain(
+                        1,
+                        starting_facts=starting_facts,
+                        only_verified=False,
+                        track_epistemic=False,
+                    ) - starting_facts
+                )
+
+            sampler._consistency_fast_context = {
+                "kb_id": id(kb),
+                "starting_facts": starting_facts,
+                "baseline": baseline,
+                "first_step_facts": first_step,
+                "singleton_first_step_delta_by_rule": singleton_cache,
+            }
+            cached = sampler._consistency_score(
+                kb,
+                rules,
+                baseline,
+                starting_facts,
+                target_facts=[target],
+            )
 
         self.assertAlmostEqual(direct[0], cached[0], places=6)
         self.assertAlmostEqual(direct[1], cached[1], places=6)
@@ -591,7 +953,7 @@ class CreativeSymbolicEnginesTest(unittest.TestCase):
             "baseline": baseline,
             "first_step_facts": first_step,
             "singleton_first_step_delta_by_rule": {
-                hash(new_rule): frozenset(),
+                new_rule: frozenset(),
             },
         }
         fast = sampler._consistency_score(
@@ -622,7 +984,7 @@ class CreativeSymbolicEnginesTest(unittest.TestCase):
             tracked_kb.add_rule(tracked_bridge, status=EpistemicStatus.proposed)
             untracked_kb.add_rule(untracked_bridge, status=EpistemicStatus.proposed)
             before_rule = (int(untracked_bridge.use_count), float(untracked_bridge.weight))
-            before_record = untracked_kb._records[hash(untracked_bridge)]
+            before_record = untracked_kb._records[untracked_bridge]
             before_state = (
                 before_record.status,
                 int(before_record.use_count),
@@ -644,7 +1006,7 @@ class CreativeSymbolicEnginesTest(unittest.TestCase):
             )
 
             self.assertEqual(tracked, untracked)
-            after_record = untracked_kb._records[hash(untracked_bridge)]
+            after_record = untracked_kb._records[untracked_bridge]
             after_state = (
                 after_record.status,
                 int(after_record.use_count),
@@ -675,7 +1037,7 @@ class CreativeSymbolicEnginesTest(unittest.TestCase):
             bridge = rule(atom(12, Var("X"), Var("Y")), atom(10, Var("X"), Var("Y")))
             kb.add_rule(bridge, status=EpistemicStatus.proposed)
             before_rule = (int(bridge.use_count), float(bridge.weight))
-            before_record = kb._records[hash(bridge)]
+            before_record = kb._records[bridge]
             before_state = (
                 before_record.status,
                 int(before_record.use_count),
@@ -697,7 +1059,7 @@ class CreativeSymbolicEnginesTest(unittest.TestCase):
             )
 
             self.assertTrue(hypotheses)
-            after_record = kb._records[hash(bridge)]
+            after_record = kb._records[bridge]
             after_state = (
                 after_record.status,
                 int(after_record.use_count),

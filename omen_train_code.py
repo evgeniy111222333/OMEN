@@ -763,6 +763,23 @@ def _serialize_kb(kb) -> dict:
     }
 
 
+def _restore_structural_rule_set(kb_state: dict, rules: Sequence) -> set:
+    """
+    Нормалізує legacy checkpoint state до structural set правил.
+
+    Старі checkpoint-и могли зберігати лише int hash-значення або взагалі
+    не містити rule-set. Для TensorKnowledgeBase це ламає dedupe після restore,
+    тому тут завжди відновлюємо set із реальних HornClause.
+    """
+    raw_rule_set = kb_state.get("rule_hash_set")
+    if raw_rule_set is None:
+        raw_rule_set = kb_state.get("rule_set")
+    if not raw_rule_set:
+        return set(rules)
+    structural_rules = {rule for rule in rules if rule in raw_rule_set}
+    return structural_rules if len(structural_rules) == len(rules) else set(rules)
+
+
 def _restore_kb(model, kb_state: dict, device) -> None:
     """Відновлює TensorKnowledgeBase з серіалізованого стану."""
     kb = model.prover.kb
@@ -780,7 +797,7 @@ def _restore_kb(model, kb_state: dict, device) -> None:
     kb._records       = (pickle.loads(kb_state["records"])
                          if isinstance(kb_state["records"], bytes)
                          else kb_state.get("records", {}))
-    kb._rule_hash_set = kb_state.get("rule_hash_set", {hash(r) for r in kb.rules})
+    kb._rule_hash_set = _restore_structural_rule_set(kb_state, kb.rules)
     # Інвалідуємо кеш фактів
     kb._facts_cache   = None
     kb._facts_cache_n = -1

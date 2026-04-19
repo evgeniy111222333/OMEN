@@ -207,7 +207,7 @@ class PredicateVocabEntry:
     confidence: float = 0.0
     gap_before: float = 0.0
     gap_after: float = 0.0
-    supporting_rules: Tuple[int, ...] = field(default_factory=tuple)
+    supporting_rules: Tuple[Any, ...] = field(default_factory=tuple)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -324,7 +324,7 @@ class RuleHypothesisSampler:
         preserve_status: bool,
         include_rules: bool = True,
     ) -> None:
-        from omen_prolog import EpistemicStatus, RuleRecord
+        from omen_prolog import EpistemicStatus, _clone_rule_records
 
         if (
             hasattr(kb, "_fact_buf")
@@ -351,22 +351,13 @@ class RuleHypothesisSampler:
                 sandbox._rule_is_tensor[:n_rules] = kb._rule_is_tensor[:n_rules].to(device=sandbox._dev)
             sandbox._n_rules = n_rules
             sandbox.rules = list(rules)
-            sandbox._rule_hash_set = set(getattr(kb, "_rule_hash_set", set())) if include_rules else set()
+            sandbox._rule_hash_set = set(rules) if include_rules else set()
             sandbox._global_step = int(getattr(kb, "_global_step", 0))
-            status_by_hash = {
-                key: getattr(record, "status", EpistemicStatus.proposed)
-                for key, record in getattr(kb, "_records", {}).items()
-            }
-            if preserve_status:
-                sandbox._records = {
-                    hash(rule): RuleRecord(rule=rule, status=status_by_hash.get(hash(rule), EpistemicStatus.proposed))
-                    for rule in sandbox.rules
-                }
-            else:
-                sandbox._records = {
-                    hash(rule): RuleRecord(rule=rule, status=EpistemicStatus.proposed)
-                    for rule in sandbox.rules
-                }
+            sandbox._records = _clone_rule_records(
+                sandbox.rules,
+                getattr(kb, "_records", {}),
+                preserve_status=preserve_status,
+            )
             sandbox._n_proposed = sum(
                 1 for record in sandbox._records.values() if record.status == EpistemicStatus.proposed
             )
@@ -379,22 +370,13 @@ class RuleHypothesisSampler:
         rules = list(getattr(kb, "rules", ())) if include_rules else []
         sandbox.facts = facts
         sandbox.rules = list(rules)
-        sandbox._rule_set = set(getattr(kb, "_rule_set", {hash(rule) for rule in rules})) if include_rules else set()
+        sandbox._rule_set = set(rules) if include_rules else set()
         sandbox._global_step = int(getattr(kb, "_global_step", 0))
-        status_by_hash = {
-            key: getattr(record, "status", EpistemicStatus.proposed)
-            for key, record in getattr(kb, "_records", {}).items()
-        }
-        if preserve_status:
-            sandbox._records = {
-                hash(rule): RuleRecord(rule=rule, status=status_by_hash.get(hash(rule), EpistemicStatus.proposed))
-                for rule in rules
-            }
-        else:
-            sandbox._records = {
-                hash(rule): RuleRecord(rule=rule, status=EpistemicStatus.proposed)
-                for rule in rules
-            }
+        sandbox._records = _clone_rule_records(
+            rules,
+            getattr(kb, "_records", {}),
+            preserve_status=preserve_status,
+        )
 
     @staticmethod
     def _is_safe_rule(rule: Any) -> bool:
@@ -425,8 +407,8 @@ class RuleHypothesisSampler:
         return float(sum(1.0 for target in targets if cls._supports_target(target, facts)))
 
     @staticmethod
-    def _target_facts_cache_key(target_facts: Optional[Sequence[Any]]) -> Tuple[int, ...]:
-        return tuple(sorted(hash(target) for target in (target_facts or ())))
+    def _target_facts_cache_key(target_facts: Optional[Sequence[Any]]) -> Tuple[str, ...]:
+        return tuple(sorted(repr(target) for target in (target_facts or ())))
 
     @classmethod
     def _baseline_coverage_cached(
@@ -454,9 +436,9 @@ class RuleHypothesisSampler:
         cls,
         new_rules: Sequence[Any],
         target_facts: Optional[Sequence[Any]],
-    ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+    ) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
         return (
-            tuple(sorted(hash(rule) for rule in new_rules)),
+            tuple(sorted(repr(rule) for rule in new_rules)),
             cls._target_facts_cache_key(target_facts),
         )
 
@@ -515,8 +497,7 @@ class RuleHypothesisSampler:
         if isinstance(singleton_delta_cache, dict):
             delta_facts = set()
             for rule in new_rules:
-                rule_hash = hash(rule)
-                cached_delta = singleton_delta_cache.get(rule_hash)
+                cached_delta = singleton_delta_cache.get(rule)
                 if cached_delta is None:
                     tiny = self._build_empty_sandbox(
                         kb,
@@ -531,7 +512,7 @@ class RuleHypothesisSampler:
                             track_epistemic=False,
                         ) - starting_facts
                     )
-                    singleton_delta_cache[rule_hash] = cached_delta
+                    singleton_delta_cache[rule] = cached_delta
                 delta_facts.update(cached_delta)
             delta_union = frozenset(delta_facts)
         else:
@@ -658,10 +639,9 @@ class RuleHypothesisSampler:
             return
         if not self._is_safe_rule(rule):
             return
-        h = hash(rule)
-        if h in seen:
+        if rule in seen:
             return
-        seen.add(h)
+        seen.add(rule)
         consistency, coverage_gain, novelty_gain = self._consistency_score(
             kb,
             [rule],
@@ -923,7 +903,7 @@ class RuleHypothesisSampler:
         for base in core[: self.max_hypotheses]:
             for bridge in bridges[: self.max_hypotheses]:
                 pair_rules = [base.clause, bridge.clause]
-                pair_key = tuple(sorted(hash(rule) for rule in pair_rules))
+                pair_key = tuple(sorted(repr(rule) for rule in pair_rules))
                 if pair_key in seen_bundles:
                     continue
                 seen_bundles.add(pair_key)
@@ -942,7 +922,7 @@ class RuleHypothesisSampler:
 
                 for alias in aliases[: self.max_hypotheses]:
                     triple_rules = [base.clause, bridge.clause, alias.clause]
-                    triple_key = tuple(sorted(hash(rule) for rule in triple_rules))
+                    triple_key = tuple(sorted(repr(rule) for rule in triple_rules))
                     if triple_key in seen_bundles:
                         continue
                     seen_bundles.add(triple_key)
@@ -1125,16 +1105,15 @@ class RuleHypothesisSampler:
         hypotheses: List[_RuleHypothesis] = []
         seen: set = set()
         explanation_targets: List[Any] = []
-        seen_targets: set[int] = set()
+        seen_targets: set[Any] = set()
         if goal is not None:
             explanation_targets.append(goal)
-            seen_targets.add(hash(goal))
+            seen_targets.add(goal)
         for target in target_facts or ():
-            target_hash = hash(target)
-            if target_hash in seen_targets:
+            if target in seen_targets:
                 continue
             explanation_targets.append(target)
-            seen_targets.add(target_hash)
+            seen_targets.add(target)
 
         # Індекс фактів по предикату
         ip_facts_map: Dict[int, List[Any]] = defaultdict(list)
@@ -1432,26 +1411,31 @@ class RuleHypothesisSampler:
             key=lambda hyp: (max(hyp.score, hyp.bundle_score), hyp.coverage_gain, hyp.novelty_gain),
             reverse=True,
         )
+        return self._select_top_hypotheses(hypotheses)
+
+    def _select_top_hypotheses(
+        self,
+        hypotheses: Sequence[_RuleHypothesis],
+    ) -> List[_RuleHypothesis]:
         if len(hypotheses) <= self.max_hypotheses:
-            return hypotheses
+            return list(hypotheses)
 
         selected: List[_RuleHypothesis] = []
-        selected_hashes: set[int] = set()
+        selected_clauses: set[Any] = set()
         seen_templates: set[str] = set()
         for hyp in hypotheses:
             if hyp.template in seen_templates:
                 continue
             selected.append(hyp)
-            selected_hashes.add(hash(hyp.clause))
+            selected_clauses.add(hyp.clause)
             seen_templates.add(hyp.template)
             if len(selected) >= self.max_hypotheses:
                 return selected
         for hyp in hypotheses:
-            hyp_hash = hash(hyp.clause)
-            if hyp_hash in selected_hashes:
+            if hyp.clause in selected_clauses:
                 continue
             selected.append(hyp)
-            selected_hashes.add(hyp_hash)
+            selected_clauses.add(hyp.clause)
             if len(selected) >= self.max_hypotheses:
                 break
         return selected[: self.max_hypotheses]
@@ -1766,7 +1750,7 @@ class OntologyExpansionEngine:
         pred_ids = list(accepted_pred_ids) if accepted_pred_ids is not None else list(self._last_pred_ids)
         gap_before_f = float(self._last_gap_norm if gap_before is None else gap_before)
         gap_after_f = float(gap_before_f if gap_after is None else gap_after)
-        rule_hashes = tuple(hash(rule) for rule in (supporting_rules or ()))
+        rule_refs = tuple(supporting_rules or ())
         for pred_id in pred_ids:
             pred_id = int(pred_id)
             entry = self._predicate_vocab.get(pred_id)
@@ -1790,7 +1774,7 @@ class OntologyExpansionEngine:
                 confidence=entry.confidence,
                 gap_before=gap_before_f,
                 gap_after=gap_after_f,
-                supporting_rules=rule_hashes or entry.supporting_rules,
+                supporting_rules=rule_refs or entry.supporting_rules,
                 metadata=entry_meta,
             )
 
@@ -1922,25 +1906,23 @@ class OntologyExpansionEngine:
 
         fact_pool: List[Any] = list(current_facts)
         for fact in paradox_facts or ():
-            if all(hash(fact) != hash(existing) for existing in fact_pool):
+            if fact not in fact_pool:
                 fact_pool.append(fact)
         explanation_targets: List[Any] = []
-        seen_targets: set[int] = set()
+        seen_targets: set[Any] = set()
         if goal is not None:
             explanation_targets.append(goal)
-            seen_targets.add(hash(goal))
+            seen_targets.add(goal)
         for fact in target_facts or ():
-            fact_hash = hash(fact)
-            if fact_hash in seen_targets:
+            if fact in seen_targets:
                 continue
             explanation_targets.append(fact)
-            seen_targets.add(fact_hash)
+            seen_targets.add(fact)
         for fact in paradox_facts or ():
-            fact_hash = hash(fact)
-            if fact_hash in seen_targets:
+            if fact in seen_targets:
                 continue
             explanation_targets.append(fact)
-            seen_targets.add(fact_hash)
+            seen_targets.add(fact)
 
         if predicate_embeddings and kb is not None:
             return self._neural_generate(
@@ -2188,13 +2170,12 @@ class OntologyExpansionEngine:
             seen_bridge_targets: set[int] = set()
             if goal is not None:
                 bridge_targets.append(goal)
-                seen_bridge_targets.add(hash(goal))
+                seen_bridge_targets.add(goal)
             for target in target_facts:
-                target_hash = hash(target)
-                if target_hash in seen_bridge_targets:
+                if target in seen_bridge_targets:
                     continue
                 bridge_targets.append(target)
-                seen_bridge_targets.add(target_hash)
+                seen_bridge_targets.add(target)
 
             for target in bridge_targets:
                 target_arity = len(tuple(getattr(target, "args", ())))
@@ -2210,7 +2191,7 @@ class OntologyExpansionEngine:
                     weight=1.0,
                     use_count=0,
                 )
-                template = "heuristic_bridge" if goal is not None and hash(target) == hash(goal) else "heuristic_target_bridge"
+                template = "heuristic_bridge" if goal is not None and target == goal else "heuristic_target_bridge"
                 candidates.append(RuleCandidate(
                     clause=bridge_rule,
                     source="ontology",

@@ -13,7 +13,7 @@ import math
 import random
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
-from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -409,7 +409,11 @@ class HornClause:
         return hash((self.head, self.body))
 
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, HornClause) and hash(self) == hash(other)
+        return (
+            isinstance(other, HornClause)
+            and self.head == other.head
+            and self.body == other.body
+        )
 
     def __repr__(self) -> str:
         if self.is_fact():
@@ -538,7 +542,7 @@ class SymbolicTaskContext:
         include_targets: bool = False,
     ) -> Tuple[Tuple[str, HornAtom], ...]:
         records: List[Tuple[str, HornAtom]] = []
-        seen: Set[int] = set()
+        seen: Set[HornAtom] = set()
         source_groups = (
             ("observed_now", self.observed_now_facts),
             ("memory", self.memory_derived_facts),
@@ -549,22 +553,19 @@ class SymbolicTaskContext:
         )
         for label, facts in source_groups:
             for atom in sorted(facts, key=repr):
-                atom_hash = hash(atom)
-                if atom_hash in seen:
+                if atom in seen:
                     continue
-                seen.add(atom_hash)
+                seen.add(atom)
                 records.append((label, atom))
         if include_goal and self.goal is not None:
-            goal_hash = hash(self.goal)
-            if goal_hash not in seen:
-                seen.add(goal_hash)
+            if self.goal not in seen:
+                seen.add(self.goal)
                 records.append(("goal", self.goal))
         if include_targets:
             for atom in sorted(self.target_facts, key=repr):
-                atom_hash = hash(atom)
-                if atom_hash in seen:
+                if atom in seen:
                     continue
-                seen.add(atom_hash)
+                seen.add(atom)
                 records.append(("target", atom))
         return tuple(records)
 
@@ -836,6 +837,46 @@ class RuleRecord:
         return float(self.rule.description_length_bits()) - eta * self.utility()
 
 
+def _rule_record_get(
+    records: Optional[Mapping[Any, RuleRecord]],
+    clause: "HornClause",
+) -> Optional[RuleRecord]:
+    if not records:
+        return None
+    direct = records.get(clause)
+    if direct is not None:
+        return direct
+    legacy = records.get(hash(clause))
+    if legacy is not None and getattr(legacy, "rule", clause) == clause:
+        return legacy
+    return None
+
+
+def _clone_rule_records(
+    rules: Sequence["HornClause"],
+    source_records: Optional[Mapping[Any, RuleRecord]],
+    *,
+    preserve_status: bool,
+) -> Dict["HornClause", RuleRecord]:
+    status_by_rule: Dict[HornClause, EpistemicStatus] = {}
+    if preserve_status and source_records:
+        for key, record in source_records.items():
+            rule = getattr(record, "rule", None)
+            if rule is None and isinstance(key, HornClause):
+                rule = key
+            if rule is None:
+                continue
+            status_by_rule[rule] = getattr(record, "status", EpistemicStatus.proposed)
+    default_status = EpistemicStatus.proposed
+    return {
+        rule: RuleRecord(
+            rule=rule,
+            status=status_by_rule.get(rule, default_status) if preserve_status else default_status,
+        )
+        for rule in rules
+    }
+
+
 class VerificationModule(nn.Module):
     """
     Verification Module (VeM) — нейронний фільтр кандидатів AbductionHead.
@@ -975,11 +1016,11 @@ class KnowledgeBase:
     def __init__(self, max_rules: int = 1024):
         self.facts:     FrozenSet[HornAtom] = frozenset()
         self.rules:     List[HornClause]    = []   # активні правила
-        self._rule_set: Set[int]            = set()
+        self._rule_set: Set[HornClause]     = set()
         self.max_rules  = max_rules
 
         # Епістемічний трекер: hash(rule) → RuleRecord
-        self._records:  Dict[int, RuleRecord] = {}
+        self._records:  Dict[HornClause, RuleRecord] = {}
         self._global_step: int = 0             # для age_steps
 
     # ── Додавання ──────────────────────────────────────────────────────────────
@@ -995,55 +1036,56 @@ class KnowledgeBase:
         Додає правило з початковим статусом (proposed за замовч.).
         Якщо правило вже є — збільшуємо use_count.
         """
-        h = hash(clause)
-        if h in self._rule_set:
+        if clause in self._rule_set:
             # Правило вже є — оновлюємо запис
             for r in self.rules:
-                if hash(r) == h:
+                if r == clause:
                     r.use_count += 1
                     break
-            if h in self._records:
-                self._records[h].use_count += 1
+            rec = self._records.get(clause)
+            if rec is not None:
+                rec.use_count += 1
             return False
         if len(self.rules) >= self.max_rules:
             # LRU-евікція: видаляємо правило з найменшою корисністю (Utility)
             worst_i = min(
                 range(len(self.rules)),
-                key=lambda i: self._records.get(hash(self.rules[i]),
-                              RuleRecord(rule=self.rules[i])).utility()
+                key=lambda i: self._records.get(
+                    self.rules[i],
+                    RuleRecord(rule=self.rules[i]),
+                ).utility()
             )
-            evicted_h = hash(self.rules[worst_i])
-            self._rule_set.discard(evicted_h)
-            self._records.pop(evicted_h, None)
+            evicted = self.rules[worst_i]
+            self._rule_set.discard(evicted)
+            self._records.pop(evicted, None)
             self.rules.pop(worst_i)
         self.rules.append(clause)
-        self._rule_set.add(h)
-        self._records[h] = RuleRecord(rule=clause, status=status)
+        self._rule_set.add(clause)
+        self._records[clause] = RuleRecord(rule=clause, status=status)
         return True
 
     def mark_rule_verified(self, clause: HornClause) -> None:
         """Позначити правило як verified після успішного доведення."""
-        h = hash(clause)
-        if h in self._records:
-            rec = self._records[h]
+        rec = self._records.get(clause)
+        if rec is not None:
             rec.status         = EpistemicStatus.verified
             rec.success_count += 1
             rec.weight        *= 1.05   # підвищуємо довіру
         # Оновлюємо use_count у самому clause (для зворотньої сумісності)
         for r in self.rules:
-            if hash(r) == h:
+            if r == clause:
                 r.use_count    += 1
                 r.weight       *= 1.01
                 break
 
     def mark_rule_contradicted(self, clause: HornClause) -> None:
         """Позначити правило як contradicted (буде видалено при консолідації)."""
-        h = hash(clause)
-        if h in self._records:
-            self._records[h].status = EpistemicStatus.contradicted
+        rec = self._records.get(clause)
+        if rec is not None:
+            rec.status = EpistemicStatus.contradicted
 
     def rule_status(self, clause: HornClause) -> EpistemicStatus:
-        rec = self._records.get(hash(clause))
+        rec = self._records.get(clause)
         if rec is None:
             return EpistemicStatus.verified
         return rec.status
@@ -1064,25 +1106,25 @@ class KnowledgeBase:
 
         Повертає кількість видалених правил.
         """
-        to_remove: Set[int] = set()
-        for h, rec in list(self._records.items()):
+        to_remove: Set[HornClause] = set()
+        for rule, rec in list(self._records.items()):
             if rec.status == EpistemicStatus.contradicted:
-                to_remove.add(h)
+                to_remove.add(rule)
             elif (
                 rec.status == EpistemicStatus.proposed
                 and rec.use_count < use_count_threshold
                 and rec.utility() < 0.05
                 and rec.age_steps > 50
             ):
-                to_remove.add(h)
+                to_remove.add(rule)
 
         if not to_remove:
             return 0
 
-        self.rules     = [r for r in self.rules if hash(r) not in to_remove]
-        self._rule_set = {h for h in self._rule_set if h not in to_remove}
-        for h in to_remove:
-            self._records.pop(h, None)
+        self.rules     = [r for r in self.rules if r not in to_remove]
+        self._rule_set = {r for r in self._rule_set if r not in to_remove}
+        for rule in to_remove:
+            self._records.pop(rule, None)
 
         return len(to_remove)
 
@@ -1148,7 +1190,7 @@ class KnowledgeBase:
         """
         total = 0.0
         for r in self.rules:
-            rec = self._records.get(hash(r))
+            rec = self._records.get(r)
             util = rec.utility() if rec is not None else 0.0
             total += float(r.description_length_bits()) - eta * util
         return total
@@ -1270,11 +1312,11 @@ class TensorKnowledgeBase:
 
         # ── Швидке дедуплікування (Python set) ───────────────────────────────
         self._fact_set: Set[Tuple[int, int, int]] = set()
-        self._rule_hash_set: Set[int] = set()
+        self._rule_hash_set: Set[HornClause] = set()
 
         # ── Збережені Python-об'єкти (для сумісності) ────────────────────────
         self.rules: List[HornClause] = []          # всі правила (HornClause)
-        self._records: Dict[int, RuleRecord] = {}
+        self._records: Dict[HornClause, RuleRecord] = {}
         self._global_step: int = 0
 
         # Кеш facts як frozenset[HornAtom] (для сумісності з .facts property)
@@ -1418,15 +1460,15 @@ class TensorKnowledgeBase:
     # ── add_rule ──────────────────────────────────────────────────────────────
     def add_rule(self, clause: HornClause,
                  status: EpistemicStatus = EpistemicStatus.proposed) -> bool:
-        h = hash(clause)
-        if h in self._rule_hash_set:
+        if clause in self._rule_hash_set:
             # Дублікат → збільшуємо use_count
             for r in self.rules:
-                if hash(r) == h:
+                if r == clause:
                     r.use_count += 1
                     break
-            if h in self._records:
-                self._records[h].use_count += 1
+            rec = self._records.get(clause)
+            if rec is not None:
+                rec.use_count += 1
             return False
 
         # LRU-евікція якщо переповнений
@@ -1442,8 +1484,8 @@ class TensorKnowledgeBase:
         # else: multi-body → tensor slot лишається NONE (пропускається у fc)
 
         self.rules.append(clause)
-        self._rule_hash_set.add(h)
-        self._records[h] = RuleRecord(rule=clause, status=status)
+        self._rule_hash_set.add(clause)
+        self._records[clause] = RuleRecord(rule=clause, status=status)
         self._n_rules += 1
         # Оновлюємо кешований лічильник статусів
         if status == EpistemicStatus.proposed:
@@ -1458,20 +1500,19 @@ class TensorKnowledgeBase:
             return
         worst_i = min(
             range(len(self.rules)),
-            key=lambda i: self._records.get(hash(self.rules[i]),
+            key=lambda i: self._records.get(self.rules[i],
                           RuleRecord(rule=self.rules[i])).utility()
         )
         evicted = self.rules.pop(worst_i)
-        evicted_h = hash(evicted)
         # Оновлюємо кешований лічильник статусів
-        evicted_rec = self._records.get(evicted_h)
+        evicted_rec = self._records.get(evicted)
         if evicted_rec is not None:
             if evicted_rec.status == EpistemicStatus.proposed:
                 self._n_proposed -= 1
             elif evicted_rec.status == EpistemicStatus.verified:
                 self._n_verified -= 1
-        self._rule_hash_set.discard(evicted_h)
-        self._records.pop(evicted_h, None)
+        self._rule_hash_set.discard(evicted)
+        self._records.pop(evicted, None)
         # Зсуваємо тензорний буфер (compact)
         if worst_i < self._n_rules - 1:
             self._rule_buf[worst_i:self._n_rules - 1] = \
@@ -1579,17 +1620,17 @@ class TensorKnowledgeBase:
                 and not self._can_structured_fast_rule(r)
             ]
 
-        handled_rule_ids: Set[int] = set()
+        handled_rule_ids: Set[HornClause] = set()
         if n_tensor_rules > 0:
             handled_rule_ids.update(
-                hash(self.rules[int(rule_idx.item())]) for rule_idx in tensor_rule_indices
+                self.rules[int(rule_idx.item())] for rule_idx in tensor_rule_indices
             )
-        handled_rule_ids.update(hash(rule) for rule in fast_multi_rules)
-        handled_rule_ids.update(hash(rule) for rule in structured_multi_rules)
-        handled_rule_ids.update(hash(rule) for rule in multi_body_rules)
+        handled_rule_ids.update(fast_multi_rules)
+        handled_rule_ids.update(structured_multi_rules)
+        handled_rule_ids.update(multi_body_rules)
         python_fallback_rules = [
             rule for rule in self.rules[:self._n_rules]
-            if hash(rule) not in handled_rule_ids and self.rule_is_usable(rule, only_verified=only_verified)
+            if rule not in handled_rule_ids and self.rule_is_usable(rule, only_verified=only_verified)
         ]
 
         for _depth in range(max_depth):
@@ -2196,9 +2237,8 @@ class TensorKnowledgeBase:
 
     # ── Епістемічний трекер (ідентичний KnowledgeBase) ───────────────────────
     def mark_rule_verified(self, clause: HornClause) -> None:
-        h = hash(clause)
-        if h in self._records:
-            rec = self._records[h]
+        rec = self._records.get(clause)
+        if rec is not None:
             old_status = rec.status
             rec.status = EpistemicStatus.verified
             rec.success_count += 1
@@ -2210,16 +2250,16 @@ class TensorKnowledgeBase:
             elif old_status != EpistemicStatus.verified:
                 self._n_verified += 1
         for r in self.rules:
-            if hash(r) == h:
+            if r == clause:
                 r.use_count += 1
                 r.weight *= 1.01
                 break
 
     def mark_rule_contradicted(self, clause: HornClause) -> None:
-        h = hash(clause)
-        if h in self._records:
-            old_status = self._records[h].status
-            self._records[h].status = EpistemicStatus.contradicted
+        rec = self._records.get(clause)
+        if rec is not None:
+            old_status = rec.status
+            rec.status = EpistemicStatus.contradicted
             # Оновлюємо кешовані лічильники
             if old_status == EpistemicStatus.proposed:
                 self._n_proposed -= 1
@@ -2227,7 +2267,7 @@ class TensorKnowledgeBase:
                 self._n_verified -= 1
 
     def rule_status(self, clause: HornClause) -> EpistemicStatus:
-        rec = self._records.get(hash(clause))
+        rec = self._records.get(clause)
         if rec is None:
             return EpistemicStatus.verified
         return rec.status
@@ -2242,24 +2282,24 @@ class TensorKnowledgeBase:
 
     def consolidate(self, use_count_threshold: int = 2) -> int:
         """Видаляємо слабкі / contradicted правила."""
-        to_remove: Set[int] = set()
-        for h, rec in list(self._records.items()):
+        to_remove: Set[HornClause] = set()
+        for rule, rec in list(self._records.items()):
             if rec.status == EpistemicStatus.contradicted:
-                to_remove.add(h)
+                to_remove.add(rule)
             elif (
                 rec.status == EpistemicStatus.proposed
                 and rec.use_count < use_count_threshold
                 and rec.utility() < 0.05
                 and rec.age_steps > 50
             ):
-                to_remove.add(h)
+                to_remove.add(rule)
         if not to_remove:
             return 0
 
         # Знаходимо індекси для видалення
         indices_to_remove = [
             i for i, r in enumerate(self.rules)
-            if hash(r) in to_remove
+            if r in to_remove
         ]
         # Compact тензорних буферів (видаляємо рядки)
         keep_mask = torch.ones(self._n_rules, dtype=torch.bool, device=self._dev)
@@ -2275,18 +2315,18 @@ class TensorKnowledgeBase:
             self._rule_buf[n_kept:self._n_rules] = self.NONE
             self._rule_is_tensor[n_kept:self._n_rules] = False
 
-        self.rules = [r for r in self.rules if hash(r) not in to_remove]
+        self.rules = [r for r in self.rules if r not in to_remove]
         self._rule_hash_set -= to_remove
         # Оновлюємо кешовані лічильники перед видаленням записів
-        for h in to_remove:
-            rec = self._records.get(h)
+        for rule in to_remove:
+            rec = self._records.get(rule)
             if rec is not None:
                 if rec.status == EpistemicStatus.proposed:
                     self._n_proposed -= 1
                 elif rec.status == EpistemicStatus.verified:
                     self._n_verified -= 1
-        for h in to_remove:
-            self._records.pop(h, None)
+        for rule in to_remove:
+            self._records.pop(rule, None)
         self._n_rules = len(self.rules)
         return len(to_remove)
 
@@ -2310,7 +2350,7 @@ class TensorKnowledgeBase:
     def utility_adjusted_penalty(self, eta: float = 0.1) -> float:
         total = 0.0
         for r in self.rules:
-            rec = self._records.get(hash(r))
+            rec = self._records.get(r)
             util = rec.utility() if rec is not None else 0.0
             total += float(r.description_length_bits()) - eta * util
         return total
@@ -3252,15 +3292,15 @@ class DifferentiableProver(nn.Module):
         self.last_forward_info: Dict[str, Union[int, float, str]] = {}
         self.last_abduced_rules: List[HornClause] = []
         self.last_used_rules: List[HornClause] = []
-        self._last_used_rule_hashes: Set[int] = set()
-        self._rule_utility_history: Dict[int, List[float]] = defaultdict(list)
+        self._last_used_rule_hashes: Set[HornClause] = set()
+        self._rule_utility_history: Dict[HornClause, List[float]] = defaultdict(list)
         self._ground_cache: Dict[Tuple[str, FrozenSet[HornAtom]], torch.Tensor] = {}
         self._rule_prediction_cache: Dict[
-            Tuple[int, FrozenSet[HornAtom], str, int],
+            Tuple[HornClause, FrozenSet[HornAtom], str, int],
             RulePredictionSummary,
         ] = {}
-        self._pred_error_cache: Dict[Tuple[int, FrozenSet[HornAtom]], float] = {}
-        self._world_rule_error_cache: Dict[Tuple[int, Optional[HornAtom], str], Optional[float]] = {}
+        self._pred_error_cache: Dict[Tuple[HornClause, FrozenSet[HornAtom]], float] = {}
+        self._world_rule_error_cache: Dict[Tuple[HornClause, Optional[HornAtom], str], Optional[float]] = {}
         self._substitution_cache: Dict[
             Tuple[Tuple[HornAtom, ...], FrozenSet[HornAtom], str],
             RuleSubstitutionCacheEntry,
@@ -4223,7 +4263,7 @@ class DifferentiableProver(nn.Module):
         device: torch.device,
         action_probs: Optional[torch.Tensor] = None,
     ) -> Optional[float]:
-        cache_key = (hash(clause), derived, str(device))
+        cache_key = (clause, derived, str(device))
         if cache_key in self._world_rule_error_cache:
             return self._world_rule_error_cache[cache_key]
         if self._world_rnn is None or self._last_z is None or self._world_rnn_vocab <= 0:
@@ -4388,7 +4428,7 @@ class DifferentiableProver(nn.Module):
     ) -> FrozenSet[HornAtom]:
         support = set(before_facts)
         for fact in after_facts:
-            if head is not None and hash(fact) == hash(head):
+            if head is not None and fact == head:
                 continue
             if self._trace_fact_priority(fact) >= 3:
                 support.add(fact)
@@ -4483,7 +4523,7 @@ class DifferentiableProver(nn.Module):
         records = getattr(self.kb, "_records", None)
         if records is None:
             return None
-        return records.get(hash(clause))
+        return _rule_record_get(records, clause)
 
     def _rule_status(self, clause: HornClause) -> EpistemicStatus:
         record = self._rule_record(clause)
@@ -4651,7 +4691,7 @@ class DifferentiableProver(nn.Module):
 
         example_heads: List[HornAtom] = [goal]
         for target_fact in self.task_context.target_facts:
-            if hash(target_fact) == hash(goal):
+            if target_fact == goal:
                 continue
             example_heads.append(target_fact)
         template_support: Counter = Counter()
@@ -4728,23 +4768,21 @@ class DifferentiableProver(nn.Module):
     def _note_used_rule(self, clause: Optional[HornClause]) -> None:
         if clause is None:
             return
-        rule_hash = hash(clause)
-        if rule_hash in self._last_used_rule_hashes:
+        if clause in self._last_used_rule_hashes:
             return
-        self._last_used_rule_hashes.add(rule_hash)
+        self._last_used_rule_hashes.add(clause)
         self.last_used_rules.append(clause)
 
     def _extend_recent_abduced_rules(self, rules: List[HornClause]) -> None:
-        seen = {hash(rule) for rule in self.last_abduced_rules}
+        seen = set(self.last_abduced_rules)
         for rule in rules:
-            rule_hash = hash(rule)
-            if rule_hash in seen:
+            if rule in seen:
                 continue
             self.last_abduced_rules.append(rule)
-            seen.add(rule_hash)
+            seen.add(rule)
 
     def _record_rule_utility(self, clause: HornClause, utility: float) -> None:
-        history = self._rule_utility_history[hash(clause)]
+        history = self._rule_utility_history[clause]
         history.append(float(max(0.0, min(1.0, utility))))
         if len(history) > 32:
             del history[0]
@@ -5009,7 +5047,7 @@ class DifferentiableProver(nn.Module):
             ):
                 swapped_head = HornAtom(target.pred, clause.head.args)
                 swapped_rule = HornClause(swapped_head, clause.body)
-                if hash(swapped_rule) != hash(clause):
+                if swapped_rule != clause:
                     candidates.append(
                         (self._rule_edit_distance(clause, swapped_rule), swapped_rule)
                     )
@@ -5022,7 +5060,7 @@ class DifferentiableProver(nn.Module):
             )
             for body_score, body in ranked_bodies[:4]:
                 repaired = self._generalize_example_rule(target, body)
-                if repaired is None or hash(repaired) == hash(clause):
+                if repaired is None or repaired == clause:
                     continue
                 bridge_bonus = float(
                     structural_bridge_variable_count(repaired.head, repaired.body)
@@ -5253,17 +5291,16 @@ class DifferentiableProver(nn.Module):
         result["stats"]["contextual_candidates"] = float(len(contextual_candidates))
         result["stats"]["neural_candidates"] = float(len(neural_specs))
 
-        candidate_specs: Dict[int, Tuple[HornClause, Optional[torch.Tensor], str, Optional[RelaxedHornClauseSpec]]] = {}
+        candidate_specs: Dict[HornClause, Tuple[HornClause, Optional[torch.Tensor], str, Optional[RelaxedHornClauseSpec]]] = {}
         for clause in trace_candidates:
-            candidate_specs[hash(clause)] = (clause, None, "trace", None)
+            candidate_specs[clause] = (clause, None, "trace", None)
         for clause in contextual_candidates:
-            candidate_specs[hash(clause)] = (clause, None, "contextual", None)
+            candidate_specs[clause] = (clause, None, "contextual", None)
         for spec in neural_specs:
             clause = spec.clause
-            rule_hash = hash(clause)
-            if rule_hash in candidate_specs:
+            if clause in candidate_specs:
                 continue
-            candidate_specs[rule_hash] = (clause, spec.log_prob, "neural", spec)
+            candidate_specs[clause] = (clause, spec.log_prob, "neural", spec)
         if not candidate_specs:
             return result
 
@@ -5290,7 +5327,7 @@ class DifferentiableProver(nn.Module):
         )
         result["stats"]["candidate_budget"] = float(budget)
         pending: List[Tuple[float, HornClause, Optional[torch.Tensor], str, Optional[RelaxedHornClauseSpec]]] = ranked_candidates[:budget]
-        seen_candidate_hashes = {hash(clause) for _, clause, _, _, _ in pending}
+        seen_candidate_hashes = {clause for _, clause, _, _, _ in pending}
         repair_budget = max_repairs
 
         query_atom = self._current_query_atom()
@@ -5525,7 +5562,7 @@ class DifferentiableProver(nn.Module):
                     effective_targets,
                     max_body_atoms=3,
                 )
-                if repair_candidate is not None and hash(repair_candidate) not in seen_candidate_hashes:
+                if repair_candidate is not None and repair_candidate not in seen_candidate_hashes:
                     pending.append((
                         float(_mdl_score) - 0.25,
                         repair_candidate,
@@ -5533,7 +5570,7 @@ class DifferentiableProver(nn.Module):
                         "repair",
                         None,
                     ))
-                    seen_candidate_hashes.add(hash(repair_candidate))
+                    seen_candidate_hashes.add(repair_candidate)
                     repair_budget -= 1
                     repaired += 1
                     if self._rule_record(clause) is not None:
@@ -5936,7 +5973,7 @@ class DifferentiableProver(nn.Module):
         max_predictions: int = 8,
     ) -> RulePredictionSummary:
         max_predictions = max(1, int(max_predictions))
-        cache_key = (hash(rule), current_facts, str(device), max_predictions)
+        cache_key = (rule, current_facts, str(device), max_predictions)
         cached = self._rule_prediction_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -6361,7 +6398,7 @@ class DifferentiableProver(nn.Module):
         Для pure-fact-правил (body=[]) — перевіряємо, чи голова є у фактах.
         Для правил з тілом — рахуємо кількість успішних уніфікацій тіла.
         """
-        cache_key = (hash(clause), observed_facts)
+        cache_key = (clause, observed_facts)
         cached = self._pred_error_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -6575,8 +6612,8 @@ class DifferentiableProver(nn.Module):
 
         # Зберігаємо MDL-scores для REINFORCE (заохочуємо нейронну мережу
         # генерувати MDL-мінімальні правила)
-        mdl_scores_map: Dict[int, float] = {
-            hash(clause): score for score, clause in mdl_ranked
+        mdl_scores_map: Dict[HornClause, float] = {
+            clause: score for score, clause in mdl_ranked
         }
 
         # 3. VeM-фільтрація (U(R) > τ) на MDL-відібраних кандидатах
@@ -6589,14 +6626,13 @@ class DifferentiableProver(nn.Module):
         neural_mdl_utilities: List[float] = []
         if log_probs.numel() > 0:
             for i, nc in enumerate(neural_candidates):
-                h = hash(nc)
-                if h in mdl_scores_map and i < log_probs.shape[0]:
+                if nc in mdl_scores_map and i < log_probs.shape[0]:
                     # Нормалізуємо MDL-score до [0,1]: менший score = більша utility
                     max_possible_mdl = max(
                         (s for s, _ in mdl_ranked), default=1.0
                     )
                     mdl_utility = 1.0 - min(
-                        mdl_scores_map[h] / max(max_possible_mdl, 1.0), 1.0
+                        mdl_scores_map[nc] / max(max_possible_mdl, 1.0), 1.0
                     )
                     # Комбінуємо VeM utility + MDL utility
                     vem_u = self.vem.score(nc, device)
@@ -6654,12 +6690,12 @@ class DifferentiableProver(nn.Module):
     def vem_retrospective_update(self, ce_utility: float, device: torch.device) -> None:
         blended_ce = float(max(0.0, min(1.0, ce_utility)))
         for clause in self.kb.rules:
-            history = self._rule_utility_history.get(hash(clause), [])
+            history = self._rule_utility_history.get(clause, [])
             if history:
                 hist_mean = sum(history) / float(len(history))
                 target = 0.7 * hist_mean + 0.3 * blended_ce
             else:
-                record = self.kb._records.get(hash(clause))
+                record = _rule_record_get(self.kb._records, clause)
                 if record is not None and record.status == EpistemicStatus.verified:
                     target = max(0.6, blended_ce)
                 else:
@@ -6782,7 +6818,7 @@ class DifferentiableProver(nn.Module):
                 try:
                     return unify(left, right) is not None
                 except Exception:
-                    return hash(left) == hash(right)
+                    return left == right
 
             background_intrinsic_goals = tuple(
                 target for target in scheduled_intrinsic_goals if not _goal_match(target, goal)

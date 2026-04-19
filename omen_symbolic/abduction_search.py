@@ -227,6 +227,10 @@ def structural_template_bodies(
     return ranked[:max_candidates]
 
 
+def _body_identity_key(body: Tuple[AtomT, ...]) -> Tuple[str, ...]:
+    return tuple(repr(atom) for atom in body)
+
+
 def rank_goal_directed_bodies(
     example_head: AtomT,
     facts: Sequence[AtomT],
@@ -235,9 +239,9 @@ def rank_goal_directed_bodies(
     max_fact_scan: int = 14,
     max_paths: int = 16,
     max_templates: int = 24,
-) -> List[Tuple[int, Tuple[AtomT, ...]]]:
+    ) -> List[Tuple[int, Tuple[AtomT, ...]]]:
     ranked: List[Tuple[int, Tuple[AtomT, ...]]] = []
-    seen: Set[Tuple[int, ...]] = set()
+    seen: Set[Tuple[str, ...]] = set()
     for score, body in bridge_path_bodies(
         example_head,
         facts,
@@ -246,7 +250,7 @@ def rank_goal_directed_bodies(
         max_fact_scan=max_fact_scan,
         max_paths=max_paths,
     ):
-        key = tuple(hash(atom) for atom in body)
+        key = _body_identity_key(body)
         if key in seen:
             continue
         seen.add(key)
@@ -259,7 +263,7 @@ def rank_goal_directed_bodies(
         max_fact_scan=max_fact_scan,
         max_candidates=max_templates,
     ):
-        key = tuple(hash(atom) for atom in body)
+        key = _body_identity_key(body)
         if key in seen:
             continue
         seen.add(key)

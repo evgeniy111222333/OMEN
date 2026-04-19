@@ -124,11 +124,46 @@ class DecoderPathProtocolTest(unittest.TestCase):
              mock.patch.object(model.prover, "forward", return_value=prover_out):
             generated = model.generate(prompt, max_new=1, temperature=1.0, dynamic_reasoning=False)
 
-        self.assertEqual(int(generated[0, -1].item()), 7)
+        last_tokens, _valid_rows, _last_idx = model._batch_last_content_tokens(generated)
+        self.assertEqual(int(last_tokens[0].item()), 7)
         self.assertEqual(model.last_generate_info.get("decoder_mode"), "osf_decoder_with_net_encoder")
         self.assertEqual(float(model.last_generate_info.get("decoder_path_osf", 0.0)), 1.0)
         self.assertEqual(float(model.last_generate_info.get("decoder_path_net", 1.0)), 0.0)
         self.assertEqual(float(model.last_generate_info.get("decoder_osf_replaces_net", 0.0)), 1.0)
+
+    def test_generation_uses_last_content_logit_and_fills_first_pad_slot(self) -> None:
+        cfg = _decoder_test_config()
+        cfg.net_enabled = False
+        cfg.osf_enabled = False
+        model = OMENScale(cfg)
+        model.eval()
+        prompt = torch.tensor([[11, 13, 0, 0]], dtype=torch.long)
+
+        prover_out = (
+            torch.zeros(1, cfg.d_latent, dtype=torch.float32),
+            torch.tensor(0.0, dtype=torch.float32),
+        )
+
+        def fake_tok_decoder(ctx: torch.Tensor, z_final: torch.Tensor):
+            del z_final
+            logits = torch.full(
+                (ctx.size(0), ctx.size(1), cfg.vocab_size),
+                -1e4,
+                device=ctx.device,
+            )
+            logits[:, :, 5] = 1e3
+            logits[:, 1, 7] = 1e4
+            logits[:, -1, 9] = 1e4
+            return logits
+
+        with mock.patch.object(model.prover, "forward", return_value=prover_out), \
+             mock.patch.object(model.tok_decoder, "forward", side_effect=fake_tok_decoder):
+            generated = model.generate(prompt, max_new=1, temperature=1.0, dynamic_reasoning=False)
+
+        last_tokens, _valid_rows, last_idx = model._batch_last_content_tokens(generated)
+        self.assertEqual(generated.tolist(), [[11, 13, 7, 0]])
+        self.assertEqual(last_idx.tolist(), [2])
+        self.assertEqual(int(last_tokens[0].item()), 7)
 
     def test_training_does_not_call_net_decode_when_osf_replaces_decoder(self) -> None:
         cfg = _decoder_test_config()

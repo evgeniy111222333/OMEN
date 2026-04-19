@@ -97,6 +97,11 @@ def _build_fact_index(facts: Sequence[Any]) -> Dict[Tuple[int, Tuple[Any, ...]],
     return {_fact_signature(fact): fact for fact in facts}
 
 
+def _subset_has_distinct_originals(subset: Sequence["_Transform"]) -> bool:
+    originals = {transform.original for transform in subset}
+    return len(originals) == len(subset)
+
+
 # ─── Повний набір операторів Invert ──────────────────────────────────────────
 
 def _op_swap_args(clause: Any) -> Iterator[Any]:
@@ -236,7 +241,7 @@ class CounterfactualWorldEngine:
 
     @staticmethod
     def _copy_kb_into_sandbox(kb: Any, sandbox: Any, *, preserve_status: bool) -> None:
-        from omen_prolog import EpistemicStatus, RuleRecord
+        from omen_prolog import EpistemicStatus, _clone_rule_records
 
         if (
             hasattr(kb, "_fact_buf")
@@ -263,22 +268,13 @@ class CounterfactualWorldEngine:
                 sandbox._rule_is_tensor[:n_rules] = kb._rule_is_tensor[:n_rules].to(device=sandbox._dev)
             sandbox._n_rules = n_rules
             sandbox.rules = list(rules)
-            sandbox._rule_hash_set = set(getattr(kb, "_rule_hash_set", set()))
+            sandbox._rule_hash_set = set(rules)
             sandbox._global_step = int(getattr(kb, "_global_step", 0))
-            status_by_hash = {
-                key: getattr(record, "status", EpistemicStatus.proposed)
-                for key, record in getattr(kb, "_records", {}).items()
-            }
-            if preserve_status:
-                sandbox._records = {
-                    hash(rule): RuleRecord(rule=rule, status=status_by_hash.get(hash(rule), EpistemicStatus.proposed))
-                    for rule in sandbox.rules
-                }
-            else:
-                sandbox._records = {
-                    hash(rule): RuleRecord(rule=rule, status=EpistemicStatus.proposed)
-                    for rule in sandbox.rules
-                }
+            sandbox._records = _clone_rule_records(
+                sandbox.rules,
+                getattr(kb, "_records", {}),
+                preserve_status=preserve_status,
+            )
             sandbox._n_proposed = sum(
                 1 for record in sandbox._records.values() if record.status == EpistemicStatus.proposed
             )
@@ -291,22 +287,13 @@ class CounterfactualWorldEngine:
         rules = list(getattr(kb, "rules", ()))
         sandbox.facts = facts
         sandbox.rules = list(rules)
-        sandbox._rule_set = set(getattr(kb, "_rule_set", {hash(rule) for rule in rules}))
+        sandbox._rule_set = set(rules)
         sandbox._global_step = int(getattr(kb, "_global_step", 0))
-        status_by_hash = {
-            key: getattr(record, "status", EpistemicStatus.proposed)
-            for key, record in getattr(kb, "_records", {}).items()
-        }
-        if preserve_status:
-            sandbox._records = {
-                hash(rule): RuleRecord(rule=rule, status=status_by_hash.get(hash(rule), EpistemicStatus.proposed))
-                for rule in rules
-            }
-        else:
-            sandbox._records = {
-                hash(rule): RuleRecord(rule=rule, status=EpistemicStatus.proposed)
-                for rule in rules
-            }
+        sandbox._records = _clone_rule_records(
+            rules,
+            getattr(kb, "_records", {}),
+            preserve_status=preserve_status,
+        )
 
     @staticmethod
     def _clone_kb(kb: Any) -> Any:
@@ -324,28 +311,29 @@ class CounterfactualWorldEngine:
         Видаляє оригінали і додає трансформовані правила.
         """
         # Клонуємо базову KB
+        from omen_prolog import _clone_rule_records
         sandbox = CounterfactualWorldEngine._make_empty_sandbox(kb)
         CounterfactualWorldEngine._copy_kb_into_sandbox(kb, sandbox, preserve_status=True)
 
         # Множина оригіналів, що виключаються (Γ \ Γ_mod)
-        excluded: FrozenSet[int] = frozenset(hash(t.original) for t in gamma_mod)
+        excluded: FrozenSet[Any] = frozenset(t.original for t in gamma_mod)
 
         if excluded:
-            kept_rules = [rule for rule in sandbox.rules if hash(rule) not in excluded]
+            kept_rules = [rule for rule in sandbox.rules if rule not in excluded]
             sandbox.rules = kept_rules
             if hasattr(sandbox, "_rule_hash_set"):
-                sandbox._rule_hash_set = {hash(rule) for rule in kept_rules}
+                sandbox._rule_hash_set = set(kept_rules)
             if hasattr(sandbox, "_rule_set"):
-                sandbox._rule_set = {hash(rule) for rule in kept_rules}
-            sandbox._records = {
-                hash(rule): sandbox._records[hash(rule)]
-                for rule in kept_rules
-                if hash(rule) in sandbox._records
-            }
+                sandbox._rule_set = set(kept_rules)
+            sandbox._records = _clone_rule_records(
+                kept_rules,
+                getattr(sandbox, "_records", {}),
+                preserve_status=True,
+            )
             if hasattr(sandbox, "_rule_buf") and hasattr(sandbox, "_rule_is_tensor"):
                 kept_indices = [
                     idx for idx, rule in enumerate(getattr(kb, "rules", ()))
-                    if hash(rule) not in excluded
+                    if rule not in excluded
                 ]
                 n_kept = len(kept_indices)
                 if n_kept > 0:
@@ -401,18 +389,18 @@ class CounterfactualWorldEngine:
 
         # Complement-суперечності: p(X) та ¬p(X) як усередині sandbox,
         # так і відносно базового виводу Γ.
-        complement_pairs: Dict[Tuple[int, int], Tuple[Any, Any]] = {}
+        complement_pairs: Dict[FrozenSet[Any], Tuple[Any, Any]] = {}
         for (pred, args), fact in derived_index.items():
             complement_key = _complement_signature(pred, args)
             if complement_key is None:
                 continue
             known = derived_index.get(complement_key)
             if known is not None:
-                key = tuple(sorted((hash(fact), hash(known))))
+                key = frozenset((fact, known))
                 complement_pairs[key] = (fact, known)
             known = baseline_index.get(complement_key)
             if known is not None:
-                key = tuple(sorted((hash(fact), hash(known))))
+                key = frozenset((fact, known))
                 complement_pairs[key] = (fact, known)
         complement_contradictions = list(complement_pairs.values())
 
@@ -481,8 +469,8 @@ class CounterfactualWorldEngine:
             candidates_for_rule.extend(_op_permute_body(clause))
 
             for result in candidates_for_rule[: self.max_transforms_per_rule]:
-                key = hash(result)
-                if key in seen_results or hash(result) == hash(clause):
+                key = result
+                if key in seen_results or result == clause:
                     continue
                 seen_results.add(key)
                 transforms.append(_Transform(
@@ -566,7 +554,7 @@ class CounterfactualWorldEngine:
 
         for subset_size in range(1, min(self.max_rule_mods, len(candidate_pool)) + 1):
             for subset in combinations(candidate_pool, subset_size):
-                if len({hash(t.original) for t in subset}) != subset_size:
+                if not _subset_has_distinct_originals(subset):
                     continue
                 evaluated_subsets += 1
                 score, novel, contras, world_surprise = self._evaluate_subset(
@@ -594,52 +582,6 @@ class CounterfactualWorldEngine:
 
         return gamma_mod, best_score, best_novel, best_contradictions, best_world_surprise, evaluated_subsets
 
-        # Множина вже використаних оригінальних правил
-        used_originals: set = set()
-
-        for _step in range(self.max_rule_mods):
-            step_best_score = best_score
-            step_best_transform: Optional[_Transform] = None
-            step_best_novel: Tuple[Any, ...] = best_novel
-            step_best_contras: List[Tuple[Any, Any]] = best_contradictions
-            step_best_world_surprise: float = best_world_surprise
-
-            for t in transforms[: self.max_candidates]:
-                orig_hash = hash(t.original)
-                if orig_hash in used_originals:
-                    continue
-
-                trial_mod = gamma_mod + [t]
-                sandbox = self._build_sandbox(kb, trial_mod)
-                novel_count, novel, contras = self._measure_surprise(
-                    sandbox, baseline, starting_facts, max_depth, conflict_fn
-                )
-                world_surprise = 0.0
-                if world_surprise_fn is not None:
-                    try:
-                        world_surprise = float(world_surprise_fn(tuple(t.result for t in trial_mod), tuple(novel), sandbox))
-                    except Exception:
-                        world_surprise = 0.0
-                score = self._score(trial_mod, novel_count, len(contras), world_surprise=world_surprise)
-
-                if score < step_best_score:
-                    step_best_score = score
-                    step_best_transform = t
-                    step_best_novel = novel
-                    step_best_contras = contras
-                    step_best_world_surprise = world_surprise
-
-            if step_best_transform is None:
-                break  # немає покращення
-
-            gamma_mod.append(step_best_transform)
-            used_originals.add(hash(step_best_transform.original))
-            best_score = step_best_score
-            best_novel = step_best_novel
-            best_contradictions = step_best_contras
-            best_world_surprise = step_best_world_surprise
-
-        return gamma_mod, best_score, best_novel, best_contradictions, best_world_surprise
 
     # ─── Публічний API ───────────────────────────────────────────────────────
 
@@ -746,9 +688,8 @@ def _collect_pool_atoms(rules: Sequence[Any]) -> List[Any]:
     pool: List[Any] = []
     for rule in rules:
         for atom in getattr(rule, "body", ()):
-            h = hash(atom)
-            if h not in seen:
-                seen.add(h)
+            if atom not in seen:
+                seen.add(atom)
                 pool.append(atom)
     return pool
 

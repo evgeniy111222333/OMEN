@@ -410,11 +410,11 @@ class AestheticEvolutionEngine:
 
     def _update_gene_pool(self, candidates: List[RuleCandidate]) -> None:
         """Поповнює gene pool виживачами, обмежуючи розмір gene_pool_size."""
-        pool_hashes = {hash(c.clause) for c in self._gene_pool}
+        pool_hashes = {c.clause for c in self._gene_pool}
         for candidate in candidates:
-            if hash(candidate.clause) not in pool_hashes:
+            if candidate.clause not in pool_hashes:
                 self._gene_pool.append(candidate)
-                pool_hashes.add(hash(candidate.clause))
+                pool_hashes.add(candidate.clause)
         # Відсортувати і обрізати
         self._gene_pool.sort(key=lambda c: c.score, reverse=True)
         self._gene_pool = self._gene_pool[: self.gene_pool_size]

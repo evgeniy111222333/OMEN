@@ -752,7 +752,8 @@ class EMCGapProtocolTest(unittest.TestCase):
              mock.patch.object(model, "_ast_lang_from_bytes", return_value=""):
             generated = model.generate(prompt, max_new=1, temperature=1.0, dynamic_reasoning=False)
 
-        self.assertEqual(int(generated[0, -1].item()), 7)
+        last_tokens, _valid_rows, _last_idx = model._batch_last_content_tokens(generated)
+        self.assertEqual(int(last_tokens[0].item()), 7)
         self.assertEqual(float(model.last_generate_info.get("emc_recall_steps", 0.0)), 1.0)
         self.assertEqual(float(model.last_generate_info.get("emc_recall_effective_steps", 0.0)), 1.0)
         self.assertEqual(float(model.last_generate_info.get("emc_recall_effective_ratio", 0.0)), 1.0)
@@ -821,7 +822,8 @@ class EMCGapProtocolTest(unittest.TestCase):
              mock.patch.object(model, "_ast_lang_from_bytes", return_value=""):
             generated = model.generate(prompt, max_new=1, temperature=1.0, dynamic_reasoning=False)
 
-        self.assertEqual(int(generated[0, -1].item()), 7)
+        last_tokens, _valid_rows, _last_idx = model._batch_last_content_tokens(generated)
+        self.assertEqual(int(last_tokens[0].item()), 7)
         self.assertEqual(float(model.last_generate_info.get("emc_gap_events", 0.0)), 1.0)
         self.assertEqual(float(model.last_generate_info.get("emc_state_steps", 0.0)), 1.0)
         self.assertEqual(float(model.last_generate_info.get("emc_recall_steps", 0.0)), 0.0)

@@ -100,7 +100,11 @@ class OnlineSymbolicLearningEvalTest(unittest.TestCase):
         after = next(model.world_rnn.parameters()).detach()
         info = getattr(model, "last_generate_info", {})
 
-        self.assertEqual(generated.size(1), src.size(1) + 2)
+        _src_last_tokens, src_valid_rows, src_last_idx = model._batch_last_content_tokens(src)
+        _gen_last_tokens, gen_valid_rows, gen_last_idx = model._batch_last_content_tokens(generated)
+        self.assertTrue(src_valid_rows.all())
+        self.assertTrue(gen_valid_rows.all())
+        self.assertEqual((gen_last_idx - src_last_idx).tolist(), [2])
         self.assertGreaterEqual(float(info.get("adaptive_learning_active", 0.0)), 1.0)
         self.assertGreaterEqual(float(info.get("eval_world_self_update_applied", 0.0)), 1.0)
         self.assertGreater(float(info.get("eval_world_self_update_loss", 0.0)), 0.0)

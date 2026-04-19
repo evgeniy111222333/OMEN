@@ -18,6 +18,45 @@ from omen_symbolic.universal_bits import gaussian_tensor_bits, universal_int_bit
 from omen_perceiver import LlamaDecoderBlock, LlamaAttention, RMSNorm, SwiGLUFFN
 
 
+def _sequence_valid_mask_from_trailing_padding(tokens: torch.Tensor) -> torch.Tensor:
+    if tokens.dim() != 2:
+        raise ValueError(f"Expected (B, T) token tensor, got shape {tuple(tokens.shape)}")
+    if tokens.size(1) == 0:
+        return torch.zeros_like(tokens, dtype=torch.bool)
+    nonzero = tokens.ne(0)
+    has_content = nonzero.any(dim=1)
+    last_from_end = nonzero.flip(dims=[1]).to(torch.long).argmax(dim=1)
+    lengths = torch.where(
+        has_content,
+        tokens.new_full((tokens.size(0),), tokens.size(1)) - last_from_end,
+        tokens.new_zeros((tokens.size(0),)),
+    )
+    positions = torch.arange(tokens.size(1), device=tokens.device).unsqueeze(0)
+    return positions < lengths.unsqueeze(1)
+
+
+def _masked_sequence_cross_entropy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    if logits.dim() != 3 or targets.dim() != 2:
+        raise ValueError(
+            f"Expected logits (B, T, V) and targets (B, T), got {tuple(logits.shape)} and {tuple(targets.shape)}"
+        )
+    if logits.shape[:2] != targets.shape or targets.shape != valid_mask.shape:
+        raise ValueError(
+            f"Shape mismatch for masked CE: logits={tuple(logits.shape)}, targets={tuple(targets.shape)}, "
+            f"valid_mask={tuple(valid_mask.shape)}"
+        )
+    flat_mask = valid_mask.reshape(-1)
+    if not bool(flat_mask.any()):
+        return torch.zeros((), device=logits.device, dtype=logits.dtype)
+    flat_targets = targets.reshape(-1)[flat_mask]
+    flat_logits = logits.reshape(-1, logits.size(-1))[flat_mask]
+    return F.cross_entropy(flat_logits, flat_targets, reduction="mean")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 1.  ByteContextEncoder  (f_θ)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -192,8 +231,8 @@ class ByteContextEncoder(nn.Module):
 
     @staticmethod
     def bytes_to_text(byte_ids: torch.Tensor) -> str:
-        """Тензор байтів → рядок (ігнорує pad=0)."""
-        raw = bytes(b for b in byte_ids.view(-1).tolist() if b != 0)
+        """Тензор байтів → рядок (обрізає лише trailing pad=0)."""
+        raw = bytes(byte_ids.view(-1).tolist()).rstrip(b"\x00")
         return raw.decode("utf-8", errors="replace")
 
 
@@ -1081,10 +1120,12 @@ class ByteDecoder(nn.Module):
         # ── 6. L_rec: авторегресивна помилка відновлення ──────────────────────
         # Зсуваємо: logits[0..T-2] → targets[1..T-1]
         if return_recon_loss:
-            l_rec = F.cross_entropy(
-                logits[:, :-1].transpose(1, 2),
-                tgt[:, 1:],
-                ignore_index=0,
+            target_slice = tgt[:, 1:]
+            valid_mask = _sequence_valid_mask_from_trailing_padding(target_slice)
+            l_rec = _masked_sequence_cross_entropy(
+                logits[:, :-1],
+                target_slice,
+                valid_mask,
             )
         else:
             l_rec = None
@@ -1442,11 +1483,8 @@ class NeuralEpistemicTokenizer(nn.Module):
         """
         dec = self.byte_decoder
         logits = dec.lm_head(dec.out_norm(h_q))          # (B, T, V) — без causal bypass
-        return F.cross_entropy(
-            logits.transpose(1, 2),
-            src,
-            ignore_index=0,
-        )
+        valid_mask = _sequence_valid_mask_from_trailing_padding(src)
+        return _masked_sequence_cross_entropy(logits, src, valid_mask)
 
     # ── Utility: зв'язати Q з KB ──────────────────────────────────────────────
     def attach_kb(self, kb) -> None:

@@ -167,7 +167,8 @@ class MemoryGapProtocolTest(unittest.TestCase):
              mock.patch.object(model, "_ast_lang_from_bytes", return_value=""):
             generated = model.generate(prompt, max_new=1, temperature=1.0, dynamic_reasoning=False)
 
-        self.assertEqual(int(generated[0, -1].item()), 7)
+        last_tokens, _valid_rows, _last_idx = model._batch_last_content_tokens(generated)
+        self.assertEqual(int(last_tokens[0].item()), 7)
         self.assertTrue(seen_gap)
         self.assertLess(float(seen_gap[0].max().item()), 1e-6)
         self.assertGreater(float(model.last_generate_info.get("gap_world_only", 0.0)), 0.0)

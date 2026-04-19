@@ -228,14 +228,14 @@ class AnalogyMetaphorEngine:
     def generate_candidates(
         self,
         rules: Sequence[Any],
-        existing_hashes: Optional[Sequence[int]] = None,
+        existing_hashes: Optional[Sequence[Any]] = None,
     ) -> List[RuleCandidate]:
         if not self.state.graph_view.predicate_ids:
             self.fit(rules)
         view = self.state.graph_view
         if not view.predicate_ids:
             return []
-        existing = set(int(h) for h in (existing_hashes or ()))
+        existing_rules = {item for item in (existing_hashes or ()) if not isinstance(item, int)}
         ranked_pairs: List[Tuple[float, int, int]] = []
         for i, left in enumerate(view.predicate_ids):
             for j in range(i + 1, len(view.predicate_ids)):
@@ -258,7 +258,7 @@ class AnalogyMetaphorEngine:
                 transferred = self._transfer_rule(src_rule, source_pred, target_pred)
                 if (
                     transferred is None
-                    or hash(transferred) in existing
+                    or transferred in existing_rules
                     or self._is_trivial_rule(transferred)
                 ):
                     continue
@@ -271,6 +271,7 @@ class AnalogyMetaphorEngine:
                     metadata={
                         "source_pred": float(source_pred),
                         "target_pred": float(target_pred),
+                        "source_rule_key_text": repr(src_rule),
                         "source_rule_hash": float(hash(src_rule)),
                         "source_rule_hash_text": str(hash(src_rule)),
                         "embedding_source": view.embedding_source,
@@ -286,7 +287,7 @@ class AnalogyMetaphorEngine:
     def generate_metaphor_candidates(
         self,
         rules: Sequence[Any],
-        existing_hashes: Optional[Sequence[int]] = None,
+        existing_hashes: Optional[Sequence[Any]] = None,
     ) -> List[RuleCandidate]:
         if not self.state.graph_view.predicate_ids:
             self.fit(rules)
@@ -294,7 +295,7 @@ class AnalogyMetaphorEngine:
         if not view.predicate_ids:
             return []
 
-        existing = set(int(h) for h in (existing_hashes or ()))
+        existing_rules = {item for item in (existing_hashes or ()) if not isinstance(item, int)}
         grouped_rules = self._group_rules_by_predicate(rules)
         ranked_pairs: List[Tuple[float, int, int, float]] = []
         for i, left in enumerate(view.predicate_ids):
@@ -330,7 +331,11 @@ class AnalogyMetaphorEngine:
                     body_pred=body_pred,
                     body_arity=body_arity,
                 )
-                if bridge is None or hash(bridge) in existing or self._is_trivial_rule(bridge):
+                if (
+                    bridge is None
+                    or bridge in existing_rules
+                    or self._is_trivial_rule(bridge)
+                ):
                     continue
                 template = rule_template_signature(bridge.head, tuple(bridge.body))
                 candidate = RuleCandidate(
@@ -347,6 +352,7 @@ class AnalogyMetaphorEngine:
                         ),
                         "role_overlap": float(role_overlap),
                         "projection_arity": float(min(head_arity, body_arity)),
+                        "source_rule_key_text": repr(sample_rules[0]),
                         "source_rule_hash_text": str(hash(sample_rules[0])),
                         "source_rule_hash": float(hash(sample_rules[0])),
                         "metaphor_bridge": 1.0,

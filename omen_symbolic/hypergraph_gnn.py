@@ -695,7 +695,7 @@ class HypergraphContrastiveLearner:
         self._loss_fn = InfoNCELoss(temperature=self.temperature)
 
         # Cache
-        self._last_rule_hash: Optional[int] = None
+        self._last_rule_hash: Optional[Tuple[str, ...]] = None
         self._last_result: Optional[HypergraphEmbedResult] = None
 
     def _make_gnn(self, in_dim: int) -> HypergraphGNN:
@@ -746,8 +746,8 @@ class HypergraphContrastiveLearner:
         else:
             self._last_result = last_result
 
-    def _rule_set_hash(self, rules: Sequence) -> int:
-        return hash(tuple(hash(r) for r in rules))
+    def _rule_set_hash(self, rules: Sequence) -> Tuple[str, ...]:
+        return tuple(repr(rule) for rule in rules)
 
     @staticmethod
     def _hand_features(inc: HypergraphIncidence) -> torch.Tensor:

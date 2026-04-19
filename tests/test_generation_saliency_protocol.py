@@ -128,7 +128,8 @@ class GenerationSaliencyProtocolTest(unittest.TestCase):
              mock.patch.object(model.tok_decoder, "forward", side_effect=fake_tok_decoder):
             generated = model.generate(prompt, max_new=1, temperature=1.0, dynamic_reasoning=False)
 
-        self.assertEqual(int(generated[0, -1].item()), 7)
+        last_tokens, _valid_rows, _last_idx = model._batch_last_content_tokens(generated)
+        self.assertEqual(int(last_tokens[0].item()), 7)
         self.assertGreaterEqual(saliency_mock.call_count, 2)
         self.assertGreaterEqual(len(world_graph_saliency), 2)
         self.assertTrue(all(item is fake_saliency for item in world_graph_saliency[:2]))
