@@ -1,38 +1,38 @@
 """
-omen_ast_multilang.py — Мультимовний AST → Horn-факти
-=======================================================
-Підтримувані мови (через tree-sitter):
+omen_ast_multilang.py — Multilingual AST -> Horn facts
+======================================================
+Supported languages (via tree-sitter):
   python · javascript · typescript · java · c · cpp · rust · go · bash · lua
 
-Архітектура:
-  MultiLangASTParser        — точка входу, вибирає парсер за мовою
-  _TreeSitterVisitor        — базовий обхідник AST вузлів
+Architecture:
+  MultiLangASTParser        — entry point that selects the parser by language
+  _TreeSitterVisitor        — base AST visitor
   Language-specific parsers — Python, JS/TS, Java, C/C++, Rust, Go, Bash, Lua
 
-Вихід:  List[HornAtom]  (ті самі що PythonASTParser)
-Інтеграція: підключається до ScalableKnowledgeBase через add_facts()
+Output:  List[HornAtom]  (same structure as PythonASTParser)
+Integration: connects to ScalableKnowledgeBase through add_facts()
 
-Структура фактів (предикати з PredicateVocab):
-  define(name, scope)       — оголошення функції / класу
-  call(call_id, func)       — виклик функції
-  call_arg(call_id, arg)    — аргумент виклику
-  assign(lhs, rhs)          — присвоєння
-  param(func, arg)          — параметр функції
+Fact structure (predicates from PredicateVocab):
+  define(name, scope)       — function / class declaration
+  call(call_id, func)       — function call
+  call_arg(call_id, arg)    — call argument
+  assign(lhs, rhs)          — assignment
+  param(func, arg)          — function parameter
   return(func, val)         — return expr
   import(name, module)      — import / include / use
-  type_of(var, type)        — анотація типу
-  attr(obj, field)          — доступ obj.field
-  if_true(cond, scope)      — умова if
-  loop_body(iter, scope)    — тіло циклу
-  dep_data(a, b)            — data-dependence  a ← b
-  classdef(name, scope)     — клас
-  classbase(name, base)     — успадкування
-  decorator(target, dec)    — декоратор
-  raise(exc, scope)         — виняток
+  type_of(var, type)        — type annotation
+  attr(obj, field)          — obj.field access
+  if_true(cond, scope)      — if condition
+  loop_body(iter, scope)    — loop body
+  dep_data(a, b)            — data dependency  a <- b
+  classdef(name, scope)     — class
+  classbase(name, base)     — inheritance
+  decorator(target, dec)    — decorator
+  raise(exc, scope)         — exception
   with(ctx, scope)          — with/using
-  lang(source_id, lang)     — мова джерела (мета-факт)
+  lang(source_id, lang)     — source language (meta fact)
 
-Приклад:
+Example:
     from omen_ast_multilang import MultiLangASTParser
     parser = MultiLangASTParser()
     facts = parser.parse(code_str, lang="python", source_id=0)
@@ -51,19 +51,19 @@ from typing import Dict, List, Optional, Set, Tuple
 
 warnings.filterwarnings("ignore")
 
-# ─── Залежності OMEN ──────────────────────────────────────────────────────────
+# ─── OMEN dependencies ───────────────────────────────────────────────────────
 from omen_prolog import Const, HornAtom
 from omen_tensor_unify import PRED_VOCAB, ConstPool
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 0.  TREE-SITTER REGISTRY  (lazy load, кожна мова завантажується 1 раз)
+# 0. TREE-SITTER REGISTRY (lazy-loaded, each language is initialized once)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _TSRegistry:
-    """Ледаче завантаження tree-sitter Language об'єктів."""
+    """Lazy loader for tree-sitter Language objects."""
 
-    # (pkg_name, lang_func_name)  — деякі пакети мають нестандартні імена
+    # (pkg_name, lang_func_name) — some packages use non-standard function names
     _PACKAGES = {
         "python":     ("tree_sitter_python",     "language"),
         "javascript": ("tree_sitter_javascript",  "language"),
@@ -125,13 +125,13 @@ TS_REGISTRY = _TSRegistry()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1.  БАЗОВИЙ ОБХІДНИК  (спільна логіка)
+# 1. BASE VISITOR (shared logic)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _BaseASTVisitor(ABC):
     """
-    Базовий клас для всіх мовних парсерів.
-    Підкласи реалізують _visit_node() для конкретної мови.
+    Base class for all language parsers.
+    Subclasses implement `_visit_node()` for a specific language.
     """
 
     def __init__(self, source_id: int = 0):
@@ -141,7 +141,7 @@ class _BaseASTVisitor(ABC):
         self._call_cnt  = 0
         self._scope_stack: List[str] = [f"<src{source_id}>"]
 
-    # ─── Зручні засоби ────────────────────────────────────────────────────────
+    # ─── Convenience helpers ─────────────────────────────────────────────────
 
     @property
     def _cur_scope(self) -> str:
@@ -155,19 +155,19 @@ class _BaseASTVisitor(ABC):
         self._call_cnt += 1
         return cid
 
-    # ─── Абстрактний метод ────────────────────────────────────────────────────
+    # ─── Abstract method ─────────────────────────────────────────────────────
 
     @abstractmethod
     def parse(self, code: str) -> List[HornAtom]:
-        """Головна точка входу. Повертає список HornAtom."""
+        """Main entry point. Returns a list of HornAtom."""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2.  PYTHON VISITOR  (через stdlib ast — без tree-sitter overhead)
+# 2. PYTHON VISITOR (via stdlib ast, without tree-sitter overhead)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _PythonVisitor(_BaseASTVisitor, _pyast.NodeVisitor):
-    """Python → Horn-факти через stdlib ast (швидший за tree-sitter для Python)."""
+    """Python -> Horn facts through stdlib ast (faster than tree-sitter for Python)."""
 
     def parse(self, code: str) -> List[HornAtom]:
         code = textwrap.dedent(code)
@@ -352,18 +352,18 @@ class _PythonVisitor(_BaseASTVisitor, _pyast.NodeVisitor):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3.  TREE-SITTER БАЗОВИЙ ОБХІДНИК
+# 3. TREE-SITTER BASE VISITOR
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _TSBaseVisitor(_BaseASTVisitor):
     """
-    Базовий клас для tree-sitter парсерів.
-    Підкласи перевизначають _dispatch() для конкретних типів вузлів.
+    Base class for tree-sitter parsers.
+    Subclasses override `_dispatch()` for language-specific node types.
     """
 
-    LANG: str = ""  # встановлюється підкласами
+    LANG: str = ""  # set by subclasses
 
-    # Вузли-термінали (листя, не обходимо рекурсивно)
+    # Terminal nodes (leaves, do not recurse into them)
     TERMINAL_TYPES: Set[str] = {
         "comment", "line_comment", "block_comment",
         "string", "number", "boolean",
@@ -381,7 +381,7 @@ class _TSBaseVisitor(_BaseASTVisitor):
         return self.facts
 
     def _walk(self, node) -> None:
-        """DFS обхід дерева з dispatch на тип вузла."""
+        """DFS tree walk with dispatch by node type."""
         if node.type in self.TERMINAL_TYPES:
             return
         handled = self._dispatch(node)
@@ -391,15 +391,15 @@ class _TSBaseVisitor(_BaseASTVisitor):
 
     def _dispatch(self, node) -> bool:
         """
-        Повертає True якщо вузол повністю оброблений (рекурсія не потрібна).
-        Повертає False якщо треба продовжити обхід дочірніх вузлів.
+        Return True when the node is fully handled and recursion is unnecessary.
+        Return False when traversal should continue through child nodes.
         """
         return False
 
-    # ─── Допоміжники ──────────────────────────────────────────────────────────
+    # ─── Helpers ──────────────────────────────────────────────────────────────
 
     def _text(self, node) -> str:
-        """Текст вузла, обрізаний до 64 символів."""
+        """Node text truncated to 64 characters."""
         return node.text.decode("utf-8", errors="replace")[:64].strip()
 
     def _child_text(self, node, field_name: str) -> Optional[str]:
@@ -502,14 +502,14 @@ class _JSVisitor(_TSBaseVisitor):
         fname = self._text(name_node) if name_node else f"<fn{len(self.facts)}>"
         self._fact("define", fname, self._cur_scope)
 
-        # Параметри
+        # Parameters
         params_node = node.child_by_field_name("parameters")
         if params_node:
             for param in params_node.named_children:
                 if param.type in ("identifier", "formal_parameters"):
                     self._fact("param", fname, self._text(param))
 
-        # Декоратори (TypeScript)
+        # Decorators (TypeScript)
         for dec in self._all_children_of_type(node, "decorator"):
             self._fact("decorator", fname, self._text(dec))
 
@@ -596,7 +596,7 @@ class _TSVisitor(_JSVisitor):
     def _dispatch(self, node) -> bool:
         t = node.type
 
-        # TypeScript-специфічні конструкції
+        # TypeScript-specific constructs
         if t == "interface_declaration":
             name_node = node.child_by_field_name("name")
             iname = self._text(name_node) if name_node else "<iface>"
@@ -621,7 +621,7 @@ class _TSVisitor(_JSVisitor):
             return True
 
         if t in ("type_annotation", "type_assertion"):
-            return False  # продовжуємо обхід
+            return False  # continue traversal
 
         if t == "enum_declaration":
             name_node = node.child_by_field_name("name")
@@ -692,7 +692,7 @@ class _JavaVisitor(_TSBaseVisitor):
                     for iface in clause.named_children:
                         self._fact("classbase", cname, self._text(iface))
 
-            # Анотації
+            # Annotations
             for ann in self._all_children_of_type(node, "annotation"):
                 self._fact("decorator", cname, self._text(ann))
 
@@ -867,13 +867,13 @@ class _CVisitor(_TSBaseVisitor):
         return False
 
     def _handle_func(self, node) -> bool:
-        # Ім'я з declarator
+        # Name extracted from the declarator
         decl_node = node.child_by_field_name("declarator")
         name = self._extract_func_name(decl_node or node)
         fname = name or f"<fn{len(self.facts)}>"
         self._fact("define", fname, self._cur_scope)
 
-        # Параметри
+        # Parameters
         params_node = self._find_params(node)
         if params_node:
             for p in params_node.named_children:
@@ -938,7 +938,7 @@ class _CppVisitor(_CVisitor):
             name_node = node.child_by_field_name("name")
             cname = self._text(name_node) if name_node else f"<cls{len(self.facts)}>"
             self._fact("classdef", cname, self._cur_scope)
-            # Базові класи
+            # Base classes
             base_clause = node.child_by_field_name("base_clause")
             if base_clause:
                 for base in base_clause.named_children:
@@ -1243,7 +1243,7 @@ class _GoVisitor(_TSBaseVisitor):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 9.  BASH VISITOR (спрощений)
+# 9. BASH VISITOR (simplified)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _BashVisitor(_TSBaseVisitor):
@@ -1297,7 +1297,7 @@ class _BashVisitor(_TSBaseVisitor):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 10.  LUA VISITOR (спрощений)
+# 10. LUA VISITOR (simplified)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _LuaVisitor(_TSBaseVisitor):
@@ -1374,10 +1374,10 @@ class _LuaVisitor(_TSBaseVisitor):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 11.  ГОЛОВНА ТОЧКА ВХОДУ — MultiLangASTParser
+# 11. MAIN ENTRY POINT — MultiLangASTParser
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Розширення файлів → мова
+# File extension -> language
 _EXT_TO_LANG: Dict[str, str] = {
     ".py":   "python",
     ".js":   "javascript",
@@ -1400,7 +1400,7 @@ _EXT_TO_LANG: Dict[str, str] = {
     ".lua":  "lua",
 }
 
-# Мова → клас парсера
+# Language -> parser class
 _VISITORS: Dict[str, type] = {
     "python":     _PythonVisitor,
     "javascript": _JSVisitor,
@@ -1417,19 +1417,19 @@ _VISITORS: Dict[str, type] = {
 
 class MultiLangASTParser:
     """
-    Мультимовний AST → Horn-факти.
+    Multilingual AST -> Horn facts.
 
-    Підтримувані мови:
+    Supported languages:
       python · javascript · typescript · java · c · cpp · rust · go · bash · lua
 
-    Приклад:
+    Example:
         parser = MultiLangASTParser()
         facts  = parser.parse(code, lang="rust", source_id=42)
-        # або
+        # or
         facts  = parser.parse_file("main.go")
 
-    Кожен виклик parse() повертає свіжий список HornAtom незалежно від попередніх.
-    pool (ConstPool) доступний через last_pool після parse().
+    Each `parse()` call returns a fresh list of HornAtom objects independent of prior calls.
+    `pool` (ConstPool) is available through `last_pool` after `parse()`.
     """
 
     def __init__(self):
@@ -1443,12 +1443,12 @@ class MultiLangASTParser:
               lang: str,
               source_id: int = 0) -> List[HornAtom]:
         """
-        Парсить код і повертає Horn-факти.
+        Parse code and return Horn facts.
 
         Args:
-            code      : вихідний код
-            lang      : мова ('python', 'rust', ...)
-            source_id : числовий ідентифікатор джерела (для мета-фактів)
+            code      : source code
+            lang      : language ('python', 'rust', ...)
+            source_id : numeric source identifier (for meta facts)
 
         Returns:
             List[HornAtom]
@@ -1461,7 +1461,7 @@ class MultiLangASTParser:
         visitor = _VISITORS[lang](source_id=source_id)
         facts = visitor.parse(code)
 
-        # Мета-факт: lang(source_id, lang_id)
+        # Meta fact: lang(source_id, lang_id)
         lang_pred = PRED_VOCAB.get_id("lang")
         lang_const = visitor.pool.intern(lang)
         facts.insert(0, HornAtom(
@@ -1476,8 +1476,8 @@ class MultiLangASTParser:
                    path: str,
                    source_id: Optional[int] = None) -> List[HornAtom]:
         """
-        Парсить файл. Мова визначається за розширенням.
-        source_id за замовчуванням = hash(path) % 2**16
+        Parse a file. Language is inferred from the extension.
+        By default, `source_id = hash(path) % 2**16`.
         """
         import os
         _, ext = os.path.splitext(path.lower())
@@ -1494,17 +1494,17 @@ class MultiLangASTParser:
                     items: List[Tuple[str, str]],
                     start_id: int = 0) -> List[HornAtom]:
         """
-        Batch-парсинг: items = [(code, lang), ...]
-        Повертає об'єднаний список фактів із унікальними source_id.
+        Batch parsing: `items = [(code, lang), ...]`
+        Returns a merged list of facts with unique source_id values.
         """
         all_facts: List[HornAtom] = []
         for i, (code, lang) in enumerate(items):
             all_facts.extend(self.parse(code, lang, source_id=start_id + i))
         return all_facts
 
-    # ── Ідеальна реалізація: пункт 1 специфікації ─────────────────────────────
+    # ── Ideal implementation: item 1 of the specification ───────────────────
 
-    # Евристичні сигнатури мов — для автодетекту без tree-sitter
+    # Heuristic language signatures for autodetection without tree-sitter
     _LANG_SIGNATURES: Dict[str, List[str]] = {
         "python":     ["def ", "import ", "class ", "elif ", "lambda "],
         "javascript": ["function ", "const ", "let ", "var ", "=>", "require("],
@@ -1520,12 +1520,12 @@ class MultiLangASTParser:
 
     def detect_lang(self, code: str) -> str:
         """
-        Автодетект мови за евристичними сигнатурами.
-        Повертає найімовірнішу мову або 'python' за замовчуванням.
+        Auto-detect language from heuristic signatures.
+        Returns the most likely language, or 'python' by default.
 
-        Відповідає пункту 1 «Ідеальної реалізації»:
-          Для каждого прикладу заздалегідь визначаємо мову,
-          щоб правильно витягнути символьні факти.
+        Matches item 1 of the "Ideal implementation":
+          determine the language for each sample in advance
+          so symbolic facts can be extracted correctly.
         """
         scores: Dict[str, int] = {}
         for lang, sigs in self._LANG_SIGNATURES.items():
@@ -1536,15 +1536,15 @@ class MultiLangASTParser:
 
     def parse_autodetect(self, code: str, source_id: int = 0) -> List[HornAtom]:
         """
-        Парсить код з автодетектом мови.
-        Пробує detect_lang() → parse(). Якщо парсер недоступний — fallback на Python.
+        Parse code with language autodetection.
+        Tries `detect_lang()` -> `parse()`. If the parser is unavailable, fall back to Python.
 
-        Відповідає пункту 1 «Ідеальної реалізації»:
-          «Для коду використовується MultiLangASTParser (підтримка 10+ мов).»
+        Matches item 1 of the "Ideal implementation":
+          "Code uses MultiLangASTParser (10+ language support)."
         """
         lang = self.detect_lang(code)
         facts = self.parse(code, lang, source_id)
-        # Якщо порожньо і lang != python — пробуємо python fallback
+        # If parsing returns nothing and lang != python, try Python as a fallback.
         if not facts and lang != "python":
             facts = self.parse(code, "python", source_id)
         return facts
@@ -1553,22 +1553,22 @@ class MultiLangASTParser:
                                facts: List[HornAtom],
                                max_rules: int = 32) -> List:
         """
-        Витягує шаблони правил із Horn-фактів AST.
+        Extract rule templates from AST Horn facts.
 
-        Відповідає пункту 6 «Ідеальної реалізації»:
-          «З AST можна витягувати не лише ground-факти, але й шаблони правил.
-           Наприклад, для def f(params): body →
-             call(f, args) ∧ type_match(args, params) → return_type(T).»
+        Matches item 6 of the "Ideal implementation":
+          "AST should yield not only ground facts, but also rule templates.
+           For example, `def f(params): body` can imply
+             call(f, args) ∧ type_match(args, params) -> return_type(T)."
 
-        Стратегія:
-          · Для кожної пари (define_fact, call_fact) де вони пов'язані
-            через спільну константу func_id → генеруємо правило:
+        Strategy:
+          · For each (define_fact, call_fact) pair connected by the same
+            function constant, generate a rule:
             call(?F, ?X) :- define(?F, ?S), dep_data(?X, ?F)
-          · Для пар (param, return) → param(?F, ?T) → return(?F, ?T)
-          · Пари assign → dep_data:  assign(?X, ?Y) :- dep_data(?X, ?Y)
+          · For (param, return) pairs -> param(?F, ?T) -> return(?F, ?T)
+          · For assign pairs -> dep_data:  assign(?X, ?Y) :- dep_data(?X, ?Y)
 
         Returns:
-            List[HornClause] — шаблони правил для LTM (статус: verified)
+            List[HornClause] — rule templates for LTM (status: verified)
         """
         from omen_prolog import HornClause, HornAtom, Var, Const
 
@@ -1580,7 +1580,7 @@ class MultiLangASTParser:
         dep_pred    = PRED_VOCAB.get_id("dep_data")
         type_pred   = PRED_VOCAB.get_id("type_of")
 
-        # Групуємо факти за предикатом
+        # Group facts by predicate.
         by_pred: Dict[int, List[HornAtom]] = defaultdict(list)
         for f in facts:
             by_pred[f.pred].append(f)
@@ -1588,22 +1588,22 @@ class MultiLangASTParser:
         rules: List[HornClause] = []
         X, Y, F, S = Var("X"), Var("Y"), Var("F"), Var("S")
 
-        # Правило 1: call(?F, ?X) :- define(?F, ?S)
-        # «якщо є визначення функції — її можна викликати»
+        # Rule 1: call(?F, ?X) :- define(?F, ?S)
+        # "if a function is defined, it can be called"
         if by_pred[define_pred] and by_pred[call_pred]:
             head = HornAtom(pred=call_pred, args=(F, X))
             body = (HornAtom(pred=define_pred, args=(F, S)),)
             rules.append(HornClause(head=head, body=body))
 
-        # Правило 2: dep_data(?X, ?Y) :- assign(?X, ?Y)
-        # «присвоєння породжує залежність даних»
+        # Rule 2: dep_data(?X, ?Y) :- assign(?X, ?Y)
+        # "assignment creates a data dependency"
         if by_pred[assign_pred]:
             head = HornAtom(pred=dep_pred, args=(X, Y))
             body = (HornAtom(pred=assign_pred, args=(X, Y)),)
             rules.append(HornClause(head=head, body=body))
 
-        # Правило 3: return(?F, ?Y) :- dep_data(?X, ?Y), param(?F, ?X)
-        # «повернене значення залежить від параметра через data-flow»
+        # Rule 3: return(?F, ?Y) :- dep_data(?X, ?Y), param(?F, ?X)
+        # "the returned value depends on the parameter through data flow"
         if by_pred[dep_pred] and by_pred[param_pred]:
             head = HornAtom(pred=return_pred, args=(F, Y))
             body = (
@@ -1612,8 +1612,8 @@ class MultiLangASTParser:
             )
             rules.append(HornClause(head=head, body=body))
 
-        # Правило 4: type_of(?X, ?T) :- param(?F, ?X), type_of(?F, ?T)
-        # «параметр успадковує тип функції»
+        # Rule 4: type_of(?X, ?T) :- param(?F, ?X), type_of(?F, ?T)
+        # "the parameter inherits the function type"
         if by_pred[type_pred] and by_pred[param_pred]:
             T = Var("T")
             head = HornAtom(pred=type_pred, args=(X, T))
@@ -1623,7 +1623,7 @@ class MultiLangASTParser:
             )
             rules.append(HornClause(head=head, body=body))
 
-        # Конкретні правила на основі пар define-call зі спільними константами
+        # Concrete rules from define/call pairs sharing the same constants.
         define_funcs = {
             int(f.args[0].val): f
             for f in by_pred[define_pred]
@@ -1651,7 +1651,7 @@ class MultiLangASTParser:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 12.  INLINE ТЕСТИ
+# 12. INLINE TESTS
 # ══════════════════════════════════════════════════════════════════════════════
 
 _TEST_CODES: Dict[str, Tuple[str, str]] = {
@@ -1809,7 +1809,7 @@ def run_multilang_tests() -> None:
         results[lang] = len(facts)
         print(f"  facts generated: {len(facts)}")
 
-        # Перевіримо що є хоча б define або classdef
+        # Check that at least define or classdef is present.
         from omen_tensor_unify import PRED_VOCAB
         pred_counts: Dict[str, int] = defaultdict(int)
         for f in facts:

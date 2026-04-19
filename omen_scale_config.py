@@ -14,20 +14,20 @@ from dataclasses import dataclass, field
 class OMENScaleConfig:
     allow_noncanonical_ablation: bool = False
 
-    # ─── Рівень 1: Token-level (Fine) ─────────────────────────────────────────
-    vocab_size:      int   = 256      # NET працює на сирих байтах UTF-8 [0..255]
-    d_tok:           int   = 1_024    # Розмірність токен-рівня  (≥1024)
-    n_heads_tok:     int   = 16       # Головки уваги токен-рівня
-    n_layers_tok:    int   = 12       # Шарів трансформера токен-рівня
-    seq_len:         int   = 4_096    # Контекст  (≥4096)
+    # ─── Level 1: Token-level (Fine) ──────────────────────────────────────────
+    vocab_size:      int   = 256      # NET operates on raw UTF-8 bytes [0..255]
+    d_tok:           int   = 1_024    # Token-level dimensionality (>=1024)
+    n_heads_tok:     int   = 16       # Token-level attention heads
+    n_layers_tok:    int   = 12       # Token-level transformer layers
+    seq_len:         int   = 4_096    # Context length (>=4096)
 
-    # ─── Рівень 2: Concept-level (Coarse) — Perceiver Resampler ───────────────
-    d_latent:        int   = 256      # Концепт-простір (живе WorldRNN та M-Core)
-    n_latents:       int   = 64       # Кількість Perceiver latent queries
-    n_heads_lat:     int   = 8        # Головки Perceiver cross-attention
-    n_layers_lat:    int   = 2        # Шарів Perceiver self-attention
+    # ─── Level 2: Concept-level (Coarse) - Perceiver Resampler ───────────────
+    d_latent:        int   = 256      # Concept space (used by WorldRNN and M-Core)
+    n_latents:       int   = 64       # Number of Perceiver latent queries
+    n_heads_lat:     int   = 8        # Perceiver cross-attention heads
+    n_layers_lat:    int   = 2        # Perceiver self-attention layers
 
-    # ─── WorldRNN (концепт-рівень) ─────────────────────────────────────────────
+    # ─── WorldRNN (concept level) ─────────────────────────────────────────────
     world_rnn_hidden: int  = 512
     world_rollout_steps: int = 8
     world_teacher_forcing_start: float = 0.35
@@ -56,20 +56,20 @@ class OMENScaleConfig:
     mem_cache_size:   int   = 2_048
     mem_symbolic_cache_size: int = 2_048
     mem_write_tau:    float = 0.3
-    mem_update_steps: int   = 8      # оновлення кожні N кроків (не на кожному)
+    mem_update_steps: int   = 8      # update every N steps (not every step)
     mem_decay:        float = 0.995
     mem_symbolic_recall_topk: int = 8
     mem_symbolic_min_sim: float = 0.20
 
     # ─── ∂-Prolog (Symbolic) ──────────────────────────────────────────────────
-    sym_vocab:        int   = 128     # розмір символьного словника
-    sym_embed_dim:    int   = 64      # розмірність символьних ембеддингів
-    max_proof_depth:  int   = 5       # глибина пошуку доведення
-    n_proof_cands:    int   = 16      # кандидатів для абдукції
-    ltm_max_rules:    int   = 1_024   # макс. правил у KnowledgeBase
-    sym_max_facts:    int   = 64      # макс. фактів у WorkingMemory
-    abduct_candidates: int  = 8       # кандидати абдуктивного движка
-    sym_gnn_layers:   int   = 2       # сумісність з OMENv2
+    sym_vocab:        int   = 128     # symbolic vocabulary size
+    sym_embed_dim:    int   = 64      # symbolic embedding dimensionality
+    max_proof_depth:  int   = 5       # proof search depth
+    n_proof_cands:    int   = 16      # abduction candidate count
+    ltm_max_rules:    int   = 1_024   # max rules in KnowledgeBase
+    sym_max_facts:    int   = 64      # max facts in WorkingMemory
+    abduct_candidates: int  = 8       # abduction engine candidates
+    sym_gnn_layers:   int   = 2       # compatibility with OMENv2
     continuous_cycle_enabled: bool = True
     continuous_cycle_eval_enabled: bool = True
     continuous_cycle_contextual: int = 4
@@ -197,64 +197,64 @@ class OMENScaleConfig:
     gamma:       float = 0.1    # World consistency
     delta:       float = 1e-3   # WorldRNN complexity
     eta:         float = 0.05   # Memory recall
-    lam_sym:     float = 0.005   # LTM regularizer (сумісність v2)
+    lam_sym:     float = 0.005   # LTM regularizer (v2 compatibility)
     mdl_param_sigma: float = 0.05
     mdl_token_budget: int = 262144  # legacy field; MDL is now normalized by actual valid tokens
 
     # ─── Neural Epistemic Tokenizer (NET) ─────────────────────────────────────
-    # Замінює GPT-2 BPE (vocab=50257) нейро-символьним компресором.
-    # MDL оптимізація:  L_NET = L_vq + L_rec + λ_voc·Σ||e_v||²
-    # Повний функціонал: J_total = J_OMEN + η_tok · L_NET
+    # Replaces GPT-2 BPE (vocab=50257) with a neuro-symbolic compressor.
+    # MDL optimization: L_NET = L_vq + L_rec + lambda_voc * sum ||e_v||^2
+    # Full objective: J_total = J_OMEN + eta_tok * L_NET
     #
-    net_enabled:      bool  = True       # вмикає NET замість BPE
-    net_byte_layers:  int   = 2          # шарів ByteContextEncoder (f_θ)
-    net_dec_layers:   int   = 2          # шарів ByteDecoder (g_φ)
-    net_init_vocab:   int   = 512        # початковий розмір NET-словника
-    net_max_vocab:    int   = 8_192      # максимальний розмір NET-словника
-    net_tau:          float = 0.85       # поріг cos-подібності (новий токен)
-    net_ema_decay:    float = 0.95       # EMA для оновлення кодбуку (0.95 > 0.99: швидша адаптація)
-    net_warmup_steps: int   = 150        # кроків заморожування росту словника на старті
-                                         # (encoder нестабільний → не додаємо токени)
-    eta_tok:          float = 0.1        # вага L_NET у загальному J
-    lambda_voc:       float = 1e-4       # MDL регуляризатор словника
+    net_enabled:      bool  = True       # enables NET instead of BPE
+    net_byte_layers:  int   = 2          # ByteContextEncoder (f_theta) layers
+    net_dec_layers:   int   = 2          # ByteDecoder (g_phi) layers
+    net_init_vocab:   int   = 512        # initial NET vocabulary size
+    net_max_vocab:    int   = 8_192      # maximum NET vocabulary size
+    net_tau:          float = 0.85       # cosine-similarity threshold (new token)
+    net_ema_decay:    float = 0.95       # EMA for codebook updates (0.95 > 0.99 means faster adaptation)
+    net_warmup_steps: int   = 150        # vocabulary-growth freeze steps at startup
+                                         # (encoder is unstable -> do not add tokens yet)
+    eta_tok:          float = 0.1        # weight of L_NET inside the global J
+    lambda_voc:       float = 1e-4       # MDL vocabulary regularizer
 
     # ─── Adaptive τ scheduling ────────────────────────────────────────────────
-    # τ керує порогом «новизни»: якщо cos_sim < τ → новий концепт.
-    # Адаптивний режим: τ знижується коли H/H_max < 0.55 (мало активних кодів),
-    # підвищується коли H/H_max > 0.65 (словник добре використовується).
-    # Результат: система самостійно балансує між стабільністю і ростом словника.
-    net_tau_schedule: bool  = True       # вмикає адаптивний τ після warmup
-    net_tau_min:      float = 0.70       # нижня межа τ (за замовчуванням net_tau = верхня)
+    # tau controls the novelty threshold: if cos_sim < tau -> create a new concept.
+    # Adaptive mode lowers tau when H/H_max < 0.55 (too few active codes),
+    # and raises it when H/H_max > 0.65 (the vocabulary is being used well).
+    # Result: the system balances stability and vocabulary growth on its own.
+    net_tau_schedule: bool  = True       # enables adaptive tau after warmup
+    net_tau_min:      float = 0.70       # lower tau bound (by default net_tau is the upper bound)
 
-    # ─── Навчання ─────────────────────────────────────────────────────────────
+    # ─── Training ─────────────────────────────────────────────────────────────
     dropout:          float = 0.1
     sparsity_lambda:  float = 5e-4
-    compile_model:    bool  = False   # torch.compile (вмикати на A100/H100)
-    use_flash_attn:   bool  = True    # FlashAttention якщо доступна
+    compile_model:    bool  = False   # torch.compile (enable on A100/H100)
+    use_flash_attn:   bool  = True    # FlashAttention when available
 
     # ─── Verification Module (VeM) ────────────────────────────────────────────
-    # Фільтрує кандидати AbductionHead до додавання в LTM.
+    # Filters AbductionHead candidates before adding them to LTM.
     # U(R) = E[Success(R) − α·Cost(R)]
     # Candidates = {R ~ AbductionHead(z) | U(R) > vem_tau}
-    # δ·E_{R~Abduction}[max(0, τ − U(R))] ← штраф за генерацію поганих кандидатів
-    vem_tau:          float = 0.3    # поріг корисності (U(R) > vem_tau → приймається)
-    delta_vem:        float = 1e-3   # вага VeM-штрафу у загальному J
+    # delta * E_{R~Abduction}[max(0, tau - U(R))] <- penalty for generating poor candidates
+    vem_tau:          float = 0.3    # utility threshold (U(R) > vem_tau -> accepted)
+    delta_vem:        float = 1e-3   # weight of the VeM penalty inside the global J
 
     # ─── Epistemic Rule Tracker ───────────────────────────────────────────────
-    # Кожне правило: proposed → verified / contradicted
+    # Each rule: proposed -> verified / contradicted
     # L_rule = Σ_{R∈LTM} (Complexity(R) − η·Utility(R))
-    eta_utility:      float = 0.1    # винагорода за корисні правила (−η·Utility)
-    rule_consolidate_every: int = 100  # кроків між Rule Consolidation
+    eta_utility:      float = 0.1    # reward for useful rules (-eta * Utility)
+    rule_consolidate_every: int = 100  # steps between Rule Consolidation
 
     # ─── Semantic Feedback Loop ───────────────────────────────────────────────
     # L_semantic = −E_{(v1,v2)~S-Core}[cos(e_v1, e_v2)·Score(v1, v2)]
     # MDL_total  = MDL_NET − λ_sem·I(Z;Γ)
-    lambda_semantic:  float = 0.01   # вага L_semantic
+    lambda_semantic:  float = 0.01   # weight of L_semantic
     lambda_enc_div:   float = 1.5    # Encoder diversity anti-collapse
-                                     # FIX Bug1: 0.30→1.5 (при 0.30 enc_div grad ~87x слабший за l_rec)
-    lambda_soft_H:    float = 2.0    # Диференційована soft-entropy (anti-collapse ключовий сигнал)
-                                     # FIX Bug2: 0.5→2.0 (при 0.5 soft_H grad ~4600x слабший за l_rec)
-                                     # Soft assignments через temperature=0.5 → H градієнт ненульовий при collapse.
+                                     # FIX Bug1: 0.30->1.5 (at 0.30 enc_div grad was ~87x weaker than l_rec)
+    lambda_soft_H:    float = 2.0    # Differentiable soft entropy (key anti-collapse signal)
+                                     # FIX Bug2: 0.5->2.0 (at 0.5 soft_H grad was ~4600x weaker than l_rec)
+                                     # Soft assignments through temperature=0.5 keep the H gradient nonzero under collapse.
 
     # --- Saliency Trace language mode -----------------------------------------
     saliency_enabled: bool  = True
@@ -270,59 +270,59 @@ class OMENScaleConfig:
     saliency_consistency_threshold: float = 0.55
 
     # ─── Efficient Meta-Controller (EMC) ─────────────────────────────────────
-    # EMC замінює фіксований max_proof_depth на адаптивну мета-політику π_meta.
+    # EMC replaces fixed max_proof_depth with an adaptive meta-policy pi_meta.
     #
-    # Рівняння Беллмана:
+    # Bellman equation:
     #   V*(s) = max{ U_stop(s), max_{a∈A} [-C(a) + γ·E V*(s')] }
     #   U_stop(s) = R_task(s) + η_int·R_int(s) − λ_gap·GapNorm(s)
     #
-    # Навчання Actor-Critic:
-    #   L_meta = L_actor + 0.5·L_critic   (додається до J_OMEN з вагою ω_meta)
+    # Actor-Critic training:
+    #   L_meta = L_actor + 0.5 * L_critic   (added to J_OMEN with weight omega_meta)
     #
     # J_OMEN+EMC = J_OMEN
     #            + ω_meta · E_τ[Σ_t (R_task + η_int·R_int − λ_gap·GapNorm − C(a))]
-    emc_enabled:       bool  = True    # True → EMC керує прологом; False → стара поведінка
-    emc_max_steps:     int   = 5       # максимальна кількість кроків EMC за forward
-    emc_gamma:         float = 0.95    # коефіцієнт дисконтування майбутньої нагороди
-    emc_entropy_beta:  float = 0.01    # β: вага ентропії (exploration bonus)
-    emc_lambda_time:   float = 0.05    # штраф за кожен зайвий крок міркування
-    emc_lambda_gap:    float = 0.05    # штраф за GapNorm (незнання)
-    emc_lambda_memory_residual: float = 0.02   # штраф за memory residual у meta-control
-    emc_lambda_memory_misalignment: float = 0.02  # штраф за memory misalignment у meta-control
-    emc_eta_int:       float = 0.10    # бонус за нові факти/правила (R_int)
-    emc_c_recall:      float = 0.01    # вартість дії RecallMCore
-    emc_c_fc:          float = 0.05    # вартість дії ForwardChainStep
-    emc_c_abduce:      float = 0.10    # вартість дії Abduce
-    emc_c_intrinsic:   float = 0.03    # вартість дії FocusIntrinsicGoal
-    omega_meta:        float = 0.05    # ω_meta: вага meta_loss у загальному J
-    loss_aux_warmup:   int   = 500     # розігрів auxiliary loss-ів, щоб CE не домінував вічно
+    emc_enabled:       bool  = True    # True -> EMC controls the prover; False -> legacy behavior
+    emc_max_steps:     int   = 5       # maximum EMC steps per forward pass
+    emc_gamma:         float = 0.95    # future-reward discount factor
+    emc_entropy_beta:  float = 0.01    # beta: entropy weight (exploration bonus)
+    emc_lambda_time:   float = 0.05    # penalty for each extra reasoning step
+    emc_lambda_gap:    float = 0.05    # GapNorm penalty (ignorance)
+    emc_lambda_memory_residual: float = 0.02   # memory-residual penalty in meta-control
+    emc_lambda_memory_misalignment: float = 0.02  # memory-misalignment penalty in meta-control
+    emc_eta_int:       float = 0.10    # bonus for new facts/rules (R_int)
+    emc_c_recall:      float = 0.01    # RecallMCore action cost
+    emc_c_fc:          float = 0.05    # ForwardChainStep action cost
+    emc_c_abduce:      float = 0.10    # Abduce action cost
+    emc_c_intrinsic:   float = 0.03    # FocusIntrinsicGoal action cost
+    omega_meta:        float = 0.05    # omega_meta: meta_loss weight in the global J
+    loss_aux_warmup:   int   = 500     # auxiliary-loss warmup so CE does not dominate forever
 
-    # ─── EMC розширення: GAE + MDL(proof) + History ───────────────────────────
+    # ─── EMC extension: GAE + MDL(proof) + History ────────────────────────────
     # GAE (Generalized Advantage Estimation):
     #   A_GAE_t = Σ_{k≥0} (γλ)^k · δ_{t+k}
-    #   де δ_t = r_t + γ·V(s_{t+1}) − V(s_t)  (TD error)
-    #   При λ→0: чистий TD(0); при λ→1: Monte-Carlo. Компроміс bias/variance.
-    emc_use_gae:       bool  = True    # True → GAE замість Монте-Карло returns
-    emc_gae_lambda:    float = 0.95    # λ у GAE (0=TD, 1=MC)
+    #   where delta_t = r_t + gamma * V(s_{t+1}) - V(s_t)  (TD error)
+    #   lambda->0: pure TD(0); lambda->1: Monte Carlo. Bias/variance trade-off.
+    emc_use_gae:       bool  = True    # True -> GAE instead of Monte Carlo returns
+    emc_gae_lambda:    float = 0.95    # lambda in GAE (0=TD, 1=MC)
     emc_train_fast_maintenance_every: int = 4  # cadence for heavy symbolic maintenance in train_fast
     emc_train_fast_cycle_trace_candidates: int = 2
     emc_train_fast_cycle_contextual: int = 2
     emc_train_fast_cycle_neural: int = 2
     emc_train_fast_cycle_max_repairs: int = 1
 
-    # MDL(proof) компонент:
+    # MDL(proof) component:
     #   U_stop(s) -= λ_mdl · MDL(proof)
     #   MDL(proof) = Σ_{R ∈ used_rules} Complexity(R) + depth·c_per_step
-    #   Заохочує стислі доведення (MDL-принцип розширений на reasoning)
-    emc_lambda_mdl:    float = 0.01    # штраф за складність доведення
+    #   Encourages compact proofs (MDL principle extended to reasoning)
+    emc_lambda_mdl:    float = 0.01    # proof-complexity penalty
 
     # History encoding:
-    #   Стан розширено: s_t = (z, gap_norm, depth, n_facts, n_rules, action_hist)
-    #   action_hist — one-hot агрегат попередніх дій (допомагає уникнути cycles)
-    emc_use_action_hist: bool = True   # True → кодуємо історію дій у стані
+    #   State extended to: s_t = (z, gap_norm, depth, n_facts, n_rules, action_hist)
+    #   action_hist is a one-hot aggregate of past actions (helps avoid cycles)
+    emc_use_action_hist: bool = True   # True -> encode action history into the state
 
-    # ─── Сумісність з OMENv2 ──────────────────────────────────────────────────
-    # (поля, що очікує OMENAGILoss/WorldRNN)
+    # ─── Compatibility with OMENv2 ────────────────────────────────────────────
+    # (fields expected by OMENAGILoss/WorldRNN)
     n_heads:         int   = 16
     n_layers:        int   = 12
     d_model:         int   = 1_024
@@ -330,39 +330,39 @@ class OMENScaleConfig:
 
     # ════════════════════════════════════════════════════════════════════════
     # ─── OMEN Synthesis Framework (OSF) ──────────────────────────────────────
-    # OSF замінює TokenDecoder ієрархічною нейро-символьною генерацією.
-    # Чотири рівні: Intent → Plan → Expression → Tokens.
+    # OSF replaces TokenDecoder with hierarchical neuro-symbolic generation.
+    # Four levels: Intent -> Plan -> Expression -> Tokens.
     #
     # J_OSF = λ_plan·L_plan + λ_sim·L_sim + λ_refl·L_refl + λ_meta·L_meta
-    # Повний функціонал: J_total = J_OMEN + λ_osf · J_OSF
+    # Full objective: J_total = J_OMEN + lambda_osf * J_OSF
     #
-    osf_enabled:      bool  = True      # True → OSF замість TokenDecoder
-    osf_d_intent:     int   = 64        # розмір Intent-простору (H1)
-    osf_n_goals:      int   = 32        # кількість абстрактних цілей
-    osf_d_plan:       int   = 64        # розмір Plan-простору (H2)
-    osf_n_operators:  int   = 32        # бібліотека план-операторів
-    osf_template_len: int   = 8         # довжина шаблону оператора (H3)
-    osf_max_plan_depth: int = 4         # максимальна глибина плану
-    osf_beam_width:   int   = 2         # ширина beam search
-    osf_lambda_plan:  float = 0.10      # вага L_plan
-    osf_lambda_sim:   float = 0.05      # вага L_sim
-    osf_lambda_refl:  float = 0.05      # вага L_refl
-    osf_lambda_meta:  float = 0.05      # вага L_meta (стратегія)
+    osf_enabled:      bool  = True      # True -> OSF instead of TokenDecoder
+    osf_d_intent:     int   = 64        # Intent-space size (H1)
+    osf_n_goals:      int   = 32        # number of abstract goals
+    osf_d_plan:       int   = 64        # Plan-space size (H2)
+    osf_n_operators:  int   = 32        # library of plan operators
+    osf_template_len: int   = 8         # operator template length (H3)
+    osf_max_plan_depth: int = 4         # maximum plan depth
+    osf_beam_width:   int   = 2         # beam-search width
+    osf_lambda_plan:  float = 0.10      # weight of L_plan
+    osf_lambda_sim:   float = 0.05      # weight of L_sim
+    osf_lambda_refl:  float = 0.05      # weight of L_refl
+    osf_lambda_meta:  float = 0.05      # weight of L_meta (strategy)
     osf_lambda_intent: float = 0.01     # anti-collapse intent
-    osf_lambda_total: float = 0.3       # λ_osf: вага J_OSF у J_total
+    osf_lambda_total: float = 0.3       # lambda_osf: weight of J_OSF in J_total
     osf_use_simulation: bool = True     # WorldSimulator
     osf_use_reflection: bool = True     # ReflectionModule
     osf_use_meta:     bool  = True      # SynthesisMetaController
-    osf_meta_beta:    float = 0.1       # баланс якість/вартість σ
+    osf_meta_beta:    float = 0.1       # quality/cost balance for sigma
     osf_gumbel_tau:   float = 1.0       # Gumbel-Softmax temperature
 
     @classmethod
     def demo(cls) -> "OMENScaleConfig":
-        """Конфіг для тестування на будь-якому залізі (CPU/GPU)"""
+        """Config for testing on any hardware (CPU/GPU)."""
         return cls(
-            # ВАЖЛИВО: vocab_size=256 → true byte mode → bidirectional attention
-            # + segment pooling → різноманітні вектори → немає encoder collapse!
-            # vocab_size=4096 (legacy) давало MeanSim=0.9935 → 83% dead codes.
+            # IMPORTANT: vocab_size=256 -> true byte mode -> bidirectional attention
+            # + segment pooling -> diverse vectors -> no encoder collapse.
+            # vocab_size=4096 (legacy) produced MeanSim=0.9935 -> 83% dead codes.
             vocab_size=256,     d_tok=256,    n_heads_tok=4,  n_layers_tok=2,
             seq_len=128,        d_latent=64,  n_latents=16,   n_heads_lat=4,
             n_layers_lat=1,     world_rnn_hidden=128, world_rollout_steps=8,
@@ -371,7 +371,7 @@ class OMENScaleConfig:
             sym_vocab=64,       sym_embed_dim=32,    max_proof_depth=3,
             n_proof_cands=8,    ltm_max_rules=256,   sym_max_facts=32,
             abduct_candidates=8, n_heads=4, n_layers=2, d_model=256,
-            # NET: малий словник для швидкого тестування на CPU/GPU
+            # NET: small vocabulary for fast CPU/GPU testing
             net_enabled=True,   net_byte_layers=1,   net_dec_layers=1,
             net_init_vocab=32,  net_max_vocab=512,   net_tau=0.85,
             net_ema_decay=0.95, eta_tok=0.1,         lambda_voc=1e-4,
@@ -381,15 +381,15 @@ class OMENScaleConfig:
             net_tau_schedule=True, net_tau_min=0.70,
             vem_tau=0.3,        delta_vem=1e-3,      eta_utility=0.1,
             lambda_semantic=0.01, rule_consolidate_every=50,
-            # EMC: адаптивний контролер міркування
+            # EMC: adaptive reasoning controller
             emc_enabled=True,   emc_max_steps=3,     emc_gamma=0.95,
             emc_entropy_beta=0.01, emc_lambda_time=0.05, emc_lambda_gap=0.05,
             emc_eta_int=0.1,    emc_c_recall=0.01,   emc_c_fc=0.05,
             emc_c_abduce=0.10,  omega_meta=0.05,
-            # EMC розширення
+            # EMC extension
             emc_use_gae=True,   emc_gae_lambda=0.95, emc_lambda_mdl=0.01,
             emc_use_action_hist=True,
-            # OSF: Synthesis Framework (малий для demo)
+            # OSF: Synthesis Framework (small demo setup)
             osf_enabled=True,   osf_d_intent=32,     osf_n_goals=16,
             osf_d_plan=32,      osf_n_operators=16,  osf_template_len=4,
             osf_max_plan_depth=3, osf_beam_width=2,
@@ -401,20 +401,20 @@ class OMENScaleConfig:
     @classmethod
     def strong(cls) -> "OMENScaleConfig":
         """
-        ~80–120M-параметрова конфігурація для одного сучасного GPU (RTX 3080/4080/A100).
+        ~80-120M-parameter configuration for a single modern GPU (RTX 3080/4080/A100).
 
-        Ключові відмінності від demo:
-          · vocab_size=256 (байт-режим) — bidirectional attention + segment pooling
-          · d_tok=512, n_layers=4, seq_len=512 — значно більша ємність
-          · net_max_vocab=4096 — простір для багатого символьного словника
-          · net_tau_schedule=True — адаптивний поріг (самобалансування)
-          · lambda_enc_div=1.5 — активний анти-колапс encoder (FIX Bug1: 0.3→1.5)
+        Key differences from demo:
+          - vocab_size=256 (byte mode) -> bidirectional attention + segment pooling
+          - d_tok=512, n_layers=4, seq_len=512 -> much larger capacity
+          - net_max_vocab=4096 -> room for a richer symbolic vocabulary
+          - net_tau_schedule=True -> adaptive threshold (self-balancing)
+          - lambda_enc_div=1.5 -> active anti-collapse encoder signal (FIX Bug1: 0.3->1.5)
 
-        Очікувані результати (порівняно з demo):
-          · Used/Vocab > 60% (замість ~18% у demo)
-          · MeanSim < 0.70 (замість 0.99)
-          · Entropy > 6 bits (замість ~4)
-          · PPL < 2.5 на Python code (замість ~3.6)
+        Expected results relative to demo:
+          - Used/Vocab > 60% (instead of ~18% in demo)
+          - MeanSim < 0.70 (instead of 0.99)
+          - Entropy > 6 bits (instead of ~4)
+          - PPL < 2.5 on Python code (instead of ~3.6)
         """
         return cls(
             vocab_size=256,      d_tok=512,     n_heads_tok=8,  n_layers_tok=4,
@@ -424,7 +424,7 @@ class OMENScaleConfig:
             sym_vocab=128,       sym_embed_dim=64,    max_proof_depth=4,
             n_proof_cands=16,    ltm_max_rules=512,   sym_max_facts=64,
             abduct_candidates=8, n_heads=8,    n_layers=4,     d_model=512,
-            # NET: повний байт-рівень, великий словник
+            # NET: full byte-level setup, large vocabulary
             net_enabled=True,    net_byte_layers=2,   net_dec_layers=2,
             net_init_vocab=64,   net_max_vocab=4096,  net_tau=0.85,
             net_ema_decay=0.95,  eta_tok=0.1,         lambda_voc=1e-4,
@@ -440,7 +440,7 @@ class OMENScaleConfig:
             emc_entropy_beta=0.01, emc_lambda_time=0.05, emc_lambda_gap=0.05,
             emc_eta_int=0.1,    emc_c_recall=0.01,   emc_c_fc=0.05,
             emc_c_abduce=0.10,  omega_meta=0.05,
-            # EMC розширення
+            # EMC extension
             emc_use_gae=True,   emc_gae_lambda=0.95, emc_lambda_mdl=0.01,
             emc_use_action_hist=True,
             # OSF
@@ -453,14 +453,14 @@ class OMENScaleConfig:
 
     @classmethod
     def mid(cls) -> "OMENScaleConfig":
-        """~1B-параметрова конфігурація для одного A100"""
+        """~1B-parameter configuration for a single A100."""
         return cls(
             vocab_size=256,    d_tok=1_024, n_heads_tok=16, n_layers_tok=16,
             seq_len=2_048,     d_latent=256, n_latents=64,  n_heads_lat=8,
             n_layers_lat=2,    world_rnn_hidden=512,
             mem_heads=16,      mem_cache_size=1_024, mem_update_steps=8,
             n_heads=16, n_layers=16, d_model=1_024,
-            # NET: повний розмір для серйозного тренування
+            # NET: full-size setup for serious training
             net_enabled=True,  net_byte_layers=2,    net_dec_layers=2,
             net_init_vocab=512, net_max_vocab=8_192, net_tau=0.85,
             net_ema_decay=0.95, eta_tok=0.1,          lambda_voc=1e-4,
@@ -472,5 +472,5 @@ class OMENScaleConfig:
 
     @classmethod
     def full(cls) -> "OMENScaleConfig":
-        """Повний масштаб (≥4×A100 80 GB, FSDP)"""
+        """Full scale (>=4x A100 80 GB, FSDP)."""
         return cls()

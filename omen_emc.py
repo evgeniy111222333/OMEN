@@ -1,39 +1,39 @@
 """
 omen_emc.py — Efficient Meta-Controller (EMC) for OMEN-Scale
 =============================================================
-Реалізує оптимальне управління ресурсами міркування на основі рівняння Беллмана.
+Implements optimal control of reasoning resources using a Bellman-style decision process.
 
-Проблема, яку вирішуємо:
-  Поточний max_proof_depth — фіксований гіперпараметр.
-  Система завжди робить рівно max_depth кроків незалежно від складності задачі.
-  Це порушує MDL-принцип: Cost(Reasoning) має входити у функціонал.
+Problem addressed:
+  The current `max_proof_depth` is a fixed hyperparameter.
+  The system always performs exactly `max_depth` steps regardless of task difficulty.
+  That violates the MDL principle: `Cost(Reasoning)` should be part of the objective.
 
-Математична формалізація:
-  Стан s = (z, gap_norm, d, n_facts, n_rules)
-  Дії  A = {Stop(0), RecallMCore(1), ForwardChainStep(2), Abduce(3)}
+Mathematical formulation:
+  State s = (z, gap_norm, d, n_facts, n_rules)
+  Actions A = {Stop(0), RecallMCore(1), ForwardChainStep(2), Abduce(3)}
 
-  Рівняння Беллмана:
+  Bellman equation:
     V*(s) = max{ U_stop(s),
                  max_{a∈A} [-C(a) + γ·E_{s'~P(·|s,a)} V*(s')] }
 
   U_stop(s) = R_task(s) + η_int·R_intermediate(s) − λ_gap·GapNorm(s)
 
-  Де:
-    R_task(s)         = 1.0 якщо ціль доведена (goal ∈ KB), 0.0 інакше
-    R_intermediate(s) = Σ_{f∈KB∖KB₀} Utility(f)  — нові корисні факти
-    GapNorm(s)        = ||E(z)||  — епістемічна непевність (Curiosity Engine)
+  Where:
+    R_task(s)         = 1.0 if the goal is proved (goal ∈ KB), else 0.0
+    R_intermediate(s) = Σ_{f∈KB∖KB₀} Utility(f) — newly useful facts
+    GapNorm(s)        = ||E(z)|| — epistemic uncertainty (Curiosity Engine)
 
-Навчання Actor-Critic:
+Actor-Critic training:
   L_critic = E[(r + γ·V_φ'(s') − V_φ(s))²]
   L_actor  = E[-Σ_a π_meta(a|s)·A(s,a) − β·H(π_meta(·|s))]
 
   A(s,a) = −C(a) + E_{s'}[V(s')] − V(s)
 
-Повний функціонал OMEN+EMC (5-й член — новий):
+Full OMEN+EMC objective (the fifth term is new):
   J_OMEN+EMC = J_OMEN
              + ω_meta · E_τ[ Σ_t (R_task + η_int·R_int − λ_gap·GapNorm_t − C(a_t)) ]
 
-Де Cost(Reasoning) = Σ_t C(a_t) розширює MDL-принцип на обчислювальну вартість.
+Here `Cost(Reasoning) = Σ_t C(a_t)` extends the MDL principle to computational cost.
 """
 
 from __future__ import annotations
@@ -52,40 +52,40 @@ from omen_symbolic.controller import merge_induction_stats
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1.  КОНСТАНТИ ДІЙ
+# 1. ACTION CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-ACTION_STOP   = 0   # Зупинитись — повернути поточний z_sym
-ACTION_RECALL = 1   # Зчитати з M-Core, збагатити z
-ACTION_FC     = 2   # Один крок Forward Chaining (застосувати правила → нові факти)
-ACTION_ABDUCE = 3   # Абдукція: згенерувати нові правила через AbductionHead + VeM
-ACTION_INTRINSIC = 4   # Переключити активну ціль на внутрішню ICE-ціль
+ACTION_STOP   = 0   # Stop and return the current z_sym
+ACTION_RECALL = 1   # Read from M-Core and enrich z
+ACTION_FC     = 2   # One Forward Chaining step (apply rules -> new facts)
+ACTION_ABDUCE = 3   # Abduction: generate new rules through AbductionHead + VeM
+ACTION_INTRINSIC = 4   # Switch the active goal to an internal ICE goal
 
 N_ACTIONS = 5
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1.5  STOPPING UTILITY  та  TRAJECTORY STATS
+# 1.5 STOPPING UTILITY and TRAJECTORY STATS
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class TrajectoryStats:
     """
-    Статистика траєкторії міркування для одного епізоду EMC.
+    Reasoning-trajectory statistics for a single EMC episode.
 
-    Повертається з run_episode разом з (z_sym, sym_loss, v_mem, meta_loss).
-    Використовується OMENScaleLoss для обчислення 7-ї компоненти функціонала:
+    Returned from `run_episode` together with `(z_sym, sym_loss, v_mem, meta_loss)`.
+    Used by `OMENScaleLoss` to compute the seventh objective component:
 
       ω_meta · E_τ[ Σ_t (R_task + η_int·R_int − λ_gap·GapNorm_t − C(a_t)) ]
     """
-    trajectory_reward: float = 0.0   # Σ_t r_t  (повна дисконтована сума)
-    n_steps:           int   = 0     # скільки кроків виконано (T)
-    goal_proved:       bool  = False # чи ціль доведена
+    trajectory_reward: float = 0.0   # Σ_t r_t (full discounted return)
+    n_steps:           int   = 0     # number of executed steps (T)
+    goal_proved:       bool  = False # whether the goal is proved
     intermediate_utility: float = 0.0
     proof_mdl:         float = 0.0
     final_gap:         float = 0.0
-    gap_norms:         list  = field(default_factory=list)  # GapNorm_t на кожному кроці
-    actions:           list  = field(default_factory=list)  # a_t на кожному кроці
+    gap_norms:         list  = field(default_factory=list)  # GapNorm_t at each step
+    actions:           list  = field(default_factory=list)  # a_t at each step
     action_costs:      list  = field(default_factory=list)  # C(a_t)
     r_intermediates:   list  = field(default_factory=list)  # R_int_t
     action_histogram:  list  = field(default_factory=list)
@@ -106,13 +106,13 @@ class StoppingUtility(nn.Module):
     """
     U_stop(s) = R_task(s) + η_int·R_intermediate(s) − λ_gap·GapNorm(s)
 
-    Де:
-      R_task(s)    : м'яка оцінка ймовірності доведення (навчається через BCE)
-      R_int(s)     : накопичена проміжна корисність (Σ нових корисних фактів)
-      GapNorm(s)   : ||E(z)||  — епістемічна невпевненість
+    Where:
+      R_task(s)    : soft estimate of proof success probability (trained through BCE)
+      R_int(s)     : accumulated intermediate utility (Σ newly useful facts)
+      GapNorm(s)   : ||E(z)|| — epistemic uncertainty
 
-    Реалізує: U_stop > V(s) → STOP (рівняння Беллмана для оптимальної зупинки)
-    Навчається через gradient з meta_loss.
+    Implements the stopping rule `U_stop > V(s)` from the Bellman equation.
+    Trained through gradients from `meta_loss`.
     """
 
     def __init__(self, d_state: int, eta_int: float = 0.10,
@@ -121,9 +121,9 @@ class StoppingUtility(nn.Module):
         super().__init__()
         self.eta_int     = eta_int
         self.lambda_gap  = lambda_gap
-        self.lambda_time = lambda_time   # λ_time: штраф за кількість кроків T_elapsed
+        self.lambda_time = lambda_time   # λ_time: penalty for the number of elapsed reasoning steps
 
-        # М'яка оцінка R_task (P(goal proved | state)) — навчається через REINFORCE
+        # Soft R_task estimate (P(goal proved | state)) trained through REINFORCE
         self.task_estimator = nn.Sequential(
             nn.Linear(d_state, d_state // 2),
             nn.GELU(),
@@ -134,30 +134,32 @@ class StoppingUtility(nn.Module):
 
     def forward(self,
                 state:     torch.Tensor,       # (B, d_state)
-                r_int:     float,              # поточна проміжна корисність
-                gap_norm:  torch.Tensor,       # (B,) або scalar
+                r_int:     float,              # current intermediate utility
+                gap_norm:  torch.Tensor,       # (B,) or scalar
                 mdl_cost:  float = 0.0,
-                t_elapsed: int   = 0,          # кількість виконаних кроків міркування
+                t_elapsed: int   = 0,          # number of executed reasoning steps
                 memory_penalty: float = 0.0,
-                ) -> torch.Tensor:             # → (B,) U_stop
+                ) -> torch.Tensor:             # -> (B,) U_stop
         """
-        Обчислює U_stop(s) відповідно до розширеної формули MDL:
+        Compute `U_stop(s)` according to the extended MDL formula:
 
           U_stop(s) = R_task_soft(s)
-                    + η_int · R_int            ← бонус за нові факти
-                    − λ_gap  · GapNorm(s)      ← штраф за епістемічну прогалину
-                    − λ_mdl  · MDL(proof)      ← штраф за складність доведення
-                    − λ_time · T_elapsed       ← штраф за витрачений час
+                    + η_int · R_int            <- reward for newly useful facts
+                    − λ_gap  · GapNorm(s)      <- penalty for the epistemic gap
+                    − λ_mdl  · MDL(proof)      <- penalty for proof complexity
+                    − λ_time · T_elapsed       <- penalty for elapsed time
 
-        Остання компонента реалізує рівняння Беллмана для оптимальної зупинки:
+        The last term implements the Bellman stopping criterion:
           π_meta* = argmax_π E[R_task − λ_time·T − λ_MDL·MDL(proof)]
 
-        R_task_soft — диференційована: gradient через task_estimator → state → z.
-        R_int, gap_norm, mdl_cost, t_elapsed — скалярні (зовнішні, без grad).
+        `R_task_soft` is differentiable: gradients flow through
+        `task_estimator -> state -> z`.
+        `R_int`, `gap_norm`, `mdl_cost`, and `t_elapsed` are scalar
+        external signals without gradients.
         """
         r_task = self.task_estimator(state).squeeze(-1)   # (B,)
 
-        # Нормалізуємо gap_norm до [0,1] діапазону
+        # Normalize gap_norm into the [0, 1] range
         if isinstance(gap_norm, (int, float)):
             gn = torch.tensor(gap_norm, dtype=r_task.dtype, device=r_task.device)
         else:
@@ -167,8 +169,8 @@ class StoppingUtility(nn.Module):
             mdl_cost, dtype=r_task.dtype, device=r_task.device
         ).clamp(min=0.0)
 
-        # λ_time · T_elapsed: лінійний штраф за кожен додатковий крок міркування
-        # (реалізує Cost(Reasoning) = Σ_t C(a_t) у функціоналі MDL)
+        # λ_time · T_elapsed: linear penalty for each extra reasoning step
+        # Implements Cost(Reasoning) = Σ_t C(a_t) inside the MDL objective.
         time_pen = torch.tensor(
             self.lambda_time * float(t_elapsed),
             dtype=r_task.dtype, device=r_task.device,
@@ -187,28 +189,28 @@ class StoppingUtility(nn.Module):
         return u_stop   # (B,)
 
     def bellman_should_stop(self,
-                            u_stop:  torch.Tensor,   # (B,) — U_stop(s)
-                            v_state: torch.Tensor,   # (B,) — V_φ(s) від Critic
+                            u_stop:  torch.Tensor,   # (B,) - U_stop(s)
+                            v_state: torch.Tensor,   # (B,) - V_φ(s) from the critic
                             ) -> bool:
         """
-        Оптимальна зупинка: Stop якщо U_stop(s) ≥ E[V(s)].
-        Повертає True якщо більшість елементів батчу виграють від зупинки.
+        Optimal stopping rule: stop if `U_stop(s) ≥ E[V(s)]`.
+        Returns `True` when most batch elements benefit from stopping.
         """
-        # Порівнюємо mean(B) — global decision для епізоду
+        # Compare mean(B): a global decision for the episode.
         return (u_stop.mean() >= v_state.mean()).item()
 
 
 class VoCStoppingCriterion:
     """
-    Value of Computation (VoC) — апроксимація рівняння Беллмана:
+    Value of Computation (VoC) approximation of the Bellman equation:
 
-      Δ(s, d) > C(Δd)  →  продовжувати
-      Δ(s, d) ≤ C(Δd)  →  зупинитись
+      Δ(s, d) > C(Δd)  ->  continue
+      Δ(s, d) ≤ C(Δd)  ->  stop
 
-    де Δ(s, d) — очікуваний виграш від додаткового кроку,
-       C(Δd) = c · Δd — вартість обчислення.
+    where Δ(s, d) is the expected gain from one more step,
+    and C(Δd) = c · Δd is the computational cost.
 
-    Проста апроксимація: Δ(s,d) ≈ max(0, V(s') − V(s))
+    Simple approximation: Δ(s,d) ≈ max(0, V(s') − V(s))
     """
 
     def __init__(self, cost_per_step: float = 0.05):
@@ -219,7 +221,7 @@ class VoCStoppingCriterion:
         self._prev_value = None
 
     def should_continue(self, current_value: float) -> bool:
-        """True якщо виграш від продовження перевищує вартість."""
+        """Return `True` if the gain from continuing exceeds the cost."""
         if self._prev_value is None:
             self._prev_value = current_value
             return True
@@ -229,17 +231,18 @@ class VoCStoppingCriterion:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2.  КОДУВАЛЬНИК СТАНУ
+# 2. STATE ENCODER
 # ══════════════════════════════════════════════════════════════════════════════
 
 class EMCStateEncoder(nn.Module):
     """
-    Кодує стан s = (z, gap_norm, depth_norm, n_facts_norm, n_rules_norm)
-    у вектор d_latent-розмірності.
+    Encode the state s = (z, gap_norm, depth_norm, n_facts_norm, n_rules_norm)
+    into a `d_latent`-dimensional vector.
 
-    z (нейронний стан) проектується через лінійний шар, потім конкатенується
-    з 4 нормованими скалярними ознаками і знову проектується.
-    detach() від z — EMC отримує градієнт лише через meta_loss, не крізь z.
+    `z` (the neural state) is projected through a linear layer, concatenated
+    with four normalized scalar features, and projected again.
+    `detach()` on `z` ensures EMC receives gradients only through `meta_loss`,
+    not through `z` directly.
     """
 
     def __init__(self, d_latent: int, dropout: float = 0.1,
@@ -275,9 +278,9 @@ class EMCStateEncoder(nn.Module):
                 action_hist: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         z           : (B, d_latent)
-        *_norm      : () або (B,) — скалярні ознаки; gap_relief може бути в [-1,1]
-        action_hist : (B, N_ACTIONS) або None — one-hot агрегат попередніх дій
-        Returns     : (B, d_latent) — стан для Actor/Critic
+        *_norm      : () or (B,) - scalar features; gap_relief may lie in [-1,1]
+        action_hist : (B, N_ACTIONS) or None - one-hot aggregate of previous actions
+        Returns     : (B, d_latent) - state for Actor/Critic
         """
         B = z.shape[0]
         z_enc = self.z_proj(z)
@@ -294,7 +297,7 @@ class EMCStateEncoder(nn.Module):
         )
 
         def _as_col(t: torch.Tensor) -> torch.Tensor:
-            """() або (B,) → (B, 1)"""
+            """() or (B,) -> (B, 1)"""
             if t.dim() == 0:
                 return t.unsqueeze(0).expand(B, 1)
             return t.unsqueeze(-1) if t.dim() == 1 else t
@@ -316,7 +319,7 @@ class EMCStateEncoder(nn.Module):
             if action_hist is not None:
                 feat = torch.cat([z_enc, goal_enc, wm_enc, scalars, action_hist], dim=-1)
             else:
-                # Заповнюємо нулями якщо action_hist не передано (перший крок)
+                # Fill with zeros if action_hist is not provided (first step)
                 zeros = torch.zeros(B, N_ACTIONS, device=z.device, dtype=z.dtype)
                 feat = torch.cat([z_enc, goal_enc, wm_enc, scalars, zeros], dim=-1)
         else:
@@ -331,8 +334,8 @@ class EMCStateEncoder(nn.Module):
 
 class EMCActor(nn.Module):
     """
-    π_meta(a | s) — мета-політика.
-    Повертає logits над {Stop, RecallMCore, ForwardChainStep, Abduce}.
+    π_meta(a | s) — the meta-policy.
+    Returns logits over {Stop, RecallMCore, ForwardChainStep, Abduce}.
     """
 
     def __init__(self, d_state: int, dropout: float = 0.1):
@@ -345,14 +348,14 @@ class EMCActor(nn.Module):
         )
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
-        """state: (B, d) → logits: (B, N_ACTIONS)"""
+        """state: (B, d) -> logits: (B, N_ACTIONS)"""
         return self.net(state)
 
 
 class EMCCritic(nn.Module):
     """
-    V_φ(s) — функція цінності стану.
-    Використовується для обчислення переваги A(s,a) = r + γ·V(s') − V(s).
+    V_φ(s) — the state-value function.
+    Used to compute the advantage A(s,a) = r + γ·V(s') − V(s).
     """
 
     def __init__(self, d_state: int, dropout: float = 0.1):
@@ -365,7 +368,7 @@ class EMCCritic(nn.Module):
         )
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
-        """state: (B, d) → value: (B,)"""
+        """state: (B, d) -> value: (B,)"""
         return self.net(state).squeeze(-1)
 
 
@@ -375,31 +378,31 @@ class EMCCritic(nn.Module):
 
 class EfficientMetaController(nn.Module):
     """
-    Адаптивний контролер символьного міркування OMEN.
+    Adaptive controller for OMEN symbolic reasoning.
 
-    Замінює фіксований max_proof_depth на динамічну мета-політику π_meta,
-    яка вирішує КОЛИ зупинитись і ЯКУ дію виконати на кожному кроці.
+    Replaces fixed `max_proof_depth` with a dynamic meta-policy `π_meta`
+    that decides when to stop and which action to execute at each step.
 
-    Формально реалізує розв'язання:
+    Formally implements the solution:
       π_meta* = argmax_π E[R_task − λ_time·T − λ_MDL·MDL(proof)]
 
-    Архітектура:
-      · EMCStateEncoder   : (z, gap_norm, depth, n_facts, n_rules) → d-вим. вектор
-      · EMCActor          : state → π_meta(a|s) — розподіл над 4 діями
-      · EMCCritic         : state → V_φ(s) — оцінка цінності
-      · run_episode()     : виконує адаптивний цикл, повертає збагачений z_sym
+    Architecture:
+      · EMCStateEncoder   : (z, gap_norm, depth, n_facts, n_rules) -> d-dimensional vector
+      · EMCActor          : state -> π_meta(a|s), a distribution over four actions
+      · EMCCritic         : state -> V_φ(s), the value estimate
+      · run_episode()     : runs the adaptive loop and returns enriched z_sym
 
-    Навчання:
-      EMC навчається спільно з основною моделлю через градієнт з meta_loss,
-      який додається до J_OMEN з вагою ω_meta.
+    Training:
+      EMC is trained jointly with the base model through the gradient from
+      `meta_loss`, which is added to `J_OMEN` with weight `ω_meta`.
     """
 
-    # Вартість кожної дії (обчислювальна + ризик)
+    # Cost of each action (compute budget + risk)
     DEFAULT_COSTS = {
         ACTION_STOP:   0.0,
-        ACTION_RECALL: 0.01,   # дешево: O(d²) операцій
-        ACTION_FC:     0.05,   # середньо: перебір правил × фактів
-        ACTION_ABDUCE: 0.10,   # дорого: AbductionHead + VeM + нові правила
+        ACTION_RECALL: 0.01,   # cheap: O(d²) operations
+        ACTION_FC:     0.05,   # medium: iterate over rules × facts
+        ACTION_ABDUCE: 0.10,   # expensive: AbductionHead + VeM + new rules
         ACTION_INTRINSIC: 0.03,
     }
 
@@ -408,7 +411,7 @@ class EfficientMetaController(nn.Module):
         d = cfg.d_latent
         self.cfg = cfg
 
-        # Підмережі
+        # Subnetworks
         drop = getattr(cfg, 'dropout', 0.1)
         use_hist = getattr(cfg, 'emc_use_action_hist', True)
         self.state_enc = EMCStateEncoder(d, dropout=drop, use_action_hist=use_hist)
@@ -429,16 +432,16 @@ class EfficientMetaController(nn.Module):
             cost_per_step = getattr(cfg, 'emc_lambda_time', 0.05)
         )
 
-        # Гіперпараметри з конфігу (або дефолти)
+        # Hyperparameters from the config (or defaults)
         self.max_steps    = getattr(cfg, 'emc_max_steps',      5)
         self.gamma        = getattr(cfg, 'emc_gamma',          0.95)
         self.entropy_beta = getattr(cfg, 'emc_entropy_beta',   0.01)
-        self.lambda_time  = getattr(cfg, 'emc_lambda_time',    0.05)   # штраф за крок
-        self.lambda_gap   = getattr(cfg, 'emc_lambda_gap',     0.05)   # штраф за GapNorm
+        self.lambda_time  = getattr(cfg, 'emc_lambda_time',    0.05)   # per-step penalty
+        self.lambda_gap   = getattr(cfg, 'emc_lambda_gap',     0.05)   # GapNorm penalty
         self.lambda_memory_residual = getattr(cfg, 'emc_lambda_memory_residual', 0.02)
         self.lambda_memory_misalignment = getattr(cfg, 'emc_lambda_memory_misalignment', 0.02)
-        self.lambda_mdl   = getattr(cfg, 'emc_lambda_mdl',     0.01)   # штраф за MDL(proof)
-        self.eta_int      = getattr(cfg, 'emc_eta_int',        0.10)   # бонус за нові факти
+        self.lambda_mdl   = getattr(cfg, 'emc_lambda_mdl',     0.01)   # MDL(proof) penalty
+        self.eta_int      = getattr(cfg, 'emc_eta_int',        0.10)   # bonus for newly useful facts
         self.c_recall     = getattr(cfg, 'emc_c_recall',       0.01)
         self.c_fc         = getattr(cfg, 'emc_c_fc',           0.05)
         self.c_abduce     = getattr(cfg, 'emc_c_abduce',       0.10)
@@ -451,7 +454,7 @@ class EfficientMetaController(nn.Module):
         # Action history encoding
         self.use_action_hist = getattr(cfg, 'emc_use_action_hist', True)
 
-    # ── Допоміжні ─────────────────────────────────────────────────────────────
+    # Helpers
 
     def _action_cost(self, a: int) -> float:
         return {
@@ -475,10 +478,10 @@ class EfficientMetaController(nn.Module):
 
     def _fact_utility(self, prover, facts) -> float:
         """
-        Наближена Utility(f): заохочує новизну предиката без вибуху масштабу.
+        Approximate Utility(f): rewards predicate novelty without scale blow-up.
 
-        Підтримує як KnowledgeBase (frozenset) так і TensorKnowledgeBase (.facts property).
-        facts: результат forward_chain() — set або frozenset HornAtom.
+        Supports both KnowledgeBase (frozenset) and TensorKnowledgeBase (`.facts` property).
+        `facts` is the result of `forward_chain()`: a set or frozenset of HornAtom.
         """
         if not facts:
             return 0.0
@@ -502,7 +505,7 @@ class EfficientMetaController(nn.Module):
         derivation_trace: List[Tuple[object, Optional[object]]],
         action_count: int = 0,
     ) -> float:
-        """MDL(proof) через реальну символічну вартість застосованих правил."""
+        """MDL(proof) through the true symbolic cost of the applied rules."""
         if not derivation_trace:
             return float(action_count)
         total = 0.0
@@ -547,8 +550,8 @@ class EfficientMetaController(nn.Module):
                       hot_ratio: float = 0.0,
                       action_counts: Optional[List[int]] = None) -> torch.Tensor:
         """
-        Формує d-вимірний вектор стану.
-        action_counts: список підрахунків дій [cnt_stop, cnt_recall, cnt_fc, cnt_abduce]
+        Build a d-dimensional state vector.
+        action_counts: action-count list [cnt_stop, cnt_recall, cnt_fc, cnt_abduce]
         """
         dev = z.device
         dtype = z.dtype
@@ -565,7 +568,7 @@ class EfficientMetaController(nn.Module):
         def _s(v) -> torch.Tensor:
             return torch.tensor(v, device=dev, dtype=dtype)
 
-        # Будуємо action_hist: нормований one-hot підрахунок
+        # Build action_hist as a normalized one-hot count vector.
         action_hist = None
         if self.use_action_hist:
             counts = action_counts if action_counts is not None else [0] * N_ACTIONS
@@ -737,7 +740,7 @@ class EfficientMetaController(nn.Module):
             + self.lambda_memory_misalignment * misalignment
         )
 
-    # ── Головний цикл ─────────────────────────────────────────────────────────
+    # Main loop
 
     def run_episode(self,
                     z:         torch.Tensor,
@@ -755,26 +758,26 @@ class EfficientMetaController(nn.Module):
                     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
                                torch.Tensor, 'TrajectoryStats']:
         """
-        Адаптивний цикл символьного міркування (замінює prover.forward()).
+        Adaptive symbolic-reasoning loop (replaces `prover.forward()`).
 
-        Реалізує рівняння Беллмана для оптимальної зупинки:
+        Implements the Bellman equation for optimal stopping:
           V*(s) = max{ U_stop(s),
                        max_{a∈A} [-C(a) + γ·E_{s'~P(·|s,a)} V*(s')] }
 
-        На кожному кроці:
-          1. Обчислюємо state_vec(s) з (z, gap_norm, depth, n_facts, n_rules, action_hist)
-          2. MDL(proof) поточної траєкторії
+        At each step:
+          1. Compute state_vec(s) from (z, gap_norm, depth, n_facts, n_rules, action_hist)
+          2. MDL(proof) of the current trajectory
           3. U_stop(s) = StoppingUtility(state_vec, r_int_cum, gap_norm, mdl_cost)
           4. V(s)      = Critic(state_vec)
-          5. Якщо U_stop(s) ≥ V(s) АБО VoC(Δd) ≤ C → зупинитись (Беллман)
-          6. Інакше: Actor вибирає дію → виконуємо → оновлюємо стан
+          5. If U_stop(s) ≥ V(s) or VoC(Δd) ≤ C, stop (Bellman criterion)
+          6. Otherwise: the actor chooses an action -> execute it -> update the state
 
         Returns:
-          z_sym      : (B, d) — символьне представлення
+          z_sym      : (B, d) — symbolic representation
           sym_loss   : scalar — symbolic consistency + proof + VeM
-          v_mem      : (B, d) — результат M-Core recall
-          meta_loss  : scalar — Actor-Critic loss (GAE або MC) → до J_OMEN
-          traj_stats : TrajectoryStats — деталі траєкторії (для 7-го члена J_OMEN+EMC:
+          v_mem      : (B, d) — M-Core recall result
+          meta_loss  : scalar — Actor-Critic loss (GAE or MC) -> added to J_OMEN
+          traj_stats : TrajectoryStats — trajectory details (for the seventh term of J_OMEN+EMC:
                          ω_meta · Σ_t (R_task + η_int·R_int − λ_gap·GapNorm − C(a_t)))
         """
         if hasattr(prover, "_clear_runtime_caches"):
@@ -790,15 +793,15 @@ class EfficientMetaController(nn.Module):
             "mean_score": 0.0,
         }
 
-        # ── 0. Housekeeping ───────────────────────────────────────────────────
+        # 0. Housekeeping
         prover._step += 1
         prover.kb.tick()
         if prover._step % prover.consolidate_every == 0:
             prover.kb.consolidate(use_count_threshold=2)
 
-        # ── FIX: оновлюємо _last_z для _mental_simulate_rule() і _pred_error_for_rule()
-        # В EMC-режимі prover.forward() НЕ викликається, тому _last_z був би stale/None.
-        # WorldRNN latent-space компонента Дедукції та Абдукції потребує актуального z.
+        # FIX: update _last_z for _mental_simulate_rule() and _pred_error_for_rule().
+        # In EMC mode, prover.forward() is not called, so _last_z would otherwise be stale/None.
+        # The WorldRNN latent-space component of deduction and abduction needs the current z.
         prover._last_z = z.detach()
         maintenance_every = max(
             int(getattr(self.cfg, "emc_train_fast_maintenance_every", 1)),
@@ -812,7 +815,7 @@ class EfficientMetaController(nn.Module):
             or ((prover._step - 1) % maintenance_every == 0)
         )
 
-        # ── 1. Perception: z → fact → KB ──────────────────────────────────────
+        # 1. Perception: z -> fact -> KB
         prover.materialize_task_context_facts()
         goal = prover.current_goal(z)
         working_facts = prover.current_working_facts()
@@ -821,32 +824,32 @@ class EfficientMetaController(nn.Module):
         n_rules_init = len(prover.kb)
         z_cur        = z.clone()
         v_mem_out    = torch.zeros_like(z)
-        gap_norm_cur = gap_norm.clone()   # оновлюється після кожної дії
+        gap_norm_cur = gap_norm.clone()   # updated after every action
         current_gap_features = self._coerce_gap_features(gap_norm_cur, gap_features)
 
         # VoC criterion reset for new episode
         self.voc.reset()
 
-        # ── 2. Адаптивний цикл ────────────────────────────────────────────────
+        # 2. Adaptive loop
         states_list:    List[torch.Tensor] = []
         log_probs_list: List[torch.Tensor] = []
-        entropies_list: List[torch.Tensor] = []   # H(π_meta(·|s)) на кожному кроці
+        entropies_list: List[torch.Tensor] = []   # H(π_meta(·|s)) at each step
         values_list:    List[torch.Tensor] = []
         rewards_list:   List[float]        = []
-        u_stop_list:    List[float]        = []  # для логування
+        u_stop_list:    List[float]        = []  # for logging
 
         r_int_cumulative = float(getattr(prover, "current_intrinsic_value", lambda: 0.0)())
         goal_proved      = False
-        # Підрахунок дій для кодування стану (action_hist)
+        # Action counts used when encoding the state (action_hist).
         action_counts: List[int] = [0] * N_ACTIONS
-        # Реальні (rule, substitution) кроки доведення для MDL(proof)
+        # Real (rule, substitution) proof steps for MDL(proof).
         proof_derivations: List[Tuple[object, Optional[object]]] = []
         for step in range(self.max_steps):
             goal = prover.current_goal(z_cur)
             goal_embed = self._goal_embed(prover, goal, B, device)
             intrinsic_goal = getattr(prover, "current_intrinsic_goal", lambda: None)()
             intrinsic_goal_available = intrinsic_goal is not None and not self._goal_match(goal, intrinsic_goal)
-            # MDL(proof) поточного стану
+            # MDL(proof) for the current state.
             proof_mdl_cur = self._proof_mdl(
                 prover, proof_derivations, action_count=len(traj.actions)
             )
@@ -875,7 +878,7 @@ class EfficientMetaController(nn.Module):
             val = self.critic(state_vec).mean()   # scalar
 
             # ── StoppingUtility: U_stop(s) ────────────────────────────────────
-            # Включає MDL(proof) та T_elapsed як штрафи за складність та час
+            # Includes MDL(proof) and T_elapsed as complexity/time penalties
             # U_stop(s) = R_task + η_int·R_int − λ_gap·GapNorm − λ_mdl·MDL − λ_time·T
             mdl_cost_cur = self.lambda_mdl * proof_mdl_cur
             u_stop = self.stopping_utility(
@@ -886,15 +889,15 @@ class EfficientMetaController(nn.Module):
             u_stop_scalar = u_stop.mean().item()
             u_stop_list.append(u_stop_scalar)
 
-            # ── Bellman Stopping Check: U_stop(s) ≥ V(s) → зупинитись ─────────
-            # Також VoC: Δ ≤ C(Δd) → не варто продовжувати
+            # ── Bellman stopping check: U_stop(s) >= V(s) -> stop ─────────────
+            # Also VoC: Delta <= C(Delta d) -> not worth continuing
             bellman_stop = self.stopping_utility.bellman_should_stop(u_stop, val.unsqueeze(0).expand(B))
             voc_stop     = not self.voc.should_continue(val.item())
 
             if (bellman_stop or voc_stop) and step > 0:
-                # Записуємо нульову дію-зупинку як вибір
+                # Record the zero stop-action as the chosen action
                 traj.stop_reason = "bellman" if bellman_stop else "voc"
-                # Додаємо термінальну нагороду
+                # Add terminal reward
                 rewards_list.append(u_stop_scalar)
                 break
 
@@ -910,8 +913,8 @@ class EfficientMetaController(nn.Module):
             dist          = Categorical(logits=masked_logits)
             action        = dist.sample()
             log_p         = dist.log_prob(action)
-            # Справжня ентропія H(π) = -Σ_a π(a|s)·log π(a|s) (скалярна)
-            # Використовується в L_actor = -E[A·log π] - β·H(π)
+            # True entropy H(pi) = -sum_a pi(a|s)·log pi(a|s) (scalar)
+            # Used in L_actor = -E[A·log pi] - beta·H(pi)
             entropy       = dist.entropy()                   # scalar ≥ 0
 
             states_list.append(state_vec.detach())
@@ -923,14 +926,14 @@ class EfficientMetaController(nn.Module):
             traj.actions.append(a)
             action_counts[a] = action_counts[a] + 1
 
-            # ── Явна дія STOP ─────────────────────────────────────────────────
+            # ── Explicit STOP action ───────────────────────────────────────────
             if a == ACTION_STOP:
                 action_counts[ACTION_STOP] += 1
                 rewards_list.append(u_stop_scalar)
                 traj.stop_reason = "action_stop"
                 break
 
-            # ── Виконуємо дію та обчислюємо R_int ────────────────────────────
+            # ── Execute the action and compute R_int ──────────────────────────
             r_int    = 0.0
             cost_a   = self._action_cost(a)
             gap_delta = 0.0
@@ -961,9 +964,9 @@ class EfficientMetaController(nn.Module):
                 )
 
             elif a == ACTION_FC:
-                # FIX Bug-FC: forward_chain() повертає frozenset але НЕ додає факти в KB.
-                # forward_chain_step() виконує один крок І персистує нові факти через
-                # kb.add_fact() → state KB реально оновлюється для наступних кроків.
+                # FIX Bug-FC: forward_chain() returns a frozenset but does NOT add facts to the KB.
+                # forward_chain_step() performs one step AND persists new facts through
+                # kb.add_fact() so the KB state is truly updated for subsequent steps.
                 n_added_fc, new_fact_set, fc_trace, working_facts = prover.forward_chain_step_local(
                     working_facts
                 )
@@ -972,7 +975,7 @@ class EfficientMetaController(nn.Module):
                 r_int = self._fact_utility(prover, new_facts)
                 if n_added_fc > 0:
                     r_int = max(r_int, float(n_added_fc) / max(n_facts_init + 1, 1))
-                # GapNorm має оцінюватися за новим grounded symbolic-state, а не через фіксований shrink.
+                # GapNorm must be evaluated from the new grounded symbolic state, not via a fixed shrink factor.
                 if n_added_fc > 0:
                     z_before = z_cur
                     z_cur = prover.ground(working_facts, device).expand(B, -1)
@@ -1083,7 +1086,7 @@ class EfficientMetaController(nn.Module):
                        - self.lambda_gap * min(gn_val, 5.0)
                        - memory_pressure
                        - self.lambda_time
-                       - self.lambda_mdl * float(cost_a))   # MDL(proof) штраф за крок
+                       - self.lambda_mdl * float(cost_a))   # MDL(proof) penalty per step
             rewards_list.append(instant)
 
         else:
@@ -1091,12 +1094,12 @@ class EfficientMetaController(nn.Module):
 
         traj.n_steps = len(traj.actions)
         traj.action_histogram = list(action_counts)
-        # MDL фінального доведення
+        # MDL of the final proof
         traj.proof_mdl = self._proof_mdl(
             prover, proof_derivations, action_count=len(traj.actions)
         )
 
-        # ── 3. Фінальне Forward Chaining + Grounding ──────────────────────────
+        # ── 3. Final forward chaining + grounding ─────────────────────────────
         all_facts = prover.forward_chain_reasoned(
             prover.max_depth,
             starting_facts=working_facts,
@@ -1290,7 +1293,7 @@ class EfficientMetaController(nn.Module):
                     + 0.05 * abductor_aux
                     + 0.01 * vem_self_loss)
 
-        # ── 6. Фінальна нагорода за задачу + оновлення траєкторії ─────────────
+        # ── 6. Final task reward + trajectory update ──────────────────────────
         intrinsic_goal = getattr(prover, "current_intrinsic_goal", lambda: None)()
         intrinsic_value = float(getattr(prover, "current_intrinsic_value", lambda: 0.0)())
         scheduled_intrinsic_goals = tuple(getattr(prover, "scheduled_intrinsic_goals", lambda: ())())
@@ -1331,7 +1334,7 @@ class EfficientMetaController(nn.Module):
             empty_stats = TrajectoryStats(trajectory_reward=0.0, stop_reason="no_actions")
             return z_sym, sym_loss, v_mem_out, torch.zeros(1, device=device).squeeze(), empty_stats
 
-        # Повна дисконтована сума траєкторії (для J_OMEN+EMC 7-й член)
+        # Full discounted trajectory sum (for the 7th J_OMEN+EMC term)
         G = 0.0
         for r in reversed(rewards_list):
             G = r + self.gamma * G
@@ -1346,17 +1349,17 @@ class EfficientMetaController(nn.Module):
                                           entropies=entropies_list)
 
         # ── 8. Task-Estimator BCE supervision ─────────────────────────────────
-        # task_estimator.task_estimator передбачає P(goal_proved | state).
-        # Проблема: у головному циклі u_stop.item() перериває граф обчислень,
-        # тому task_estimator ніколи не отримує градієнт через AC loss.
-        # Рішення: після знання goal_proved — додаємо BCE-сигнал явно.
+        # task_estimator predicts P(goal_proved | state).
+        # Problem: in the main loop, u_stop.item() breaks the computation graph,
+        # so task_estimator never receives gradient through the AC loss.
+        # Fix: once goal_proved is known, add the BCE signal explicitly.
         #
-        # Математично: L_task = -[y·log R_task + (1-y)·log(1-R_task)]
-        # де y = 1.0 якщо goal_proved, 0.0 інакше.
-        # Цей член навчає StoppingUtility.task_estimator передбачати успішність доведення,
-        # що є ключовим для правильної оцінки U_stop(s) = R_task + η_int·R_int − λ_gap·GapNorm.
+        # Mathematically: L_task = -[y·log R_task + (1-y)·log(1-R_task)]
+        # where y = 1.0 if goal_proved, else 0.0.
+        # This term trains StoppingUtility.task_estimator to predict proof success,
+        # which is critical for correctly estimating U_stop(s) = R_task + η_int·R_int − λ_gap·GapNorm.
         if self.training:
-            # Перераховуємо state_vec без detach (щоб градієнт потрапив у task_estimator)
+            # Recompute state_vec without detach so the gradient reaches task_estimator
             task_sv = self._encode_state(
                 z_cur, gap_norm_cur,
                 len(traj.actions),
@@ -1504,7 +1507,7 @@ class EfficientMetaController(nn.Module):
 
         return z_sym, sym_loss, v_mem_out, meta_loss, traj
 
-    # ── Eval-mode: адаптивне міркування для generate() ────────────────────────
+    # ── Eval mode: adaptive reasoning for generate() ──────────────────────────
 
     @torch.no_grad()
     def run_episode_eval(self,
@@ -1520,28 +1523,28 @@ class EfficientMetaController(nn.Module):
                          ] = None,
                          ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Eval-mode Bellman adaptive reasoning (без обчислення loss).
+        Eval-mode Bellman adaptive reasoning (without computing loss).
 
-        Використовується в generate() при dynamic_reasoning=True та emc_enabled=True.
-        Замінює фіксований forward_chain(max_depth) на адаптивний пошук:
+        Used in generate() when dynamic_reasoning=True and emc_enabled=True.
+        Replaces fixed forward_chain(max_depth) with adaptive search:
 
-          Поки U_stop(s) < V(s) І VoC(ΔV) > C:
-            вибрати дію a ← argmax π_meta(a|s)  (greedy, не sample)
-            виконати дію → оновити z_cur, gap_norm_cur
+          While U_stop(s) < V(s) and VoC(Delta V) > C:
+            choose action a <- argmax pi_meta(a|s)  (greedy, not sampled)
+            execute the action -> update z_cur, gap_norm_cur
 
-        Це реалізує π_meta* = argmax_π E[R_task − λ_time·T − λ_MDL·MDL(proof)]
-        під час inference, а не лише під час training.
+        This implements pi_meta* = argmax_pi E[R_task − λ_time·T − λ_MDL·MDL(proof)]
+        during inference, not only during training.
 
         Returns:
-          z_sym     : (B, d) — символьне представлення після адаптивного міркування
-          v_mem_out : (B, d) — результат останнього M-Core recall (або нулі)
+          z_sym     : (B, d) - symbolic representation after adaptive reasoning
+          v_mem_out : (B, d) - result of the last M-Core recall (or zeros)
         """
         if hasattr(prover, "_clear_runtime_caches"):
             prover._clear_runtime_caches()
         B = z.shape[0]
 
-        # Perception: z → fact → KB (без модифікації prover._step)
-        # FIX: оновлюємо _last_z щоб mental simulation під час eval бачила актуальний z
+        # Perception: z -> fact -> KB (without modifying prover._step)
+        # FIX: update _last_z so mental simulation during eval sees the current z
         prover._last_z = z.detach()
         prover.materialize_task_context_facts()
         goal = prover.current_goal(z)
@@ -1608,14 +1611,14 @@ class EfficientMetaController(nn.Module):
                 t_elapsed=step,
                 memory_penalty=memory_pressure)
 
-            # Bellman + VoC зупинка
+            # Bellman + VoC stop check
             bellman_stop = self.stopping_utility.bellman_should_stop(
                 u_stop, val.unsqueeze(0).expand(B))
             voc_stop = not self.voc.should_continue(val.item())
             if (bellman_stop or voc_stop) and step > 0:
                 break
 
-            # Greedy action selection (argmax, не sample — eval mode)
+            # Greedy action selection (argmax, not sampling - eval mode)
             action_logits = self.actor(state_vec)
             mean_logits   = action_logits.mean(0)
             action_mask = self._action_mask(
@@ -1656,7 +1659,7 @@ class EfficientMetaController(nn.Module):
                 )
 
             elif a == ACTION_FC:
-                # FIX Bug-FC: forward_chain() не змінює KB. forward_chain_step() персистує.
+                # FIX Bug-FC: forward_chain() does not mutate the KB. forward_chain_step() persists state.
                 n_added_fc, _, fc_trace, working_facts = prover.forward_chain_step_local(
                     working_facts
                 )
@@ -1764,7 +1767,7 @@ class EfficientMetaController(nn.Module):
 
             r_int_cumulative += r_int
 
-        # Фінальний grounding: KB → z_sym
+        # Final grounding: KB -> z_sym
         all_facts = prover.forward_chain_reasoned(
             prover.max_depth,
             starting_facts=working_facts,
@@ -1941,47 +1944,47 @@ class EfficientMetaController(nn.Module):
                          entropies: Optional[List[torch.Tensor]] = None,
                          ) -> torch.Tensor:
         """
-        Actor-Critic loss із ентропійною регуляризацією.
+        Actor-Critic loss with entropy regularization.
 
-        Два режими (залежить від self.use_gae):
+        Two modes (depends on self.use_gae):
 
         GAE (Generalized Advantage Estimation, emc_use_gae=True):
-          δ_t   = r_t + γ·V(s_{t+1}) − V(s_t)   ← TD-error
-          A_t   = Σ_{k≥0} (γ·λ)^k · δ_{t+k}     ← зважена сума TD-errors
-          G_t   = A_t + V(s_t)                    ← λ-return (ціль для критика)
+          δ_t   = r_t + γ·V(s_{t+1}) − V(s_t)   <- TD error
+          A_t   = Σ_{k≥0} (γ·λ)^k · δ_{t+k}     <- weighted sum of TD errors
+          G_t   = A_t + V(s_t)                  <- λ-return (critic target)
 
-          При λ→0: чистий TD(0) (низький variance, вищий bias)
-          При λ→1: Монте-Карло (нульовий bias, вищий variance)
-          λ=0.95: оптимальний компроміс для більшості задач
+          λ→0: pure TD(0) (low variance, higher bias)
+          λ→1: Monte Carlo (zero bias, higher variance)
+          λ=0.95: a practical compromise for most tasks
 
-        MC (Monte-Carlo, emc_use_gae=False):
-          G_t   = Σ_{k≥t} γ^{k−t}·r_k            ← дисконтована дохідність
-          A(s,a) = G_t − V_φ(s_t)                 ← перевага
+        MC (Monte Carlo, emc_use_gae=False):
+          G_t    = Σ_{k≥t} γ^{k−t}·r_k          <- discounted return
+          A(s,a) = G_t − V_φ(s_t)               <- advantage
 
-        Математична відповідність до MDL-формули:
+        Mathematical alignment with the MDL formula:
           A(s,a) = −C(a) + E_{s'}[V(s')] − V(s)
-          У GAE: E_{s'}[V(s')] ≈ A_GAE_t + V(s_t) (λ-return)
-          У MC:  E_{s'}[V(s')] ≈ G_t
+          In GAE: E_{s'}[V(s')] ≈ A_GAE_t + V(s_t) (λ-return)
+          In MC:  E_{s'}[V(s')] ≈ G_t
 
-        Ентропійна регуляризація (з реальним H(π)):
+        Entropy regularization (with true H(π)):
           L_actor = E[-Σ_a π_meta(a|s)·A(s,a) − β·H(π_meta(·|s))]
           ≈ REINFORCE: E[-A·log π] − β·E[H(π)]
 
-          де H(π) = −Σ_a π(a|s)·log π(a|s)  — справжня ентропія Categorical dist.
-          (НЕ апроксимація через -log_p сampledої дії, а повна ентропія розподілу)
+          where H(π) = −Σ_a π(a|s)·log π(a|s) is the true entropy of the
+          Categorical distribution, not an approximation from -log_p(sampled action).
 
-          При більшому H(π): рівномірніший розподіл → більше exploration.
-          β·H(π) ≥ 0 завжди → підвищення ентропії ЗМЕНШУЄ L_actor → ЗАОХОЧУЄТЬСЯ.
+          Larger H(π) means a more uniform distribution and more exploration.
+          β·H(π) ≥ 0 always, so increasing entropy reduces L_actor and is encouraged.
         """
         n = len(rewards)
         if n == 0 or not log_probs:
             return torch.zeros(1, device=device).squeeze()
 
-        # Вирівнюємо довжини (log_probs може бути коротшим за rewards при Bellman-stop)
+        # Align lengths (log_probs may be shorter than rewards after Bellman stop)
         T = min(len(log_probs), len(values), n)
 
-        values_t = torch.stack(values[:T])            # (T,) — диференційований
-        log_ps_t = torch.stack(log_probs[:T])         # (T,) — диференційований
+        values_t = torch.stack(values[:T])            # (T,) - differentiable
+        log_ps_t = torch.stack(log_probs[:T])         # (T,) - differentiable
         rewards_t = rewards[:T]
 
         if self.use_gae and T > 1:
@@ -1997,7 +2000,7 @@ class EfficientMetaController(nn.Module):
                 delta = rewards_t[t] + self.gamma * v_next - vals_np[t]
                 deltas.append(delta)
 
-            # Зворотній прохід для A_GAE
+            # Reverse pass for A_GAE
             advantages: List[float] = [0.0] * T
             gae = 0.0
             for t in reversed(range(T)):
@@ -2019,7 +2022,7 @@ class EfficientMetaController(nn.Module):
             returns_t = torch.tensor(returns, dtype=torch.float32, device=device)
             adv_t = returns_t - values_t.detach()
 
-        # ── Нормалізація переваг для стабільності навчання ───────────────────
+        # ── Advantage normalization for training stability ────────────────────
         if adv_t.numel() > 1:
             adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
         if returns_t.numel() > 1:
@@ -2029,34 +2032,34 @@ class EfficientMetaController(nn.Module):
         l_critic = F.mse_loss(values_t, returns_t.detach())
 
         # ── Actor loss: −E[A·log π(a|s)] ─────────────────────────────────────
-        # A(s,a) ≈ -C(a) + E[V(s')] - V(s)  (MDL-розширення)
+        # A(s,a) ≈ -C(a) + E[V(s')] - V(s)  (MDL extension)
         l_actor = -(adv_t.detach() * log_ps_t).mean()
 
-        # ── Ентропійний бонус: −β·H(π_meta(·|s)) ────────────────────────────
+        # ── Entropy bonus: −β·H(π_meta(·|s)) ─────────────────────────────────
         # L_actor = E[-A·log π] − β·H(π)
         #
-        # H(π) = −Σ_a π(a|s)·log π(a|s) ≥ 0  — справжня ентропія розподілу.
-        # (Categorical.entropy(), а не -log_p сampledої дії — точна, не апрокс.)
+        # H(π) = −Σ_a π(a|s)·log π(a|s) ≥ 0  - true distribution entropy.
+        # (Categorical.entropy(), not -log_p(sampled action) - exact, not approximate.)
         #
-        # entropy_bonus = −β·H(π) ≤ 0  → зменшує L_actor → ЗАОХОЧУЄ exploration.
-        # Рівняння MDL: π_meta* = argmax E[R_task − λ_time·T − λ_MDL·MDL(proof)]
-        # Регуляризація ентропії запобігає передчасній збіжності до одного шляху.
+        # entropy_bonus = −β·H(π) ≤ 0  -> lowers L_actor -> encourages exploration.
+        # MDL equation: π_meta* = argmax E[R_task − λ_time·T − λ_MDL·MDL(proof)]
+        # Entropy regularization prevents premature collapse to a single path.
         if entropies is not None and len(entropies) >= T:
-            entropies_t = torch.stack(entropies[:T])          # (T,) справжні H(π)
+            entropies_t = torch.stack(entropies[:T])          # (T,) true H(π)
             entropy_bonus = -self.entropy_beta * entropies_t.mean()
         else:
-            # Запасний варіант: апроксимація через −log_p (як у REINFORCE стандартному)
+            # Fallback path: approximation via −log_p (as in standard REINFORCE)
             entropy_bonus = -self.entropy_beta * (-log_ps_t.mean())
 
         return l_actor + 0.5 * l_critic + entropy_bonus
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5.  INLINE ТЕСТИ
+# 5.  INLINE TESTS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _run_emc_tests() -> None:
-    """Самостійні тести EMC без залежності від інших OMEN-модулів."""
+    """Standalone EMC tests without dependencies on other OMEN modules."""
     try:
         import sys
 
@@ -2069,7 +2072,7 @@ def _run_emc_tests() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[omen_emc] device={device}")
 
-    # ── Простий мок-конфіг ────────────────────────────────────────────────────
+    # ── Simple mock config ────────────────────────────────────────────────────
     class MockCfg:
         d_latent       = 64
         dropout        = 0.1
@@ -2093,7 +2096,7 @@ def _run_emc_tests() -> None:
     cfg = MockCfg()
 
     # ── T1: StateEncoder ──────────────────────────────────────────────────────
-    sep("T1 · EMCStateEncoder — форми та forward")
+    sep("T1 · EMCStateEncoder — shapes and forward")
     enc = EMCStateEncoder(cfg.d_latent, dropout=0.0).to(device)
     B, d = 4, cfg.d_latent
     z    = torch.randn(B, d, device=device)
@@ -2106,7 +2109,7 @@ def _run_emc_tests() -> None:
     print(f"  state shape: {tuple(s.shape)}  [PASS]")
 
     # ── T2: Actor + Critic ────────────────────────────────────────────────────
-    sep("T2 · EMCActor + EMCCritic — logits та values")
+    sep("T2 · EMCActor + EMCCritic — logits and values")
     actor  = EMCActor(d, dropout=0.0).to(device)
     critic = EMCCritic(d, dropout=0.0).to(device)
 
@@ -2117,15 +2120,15 @@ def _run_emc_tests() -> None:
 
     # Softmax → probability
     probs = F.softmax(logits, dim=-1)
-    assert (probs.sum(-1) - 1.0).abs().max() < 1e-5, "Probs не суммуються до 1"
+    assert (probs.sum(-1) - 1.0).abs().max() < 1e-5, "Probs do not sum to 1"
     print(f"  logits: {logits.shape}  vals: {vals.shape}  probs ok  [PASS]")
 
-    # ── T3: _compute_ac_loss — MC та GAE ─────────────────────────────────────
-    sep("T3 · Actor-Critic Loss — MC та GAE режими")
+    # ── T3: _compute_ac_loss — MC and GAE ────────────────────────────────────
+    sep("T3 · Actor-Critic Loss — MC and GAE modes")
     emc = EfficientMetaController(cfg).to(device)
     emc.train()
 
-    # Симулюємо 3-кроку траєкторію
+    # Simulate a 3-step trajectory
     mock_rewards   = [0.05, -0.03, 0.10]
     mock_log_probs = [torch.log(torch.tensor(0.3, device=device)),
                       torch.log(torch.tensor(0.4, device=device)),
@@ -2134,10 +2137,10 @@ def _run_emc_tests() -> None:
                       torch.tensor(0.15, device=device, requires_grad=True),
                       torch.tensor(0.25, device=device, requires_grad=True)]
 
-    # GAE mode (за замовчуванням у конфігу emc_use_gae=True)
+    # GAE mode (default in config: emc_use_gae=True)
     loss_gae = emc._compute_ac_loss(mock_log_probs, mock_values, mock_rewards, device)
     assert loss_gae.shape == torch.Size([]), f"Loss shape FAIL: {loss_gae.shape}"
-    assert not torch.isnan(loss_gae), "NaN у AC loss (GAE)"
+    assert not torch.isnan(loss_gae), "NaN in AC loss (GAE)"
     loss_gae.backward()
     print(f"  meta_loss (GAE)  = {loss_gae.item():.4f}  backward ok  [PASS]")
 
@@ -2147,10 +2150,10 @@ def _run_emc_tests() -> None:
                     torch.tensor(0.15, device=device, requires_grad=True),
                     torch.tensor(0.25, device=device, requires_grad=True)]
     loss_mc = emc._compute_ac_loss(mock_log_probs, mock_values2, mock_rewards, device)
-    assert not torch.isnan(loss_mc), "NaN у AC loss (MC)"
+    assert not torch.isnan(loss_mc), "NaN in AC loss (MC)"
     loss_mc.backward()
     print(f"  meta_loss (MC)   = {loss_mc.item():.4f}  backward ok  [PASS]")
-    emc.use_gae = True  # відновлюємо
+    emc.use_gae = True  # restore
 
     # ── T4: EfficientMetaController — _encode_state ──────────────────────────
     sep("T4 · EfficientMetaController — _encode_state")
@@ -2162,52 +2165,52 @@ def _run_emc_tests() -> None:
     print(f"  state_vec shape: {tuple(sv2.shape)}  [PASS]")
 
     # ── T5: StoppingUtility + λ_time·T_elapsed ───────────────────────────────
-    sep("T5 · StoppingUtility — U_stop(s), λ_time·T_elapsed та Bellman check")
+    sep("T5 · StoppingUtility — U_stop(s), λ_time·T_elapsed and Bellman check")
     su = StoppingUtility(d_state=d, eta_int=0.10, lambda_gap=0.05,
                          lambda_time=0.05).to(device)
     su.train()
     z_t   = torch.randn(B, d, device=device)
     gn_t  = torch.tensor(0.5, device=device)
 
-    # Пряме обчислення U_stop (t_elapsed=0)
+    # Direct U_stop computation (t_elapsed=0)
     u_t0 = su(z_t, r_int=0.2, gap_norm=gn_t, t_elapsed=0)
-    # U_stop при t_elapsed=5 (більший штраф) → менше значення
+    # U_stop at t_elapsed=5 (larger penalty) -> smaller value
     u_t5 = su(z_t, r_int=0.2, gap_norm=gn_t, t_elapsed=5)
     assert u_t0.shape == (B,), f"U_stop shape FAIL: {u_t0.shape}"
-    assert not torch.isnan(u_t0).any(), "NaN у U_stop"
-    # Перевірка: T_elapsed штраф зменшує U_stop
+    assert not torch.isnan(u_t0).any(), "NaN in U_stop"
+    # Check: the T_elapsed penalty lowers U_stop
     assert u_t5.mean() < u_t0.mean(), (
-        f"FAIL: T_elapsed penalty не зменшує U_stop  "
+        f"FAIL: T_elapsed penalty does not lower U_stop  "
         f"(t=0: {u_t0.mean():.3f}, t=5: {u_t5.mean():.3f})")
 
-    # Перевірка BCE training signal для task_estimator (виправлення Bug 2)
-    # task_estimator має отримувати градієнт через BCE, а не через u_stop.item()
+    # Check BCE training signal for task_estimator (Bug 2 fix)
+    # task_estimator must receive gradient through BCE, not through u_stop.item()
     su.zero_grad()
     r_pred_pos = su.task_estimator(z_t).squeeze(-1)         # goal_proved=True
     bce_pos    = F.binary_cross_entropy(r_pred_pos.clamp(1e-6, 1-1e-6),
                                          torch.ones(B, device=device))
     bce_pos.backward()
     grad_via_bce = sum(p.grad.norm().item() for p in su.parameters() if p.grad is not None)
-    assert grad_via_bce > 0, "FAIL: task_estimator не має градієнту через BCE"
+    assert grad_via_bce > 0, "FAIL: task_estimator has no gradient through BCE"
     print(f"  task_estimator BCE grad_norm={grad_via_bce:.4f}  [PASS — Bug 2 fix ✓]")
 
-    # Перевірка що u_stop.item() самостійно НЕ дає градієнт (підтверджує необхідність fix)
+    # Check that u_stop.item() alone does NOT provide gradient (confirms the need for the fix)
     su.zero_grad()
     u_scalar = su(z_t, r_int=0.2, gap_norm=gn_t, t_elapsed=0).mean().item()
-    # Після .item() — граф обчислень розірваний, параметри без grad
+    # After .item(), the computation graph is broken and parameters have no grad
     no_grad = all((p.grad is None or p.grad.norm().item() == 0.0)
                   for p in su.parameters())
-    assert no_grad, "FAIL: u_stop.item() не повинен залишати градієнт"
-    print(f"  u_stop.item() grad=None (детач підтверджено)  [PASS]")
+    assert no_grad, "FAIL: u_stop.item() should not leave gradients behind"
+    print(f"  u_stop.item() grad=None (detach confirmed)  [PASS]")
 
-    # Backward через StoppingUtility (прямий)
+    # Backward through StoppingUtility (direct)
     su.zero_grad()
     u_t0 = su(z_t, r_int=0.2, gap_norm=gn_t, t_elapsed=0)
     u_t0.mean().backward()
     grad_norm = sum(p.grad.norm().item() for p in su.parameters() if p.grad is not None)
-    assert grad_norm > 0, "FAIL: StoppingUtility не має градієнту"
+    assert grad_norm > 0, "FAIL: StoppingUtility has no gradient"
     print(f"  U_stop(t=0): mean={u_t0.mean().item():.3f}")
-    print(f"  U_stop(t=5): mean={u_t5.mean().item():.3f}  (T_elapsed штраф: OK)")
+    print(f"  U_stop(t=5): mean={u_t5.mean().item():.3f}  (T_elapsed penalty: OK)")
     print(f"  grad_norm={grad_norm:.4f}  [PASS]")
 
     # Bellman decision
@@ -2215,21 +2218,21 @@ def _run_emc_tests() -> None:
     u_high = torch.ones(B, device=device) * 0.9
     u_low  = torch.ones(B, device=device) * 0.1
     v_mid  = torch.ones(B, device=device) * 0.5
-    assert su.bellman_should_stop(u_high, v_mid) == True,  "FAIL: повинен зупинитись"
-    assert su.bellman_should_stop(u_low,  v_mid) == False, "FAIL: не повинен зупинитись"
+    assert su.bellman_should_stop(u_high, v_mid) == True,  "FAIL: should stop"
+    assert su.bellman_should_stop(u_low,  v_mid) == False, "FAIL: should not stop"
     print(f"  Bellman stop logic: OK  [PASS]")
 
     # ── T6: VoCStoppingCriterion ─────────────────────────────────────────────
     sep("T6 · VoCStoppingCriterion — Δ > C(Δd)")
     voc = VoCStoppingCriterion(cost_per_step=0.05)
-    # Перший крок завжди продовжує
-    assert voc.should_continue(0.0)   == True,  "FAIL: перший крок"
-    # Великий виграш → продовжуємо
-    assert voc.should_continue(0.2)   == True,  "FAIL: виграш 0.2 > 0.05"
-    # Малий виграш → зупиняємось
-    assert voc.should_continue(0.21)  == False, "FAIL: виграш 0.01 < 0.05"
+    # First step always continues
+    assert voc.should_continue(0.0)   == True,  "FAIL: first step"
+    # Large gain -> continue
+    assert voc.should_continue(0.2)   == True,  "FAIL: gain 0.2 > 0.05"
+    # Small gain -> stop
+    assert voc.should_continue(0.21)  == False, "FAIL: gain 0.01 < 0.05"
     voc.reset()
-    assert voc._prev_value is None, "FAIL: reset не спрацював"
+    assert voc._prev_value is None, "FAIL: reset did not work"
     print(f"  VoC logic OK  [PASS]")
 
     # ── T7: TrajectoryStats ──────────────────────────────────────────────────
@@ -2240,8 +2243,8 @@ def _run_emc_tests() -> None:
     assert ts.gap_norms == []
     print(f"  TrajectoryStats: reward={ts.trajectory_reward}  [PASS]")
 
-    # ── T8: Proper Categorical Entropy у _compute_ac_loss ────────────────────
-    sep("T8 · _compute_ac_loss — справжня H(π) через Categorical.entropy()")
+    # ── T8: proper categorical entropy in _compute_ac_loss ───────────────────
+    sep("T8 · _compute_ac_loss — true H(π) via Categorical.entropy()")
     emc3 = EfficientMetaController(cfg).to(device)
     emc3.train()
     from torch.distributions import Categorical as _Cat
@@ -2253,7 +2256,7 @@ def _run_emc_tests() -> None:
     mock_values    = [torch.tensor(0.2, device=device, requires_grad=True),
                       torch.tensor(0.15, device=device, requires_grad=True),
                       torch.tensor(0.25, device=device, requires_grad=True)]
-    # Реальні ентропії з рівномірного і пікового розподілу
+    # True entropies from uniform and peaked distributions
     uniform_logits = torch.zeros(N_ACTIONS, device=device)
     peaked_logits  = torch.tensor([10.0, -5.0, -5.0, -5.0], device=device)
     mock_entropies = [
@@ -2265,19 +2268,19 @@ def _run_emc_tests() -> None:
     loss_with_ent = emc3._compute_ac_loss(
         mock_log_probs, mock_values, mock_rewards, device,
         entropies=mock_entropies)
-    assert not torch.isnan(loss_with_ent), "NaN у AC loss з ентропіями"
+    assert not torch.isnan(loss_with_ent), "NaN in AC loss with entropies"
     loss_with_ent.backward()
 
-    # Перевірка: loss БЕЗ ентропій (запасний варіант)
+    # Check: loss without entropies (fallback path)
     mock_values2 = [torch.tensor(0.2, device=device, requires_grad=True),
                     torch.tensor(0.15, device=device, requires_grad=True),
                     torch.tensor(0.25, device=device, requires_grad=True)]
     loss_no_ent = emc3._compute_ac_loss(
         mock_log_probs, mock_values2, mock_rewards, device,
         entropies=None)
-    assert not torch.isnan(loss_no_ent), "NaN у AC loss без ентропій"
+    assert not torch.isnan(loss_no_ent), "NaN in AC loss without entropies"
 
-    # Перевірка: loss з вищою ентропією МЕНШИЙ (більший exploration bonus)
+    # Check: higher-entropy loss is SMALLER (larger exploration bonus)
     mock_values3 = [torch.tensor(0.2, device=device, requires_grad=True),
                     torch.tensor(0.15, device=device, requires_grad=True),
                     torch.tensor(0.25, device=device, requires_grad=True)]
@@ -2286,24 +2289,24 @@ def _run_emc_tests() -> None:
         mock_log_probs, mock_values3, mock_rewards, device,
         entropies=peaked_entropies)
 
-    # Порівнюємо entropy_bonus між uniform і peaked: uniform має більший H
+    # Compare entropy bonus for uniform vs peaked: uniform should have larger H
     H_uniform = mock_entropies[0].item()
     H_peaked  = peaked_entropies[0].item()
-    assert H_uniform > H_peaked, "FAIL: uniform повинна мати більшу ентропію"
+    assert H_uniform > H_peaked, "FAIL: uniform should have higher entropy"
     print(f"  H(uniform)={H_uniform:.3f}  H(peaked)={H_peaked:.3f}")
     print(f"  loss(H_high)={loss_with_ent.item():.4f}  "
           f"loss(H_low)={loss_low_ent.item():.4f}")
     print(f"  Categorical entropy bonus: OK  [PASS]")
 
     print(f"\n{'─'*60}")
-    print("  ✅  Всі 8 EMC тестів пройдено")
+    print("  All 8 EMC tests passed")
     print(f"{'─'*60}\n")
 
-    # ── T9 (бонус): _proof_mdl — виправлення Bug 1 ───────────────────────────
-    sep("T9 · _proof_mdl — Bug fix: action-ID не є rule-index")
+    # ── T9 (bonus): _proof_mdl — Bug 1 fix ────────────────────────────────────
+    sep("T9 · _proof_mdl — Bug fix: action ID is not a rule index")
 
     class MockKB:
-        """Мінімальний mock KB для тестування _proof_mdl."""
+        """Minimal mock KB for testing _proof_mdl."""
         class _Rule:
             def complexity(self): return 6
         def __init__(self, n_rules=5):
@@ -2322,7 +2325,7 @@ def _run_emc_tests() -> None:
     emc_t9 = EfficientMetaController(cfg).to(device)
     prover_mock = MockProver(n_rules=5)
 
-    # Порожня траєкторія → 0.0
+    # Empty trajectory -> 0.0
     assert emc_t9._proof_mdl(prover_mock, []) == 0.0, "FAIL: empty trajectory"
 
     traj_test = [
@@ -2335,7 +2338,7 @@ def _run_emc_tests() -> None:
     assert abs(mdl - expected) < 1e-6, f"FAIL: MDL={mdl} ≠ {expected}"
     print(f"  MDL(traj={traj_test}): {mdl:.4f} (expected {expected:.4f})  [PASS]")
 
-    # Порожній trace → MDL = лише слабкий action-count term
+    # Empty trace -> MDL is only the weak action-count term
     prover_empty = MockProver(n_rules=0)
     mdl_empty = emc_t9._proof_mdl(prover_empty, [], action_count=2)
     assert mdl_empty == 2.0, f"FAIL: empty trace MDL={mdl_empty} ≠ 2.0"
@@ -2346,7 +2349,7 @@ def _run_emc_tests() -> None:
     print(f"  MDL(with large action count): {mdl_large:.4f}  [PASS]")
 
     print(f"\n{'─'*60}")
-    print("  ✅  Всі 9 EMC тестів пройдено (включно з Bug fixes)")
+    print("  All 9 EMC tests passed (including bug fixes)")
     print(f"{'─'*60}\n")
 
 

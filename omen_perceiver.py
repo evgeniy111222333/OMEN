@@ -15,11 +15,11 @@ import torch.nn.functional as F
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1.  ПРИМІТИВИ (LLaMA-стиль)
+# 1. PRIMITIVES (LLaMA style)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Norm — без зміщення, без centering."""
+    """Root Mean Square Layer Norm without bias and without centering."""
     def __init__(self, d: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
@@ -33,19 +33,19 @@ class RMSNorm(nn.Module):
 class RotaryEmbedding(nn.Module):
     """
     Rotary Position Embedding (RoPE).
-    Не потребує фіксованого seq_len — обчислення "on-the-fly".
+    Does not require a fixed sequence length and computes values on the fly.
     """
     def __init__(self, d_head: int, base: int = 10_000):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, d_head, 2).float() / d_head))
         self.register_buffer("inv_freq", inv_freq)
         self.d_head = d_head
-        # OPT-ROPE: кеш cos/sin per (T, device) — ініціалізуємо в __init__
+        # OPT-ROPE: cache cos/sin per (T, device), initialized in __init__.
         self._cs_cache: dict = {}
 
     def _get_cos_sin(self, T: int, device) -> Tuple[torch.Tensor, torch.Tensor]:
-        # OPT-ROPE: cos/sin залежать тільки від T (inv_freq — константа).
-        # Кешуємо на першому виклику для кожного T; всі наступні — dict lookup.
+        # OPT-ROPE: cos/sin depend only on T (`inv_freq` is constant).
+        # Cache on the first call for each T; later calls use dict lookup.
         key = (T, str(device))
         cached = self._cs_cache.get(key)
         if cached is not None:
@@ -72,16 +72,16 @@ class RotaryEmbedding(nn.Module):
 
 class SwiGLUFFN(nn.Module):
     """
-    SwiGLU FFN: FFN(x) = (xW₁ ⊙ SiLU(xV)) · W₂
-    Ефективніше за GELU при рівній кількості параметрів.
+    SwiGLU FFN: FFN(x) = (xW₁ ⊙ SiLU(xV)) · W₂.
+    More efficient than GELU at the same parameter count.
     """
     def __init__(self, d: int, d_ff: Optional[int] = None, dropout: float = 0.0):
         super().__init__()
-        d_ff = d_ff or int(d * 8 / 3)   # LLaMA-стиль: 8/3 замість 4
+        d_ff = d_ff or int(d * 8 / 3)   # LLaMA style: 8/3 instead of 4.
         self.gate  = nn.Linear(d, d_ff, bias=False)
         self.up    = nn.Linear(d, d_ff, bias=False)
         self.down  = nn.Linear(d_ff, d, bias=False)
-        # OPT-4: inplace=True — dropout не виділяє новий тензор, пише поверх
+        # OPT-4: inplace=True avoids allocating a new tensor for dropout.
         self.drop  = nn.Dropout(dropout, inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -94,8 +94,8 @@ class SwiGLUFFN(nn.Module):
 
 class LlamaAttention(nn.Module):
     """
-    Multi-Head Attention з RoPE.
-    Використовує F.scaled_dot_product_attention (FlashAttention-сумісний).
+    Multi-Head Attention with RoPE.
+    Uses `F.scaled_dot_product_attention` and stays FlashAttention-compatible.
     """
     def __init__(self, d: int, n_heads: int,
                  dropout: float = 0.0,
@@ -103,13 +103,13 @@ class LlamaAttention(nn.Module):
                  cross_attn: bool = False,
                  kv_dim: Optional[int] = None):
         super().__init__()
-        assert d % n_heads == 0, f"d={d} не ділиться на n_heads={n_heads}"
+        assert d % n_heads == 0, f"d={d} is not divisible by n_heads={n_heads}"
         self.h    = n_heads
         self.dh   = d // n_heads
         self.causal = causal
         self.cross_attn = cross_attn
 
-        # Для cross-attention K/V беруться зі стороннього контексту
+        # For cross-attention, K/V come from the external context.
         kv_d = kv_dim if kv_dim else d
         self.q_proj  = nn.Linear(d,   d,   bias=False)
         self.k_proj  = nn.Linear(kv_d, d,  bias=False)
@@ -133,7 +133,7 @@ class LlamaAttention(nn.Module):
         k = self.k_proj(ctx).view(B, S, self.h, self.dh).transpose(1, 2)
         v = self.v_proj(ctx).view(B, S, self.h, self.dh).transpose(1, 2)
 
-        # RoPE тільки для self-attention
+        # RoPE is used only for self-attention.
         if self.rope is not None:
             q, k = self.rope(q, k)
 
@@ -163,7 +163,7 @@ class LlamaAttention(nn.Module):
                 return out, weights.mean(dim=1)
             return out, weights
 
-        # F.scaled_dot_product_attention: FlashAttention якщо доступна
+        # F.scaled_dot_product_attention uses FlashAttention when available.
         out = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attn_mask,
@@ -174,15 +174,15 @@ class LlamaAttention(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3.  LlamaDecoderBlock  (token-level, Fine)
+# 3. LlamaDecoderBlock (token-level, fine)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class LlamaDecoderBlock(nn.Module):
     """
-    Стандартний блок LLaMA:
-      x ← x + Attention(RMSNorm(x))
-      x ← x + SwiGLUFFN(RMSNorm(x))
-    Використовується на токен-рівні (d_tok, n_heads_tok).
+    Standard LLaMA block:
+      x <- x + Attention(RMSNorm(x))
+      x <- x + SwiGLUFFN(RMSNorm(x))
+    Used at token level (`d_tok`, `n_heads_tok`).
     """
     def __init__(self, d: int, n_heads: int, dropout: float = 0.1):
         super().__init__()
@@ -212,22 +212,22 @@ class LlamaDecoderBlock(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4.  PerceiverResampler  (Token → Concept, Fine → Coarse)
+# 4. PerceiverResampler (Token -> Concept, Fine -> Coarse)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class PerceiverResampler(nn.Module):
     """
-    Стискає довільну послідовність токенів у фіксовану кількість латентів.
+    Compress an arbitrary token sequence into a fixed number of latents.
 
-    Архітектура:
-      1. Проекція: d_tok → d_latent (якщо різні)
-      2. Cross-attention: latent queries ← tokens  (T→n_latents)
-      3. Self-attention серед латентів
-      4. Повтор 2–3 по n_layers_lat разів
-      5. Pool: mean(latents) → (B, d_latent)
+    Architecture:
+      1. Projection: d_tok -> d_latent (if they differ)
+      2. Cross-attention: latent queries <- tokens  (T->n_latents)
+      3. Self-attention among latents
+      4. Repeat steps 2-3 for `n_layers_lat` layers
+      5. Pool: mean(latents) -> (B, d_latent)
 
-    Вхід:  (B, T, d_tok)
-    Вихід: latents (B, n_latents, d_latent),  pooled (B, d_latent)
+    Input:  (B, T, d_tok)
+    Output: latents (B, n_latents, d_latent), pooled (B, d_latent)
     """
 
     def __init__(self,
@@ -239,15 +239,15 @@ class PerceiverResampler(nn.Module):
                  dropout: float = 0.1):
         super().__init__()
 
-        # 0. Проекція токен-рівня → концепт-рівень
+        # 0. Project token level -> concept level.
         self.tok_proj = (nn.Linear(d_tok, d_latent, bias=False)
                          if d_tok != d_latent else nn.Identity())
 
-        # 1. Навчальні латентні запити (фіксований розмір)
+        # 1. Learnable latent queries with fixed size.
         self.latents = nn.Parameter(
             torch.randn(1, n_latents, d_latent) * d_latent ** -0.5)
 
-        # 2+3. Пари (cross-attn, self-attn) × n_layers
+        # 2+3. Pairs of (cross-attn, self-attn) repeated `n_layers` times.
         self.cross_norms = nn.ModuleList([RMSNorm(d_latent) for _ in range(n_layers)])
         self.cross_attns = nn.ModuleList([
             LlamaAttention(d_latent, n_heads, dropout=dropout,
@@ -279,10 +279,10 @@ class PerceiverResampler(nn.Module):
         lat = self.latents.expand(B, -1, -1)                # (B, n, d_lat)
 
         for i in range(self.n_layers):
-            # Cross-attention: latents ← context
+            # Cross-attention: latents <- context.
             lat = lat + self.cross_attns[i](
                 self.cross_norms[i](lat), context=ctx)
-            # Self-attention серед латентів
+            # Self-attention among latents.
             lat = lat + self.self_attns[i](self.self_norms[i](lat))
             # FFN
             lat = lat + self.ffns[i](self.ffn_norms[i](lat))
@@ -293,7 +293,7 @@ class PerceiverResampler(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5.  L_scale PENALTY  (MDL-регуляризатор рівнів)
+# 5. L_scale PENALTY (MDL regularizer over levels)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def l_scale_penalty(z_tok: torch.Tensor,
@@ -303,11 +303,11 @@ def l_scale_penalty(z_tok: torch.Tensor,
     """
     L_scale = λ_tok·(1/T)·Σ_t ||z_t||² + λ_conc·(1/|C|)·Σ_c ||c||²
 
-    Примушує модель кластеризувати знання в концепти, а не
-    "розмазувати" інформацію по всьому гігантському вектору.
+    Encourages the model to cluster knowledge into concepts instead of
+    smearing information across one giant vector.
 
-    z_tok  : (B, T, d_tok)   — токен-рівень
-    z_conc : (B, n, d_lat)   — концепт-рівень (latents або pooled)
+    z_tok  : (B, T, d_tok)   — token level
+    z_conc : (B, n, d_lat)   — concept level (latents or pooled)
     """
     tok_penalty  = lambda_tok  * z_tok.pow(2).mean()
     conc_penalty = lambda_conc * z_conc.pow(2).mean()
@@ -315,7 +315,7 @@ def l_scale_penalty(z_tok: torch.Tensor,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 6.  INLINE ТЕСТИ
+# 6. INLINE TESTS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _run_perceiver_tests() -> None:
@@ -330,7 +330,7 @@ def _run_perceiver_tests() -> None:
     y = norm(x)
     assert y.shape == x.shape
     rms = y.pow(2).mean(-1).sqrt()
-    assert rms.mean().item() < 1.5, f"RMS={rms.mean():.3f} занадто велике"
+    assert rms.mean().item() < 1.5, f"RMS={rms.mean():.3f} is too large"
     print(f"  shape {tuple(y.shape)}  rms≈{rms.mean():.3f}  [PASS]")
 
     # T2: RotaryEmbedding
@@ -340,7 +340,7 @@ def _run_perceiver_tests() -> None:
     k = torch.randn(2, 4, 8, 32, device=device)
     q_r, k_r = rope(q, k)
     assert q_r.shape == q.shape
-    # Норми мають зберігатися (обертання ортогональне)
+    # Norms should be preserved because the rotation is orthogonal.
     assert torch.allclose(q_r.norm(dim=-1), q.norm(dim=-1), atol=1e-5)
     print(f"  norm preserved: max_err={( q_r.norm(dim=-1) - q.norm(dim=-1)).abs().max():.2e}  [PASS]")
 
@@ -360,7 +360,7 @@ def _run_perceiver_tests() -> None:
     assert y.shape == x.shape
     print(f"  shape {tuple(y.shape)}  [PASS]")
 
-    # T5: PerceiverResampler — форма
+    # T5: PerceiverResampler — shape
     sep("T5 · PerceiverResampler — shape")
     pr = PerceiverResampler(
         d_tok=128, d_latent=64, n_latents=8, n_heads=4, n_layers=2
@@ -371,7 +371,7 @@ def _run_perceiver_tests() -> None:
     assert pooled.shape  == (3, 64),    f"pooled {pooled.shape}"
     print(f"  latents {tuple(latents.shape)}  pooled {tuple(pooled.shape)}  [PASS]")
 
-    # T6: PerceiverResampler — стиснення T→n_latents
+    # T6: PerceiverResampler — compression T->n_latents
     sep("T6 · PerceiverResampler — compression ratio")
     T, n = 256, 8
     pr2 = PerceiverResampler(
@@ -390,8 +390,8 @@ def _run_perceiver_tests() -> None:
     assert pen.item() > 0
     print(f"  L_scale={pen.item():.6f}  [PASS]")
 
-    # T8: Backward через PerceiverResampler
-    sep("T8 · Backward через PerceiverResampler")
+    # T8: Backward through PerceiverResampler
+    sep("T8 · Backward through PerceiverResampler")
     pr3 = PerceiverResampler(
         d_tok=64, d_latent=32, n_latents=8, n_heads=4, n_layers=1
     ).to(device)
@@ -400,10 +400,10 @@ def _run_perceiver_tests() -> None:
     loss = pooled.pow(2).mean()
     loss.backward()
     grad_sum = sum(p.grad.norm().item() for p in pr3.parameters() if p.grad is not None)
-    assert grad_sum > 0, "FAIL: немає градієнту"
+    assert grad_sum > 0, "FAIL: no gradient"
     print(f"  grad_sum={grad_sum:.4f}  [PASS]")
 
-    print("\n  ✅  omen_perceiver: всі тести пройдено\n")
+    print("\n  ✅  omen_perceiver: all tests passed\n")
 
 
 if __name__ == "__main__":

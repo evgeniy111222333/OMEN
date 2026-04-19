@@ -1,27 +1,27 @@
 """
-omen_train_code.py — Повний тренувальний цикл OMEN-Scale + NET
-==============================================================
+omen_train_code.py — Full OMEN-Scale + NET training loop
+========================================================
 
-Два етапи навчання (як описано в специфікації NET):
+Two training stages (as described in the NET spec):
 
   Stage 1 — NET Pretraining (byte-level compression)
-    · Оптимізується L_code + L_rec (без S-Core)
-    · Словник NET формується з нуля через EMA + dead-code restart
-    · Ціль: стабільний кодбук перед символьним fine-tuning
+    · Optimize L_code + L_rec (without S-Core)
+    · Build the NET vocabulary from scratch via EMA + dead-code restart
+    · Goal: a stable codebook before symbolic fine-tuning
 
   Stage 2 — OMEN-Scale Full Training (joint)
-    · J = Perplexity + β·L_proof + γ·L_world - α·I(Z;M)
-          + L_scale + λ_rule·Complexity(Γ) + η_tok·L_NET
-    · S-Core отримує токени і виводить Horn-правила
-    · NET словник продовжує рости через абдукцію
+    · J = Perplexity + beta * L_proof + gamma * L_world - alpha * I(Z;M)
+          + L_scale + lambda_rule * Complexity(Gamma) + eta_tok * L_NET
+    · S-Core consumes tokens and derives Horn rules
+    · The NET vocabulary keeps growing through abduction
 
-Запуск:
+Usage:
   python omen_train_code.py                     # smoke test (demo config)
-  python omen_train_code.py --config demo       # CPU (швидко)
+  python omen_train_code.py --config demo       # CPU (fast)
   python omen_train_code.py --config mid        # 1x A100
-  python omen_train_code.py --real_text FILE    # реальний корпус (UTF-8)
+  python omen_train_code.py --real_text FILE    # real corpus (UTF-8)
 
-  # Рекомендований запуск на GPU (RTX 3080/4080):
+  # Recommended GPU run (RTX 3080/4080):
   python omen_train_code.py \\
       --real_text codesearchnet_python.txt \\
       --config strong --stage1_steps 1000 \\
@@ -29,11 +29,11 @@ omen_train_code.py — Повний тренувальний цикл OMEN-Scale
       --amp --grad_accum 2 \\
       --checkpoint_dir ./checkpoints
 
-  Оптимізації Stage 2 (без втрати якості):
-    --amp            : FP16 autocast на GPU  → ~2x прискорення матричних операцій
-    --grad_accum N   : накопичення градієнтів → менше opt.step (рекомендовано: 2–4)
-    --num_workers N  : DataLoader workers для паралельного prefetch даних (2–4 на GPU)
-    --max_batches N  : ліміт батчів/епоху для коротших ітерацій
+  Stage 2 optimizations (without quality loss):
+    --amp            : FP16 autocast on GPU  -> ~2x faster matrix ops
+    --grad_accum N   : gradient accumulation -> fewer opt.step calls (recommended: 2-4)
+    --num_workers N  : DataLoader workers for parallel data prefetch (2-4 on GPU)
+    --max_batches N  : batch-per-epoch cap for shorter iterations
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ from omen_data import make_counting, make_python, make_rule_transfer, collate
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# AMP доступний тільки на CUDA (на CPU — no-op через enabled=False)
+# AMP is only available on CUDA (on CPU it becomes a no-op via enabled=False)
 _AMP_AVAILABLE = torch.cuda.is_available()
 
 if DEVICE.type == "cuda":
@@ -101,21 +101,21 @@ _configure_stdio()
 
 class StackedDataset(Dataset):
     """
-    Перетворює List[Tuple[Tensor,Tensor]] у два великих тензори (N,T).
-    Це виконується ONE TIME, після чого кожен батч — просто slice (zero-copy).
+    Convert List[Tuple[Tensor,Tensor]] into two large tensors (N,T).
+    This is done one time; after that, each batch is just a slice (zero-copy).
 
-    Порівняно з поточним підходом (torch.stack кожен батч):
-      · Старий: N_batches × torch.stack(8 tensors) = N_batches × ~0.1ms = накопичується
-      · Новий:  stack один раз при ініціалізації, далі __getitem__ = O(1) indirection
+    Compared with the old approach (torch.stack on every batch):
+      · Old: N_batches × torch.stack(8 tensors) = N_batches × ~0.1ms = accumulates
+      · New: stack once during initialization, then __getitem__ = O(1) indirection
 
-    На GPU з pin_memory=True DataLoader асинхронно переносить дані CPU→GPU
-    паралельно з тим, як GPU обраховує попередній батч (реальний overlap).
+    On GPU with pin_memory=True, DataLoader transfers CPU->GPU data asynchronously
+    while the GPU computes the previous batch (real overlap).
     """
     def __init__(self, data: List[Tuple[torch.Tensor, torch.Tensor]]):
         t0 = time.perf_counter()
-        # Підтримуємо два формати (як collate):
-        #   List[Tuple[src, tgt]] — реальний текст (load_text_corpus)
-        #   List[Tensor]          — синтетичний (make_counting, make_python, …)
+        # Support two formats (same as collate):
+        #   List[Tuple[src, tgt]] - real text (load_text_corpus)
+        #   List[Tensor]          - synthetic (make_counting, make_python, ...)
         if isinstance(data[0], (tuple, list)):
             self.src = torch.stack([x[0] for x in data])   # (N, T)
             self.tgt = torch.stack([x[1] for x in data])   # (N, T)
@@ -124,8 +124,8 @@ class StackedDataset(Dataset):
             self.src = stacked[:, :-1]                      # (N, T)
             self.tgt = stacked[:, 1:]                       # (N, T)
         elapsed = (time.perf_counter() - t0) * 1000
-        print(f"  [StackedDataset] {len(self.src):,} зразків x T={self.src.shape[1]} "
-              f"стеккінг за {elapsed:.0f}ms  "
+        print(f"  [StackedDataset] {len(self.src):,} samples x T={self.src.shape[1]} "
+              f"stacked in {elapsed:.0f}ms  "
               f"({self.src.numel()*2*4/1e6:.1f} MB RAM)")
 
     def __len__(self) -> int:
@@ -139,9 +139,9 @@ class StreamingTextDataset(Dataset):
     """
     File-backed UTF-8 byte dataset.
 
-    Не тримає весь корпус у RAM: кожен __getitem__ дочитує лише потрібне вікно
-    байтів з диска. Це не IterableDataset у вузькому сенсі, але для тренування
-    вирішує головну проблему: корпус масштабується без повного preload.
+    Does not keep the full corpus in RAM: each __getitem__ reads only the needed
+    byte window from disk. It is not an IterableDataset in the narrow sense, but
+    for training it solves the main problem: the corpus scales without full preload.
     """
     def __init__(self, path: Union[str, Path], seq_len: int, max_samples: int = 50_000):
         self.path = Path(path)
@@ -174,7 +174,7 @@ class StreamingTextDataset(Dataset):
 
 def sample_examples(dataset: Union[Sequence, Dataset],
                     n_samples: int) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-    """Вибирає кілька прикладів з list/Subset/file-backed Dataset без preload."""
+    """Select a few examples from a list/Subset/file-backed Dataset without preload."""
     total = len(dataset)
     if total == 0:
         return []
@@ -189,8 +189,8 @@ def build_loader(dataset_obj: Dataset,
                  shuffle: bool = True,
                  drop_last: bool = True) -> DataLoader:
     """
-    Будує DataLoader з pin_memory (якщо CUDA) і prefetch_factor.
-    num_workers=0 — безпечно з будь-яким GPU/CPU, >0 лише якщо CUDA і стабільно.
+    Build a DataLoader with pin_memory (when CUDA is available) and prefetch_factor.
+    num_workers=0 is safe on any GPU/CPU; use >0 only when CUDA is stable.
     """
     loader_kwargs = {
         "dataset": dataset_obj,
@@ -217,23 +217,23 @@ def _finite_metric(value: object, default: float = 0.0) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. ДАНІ
+# 1. DATA
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_text_corpus(path: str, seq_len: int,
                      max_samples: int = 50_000) -> StreamingTextDataset:
     """
-    Завантажує реальний текст як байтові послідовності.
+    Load real text as byte sequences.
 
-    UTF-8 текст → int байти [0..255] → (src, tgt) пари.
-    Stride = seq_len//2 для 50% overlap між сусідніми прикладами.
+    UTF-8 text -> int bytes [0..255] -> (src, tgt) pairs.
+    Stride = seq_len//2 for 50% overlap between neighboring examples.
     """
     return StreamingTextDataset(path, seq_len=seq_len, max_samples=max_samples)
 
 
 def make_synthetic_dataset(cfg: OMENScaleConfig,
                            n: int = 512) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-    """Синтетичний датасет: counting + python + rule_transfer."""
+    """Synthetic dataset: counting + python + rule_transfer."""
     ds: List[Tuple[torch.Tensor, torch.Tensor]] = []
     for gen in [make_counting, make_python, make_rule_transfer]:
         ds.extend(gen(n // 3, cfg.seq_len))
@@ -254,12 +254,12 @@ def pretrain_net(model: OMEN,
                  use_amp: bool = False,
                  num_workers: int = 0) -> Dict:
     """
-    Stage 1: попереднє навчання NET без символьної частини.
-    Оптимізує лише: L_NET = L_code + L_rec + L_vocab + λ_vq·L_vq
-    Решта параметрів заморожена.
+    Stage 1: NET pretraining without the symbolic stack.
+    Optimizes only: L_NET = L_code + L_rec + L_vocab + lambda_vq * L_vq.
+    All remaining parameters are frozen.
     """
     if not model.net_enabled:
-        print("  [Stage 1] NET вимкнений — пропускаємо")
+        print("  [Stage 1] NET disabled - skipping")
         return {}
     if len(dataset) == 0:
         print("  [Stage 1] empty dataset — skipping")
@@ -269,7 +269,7 @@ def pretrain_net(model: OMEN,
     print("  STAGE 1: NET Pretraining  (byte-level compression)")
     print("═" * 68)
 
-    # Заморожуємо все, крім NET
+    # Freeze everything except NET
     for name, p in model.named_parameters():
         p.requires_grad = "net." in name
 
@@ -340,10 +340,10 @@ def pretrain_net(model: OMEN,
                 return_recon_loss=True,
             )
 
-            # Non-autoregressive reconstruction loss (позиційна, без causal bypass).
-            # Без цього decoder навчається передбачати tgt[i+1] з tgt[0..i]
-            # БЕЗ використання h_q → gradient через h_q до encoder слабшає → collapse.
-            # stage1_rec_loss форсує h_q[i] кодувати саме src[i].
+            # Non-autoregressive reconstruction loss (positional, without causal bypass).
+            # Without it, the decoder can learn to predict tgt[i+1] from tgt[0..i]
+            # without using h_q, which weakens the gradient through h_q to the encoder.
+            # stage1_rec_loss forces h_q[i] to encode src[i] directly.
             l_nonauto = model.net.stage1_rec_loss(h_q, src)
 
             loss_dict = model.net.compute_loss(vq_info, l_rec)
@@ -380,7 +380,7 @@ def pretrain_net(model: OMEN,
                   f"V={int(m['vocab'])}  "
                   f"{elapsed:.0f}s", flush=True)
 
-    # Розморожуємо всі параметри
+    # Unfreeze all parameters
     for p in model.parameters():
         p.requires_grad = True
 
@@ -413,23 +413,23 @@ def joint_train(model: OMEN,
                 resume_state: Optional[dict] = None,
                 start_epoch: int = 0) -> List[Dict]:
     """
-    Stage 2: спільне навчання OMEN-Scale.
-    NET має менший LR (0.3x) щоб не зруйнувати Stage-1 кодбук.
+    Stage 2: joint OMEN-Scale training.
+    NET uses a smaller LR (0.3x) so it does not destroy the Stage-1 codebook.
 
-    Оптимізації (без втрати якості):
-      · StackedDataset + DataLoader → zero-copy batching + pin_memory async transfer
-      · AMP (autocast + GradScaler) → FP16 matmul на GPU (40–100% прискорення)
-      · grad_accum > 1 → менше optimizer.step() викликів (effective_batch = batch×accum)
-      · Throughput звіт: samples/sec, tokens/sec, ms/batch
+    Optimizations (without quality loss):
+      · StackedDataset + DataLoader -> zero-copy batching + pin_memory async transfer
+      · AMP (autocast + GradScaler) -> FP16 matmul on GPU (40-100% faster)
+      · grad_accum > 1 -> fewer optimizer.step() calls (effective_batch = batch * accum)
+      · Throughput report: samples/sec, tokens/sec, ms/batch
 
-    max_batches_per_epoch=None → весь датасет за кожну епоху.
-    Задай числом щоб обмежити (наприклад 256 = 2048 зразків / епоха).
+    max_batches_per_epoch=None means the full dataset each epoch.
+    Set it to a number to cap the run (for example 256 = 2048 samples / epoch).
     """
-    use_amp = use_amp and _AMP_AVAILABLE  # AMP тільки на CUDA
+    use_amp = use_amp and _AMP_AVAILABLE  # AMP only on CUDA
     _device_type = "cuda" if DEVICE.type == "cuda" else "cpu"
 
-    # torch.autocast — уніфікований API (PyTorch ≥ 2.0).
-    # enabled=False → nullcontext-like no-op, безпечно на CPU/GPU.
+    # torch.autocast is the unified API (PyTorch >= 2.0).
+    # enabled=False acts like a nullcontext and is safe on CPU/GPU.
     def _amp_ctx():
         return torch.autocast(device_type=_device_type,
                               dtype=torch.float16 if use_amp else torch.float32,
@@ -443,7 +443,7 @@ def joint_train(model: OMEN,
     dataset_obj = dataset if isinstance(dataset, Dataset) else StackedDataset(dataset)
     loader  = build_loader(dataset_obj, batch_size, num_workers=num_workers, shuffle=True)
 
-    # Обчислюємо ефективний ліміт батчів
+    # Compute the effective batch limit
     n_total_batches = len(loader)
     _max_bat = max_batches_per_epoch if max_batches_per_epoch is not None else n_total_batches
     _max_bat = min(_max_bat, n_total_batches)
@@ -469,7 +469,7 @@ def joint_train(model: OMEN,
         {"params": net_params,   "lr": lr * 0.3, "weight_decay": 1e-5},
         {"params": other_params, "lr": lr,        "weight_decay": weight_decay},
     ])
-    # Bug fix: відновлюємо optimizer state (Adam m1/m2) після resume
+    # Bug fix: restore optimizer state (Adam m1/m2) after resume
     if resume_state and resume_state.get("optimizer"):
         try:
             opt.load_state_dict(resume_state["optimizer"])
@@ -486,7 +486,7 @@ def joint_train(model: OMEN,
     sched = SequentialLR(opt, schedulers=[warmup_sched, decay_sched],
                          milestones=[_warmup_ep])
 
-    # AMP GradScaler (no-op якщо use_amp=False)
+    # AMP GradScaler (no-op when use_amp=False)
     scaler = torch.amp.GradScaler(
         "cuda",
         enabled=use_amp,
@@ -538,7 +538,7 @@ def joint_train(model: OMEN,
         n_bat = 0
         total_tokens = 0
 
-        # timing buckets для throughput аналізу
+        # timing buckets for throughput analysis
         t_data, t_fwd, t_bwd, t_opt = 0.0, 0.0, 0.0, 0.0
 
         opt.zero_grad(set_to_none=True)
@@ -550,7 +550,7 @@ def joint_train(model: OMEN,
             src = src.to(DEVICE, non_blocking=True)
             tgt = tgt.to(DEVICE, non_blocking=True)
 
-            # ── Forward (з AMP якщо use_amp) ─────────────────────────────────
+            # ── Forward (with AMP when use_amp) ───────────────────────────────
             t1 = time.perf_counter()
             with _amp_ctx():
                 out = model(
@@ -559,19 +559,19 @@ def joint_train(model: OMEN,
                     metric_profile="train_fast" if DEVICE.type == "cuda" else "full",
                 )
 
-            # ── NaN/Inf guard з покомпонентною діагностикою ───────────────────
+            # ── NaN/Inf guard with per-component diagnostics ──────────────────
             if torch.isnan(out["total"]) or torch.isinf(out["total"]):
-                # Знаходимо проблемний компонент
+                # Find the problematic component
                 bad = [k for k, v in out.items()
                        if k not in ("logits", "z", "emc_stop")
                        and isinstance(v, float) and (math.isnan(v) or math.isinf(v))]
-                print(f"\n  ⚠️  NaN/Inf у total (batch {n_bat+1}), пропускаємо. "
-                      f"Проблемні ключі: {bad if bad else 'невідомо'}")
+                print(f"\n  WARNING: NaN/Inf in total (batch {n_bat+1}), skipping. "
+                      f"Problematic keys: {bad if bad else 'unknown'}")
                 t_iter_start = time.perf_counter()
                 continue
             t_fwd += time.perf_counter() - t1
 
-            # ── Backward (масштабований для AMP) ─────────────────────────────
+            # ── Backward (scaled for AMP) ─────────────────────────────────────
             t2 = time.perf_counter()
             loss = out["total"] / grad_accum
             scaler.scale(loss).backward()
@@ -589,7 +589,7 @@ def joint_train(model: OMEN,
                     except (TypeError, ValueError):
                         pass
 
-            # ── Optimizer step кожні grad_accum кроків ───────────────────────
+            # ── Optimizer step every grad_accum steps ─────────────────────────
             if n_bat % grad_accum == 0:
                 t3 = time.perf_counter()
                 step_stats = _optimizer_step()
@@ -597,7 +597,7 @@ def joint_train(model: OMEN,
                     agg[key] += value
                 t_opt += time.perf_counter() - t3
 
-            # ── Прогрес-лічильник ─────────────────────────────────────────────
+            # ── Progress counter ───────────────────────────────────────────────
             elapsed_bat = time.perf_counter() - t0_epoch
             ms_per_bat  = elapsed_bat / n_bat * 1000
             eta_s       = ms_per_bat * (_max_bat - n_bat) / 1000
@@ -614,7 +614,7 @@ def joint_train(model: OMEN,
 
             t_iter_start = time.perf_counter()
 
-        # Final flush якщо залишились акумульовані градієнти
+        # Final flush if accumulated gradients remain
         if n_bat % grad_accum != 0:
             step_stats = _optimizer_step()
             for key, value in step_stats.items():
@@ -628,7 +628,7 @@ def joint_train(model: OMEN,
         epoch_time = time.perf_counter() - t0_epoch
         n_opt_steps = max(int(agg.get("optimizer_steps", 0.0)), 1)
         avg = {k: v / n_bat for k, v in agg.items()}
-        # grad norms усереднені по кількості optimizer steps
+        # Grad norms averaged by the number of optimizer steps
         avg["gnorm_net"]   = agg.get("gnorm_net",   0.0) / n_opt_steps
         avg["gnorm_other"] = agg.get("gnorm_other", 0.0) / n_opt_steps
         avg["amp_overflow_steps"] = agg.get("amp_overflow_steps", 0.0)
@@ -638,16 +638,16 @@ def joint_train(model: OMEN,
         avg["epoch"]     = float(epoch)
         avg["net_vocab"] = model.net.quantizer.current_size.item() if model.net_enabled else 0
         avg["kb_facts"]  = model.prover.kb.n_facts()
-        avg["lr"]        = opt.param_groups[-1]["lr"]  # LR основної групи
+        avg["lr"]        = opt.param_groups[-1]["lr"]  # main-group LR
 
-        # Throughput breakdown (тільки epoch 1)
+        # Throughput breakdown (epoch 1 only)
         if epoch == 1:
             print(f"\n  ── Epoch 1 throughput breakdown ──")
             print(f"     data prefetch : {t_data*1000/n_bat:5.1f} ms/batch")
             print(f"     forward       : {t_fwd*1000/n_bat:5.1f} ms/batch")
             print(f"     backward      : {t_bwd*1000/n_bat:5.1f} ms/batch")
             print(f"     opt+step      : {t_opt*1000/n_bat:5.1f} ms/batch  "
-                  f"(кожні {grad_accum} batches)")
+                  f"(every {grad_accum} batches)")
             print(f"     total/batch   : {avg['ms']:5.1f} ms/batch")
             print(f"     throughput    : {avg['tok_s']:,.0f} tok/s\n")
             print(f"  {hdr}")
@@ -657,12 +657,12 @@ def joint_train(model: OMEN,
         _prev_ppl = results[-1]["ppl"] if results else avg["ppl"]
         _spike = avg["ppl"] > _prev_ppl * 3.0 and avg["ppl"] > 20.0
         if _spike:
-            print(f"\n  🔴 PPL SPIKE: {_prev_ppl:.1f} → {avg['ppl']:.1f}  Компоненти лосу:")
+            print(f"\n  PPL SPIKE: {_prev_ppl:.1f} -> {avg['ppl']:.1f}  Loss components:")
             diag_keys = ["ce", "world", "l_scale", "sym_ground", "ltm_pen",
                          "ltm_pen_raw", "net_loss", "meta_loss", "traj_reward",
                          "curiosity", "recall", "novelty", "vem_pen",
                          "gnorm_net", "gnorm_other", "lr",
-                         # OSF: компоненти J_OSF для діагностики стрибків
+                         # OSF: J_OSF components for spike diagnostics
                          "osf_l_plan", "osf_l_sim", "osf_l_refl", "osf_l_meta",
                          "osf_l_intent", "osf_struct", "osf_plan_rl"]
             for dk in diag_keys:
@@ -670,7 +670,7 @@ def joint_train(model: OMEN,
                 flag = " ⚠️" if abs(v) > 5.0 else ""
                 print(f"     {dk:<18}: {v:+10.5f}{flag}")
 
-        # ── Компактний рядок епохи ─────────────────────────────────────────────
+        # ── Compact epoch line ────────────────────────────────────────────────
         print(f"\r  {epoch:4d} "
               f"{avg.get('ce', 0):7.3f} "
               f"{min(avg.get('world', 0), 10.0):7.3f} "
@@ -682,7 +682,7 @@ def joint_train(model: OMEN,
               f"{avg['ms']:6.0f} "
               f"{avg['tok_s']:7.0f}          ", flush=True)
 
-        # ── Детальний рядок loss-компонентів ─────────────────────────────────
+        # ── Detailed loss-component line ──────────────────────────────────────
         print(f"       "
               f"sym={avg.get('sym_ground',0):.3f} "
               f"ltm={avg.get('ltm_pen',0):.3f}({avg.get('ltm_pen_raw',0):.1f}) "
@@ -695,7 +695,7 @@ def joint_train(model: OMEN,
               f"lr={avg.get('lr',0):.2e} "
               f"amp_of={avg.get('amp_overflow_steps',0):.0f}")
 
-        # ── EMC рядок (якщо ввімкнено) ────────────────────────────────────────
+        # ── EMC line (when enabled) ───────────────────────────────────────────
         if getattr(model.cfg, 'emc_enabled', False):
             emc_steps  = avg.get('emc_steps', 0.0)
             meta_loss  = avg.get('meta_loss', 0.0)
@@ -711,9 +711,9 @@ def joint_train(model: OMEN,
                   f"fc={a_fc:.0f}% abd={a_abd:.0f}% "
                   f"mdl={avg.get('emc_mdl',0):.2f}")
 
-        # ── OSF рядок (якщо ввімкнено) ────────────────────────────────────────
-        # Відображає всі компоненти J_OSF + стан мета-контролера стратегій.
-        # σ: 0=Fast, 1=Careful, 2=Exploratory — середнє за епоху.
+        # ── OSF line (when enabled) ───────────────────────────────────────────
+        # Displays all J_OSF components plus the strategic meta-controller state.
+        # sigma: 0=Fast, 1=Careful, 2=Exploratory - epoch average.
         if getattr(model.cfg, 'osf_enabled', False):
             _osf_plan   = avg.get('osf_l_plan',    0.0)
             _osf_sim    = avg.get('osf_l_sim',     0.0)
@@ -749,7 +749,7 @@ def joint_train(model: OMEN,
 
 
 def _serialize_kb(kb) -> dict:
-    """Повна серіалізація TensorKnowledgeBase: факти, правила, records, лічильники."""
+    """Full TensorKnowledgeBase serialization: facts, rules, records, counters."""
     return {
         "fact_buf":   kb._fact_buf[:kb._n_facts].cpu().clone(),   # (n_facts, 3) int64
         "rules":      pickle.dumps(list(kb.rules)),               # bytes → safe for weights_only=True
@@ -757,7 +757,7 @@ def _serialize_kb(kb) -> dict:
         "n_rules":    kb._n_rules,
         "n_proposed": kb._n_proposed,
         "n_verified": kb._n_verified,
-        "records":    pickle.dumps(dict(kb._records)),             # bytes → safe (RuleRecord містить HornClause)
+        "records":    pickle.dumps(dict(kb._records)),             # bytes -> safe (RuleRecord contains HornClause)
         "fact_set":   set(kb._fact_set),
         "rule_hash_set": set(kb._rule_hash_set),
     }
@@ -765,11 +765,11 @@ def _serialize_kb(kb) -> dict:
 
 def _restore_structural_rule_set(kb_state: dict, rules: Sequence) -> set:
     """
-    Нормалізує legacy checkpoint state до structural set правил.
+    Normalize a legacy checkpoint state into a structural rule set.
 
-    Старі checkpoint-и могли зберігати лише int hash-значення або взагалі
-    не містити rule-set. Для TensorKnowledgeBase це ламає dedupe після restore,
-    тому тут завжди відновлюємо set із реальних HornClause.
+    Older checkpoints could store only int hash values or omit the rule set
+    entirely. For TensorKnowledgeBase this breaks dedupe after restore, so
+    we always rebuild the set from real HornClause objects here.
     """
     raw_rule_set = kb_state.get("rule_hash_set")
     if raw_rule_set is None:
@@ -781,15 +781,15 @@ def _restore_structural_rule_set(kb_state: dict, rules: Sequence) -> set:
 
 
 def _restore_kb(model, kb_state: dict, device) -> None:
-    """Відновлює TensorKnowledgeBase з серіалізованого стану."""
+    """Restore TensorKnowledgeBase from serialized state."""
     kb = model.prover.kb
-    # Відновлюємо факти
+    # Restore facts
     n_f = kb_state["n_facts"]
     if n_f > 0:
         kb._fact_buf[:n_f] = kb_state["fact_buf"].to(device)
     kb._n_facts       = n_f
     kb._fact_set      = kb_state.get("fact_set", set())
-    # Відновлюємо правила
+    # Restore rules
     kb.rules          = pickle.loads(kb_state["rules"]) if isinstance(kb_state["rules"], bytes) else kb_state["rules"]
     kb._n_rules       = kb_state["n_rules"]
     kb._n_proposed    = kb_state["n_proposed"]
@@ -798,7 +798,7 @@ def _restore_kb(model, kb_state: dict, device) -> None:
                          if isinstance(kb_state["records"], bytes)
                          else kb_state.get("records", {}))
     kb._rule_hash_set = _restore_structural_rule_set(kb_state, kb.rules)
-    # Інвалідуємо кеш фактів
+    # Invalidate the fact cache
     kb._facts_cache   = None
     kb._facts_cache_n = -1
     print(f"    [restore] KB: {n_f} facts, {kb_state['n_rules']} rules")
@@ -808,18 +808,18 @@ def _save_ckpt(model, optimizer, scheduler, scaler, epoch, metrics, save_dir):
     Path(save_dir).mkdir(parents=True, exist_ok=True)
     path = str(Path(save_dir) / f"omen_epoch{epoch:04d}.pt")
 
-    # ── KB: повна серіалізація (Bug 1 fix) ─────────────────────────────────────
+    # ── KB: full serialization (Bug 1 fix) ────────────────────────────────────
     kb_state = _serialize_kb(model.prover.kb)
 
     # ── Memory cache: episodic recall (Bug 3 fix) ───────────────────────────────
     runtime_state = model.export_runtime_state()
     mem_cache = list(runtime_state.get("memory", {}).get("cache", ()))
 
-    # ── EMC: мета-статистика (Actor/Critic/StoppingUtility weights — у model.state_dict())
-    # EfficientMetaController є nn.Module зареєстрованим як self.emc → його ваги
-    # (Actor, Critic, StoppingUtility.task_estimator, EMCStateEncoder) АВТОМАТИЧНО
-    # зберігаються через model.state_dict(). Зберігаємо також мета-статистику для
-    # діагностики та перевірки коректності відновлення.
+    # ── EMC: meta statistics (Actor/Critic/StoppingUtility weights live in model.state_dict())
+    # EfficientMetaController is registered as nn.Module via self.emc, so its weights
+    # (Actor, Critic, StoppingUtility.task_estimator, EMCStateEncoder) are saved
+    # automatically through model.state_dict(). We also store meta statistics for
+    # diagnostics and restore-integrity checks.
     emc_meta = {}
     if getattr(model, 'emc_enabled', False) and hasattr(model, 'emc'):
         emc = model.emc
@@ -832,7 +832,7 @@ def _save_ckpt(model, optimizer, scheduler, scaler, epoch, metrics, save_dir):
             "eta_int":      emc.eta_int,
             "entropy_beta": emc.entropy_beta,
             "use_gae":      emc.use_gae,
-            # Підтверджуємо що ваги зберігаються через model.state_dict()
+            # Confirm that weights are saved through model.state_dict()
             "actor_param_count":  sum(p.numel() for p in emc.actor.parameters()),
             "critic_param_count": sum(p.numel() for p in emc.critic.parameters()),
             "stop_param_count":   sum(p.numel() for p in emc.stopping_utility.parameters()),
@@ -847,13 +847,13 @@ def _save_ckpt(model, optimizer, scheduler, scaler, epoch, metrics, save_dir):
         "metrics":   metrics,
         "net_vocab": model.net.quantizer.current_size.item() if model.net_enabled else 0,
         "net_tau":   float(model.net.quantizer.tau) if model.net_enabled else None,
-        "kb_facts":  kb_state["n_facts"],    # для швидкого перегляду
-        "kb_state":  kb_state,               # повний стан KB
+        "kb_facts":  kb_state["n_facts"],    # quick glance value
+        "kb_state":  kb_state,               # full KB state
         "runtime_state": runtime_state,
         "mem_cache": mem_cache,              # episodic recall cache
-        "emc_meta":  emc_meta,              # EMC гіперпараметри + param counts (weights у model)
-        # OSF: зберігаємо running CE estimate, щоб мета-контролер відновлював
-        # реалістичну оцінку якості замість хардкоду 5.0 після завантаження.
+        "emc_meta":  emc_meta,              # EMC hyperparameters + param counts (weights live in model)
+        # OSF: save the running CE estimate so the meta-controller restores
+        # a realistic quality estimate instead of hardcoded 5.0 after loading.
         "osf_running_ce": getattr(model, '_osf_running_ce', 5.0),
     }, path)
     emc_info = ""
@@ -924,20 +924,20 @@ def smoke_test() -> None:
 
     ppls = [r["ppl"] for r in results]
     best_ppl = min(ppls)
-    # Перевіряємо що best PPL краще за перший крок (не обов'язково останній)
+    # Check that best PPL beats the first step (not necessarily the last)
     assert best_ppl < ppls[0] * 0.95 or best_ppl < ppls[0], \
-        f"PPL не покращилась: best={best_ppl:.1f} vs initial={ppls[0]:.1f}"
+        f"PPL did not improve: best={best_ppl:.1f} vs initial={ppls[0]:.1f}"
     print(f"\n  PPL: {ppls[0]:.1f} → min={best_ppl:.1f} (ep{ppls.index(best_ppl)+1})  ✓")
 
     vocab_final = model.net.quantizer.current_size.item()
-    assert vocab_final > cfg.net_init_vocab, "vocab не виріс"
+    assert vocab_final > cfg.net_init_vocab, "vocab did not grow"
     print(f"  NET vocab: {cfg.net_init_vocab} → {vocab_final}  ✓")
 
-    assert model.prover.kb.n_facts() > 0, "KB порожня"
+    assert model.prover.kb.n_facts() > 0, "KB is empty"
     print(f"  KB facts: {model.prover.kb.n_facts()}  ✓")
 
     print(f"\n{model.memory_report()}")
-    print("\n  ✅  Smoke test пройдено")
+    print("\n  Smoke test passed")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -956,27 +956,27 @@ def parse_args():
     p.add_argument("--resume", default=None)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--no_net", action="store_true")
-    # FIX ❹: раніше max_batches хардкодовано 32 → 256 зразків / 45 000 = 0.57%.
-    # None = весь датасет (одна повна епоха). Числове значення = ліміт батчів.
-    # Рекомендація для RTX 3080 + strong config:
-    #   --max_batches 256  (≈ 2048 зразків / епоха, ~2 хв / епоха)
-    #   --max_batches 500  (≈ 4000 зразків / епоха, ~4 хв / епоха)
-    #   без аргументу     = весь датасет, але довго
+    # FIX 4: max_batches used to be hardcoded to 32 -> 256 samples / 45,000 = 0.57%.
+    # None = full dataset (one full epoch). A numeric value = batch limit.
+    # Recommendation for RTX 3080 + strong config:
+    #   --max_batches 256  (~2048 samples / epoch, ~2 min / epoch)
+    #   --max_batches 500  (~4000 samples / epoch, ~4 min / epoch)
+    #   no argument        = full dataset, but slow
     p.add_argument("--max_batches", type=int, default=None,
-                   help="Ліміт батчів/епоху (None = весь датасет). "
-                        "Рекомендовано: 256-500 для швидких ітерацій.")
-    # ── Оптимізація швидкості ──────────────────────────────────────────────
+                   help="Batch limit per epoch (None = full dataset). "
+                        "Recommended: 256-500 for fast iterations.")
+    # ── Speed optimization ────────────────────────────────────────────────────
     p.add_argument("--amp", action="store_true", default=False,
-                   help="Увімкнути AMP (FP16 autocast). "
-                        "Дає 40-100%% прискорення на CUDA GPU. "
-                        "Автоматично вимикається якщо немає CUDA.")
+                   help="Enable AMP (FP16 autocast). "
+                        "Gives 40-100%% speedup on CUDA GPUs. "
+                        "Automatically disables itself when CUDA is unavailable.")
     p.add_argument("--grad_accum", type=int, default=1,
                    help="Gradient accumulation steps. "
                         "effective_batch = batch_size × grad_accum. "
-                        "Рекомендовано: 2-4 (зменшує к-сть opt.step() викликів).")
+                        "Recommended: 2-4 (reduces the number of opt.step() calls).")
     p.add_argument("--num_workers", type=int, default=0,
                    help="DataLoader workers (0 = main thread). "
-                        "На CUDA можна спробувати 2-4 для prefetch.")
+                        "On CUDA, you can try 2-4 for prefetch.")
     return p.parse_args()
 
 
@@ -996,11 +996,11 @@ def main():
         f"canonical={canon.stack_id}"
     )
 
-    # Підказка: GPU-оптимізація
+    # Hint: GPU optimization
     if DEVICE.type == "cuda" and not args.amp:
-        print("\n  💡 ПІДКАЗКА: ви на GPU але --amp не задано.")
-        print("     Рекомендовано: --amp --grad_accum 2")
-        print("     Очікуване прискорення: ~2x forward/backward (FP16 tensor cores)\n")
+        print("\n  HINT: you are on GPU but --amp is not enabled.")
+        print("     Recommended: --amp --grad_accum 2")
+        print("     Expected speedup: ~2x forward/backward (FP16 tensor cores)\n")
 
     if args.real_text:
         dataset = load_text_corpus(args.real_text, cfg.seq_len)
@@ -1020,7 +1020,7 @@ def main():
         ckpt = torch.load(args.resume, map_location=DEVICE, weights_only=False)
         model.load_state_dict(ckpt["model"])
         _resume_epoch = int(ckpt.get("epoch", 0) or 0)
-        # Bug 4 fix: відновлюємо KB та memory cache
+        # Bug 4 fix: restore KB and memory cache
         if "kb_state" in ckpt:
             _restore_kb(model, ckpt["kb_state"], DEVICE)
         if "runtime_state" in ckpt:
@@ -1029,7 +1029,7 @@ def main():
             model.memory.cache.extend(
                 [(s.to(DEVICE), v.to(DEVICE)) for s, v in ckpt["mem_cache"]]
             )
-        # Bug fix: відновлюємо net_tau (Python float — не входить у state_dict)
+        # Bug fix: restore net_tau (Python float - not part of state_dict)
         if "net_tau" in ckpt and ckpt["net_tau"] is not None and model.net_enabled:
             model.net.quantizer.tau = float(ckpt["net_tau"])
         _resume_training_state = {
@@ -1041,10 +1041,10 @@ def main():
         if "runtime_state" not in ckpt and "osf_running_ce" in ckpt and getattr(model, 'osf_enabled', False):
             model._osf_running_ce = float(ckpt["osf_running_ce"])
 
-        # ── Перевірка EMC state відновлення ──────────────────────────────────
+        # ── EMC state restore check ───────────────────────────────────────────
         # EfficientMetaController (Actor + Critic + StoppingUtility + StateEncoder)
-        # зберігається через model.state_dict() → відновлюється через load_state_dict().
-        # Тут перевіряємо що EMC param counts збігаються з очікуваними (meta-info).
+        # saved through model.state_dict() -> restored through load_state_dict().
+        # Here we verify that EMC param counts match the expected meta-info.
         emc_meta_ckpt = ckpt.get("emc_meta", {})
         if emc_meta_ckpt and getattr(model, 'emc_enabled', False) and hasattr(model, 'emc'):
             emc = model.emc
@@ -1065,7 +1065,7 @@ def main():
               f"cache={runtime_cache}  "
               f"tau={ckpt.get('net_tau', '?')}")
 
-    # Stage 1: пропускаємо якщо resume (NET відновлено з checkpoint)
+    # Stage 1: skip when resuming (NET restored from checkpoint)
     if args.resume:
         print("  [resume] Stage 1 skipped because NET state was restored from the checkpoint")
     else:

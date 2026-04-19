@@ -32,41 +32,41 @@ from omen_osf_meta      import (
 @dataclass
 class OSFConfig:
     """
-    Конфігурація OMEN Synthesis Framework.
-    Зазвичай вбудовується в OMENScaleConfig.
+    Configuration for the OMEN Synthesis Framework.
+    Usually embedded into `OMENScaleConfig`.
     """
-    # Увімкнення
+    # Enablement
     osf_enabled:    bool  = True
 
-    # Архітектура
-    d_intent:       int   = 64     # розмірність Intent-простору
-    n_goals:        int   = 32     # кількість абстрактних цілей
-    d_plan:         int   = 64     # розмірність Plan-простору
-    n_operators:    int   = 32     # розмір бібліотеки план-операторів
-    template_len:   int   = 8      # довжина шаблону одного оператора
+    # Architecture
+    d_intent:       int   = 64     # dimensionality of the intent space
+    n_goals:        int   = 32     # number of abstract goals
+    d_plan:         int   = 64     # dimensionality of the plan space
+    n_operators:    int   = 32     # size of the plan-operator library
+    template_len:   int   = 8      # template length for a single operator
 
-    # Планування
-    max_plan_depth: int   = 4      # глибина плану
-    beam_width:     int   = 2      # ширина beam search
-    alpha_plan:     float = 0.1    # штраф за довжину плану
+    # Planning
+    max_plan_depth: int   = 4      # plan depth
+    beam_width:     int   = 2      # beam-search width
+    alpha_plan:     float = 0.1    # penalty for plan length
 
-    # Симуляція/рефлексія
-    mismatch_tau:   float = 0.5    # поріг невідповідності
-    verify_tau:     float = 0.5    # поріг верифікації патчу
-    lambda_mdl_refl: float = 0.01  # MDL для патчу
+    # Simulation / reflection
+    mismatch_tau:   float = 0.5    # mismatch threshold
+    verify_tau:     float = 0.5    # patch verification threshold
+    lambda_mdl_refl: float = 0.01  # MDL term for a patch
 
-    # Мета-контролер
-    meta_beta:      float = 0.1    # баланс якість/вартість σ
+    # Meta-controller
+    meta_beta:      float = 0.1    # quality/cost balance for σ
     meta_entropy_beta: float = 0.01  # exploration bonus
 
-    # Ваги J_OSF
-    lambda_plan:    float = 0.1    # план-код консистентність
-    lambda_sim:     float = 0.05   # симуляція
-    lambda_refl:    float = 0.05   # рефлексія
-    lambda_meta:    float = 0.05   # мета-стратегія
+    # J_OSF weights
+    lambda_plan:    float = 0.1    # plan/code consistency
+    lambda_sim:     float = 0.05   # simulation
+    lambda_refl:    float = 0.05   # reflection
+    lambda_meta:    float = 0.05   # meta-strategy
     lambda_intent:  float = 0.01   # Intent anti-collapse
 
-    # Увімкнення підкомпонентів
+    # Subcomponent enablement
     use_simulation:  bool  = True
     use_reflection:  bool  = True
     use_meta:        bool  = True
@@ -87,12 +87,12 @@ class OSFConfig:
 
 class OSFSynthesizer(nn.Module):
     """
-    Повний OMEN Synthesis Framework.
+    Full OMEN Synthesis Framework.
 
-    Замінює TokenDecoder в OMENScale коли osf_enabled=True.
-    Повертає ті самі logits (B, T, vocab_size) + словник OSF losів.
+    Replaces TokenDecoder inside OMENScale when `osf_enabled=True`.
+    Returns the same logits `(B, T, vocab_size)` plus a dictionary of OSF losses.
 
-    Виклик з OMENScale.forward():
+    Called from `OMENScale.forward()`:
       logits, osf_out = self.osf_synthesizer(
           h_tok    = h_tok,          # (B, T, d_tok) — TokenEncoder output
           z_final  = z_final,        # (B, d_latent) — Perceiver output
@@ -153,7 +153,7 @@ class OSFSynthesizer(nn.Module):
             lambda_struct = 0.1,
         )
 
-        # ── Симуляція та рефлексія ────────────────────────────────────────────
+        # ── Simulation and reflection ────────────────────────────────────────
         self.symbolic_verifier = SymbolicPlanVerifier()
         if cfg.use_simulation:
             self.simulator = WorldSimulator(
@@ -169,7 +169,7 @@ class OSFSynthesizer(nn.Module):
                 lambda_mdl = cfg.lambda_mdl_refl,
             )
 
-        # ── Мета-контролер стратегії ──────────────────────────────────────────
+        # ── Strategy meta-controller ─────────────────────────────────────────
         if cfg.use_meta:
             self.meta_ctrl = SynthesisMetaController(
                 d_state      = 32,
@@ -178,7 +178,7 @@ class OSFSynthesizer(nn.Module):
                 dropout      = cfg.dropout,
             )
 
-        # ── Plan-Code Consistency: порівнює план з кодом (L_plan) ────────────
+        # ── Plan-Code Consistency: compare the plan with the code (L_plan) ──
         # L_plan = MSE(z_plan_summary, z_code_summary)
         self.plan_code_align = nn.Sequential(
             nn.Linear(cfg.d_plan, d_latent),
@@ -187,10 +187,10 @@ class OSFSynthesizer(nn.Module):
         )
         self.code_summarizer = nn.Linear(d_tok, d_latent, bias=False)
 
-    # ── Допоміжний: якість → нормований reward ──────────────────────────────
+    # ── Helper: quality -> normalized reward ────────────────────────────────
     @staticmethod
     def _quality_reward(ce_loss: float) -> float:
-        """Нормований reward з CE: 1 при CE=0, ~0 при CE=5."""
+        """Normalized reward from CE: 1 at CE=0 and about 0 at CE=5."""
         return max(0.0, 1.0 - ce_loss / 5.0)
 
     def _plan_with_strategy(
@@ -305,13 +305,13 @@ class OSFSynthesizer(nn.Module):
                     break
         return best_plan, best_verify, tried
 
-    # ── Основний forward ────────────────────────────────────────────────────
+    # ── Main forward ────────────────────────────────────────────────────────
     def forward(
         self,
         h_tok:     torch.Tensor,           # (B, T, d_tok)
         z_final:   torch.Tensor,           # (B, d_latent)
-        tgt:       torch.Tensor,           # (B, T) токени
-        world_rnn: nn.Module,              # WorldRNN з omen_v2
+        tgt:       torch.Tensor,           # (B, T) tokens
+        world_rnn: nn.Module,              # WorldRNN from omen_v2
         gap_norm:  float = 0.0,
         ce_loss:   float = 5.0,
         n_rules:   int   = 0,
@@ -324,12 +324,12 @@ class OSFSynthesizer(nn.Module):
         """
         Returns:
           logits  : (B, T, vocab_size)
-          osf_out : dict з лос-компонентами та статистикою
+          osf_out : dict with loss components and statistics
         """
         device = z_final.device
         B, T   = tgt.shape
 
-        # ── Вибір стратегії σ ─────────────────────────────────────────────────
+        # ── Strategy selection σ ─────────────────────────────────────────────
 
         intent_state = self.intent_encoder(z_final)
         goal_entropy = float(intent_state.goal_entropy.mean().item())
@@ -370,7 +370,7 @@ class OSFSynthesizer(nn.Module):
             sim_steps      = strat_cfg.sim_steps
             strategy_tau   = strat_cfg.confidence_tau
         else:
-            # Inference або без meta: Careful за замовчуванням
+            # Inference or no meta-controller: default to Careful.
             plan_depth_use = cfg_used.max_plan_depth
             n_reflections  = 1 if cfg_used.use_reflection else 0
             sim_steps      = 4
@@ -384,7 +384,7 @@ class OSFSynthesizer(nn.Module):
             prover=prover,
         )
 
-        # ── Симуляція + symbolic verification ───────────────────────────────
+        # ── Simulation + symbolic verification ──────────────────────────────
         l_sim       = torch.tensor(0.0, device=device)
         l_verify    = torch.tensor(0.0, device=device)
         z_reflected = z_final
@@ -448,7 +448,7 @@ class OSFSynthesizer(nn.Module):
             mismatch_before = max(mismatch_before, sim_summary[1])
             mismatch_after = max(mismatch_after, sim_summary[1])
 
-            # ── Рефлексія з повторним simulation+verification ───────────────
+            # ── Reflection with repeated simulation + verification ──────────
             needs_latent_reflection = (
                 cfg_used.use_reflection
                 and (
@@ -566,13 +566,13 @@ class OSFSynthesizer(nn.Module):
             tgt_tokens = tgt,
         )
 
-        # ── L_plan: план-код консистентність ─────────────────────────────────
-        # Summary плану: mean(plan.embeddings)
+        # ── L_plan: plan/code consistency ────────────────────────────────────
+        # Plan summary: mean(plan.embeddings)
         plan_emb_lat = self.plan_code_align(
             plan.embeddings.to(device).mean(0, keepdim=True))       # (1, d_latent)
         plan_emb_lat = plan_emb_lat.expand(B, -1)                   # (B, d_latent)
 
-        # Summary коду (через h_tok): mean по часовій осі
+        # Code summary (via h_tok): mean over the time axis.
         code_summary = self.code_summarizer(h_tok.mean(1))          # (B, d_latent)
 
         goal_penalty = F.relu(
@@ -583,7 +583,7 @@ class OSFSynthesizer(nn.Module):
         # ── Intent anti-collapse ──────────────────────────────────────────────
         l_intent = self.intent_encoder.intent_loss(decode_intent_state)
 
-        # ── L_meta: REINFORCE для стратегії ──────────────────────────────────
+        # ── L_meta: REINFORCE for the strategy ───────────────────────────────
         l_meta = torch.tensor(0.0, device=device)
         if cfg_used.use_meta and self.training:
             quality   = self._quality_reward(ce_loss)
@@ -592,26 +592,26 @@ class OSFSynthesizer(nn.Module):
             l_meta    = meta_traj.meta_loss
 
         # ── J_OSF = L_plan + λ_sim·L_sim + λ_refl·L_refl + λ_meta·L_meta ───
-        # plan.plan_loss — REINFORCE-лос планувальника (policy gradient).
-        # Обрізаємо до [-1, 1] для стабільності: великі PG-грани розбалансовують
-        # спільний функціонал J_OSF, тому tight clamp тут критичний.
+        # plan.plan_loss is the planner REINFORCE loss (policy gradient).
+        # Clamp it to [-1, 1] for stability: large PG gradients can destabilize
+        # the shared J_OSF objective, so a tight clamp is important here.
         plan_rl_loss = plan.plan_loss.clamp(-1.0, 1.0) if self.training else torch.tensor(0.0, device=device)
         sim_mix = l_verify + 0.25 * l_sim
 
         j_osf = (
-            plan_rl_loss                            # REINFORCE для планувальника
+            plan_rl_loss                            # REINFORCE for the planner
           + cfg_used.lambda_plan   * l_plan
           + cfg_used.lambda_sim    * sim_mix
           + cfg_used.lambda_refl   * l_refl
           + cfg_used.lambda_meta   * l_meta
           + cfg_used.lambda_intent * l_intent
-          + struct_loss                         # вже зважений у HierarchicalDecoder
+          + struct_loss                         # already weighted in HierarchicalDecoder
         )
 
-        # Clamp для стабільності
+        # Clamp for stability.
         j_osf = j_osf.clamp(-10.0, 10.0) if torch.is_tensor(j_osf) else j_osf
 
-        # ── Статистика ────────────────────────────────────────────────────────
+        # ── Statistics ───────────────────────────────────────────────────────
         osf_out: Dict = {
             "j_osf":           j_osf,
             "osf_l_plan":      l_plan.item(),
@@ -647,7 +647,7 @@ class OSFSynthesizer(nn.Module):
         return logits, osf_out
 
     def memory_report(self) -> str:
-        """Звіт про параметри OSF."""
+        """Report OSF parameter statistics."""
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         cfg      = self.cfg
         return (

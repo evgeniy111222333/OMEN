@@ -1,32 +1,32 @@
 """
-omen_tensor_unify.py — Масштабована Символьна Машина
-=====================================================
-Чотири компоненти для виходу з демо-режиму в реальний світ:
+omen_tensor_unify.py - Scalable Symbolic Machine
+================================================
+Four components for taking the system from demo mode into the real world:
 
-  TensorFactBase      : факти як int32-тензори в VRAM → O(1) batch lookup
-  TensorUnifyEngine   : GPU forward-chaining через реляційний join
-                        (замість Python-циклів)
-  ReteIndex           : інкрементальний тригер правил, O(1) per fact
-  PythonASTParser     : Python/JS AST → Horn-факти (500+ предикатів)
-  BPESymbolMapper     : GPT-2/CodeGen BPE токени → sym_vocab id
+  TensorFactBase       : facts as int32 tensors in VRAM -> O(1) batch lookup
+  TensorUnifyEngine    : GPU forward chaining via relational joins
+                         (instead of Python loops)
+  ReteIndex            : incremental rule triggering, O(1) per fact
+  PythonASTParser      : Python/JS AST -> Horn facts (500+ predicates)
+  BPESymbolMapper      : GPT-2/CodeGen BPE tokens -> sym_vocab ids
   ScalableKnowledgeBase: TensorFactBase + ReteIndex + TensorUnifyEngine
-                         + Python symbolic (fallback)
+                         + Python symbolic fallback
 
-Математика — тензорна уніфікація як реляційна алгебра:
-  ∀ rule r з тілом [B₀, B₁, ..., Bₖ]:
-    C_i = Facts[pred == B_i.pred]                    ← proj
-    фільтр: C_i[:, j] == B_i.arg[j]  if arg[j] ≥ 0 ← select (ground)
-    join(C₀, C₁) on shared_vars:  C₀[:,p] == C₁[:,q] ← equijoin (GPU)
-    head = (head_pred, C[var_map(head.args)])         ← project
+Mathematics - tensor unification as relational algebra:
+  for each rule r with body [B0, B1, ..., Bk]:
+    C_i = Facts[pred == B_i.pred]                    <- proj
+    filter: C_i[:, j] == B_i.arg[j] if arg[j] >= 0  <- select (ground)
+    join(C0, C1) on shared_vars: C0[:,p] == C1[:,q] <- equijoin (GPU)
+    head = (head_pred, C[var_map(head.args)])        <- project
 
-Складність:
-  Naive DFS forward_chain: O(R · N^B)  де N=|facts|, B=body_size
-  TensorUnifyEngine:       O(R · N²/b) де b=GPU batch → ~100x швидше
+Complexity:
+  Naive DFS forward_chain: O(R * N^B)  where N=|facts|, B=body_size
+  TensorUnifyEngine:      O(R * N^2/b) where b=GPU batch -> ~100x faster
 
-Режими роботи:
-  fast  : TensorUnifyEngine (GPU, ≥10k фактів)
-  slow  : Python DFS (точний, з occurs check, ≤1k фактів)
-  hybrid: fast за замовчуванням, slow як oracle-fallback
+Operating modes:
+  fast  : TensorUnifyEngine (GPU, >=10k facts)
+  slow  : Python DFS (exact, with occurs check, <=1k facts)
+  hybrid: fast by default, slow as an oracle fallback
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Імпортуємо символьний рівень із omen_prolog
+# Import the symbolic layer from omen_prolog.
 from omen_prolog import (
     Const, Var, Compound, Term,
     HornAtom, HornClause,
@@ -62,12 +62,12 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 0.  PREDICATE VOCABULARY  (500+ реальних предикатів)
+# 0.  PREDICATE VOCABULARY  (500+ real predicates)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class PredicateVocab:
     """
-    Реєстр предикатів.  Перші 512 слотів зарезервовані для категорій:
+    Predicate registry. The first 512 slots are reserved for categories:
 
     0–63   : code structure   (assign, call, ret, import, def, class, …)
     64–127 : types            (type_of, instanceof, subtype, …)
@@ -77,10 +77,10 @@ class PredicateVocab:
     320–383: arith/logic      (add, sub, mul, gt, eq, …)
     384–447: memory           (alloc, free, read_mem, write_mem, …)
     448–511: meta/epistemic   (knows, believes, inferred, abduced, …)
-    512+   : динамічні        (дод. під час парсингу)
+    512+   : dynamic          (added during parsing)
     """
 
-    # --- Вбудовані категорії ---
+    # --- Built-in categories ---
     CODE = {
         "assign": 0, "call": 1, "return": 2, "import": 3,
         "define": 4, "classdef": 5, "attr": 6, "subscript": 7,
@@ -146,7 +146,7 @@ class PredicateVocab:
         self._id2name[pid]   = name
 
     def get_id(self, name: str) -> int:
-        """Повертає id предиката (або реєструє новий динамічний)."""
+        """Return a predicate id, registering a new dynamic one if needed."""
         if name in self._name2id:
             return self._name2id[name]
         pid = self._next_dynamic
@@ -168,29 +168,29 @@ PRED_VOCAB = PredicateVocab()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1.  BPE SYMBOL MAPPER  (GPT-2 / CodeGen токени ↔ sym_vocab)
+# 1.  BPE SYMBOL MAPPER  (GPT-2 / CodeGen tokens <-> sym_vocab)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class BPESymbolMapper:
     """
-    Відображення BPE-токенів (GPT-2/CodeGen) ↔ символьні константи.
+    Mapping between BPE tokens (GPT-2/CodeGen) and symbolic constants.
 
-    Проблема: `sym_vocab=64` vs `vocab_size=50257` BPE токенів.
-    Рішення:  group-hashing — групуємо рідкісні токени через хеш,
-              поширені (top-K) отримують прямі слоти.
+    Problem: `sym_vocab=64` vs `vocab_size=50257` BPE tokens.
+    Solution: group hashing - route rare tokens through a hash bucket,
+    while frequent tokens (top-K) receive direct slots.
 
-    BPE → sym_id:
-      top_K (K=sym_vocab-10) найчастіших токенів → прямий маппінг
-      інші → sym_id = K + (hash(tok) % (sym_vocab - K - 1))
+    BPE -> sym_id:
+      top_K (K=sym_vocab-10) most frequent tokens -> direct mapping
+      others -> sym_id = K + (hash(tok) % (sym_vocab - K - 1))
 
-    sym_id → BPE: зворотний словник (top-K точно, хеш-група приблизно).
+    sym_id -> BPE: reverse dictionary (exact for top-K, approximate for hash groups).
     """
 
     def __init__(self, sym_vocab: int = 512, top_k: Optional[int] = None):
         self.sym_vocab = sym_vocab
-        self.top_k     = top_k or (sym_vocab - 32)   # резерв 32 для спец. токенів
+        self.top_k     = top_k or (sym_vocab - 32)   # reserve 32 for special tokens
 
-        # Спробуємо завантажити tiktoken
+        # Try to load tiktoken.
         self._enc     = None
         self._bpe2sym: Dict[int, int] = {}
         self._sym2bpe: Dict[int, int] = {}
@@ -222,22 +222,22 @@ class BPESymbolMapper:
         """BPE token id → sym_vocab id."""
         if bpe_id in self._bpe2sym:
             return self._bpe2sym[bpe_id]
-        # Group hashing для рідкісних токенів
+        # Group hashing for rare tokens.
         return self.top_k + (bpe_id % (self.sym_vocab - self.top_k - 1))
 
     def sym_to_bpe(self, sym_id: int) -> Optional[int]:
-        """sym_vocab id → BPE token id (None для хеш-груп)."""
+        """sym_vocab id -> BPE token id (`None` for hash groups)."""
         return self._sym2bpe.get(sym_id)
 
     def encode(self, text: str) -> List[int]:
-        """Текст → список sym_vocab ids."""
+        """Convert text to a list of sym_vocab ids."""
         if self._enc is None:
             return [abs(hash(c)) % self.sym_vocab for c in text.split()]
         bpe_ids = self._enc.encode(text)
         return [self.bpe_to_sym(b) for b in bpe_ids]
 
     def decode(self, sym_ids: List[int]) -> str:
-        """sym_vocab ids → приблизний текст (де можливо)."""
+        """Convert sym_vocab ids back to approximate text where possible."""
         if self._enc is None:
             return " ".join(f"<{s}>" for s in sym_ids)
         bpe_ids = [self._sym2bpe.get(s) for s in sym_ids]
@@ -255,23 +255,23 @@ class BPESymbolMapper:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2.  TENSOR FACT BASE  (int32 тензори в VRAM)
+# 2.  TENSOR FACT BASE  (int32 tensors in VRAM)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TensorFactBase:
     """
-    Компактне представлення фактів як int32-тензори.
+    Compact fact storage as int32 tensors.
 
     F ∈ Z^{N × (1 + MAX_ARITY)}
       F[i, 0]   = pred_id  (≥ 0)
-      F[i, j+1] = const_id (≥ 0) або PAD (-1)
+      F[i, j+1] = const_id (>= 0) or PAD (-1)
 
-    Переваги:
-      · Batch lookup: F[F[:,0] == p] — O(N) на GPU замість O(N) Python-цикл
-      · Кеш-ефективний: sequential memory access
-      · Готовий до torch.compile()
+    Advantages:
+      · Batch lookup: F[F[:,0] == p] - O(N) on GPU instead of an O(N) Python loop
+      · Cache-friendly: sequential memory access
+      · Ready for torch.compile()
 
-    PAD = -1 означає відсутній аргумент (факти з меншою арністю).
+    PAD = -1 means a missing argument (facts with smaller arity).
     """
 
     PAD = -1
@@ -279,14 +279,14 @@ class TensorFactBase:
     def __init__(self, max_arity: int = 3, device: torch.device = DEVICE):
         self.max_arity = max_arity
         self.device    = device
-        # Основний тензор фактів (росте динамічно)
+        # Main fact tensor (grows dynamically).
         self._F: Optional[torch.Tensor] = None   # (N, 1+max_arity), int32
         self._n = 0
 
-        # Предикатний індекс: pred_id → список рядків (для швидкого доступу)
+        # Predicate index: pred_id -> row indices for fast lookup.
         self._pred_index: Dict[int, List[int]] = defaultdict(list)
 
-        # Множина для дедуплікації
+        # Set used for deduplication.
         self._fact_set: Set[Tuple] = set()
 
         # Ground-term interning: Const/Compound -> stable int ids.
@@ -313,7 +313,7 @@ class TensorFactBase:
     def _decode_term(self, term_id: int) -> Term:
         return self._id_to_term.get(term_id, Const(int(term_id)))
 
-    # ── Конверсія ─────────────────────────────────────────────────────────────
+    # -- Conversion ------------------------------------------------------------
     def atom_to_row(self, atom: HornAtom) -> Optional[Tuple[int, ...]]:
         """HornAtom → tensor row with ground Const/Compound args encoded via term ids."""
         if not atom.is_ground():
@@ -329,7 +329,7 @@ class TensorFactBase:
         return (atom.pred,) + tuple(args)
 
     def row_to_atom(self, row: torch.Tensor) -> Optional[HornAtom]:
-        """Рядок тензора → HornAtom."""
+        """Convert a tensor row to a `HornAtom`."""
         pred = int(row[0].item())
         args = []
         for j in range(self.max_arity):
@@ -339,9 +339,9 @@ class TensorFactBase:
             args.append(self._decode_term(v))
         return HornAtom(pred=pred, args=tuple(args))
 
-    # ── Додавання фактів ───────────────────────────────────────────────────────
+    # -- Fact insertion --------------------------------------------------------
     def add_atom(self, atom: HornAtom) -> bool:
-        """Додає HornAtom як рядок у тензор. Повертає True якщо новий."""
+        """Add a `HornAtom` as a tensor row. Return `True` if it is new."""
         row_tuple = self.atom_to_row(atom)
         if row_tuple is None:
             return False
@@ -361,12 +361,12 @@ class TensorFactBase:
         return True
 
     def add_atoms(self, atoms: Iterable[HornAtom]) -> int:
-        """Batch-додавання. Повертає кількість нових фактів."""
+        """Batch insertion. Return the number of newly added facts."""
         return sum(1 for a in atoms if self.add_atom(a))
 
-    # ── Запити ────────────────────────────────────────────────────────────────
+    # -- Queries ---------------------------------------------------------------
     def get_by_pred(self, pred_id: int) -> Optional[torch.Tensor]:
-        """Повертає підматрицю F де F[:,0] == pred_id. O(1) by index."""
+        """Return the submatrix `F` where `F[:,0] == pred_id`. O(1) via index."""
         indices = self._pred_index.get(pred_id)
         if not indices or self._F is None:
             return None
@@ -377,7 +377,7 @@ class TensorFactBase:
         return self._F
 
     def to_horn_atoms(self, rows: Optional[torch.Tensor] = None) -> List[HornAtom]:
-        """Тензор рядків → список HornAtom."""
+        """Convert a tensor of rows to a list of `HornAtom`s."""
         if rows is None:
             rows = self._F
         if rows is None:
@@ -400,30 +400,30 @@ class TensorFactBase:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3.  RETE INDEX  (O(1) тригер правил за фактом)
+# 3.  RETE INDEX  (O(1) rule triggering per fact)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class ReteNode:
-    """Вузол RETE-мережі: відстежує які правила тригеруються предикатом p."""
+    """RETE node tracking which rules are triggered by predicate `p`."""
     pred_id:  int
-    rule_ids: List[int] = field(default_factory=list)  # індекси правил у KB
-    body_pos: List[int] = field(default_factory=list)  # позиція у тілі правила
+    rule_ids: List[int] = field(default_factory=list)  # rule indices in the KB
+    body_pos: List[int] = field(default_factory=list)  # position inside the rule body
 
 
 class ReteIndex:
     """
-    Спрощена RETE-мережа для O(1) визначення «яке правило може спрацювати
-    від нового факту p(...)».
+    Simplified RETE network for O(1) discovery of which rule can fire
+    from a new fact `p(...)`.
 
-    При додаванні нового факту f з pred=p:
-      trig = rete[p]   → список (rule_id, body_position)
+    When a new fact `f` with `pred=p` is added:
+      trig = rete[p] -> list of (rule_id, body_position)
 
-    Це дозволяє уникнути O(R) сканування всіх правил.
+    This avoids an O(R) scan over all rules.
 
-    Інкрементальне оновлення:
-      Замість перерахунку всіх правил для всіх фактів — тільки
-      правила, тіло яких містить p.
+    Incremental update:
+      instead of re-evaluating all rules for all facts, only process
+      rules whose body contains `p`.
     """
 
     def __init__(self):
@@ -432,7 +432,7 @@ class ReteIndex:
         self._rules: List[HornClause] = []
 
     def register_rule(self, rule: HornClause) -> int:
-        """Реєструє правило. Повертає rule_id."""
+        """Register a rule and return its `rule_id`."""
         rule_id = len(self._rules)
         self._rules.append(rule)
         for body_pos, atom in enumerate(rule.body):
@@ -441,8 +441,8 @@ class ReteIndex:
 
     def get_triggered(self, pred_id: int) -> List[Tuple[int, HornClause, int]]:
         """
-        Повертає список (rule_id, rule, body_pos) для предиката pred_id.
-        O(k) де k = кількість правил з цим предикатом у тілі.
+        Return a list of `(rule_id, rule, body_pos)` entries for `pred_id`.
+        O(k), where `k` is the number of rules whose body contains this predicate.
         """
         return [
             (rid, self._rules[rid], bpos)
@@ -457,57 +457,57 @@ class ReteIndex:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4.  TENSOR UNIFY ENGINE  (GPU-векторизований forward chaining)
+# 4.  TENSOR UNIFY ENGINE  (GPU-vectorized forward chaining)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TensorUnifyEngine:
     """
-    GPU-векторизований forward chaining через реляційну алгебру.
+    GPU-vectorized forward chaining via relational algebra.
 
-    Тензорна уніфікація:
-      ∀ rule r з body [B₀, B₁]:  (2-body-atom rules, загальний випадок нижче)
+    Tensor unification:
+      for each rule `r` with body [B0, B1]:  (2-body-atom rules; general case below)
 
-        C₀ = F[pred == B₀.pred]              # (k₀, 1+A) — кандидати для B₀
-        C₁ = F[pred == B₁.pred]              # (k₁, 1+A) — кандидати для B₁
+        C0 = F[pred == B0.pred]              # (k0, 1+A) - candidates for B0
+        C1 = F[pred == B1.pred]              # (k1, 1+A) - candidates for B1
 
-        # Ground-arg фільтр (select):
+        # Ground-argument filter (select):
         mask₀ = AND_{j: B₀.arg[j] is ground} (C₀[:,j+1] == B₀.arg[j])
         C₀    = C₀[mask₀]                   # (k₀', 1+A)
 
-        # Equijoin за shared variables:
-        # Якщо var v є в B₀ at pos p₀ і в B₁ at pos p₁:
+        # Equijoin on shared variables:
+        # If variable v appears in B0 at pos p0 and in B1 at pos p1:
         #   join_mask = (C₀[:, p₀+1].unsqueeze(1) == C₁[:, p₁+1].unsqueeze(0))
-        # Для кількох shared vars: AND всіх join_masks.
+        # For multiple shared vars: AND all join masks.
 
         i₀, i₁ = join_mask.nonzero(as_tuple=True)   # (m,) (m,)
 
-        # Проектуємо голову:
+        # Project the head:
         head_rows = build_head(C₀[i₀], C₁[i₁], head_template, var_map)
 
-        # Дедуплікація:
+        # Deduplication:
         new_facts = head_rows[~isin(head_rows, F)]
 
-    Підтримує body ≤ MAX_BODY_SIZE = 3.
-    Для більших: рекурсивно розбиває на пари.
+    Supports bodies with `len(body) <= MAX_BODY_SIZE = 3`.
+    Larger bodies are recursively split into pairs.
 
     Complexity vs Python DFS:
-      Python: O(R · k^B · A)    де k=avg_facts_per_pred, B=body_size
-      GPU:    O(R · k² / W)     де W=warp_width ≈ 32  (тільки join matmul)
+      Python: O(R * k^B * A)    where k=avg_facts_per_pred, B=body_size
+      GPU:    O(R * k^2 / W)    where W=warp_width ~= 32  (join matmul only)
     """
 
-    MAX_BODY = 3  # максимальна підтримувана довжина тіла
+    MAX_BODY = 3  # maximum supported body length
 
     def __init__(self, max_arity: int = 3, device: torch.device = DEVICE):
         self.max_arity = max_arity
         self.device    = device
 
-    # ── Внутрішні утиліти ─────────────────────────────────────────────────────
+    # -- Internal helpers ------------------------------------------------------
 
     @staticmethod
     def _var_positions(atom: HornAtom) -> Dict[str, List[int]]:
         """
-        Повертає {var_name → [позиції в args]} для атому.
-        Позиції = 0-based індекс в args.
+        Return `{var_name: [positions in args]}` for an atom.
+        Positions are 0-based indices inside `args`.
         """
         result: Dict[str, List[int]] = defaultdict(list)
         for i, a in enumerate(atom.args):
@@ -566,8 +566,8 @@ class TensorUnifyEngine:
                        atom: HornAtom,
                        fact_base: TensorFactBase) -> torch.Tensor:
         """
-        Фільтрує рядки кандидатів (N, 1+A) по ground args атому.
-        Повертає булеву маску (N,).
+        Filter candidate rows `(N, 1+A)` by an atom's ground arguments.
+        Return a boolean mask of shape `(N,)`.
         """
         if candidates.numel() == 0:
             return torch.zeros(0, dtype=torch.bool,
@@ -774,32 +774,32 @@ class TensorUnifyEngine:
         body1: HornAtom,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Equijoin C0 × C1 за shared variables між body0 та body1.
-        Повертає (indices_in_C0, indices_in_C1) форми (m,).
+        Equijoin `C0 x C1` on shared variables between `body0` and `body1`.
+        Return `(indices_in_C0, indices_in_C1)` with shape `(m,)`.
         """
         if C0.numel() == 0 or C1.numel() == 0:
             empty = torch.zeros(0, dtype=torch.long, device=self.device)
             return empty, empty
 
-        # Знаходимо спільні змінні та їх позиції
+        # Find shared variables and their positions.
         vars0 = self._var_positions(body0)
         vars1 = self._var_positions(body1)
         shared = set(vars0.keys()) & set(vars1.keys())
 
         if not shared:
-            # Немає спільних змінних → декартів добуток (обережно: може бути великий)
+            # No shared variables -> Cartesian product (can be large).
             k0, k1 = C0.shape[0], C1.shape[0]
             i0 = torch.arange(k0, device=self.device).repeat_interleave(k1)
             i1 = torch.arange(k1, device=self.device).repeat(k0)
             return i0, i1
 
-        # Будуємо join mask через broadcasting
-        # Для кожної shared var v: C0[:, p0+1] == C1[:, p1+1]
+        # Build the join mask via broadcasting.
+        # For each shared variable v: C0[:, p0+1] == C1[:, p1+1]
         join_mask = torch.ones(C0.shape[0], C1.shape[0],
                                dtype=torch.bool, device=self.device)
         for vname in shared:
-            p0 = vars0[vname][0]   # перша позиція в body0
-            p1 = vars1[vname][0]   # перша позиція в body1
+            p0 = vars0[vname][0]   # first position in body0
+            p1 = vars1[vname][0]   # first position in body1
             # Broadcasting: (k0, 1) == (1, k1)
             col0 = C0[:, p0 + 1].unsqueeze(1)   # (k0, 1)
             col1 = C1[:, p1 + 1].unsqueeze(0)   # (1, k1)
@@ -809,14 +809,14 @@ class TensorUnifyEngine:
 
     def _build_head_rows(
         self,
-        C_list: List[torch.Tensor],  # список (m, 1+A) для кожного body atom
+        C_list: List[torch.Tensor],  # list of (m, 1+A) tensors for each body atom
         body:   Tuple[HornAtom, ...],
         head:   HornAtom,
         fact_base: TensorFactBase,
     ) -> Optional[torch.Tensor]:
         """
-        Будує рядки нових фактів для голови правила.
-        C_list[i][j] = j-й fact row для i-го body atom (joined).
+        Build rows for newly derived facts from the rule head.
+        `C_list[i][j]` is the j-th fact row for the i-th body atom after joining.
         """
         if not C_list:
             return None
@@ -830,16 +830,16 @@ class TensorUnifyEngine:
                                dtype=torch.int32, device=self.device)
         head_rows[:, 0] = head.pred
 
-        # Побудовуємо var_map: var_name → tensor column (m,)
+        # Build var_map: var_name -> tensor column `(m,)`.
         var_map: Dict[str, torch.Tensor] = {}
         for bi, (atom, C) in enumerate(zip(body, C_list)):
             for j, a in enumerate(atom.args):
                 if isinstance(a, Var) and not a.name.startswith('_'):
-                    # Беремо значення з C (joined rows)
+                    # Read the value from the joined candidate rows.
                     if a.name not in var_map:
                         var_map[a.name] = C[:, j + 1]
 
-        # Заповнюємо аргументи голови
+        # Fill head arguments.
         for j, a in enumerate(head.args):
             if j >= self.max_arity:
                 break
@@ -849,7 +849,7 @@ class TensorUnifyEngine:
             elif isinstance(a, Var):
                 if a.name in var_map:
                     head_rows[:, j + 1] = var_map[a.name]
-                # else: не вдалося визначити → залишаємо PAD
+                # else: could not resolve the value -> keep PAD
 
         return head_rows
 
@@ -896,21 +896,21 @@ class TensorUnifyEngine:
     def _fast_isin(self, new_rows: torch.Tensor,
                    existing: Optional[torch.Tensor]) -> torch.Tensor:
         """
-        Перевіряє, які рядки з new_rows вже є в existing.
-        Повертає булеву маску (len(new_rows),): True = вже є.
+        Check which rows in `new_rows` already exist in `existing`.
+        Return a boolean mask of shape `(len(new_rows),)` where `True` means "already present".
         """
         if existing is None or existing.numel() == 0:
             return torch.zeros(new_rows.shape[0], dtype=torch.bool,
                                device=self.device)
 
-        # Перетворюємо в int64 і використовуємо broadcasting для порівняння
-        # Гарантований підхід без overflow: порівнюємо кожен стовпець окремо
+        # Cast to int64 and use broadcasting for comparison.
+        # Safe, overflow-free approach: compare each column separately.
         new_i64  = new_rows.to(torch.int64)    # (n_new, W)
         exist_i64 = existing.to(torch.int64)   # (n_exist, W)
         W = new_i64.shape[1]
 
-        # (n_new, n_exist, W) — попарне порівняння кожного рядка
-        # Розбиваємо на шматки якщо великий
+        # (n_new, n_exist, W) - pairwise comparison of each row.
+        # Process in chunks if the tensor is large.
         chunk = 512
         result = torch.zeros(new_rows.shape[0], dtype=torch.bool,
                              device=self.device)
@@ -918,40 +918,40 @@ class TensorUnifyEngine:
             block = new_i64[start:start+chunk]           # (b, W)
             # (b, n_exist, W)
             match = (block.unsqueeze(1) == exist_i64.unsqueeze(0))
-            # Рядок вже є, якщо всі W колонки співпадають хоч з одним існуючим
+            # A row already exists if all W columns match at least one existing row.
             result[start:start+chunk] = match.all(dim=2).any(dim=1)
 
         return result
 
-    # ── Основний метод: forward chain крок ────────────────────────────────────
+    # -- Main method: one forward-chaining step --------------------------------
     def forward_chain_step(
         self,
         fact_base: TensorFactBase,
         rules: List[HornClause],
     ) -> int:
         """
-        Один крок GPU forward chaining.
-        Повертає кількість нових доданих фактів.
+        Execute one GPU forward-chaining step.
+        Return the number of newly added facts.
 
-        Для кожного правила:
-          1. Отримуємо кандидатів для кожного body atom (by pred)
-          2. Ground-arg фільтр
-          3. Equijoin (1→2 body atoms) або chain join (3 body atoms)
-          4. Будуємо нові факти (head template)
-          5. Дедуплікуємо і додаємо
+        For each rule:
+          1. Gather candidates for each body atom (by predicate)
+          2. Apply the ground-argument filter
+          3. Run an equijoin (1->2 body atoms) or chain join (3 body atoms)
+          4. Build new facts from the head template
+          5. Deduplicate and insert
         """
         total_added = 0
 
         for rule in rules:
             if not rule.body:
                 continue
-            # Freshen vars (уникнення конфліктів)
+            # Freshen variables to avoid naming conflicts.
             fresh = freshen_vars(rule)
             body  = fresh.body
             head  = fresh.head
 
             if len(body) > self.MAX_BODY:
-                # Довгі тіла — fallback до Python DFS
+                # Long bodies fall back to Python DFS.
                 from omen_prolog import find_all_substitutions
                 subs = find_all_substitutions(
                     body, fact_base.to_frozenset(), max_solutions=128)
@@ -1019,7 +1019,7 @@ class TensorUnifyEngine:
                 continue
 
             if not self._is_tensor_rule(fresh):
-                # Unsupported tensor rule — fallback до Python DFS
+                # Unsupported tensor rule -> fall back to Python DFS.
                 from omen_prolog import find_all_substitutions
                 subs = find_all_substitutions(
                     body, fact_base.to_frozenset(), max_solutions=128)
@@ -1030,7 +1030,7 @@ class TensorUnifyEngine:
                         total_added += 1
                 continue
 
-            # ── Отримуємо кандидатів для body[0] ──────────────────────────────
+            # -- Gather candidates for body[0] ---------------------------------
             C0_raw = fact_base.get_by_pred(body[0].pred)
             if C0_raw is None:
                 continue
@@ -1040,12 +1040,12 @@ class TensorUnifyEngine:
                 continue
 
             if len(body) == 1:
-                # Одне тіло-атом → просто проеціюємо голову
+                # Single body atom -> just project the head.
                 C_joined = [C0]
                 head_rows = self._build_head_rows(C_joined, body, head, fact_base)
 
             elif len(body) == 2:
-                # Два body-атоми → один equijoin
+                # Two body atoms -> one equijoin.
                 C1_raw = fact_base.get_by_pred(body[1].pred)
                 if C1_raw is None:
                     continue
@@ -1080,8 +1080,8 @@ class TensorUnifyEngine:
                 C01_1 = C1[i11]
 
                 # Phase 2: join intermediate × body2
-                # Побудуємо "merged" атом для join (через var_positions)
-                # Спрощення: join на var positions тіла 1 і 2
+                # Build a merged atom for the join via var_positions.
+                # Simplification: join on variable positions from bodies 1 and 2.
                 i_mid, i2 = self._equijoin(C01_1, C2, body[1], body[2])
                 if len(i_mid) == 0:
                     continue
@@ -1091,19 +1091,19 @@ class TensorUnifyEngine:
             if head_rows is None or head_rows.shape[0] == 0:
                 continue
 
-            # ── Фільтруємо PAD-арг та ненульовий предикат ─────────────────────
+            # -- Filter PAD arguments and invalid predicates --------------------
             valid = (head_rows[:, 0] >= 0) & (head_rows[:, 1] != TensorFactBase.PAD)
             head_rows = head_rows[valid]
             if head_rows.shape[0] == 0:
                 continue
 
-            # ── Дедуплікація через isin ────────────────────────────────────────
+            # -- Deduplicate via `isin` -----------------------------------------
             already = self._fast_isin(head_rows, fact_base.get_all())
             new_rows = head_rows[~already]
             if new_rows.shape[0] == 0:
                 continue
 
-            # ── Додаємо нові факти ─────────────────────────────────────────────
+            # -- Insert new facts -----------------------------------------------
             new_atoms = fact_base.to_horn_atoms(new_rows)
             added = fact_base.add_atoms(new_atoms)
             total_added += added
@@ -1121,8 +1121,8 @@ class TensorUnifyEngine:
         verbose: bool = False,
     ) -> int:
         """
-        Full GPU forward chaining до fixpoint або max_depth ітерацій.
-        Повертає загальну кількість нових фактів.
+        Run full GPU forward chaining until a fixpoint or `max_depth` iterations.
+        Return the total number of newly derived facts.
         """
         total = 0
         for depth in range(max_depth):
@@ -1141,7 +1141,7 @@ class TensorUnifyEngine:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ConstPool:
-    """Інтернування рядкових імен у Const(int)."""
+    """Intern string names into `Const(int)` values."""
     def __init__(self):
         self._pool: Dict[str, int] = {}
         self._rev:  Dict[int, str] = {}
@@ -1158,7 +1158,7 @@ class ConstPool:
         return self._rev.get(cid, f"<{cid}>")
 
     def atom(self, pred_name: str, *args: str) -> HornAtom:
-        """Зручний конструктор HornAtom через рядкові імена."""
+        """Convenience constructor for `HornAtom` using string names."""
         pred = PRED_VOCAB.get_id(pred_name)
         arg_consts = tuple(Const(self.intern(a)) for a in args)
         return HornAtom(pred=pred, args=arg_consts)
@@ -1169,23 +1169,23 @@ class ConstPool:
 
 class PythonASTParser(ast.NodeVisitor):
     """
-    Парсер Python → Horn-факти.
+    Python -> Horn-fact parser.
 
-    Підтримує 12 категорій фактів:
-      assign(lhs, rhs)       — присвоєння
-      call(result, func)     — виклик функції
-      call_arg(call, arg)    — аргумент виклику
-      define(name, scope)    — визначення функції/класу
-      param(func, arg)       — параметр функції
-      return(func, val)      — повернення значення
-      import(module)         — імпорт
-      type_of(var, type)     — анотація типу
-      attr(obj, field)       — доступ до поля
-      if_true/if_false(cond, scope)  — гілки
-      loop_body(iter, scope) — тіло циклу
-      dep_data(a, b)         — data dependency a використовує b
+    Supports 12 fact categories:
+      assign(lhs, rhs)       - assignment
+      call(result, func)     - function call
+      call_arg(call, arg)    - call argument
+      define(name, scope)    - function/class definition
+      param(func, arg)       - function parameter
+      return(func, val)      - returned value
+      import(module)         - import
+      type_of(var, type)     - type annotation
+      attr(obj, field)       - field access
+      if_true/if_false(cond, scope)  - branches
+      loop_body(iter, scope) - loop body
+      dep_data(a, b)         - data dependency: `a` uses `b`
 
-    Кожне ім'я інтернується у пул констант.
+    Every name is interned into the constant pool.
     """
 
     def __init__(self, scope: str = "<module>"):
@@ -1203,7 +1203,7 @@ class PythonASTParser(ast.NodeVisitor):
         self.facts.append(self.pool.atom(pred_name, *args))
 
     def _name(self, node) -> str:
-        """Витягує рядкову назву з AST вузла."""
+        """Extract a string name from an AST node."""
         if isinstance(node, ast.Name):
             return node.id
         if isinstance(node, ast.Attribute):
@@ -1365,8 +1365,8 @@ class PythonASTParser(ast.NodeVisitor):
     def parse_code(cls, code: str,
                    scope: str = "<module>") -> Tuple[List[HornAtom], ConstPool]:
         """
-        Головна точка входу.
-        Повертає (список HornAtom, ConstPool для декодування).
+        Main entry point.
+        Return `(list[HornAtom], ConstPool)` for decoding.
         """
         code = textwrap.dedent(code)
         try:
@@ -1389,14 +1389,14 @@ class PythonASTParser(ast.NodeVisitor):
 
 class ScalableKnowledgeBase:
     """
-    Гібридна KB: TensorFactBase + ReteIndex + TensorUnifyEngine + Python fallback.
+    Hybrid KB: TensorFactBase + ReteIndex + TensorUnifyEngine + Python fallback.
 
-    Режими:
-      'fast'   : тільки GPU-tensor (для ≥ 1000 фактів)
-      'slow'   : тільки Python DFS (точний, з occurs check)
-      'hybrid' : fast до порогу, slow для складних правил (body ≥ 3 зі змінними)
+    Modes:
+      'fast'   : GPU tensor path only (for >= 1000 facts)
+      'slow'   : Python DFS only (exact, with occurs check)
+      'hybrid' : fast up to the threshold, slow for complex rules (body >= 3 with variables)
 
-    Інтерфейс сумісний з omen_prolog.KnowledgeBase.
+    The interface is compatible with `omen_prolog.KnowledgeBase`.
     """
 
     def __init__(self,
@@ -1418,10 +1418,10 @@ class ScalableKnowledgeBase:
         # Python backend (fallback / oracle)
         self.py_kb       = KnowledgeBase(max_rules=max_rules)
 
-        # Синхронізований стан
+        # Synchronized state.
         self._synced     = True
 
-    # ── Додавання ─────────────────────────────────────────────────────────────
+    # -- Insertion -------------------------------------------------------------
     def add_fact(self, atom: HornAtom) -> bool:
         added = self.tensor_fb.add_atom(atom)
         if added:
@@ -1449,14 +1449,14 @@ class ScalableKnowledgeBase:
                       verbose: bool = False) -> FrozenSet[HornAtom]:
         """
         Hybrid forward chaining:
-          · fast: TensorUnifyEngine (GPU) — основний цикл
-          · slow: Python DFS — для правил з body > MAX_BODY або occurs
+          · fast: TensorUnifyEngine (GPU) - main loop
+          · slow: Python DFS - for rules with `body > MAX_BODY` or occurs checks
         """
         rules = self.rete.all_rules()
         n     = len(self.tensor_fb)
 
         if self.mode == "slow":
-            # Чистий Python
+            # Pure Python.
             return self.py_kb.forward_chain(max_depth)
 
         if self.mode != "fast" and n < self.threshold and not self._has_fast_compatible_rule(rules):
@@ -1466,7 +1466,7 @@ class ScalableKnowledgeBase:
         added = self.tensor_eng.forward_chain(
             self.tensor_fb, rules, max_depth, verbose)
 
-        # Sync back до Python KB
+        # Sync back into the Python KB.
         new_atoms = self.tensor_fb.to_horn_atoms()
         for a in new_atoms:
             self.py_kb.add_fact(a)
@@ -1481,7 +1481,7 @@ class ScalableKnowledgeBase:
     def complexity_penalty(self) -> float:
         return self.py_kb.complexity_penalty()
 
-    # ── Статистика ─────────────────────────────────────────────────────────────
+    # -- Statistics ------------------------------------------------------------
     def stats(self) -> Dict[str, int]:
         rules = self.rete.all_rules()
         return {
@@ -1497,22 +1497,22 @@ class ScalableKnowledgeBase:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 7.  ВБУДОВАНІ ПРАВИЛА ДЛЯ КОДУ  (стартові Horn-клаузи для аналізу програм)
+# 7.  BUILT-IN RULES FOR CODE  (starter Horn clauses for program analysis)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def make_code_rules(kb: ScalableKnowledgeBase) -> None:
     """
-    Додає базові правила аналізу Python-коду до KB.
+    Add baseline Python-code analysis rules to the KB.
 
-    Правила (Horn-клаузи з FOL змінними):
-      1. Транзитивність data dependency:
+    Rules (Horn clauses with FOL variables):
+      1. Transitive data dependency:
          dep_data(?A,?C) :- dep_data(?A,?B), dep_data(?B,?C)
-      2. Визначення через присвоєння:
+      2. Definition through assignment:
          def_var(?X, ?S) :- assign(?X, ?_), define(?_, ?S)
-         [спрощено: def_var(?X) :- assign(?X, ?_)]
-      3. Виклик з результатом:
+         [simplified: def_var(?X) :- assign(?X, ?_)]
+      3. Call result usage:
          use(?R, ?F) :- call(?R, ?F)
-      4. Param use:
+      4. Parameter usage:
          use(?P, ?F) :- param(?F, ?P)
       5. Return dependency:
          dep_data(?F, ?V) :- return(?F, ?V)
@@ -1549,7 +1549,7 @@ def make_code_rules(kb: ScalableKnowledgeBase) -> None:
         body=(HornAtom(pred=p("return"), args=(F, V)),)
     ))
 
-    # 5. Type inference: якщо assign(X, Y) і type_of(Y, T) → type_of(X, T)
+    # 5. Type inference: if assign(X, Y) and type_of(Y, T) -> type_of(X, T)
     kb.add_rule(HornClause(
         head=HornAtom(pred=p("type_of"), args=(X, V)),
         body=(
@@ -1560,16 +1560,16 @@ def make_code_rules(kb: ScalableKnowledgeBase) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 8.  INLINE ТЕСТИ
+# 8.  INLINE TESTS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _run_tensor_tests() -> None:
     sep  = lambda s: print(f"\n{'═'*62}\n  {s}\n{'═'*62}")
-    device = torch.device("cpu")   # CPU для тестів (GPU опціонально)
+    device = torch.device("cpu")   # CPU for tests (GPU optional)
     print(f"[omen_tensor_unify] device={device}")
 
     # ══ T0: PredicateVocab ═════════════════════════════════════════════════════
-    sep("T0 · PredicateVocab (500+ предикатів)")
+    sep("T0 · PredicateVocab (500+ predicates)")
     pv = PredicateVocab()
     assert pv.get_id("assign") == 0,   f"assign FAIL: {pv.get_id('assign')}"
     assert pv.get_id("dep_data") == 197
@@ -1581,12 +1581,12 @@ def _run_tensor_tests() -> None:
     print(f"  vocab_size={pv.vocab_size()}  dynamic_id={dyn_id}  [PASS]")
 
     # ══ T1: BPESymbolMapper ════════════════════════════════════════════════════
-    sep("T1 · BPESymbolMapper (GPT-2/CodeGen токени)")
+    sep("T1 · BPESymbolMapper (GPT-2/CodeGen tokens)")
     bpe = BPESymbolMapper(sym_vocab=512, top_k=480)
-    # Маппінг BPE → sym (детермінований)
+    # BPE -> sym mapping is deterministic.
     s0 = bpe.bpe_to_sym(100)
     s1 = bpe.bpe_to_sym(100)
-    assert s0 == s1, "Маппінг має бути детермінованим"
+    assert s0 == s1, "Mapping must be deterministic"
     assert 0 <= s0 < 512
     # Encode/decode
     enc = bpe.encode("def foo(x): return x + 1")
@@ -1596,7 +1596,7 @@ def _run_tensor_tests() -> None:
           f"  sym_range=[{min(enc)},{max(enc)}]  [PASS]")
 
     # ══ T2: TensorFactBase ════════════════════════════════════════════════════
-    sep("T2 · TensorFactBase (int32 тензор)")
+    sep("T2 · TensorFactBase (int32 tensor)")
     fb = TensorFactBase(max_arity=2, device=device)
     p_parent = PRED_VOCAB.get_id("parent")
 
@@ -1608,7 +1608,7 @@ def _run_tensor_tests() -> None:
     for a in atoms: fb.add_atom(a)
 
     assert len(fb) == 3, f"Expected 3, got {len(fb)}"
-    # Дедуплікація
+    # Deduplication.
     fb.add_atom(atoms[0])
     assert len(fb) == 3, "Duplicate not filtered"
 
@@ -1639,7 +1639,7 @@ def _run_tensor_tests() -> None:
     print(f"  compound facts={len(fb_comp)}  derived={len(marked)}  [PASS]")
 
     # ══ T3: ReteIndex ═════════════════════════════════════════════════════════
-    sep("T3 · ReteIndex (O(1) тригер)")
+    sep("T3 · ReteIndex (O(1) trigger)")
     sep("T2c · TensorUnifyEngine — structured compound join")
     p_nested = PRED_VOCAB.get_id("nested_fact")
     p_link = PRED_VOCAB.get_id("nested_link")
@@ -1663,7 +1663,7 @@ def _run_tensor_tests() -> None:
     assert any(a.args == (expected_struct,) for a in structured_atoms), f"structured derivation FAIL: {structured_atoms}"
     print(f"  structured facts={len(fb_struct)}  derived={len(structured_atoms)}  [PASS]")
 
-    sep("T3 · ReteIndex (O(1) тригер)")
+    sep("T3 · ReteIndex (O(1) trigger)")
     rete = ReteIndex()
     p_gp   = PRED_VOCAB.get_id("ancestor")
     X, Y, Z = Var("X"), Var("Y"), Var("Z")
@@ -1681,12 +1681,12 @@ def _run_tensor_tests() -> None:
 
     triggered = rete.get_triggered(p_parent)
     assert len(triggered) == 2, f"Expected 2 triggers (body x2), got {len(triggered)}"
-    # Предикат ancestor не тригерує цю rule
+    # Predicate `ancestor` does not trigger this rule.
     assert len(rete.get_triggered(p_gp)) == 0
     print(f"  triggers(parent)={len(triggered)}  triggers(ancestor)=0  [PASS]")
 
     # ══ T4: TensorUnifyEngine — 1-body rule ════════════════════════════════════
-    sep("T4 · TensorUnifyEngine — 1-body правило")
+    sep("T4 · TensorUnifyEngine — 1-body rule")
     # mortal(?X) :- human(?X)
     p_human  = PRED_VOCAB.get_id("type_of")
     p_mortal = PRED_VOCAB.get_id("instanceof")
@@ -1717,7 +1717,7 @@ def _run_tensor_tests() -> None:
     all_ancestor = fb2.get_by_pred(p_gp)
     print(f"  total_added={total}  ancestor_facts="
           f"{0 if all_ancestor is None else all_ancestor.shape[0]}")
-    # ancestor(1,3), ancestor(2,4), ancestor(1,4) мають бути виведені
+    # ancestor(1,3), ancestor(2,4), ancestor(1,4) should be derived.
     all_atoms = fb2.to_horn_atoms()
     ancestor_atoms = [a for a in all_atoms if a.pred == p_gp]
     assert any(
@@ -1745,20 +1745,20 @@ class MathHelper:
         return self.base + factorial(x)
 """
     facts, pool = PythonASTParser.parse_code(CODE)
-    assert len(facts) > 0, "Немає фактів"
+    assert len(facts) > 0, "No facts were produced"
 
-    # Перевіряємо ключові факти
+    # Check key facts.
     p_define = PRED_VOCAB.get_id("define")
     p_param  = PRED_VOCAB.get_id("param")
     p_ret    = PRED_VOCAB.get_id("return")
     p_call   = PRED_VOCAB.get_id("call")
 
     fact_preds = {f.pred for f in facts}
-    assert p_define in fact_preds, "define не знайдено"
-    assert p_param  in fact_preds, "param не знайдено"
-    assert p_ret    in fact_preds, "return не знайдено"
+    assert p_define in fact_preds, "define not found"
+    assert p_param  in fact_preds, "param not found"
+    assert p_ret    in fact_preds, "return not found"
 
-    # Перевіряємо що factorial і MathHelper визначені
+    # Check that factorial and MathHelper are defined.
     define_facts  = [f for f in facts if f.pred == p_define]
     p_classdef    = PRED_VOCAB.get_id("classdef")
     class_facts   = [f for f in facts if f.pred == p_classdef]
@@ -1777,7 +1777,7 @@ class MathHelper:
     sep("T7 · ScalableKnowledgeBase (hybrid mode)")
     skb = ScalableKnowledgeBase(max_arity=2, device=device, mode="hybrid")
 
-    # Завантажуємо факти з Python коду
+    # Load facts extracted from Python code.
     for f in facts:
         if f.is_ground():
             skb.add_fact(f)
@@ -1846,19 +1846,19 @@ result = postprocess(z)
     make_code_rules(skb2)
     skb2.forward_chain(max_depth=3)
 
-    # Перевіряємо транзитивні data deps (x → y → z → result)
+    # Check transitive data dependencies (x -> y -> z -> result).
     all_f = skb2.tensor_fb.to_horn_atoms()
     p_dep  = PRED_VOCAB.get_id("dep_data")
     dep_facts = [f for f in all_f if f.pred == p_dep]
     print(f"  pipeline facts={len(facts2)}  dep_data derived={len(dep_facts)}  [PASS]")
 
-    print("\n  ✅  omen_tensor_unify: всі тести пройдено\n")
-    print("  Готово до реального світу:")
-    print(f"    · PredicateVocab: {pv.vocab_size()} предикатів (500+ вбудованих)")
-    print(f"    · BPESymbolMapper: GPT-2 BPE {'завантажено' if bpe.is_bpe_loaded else 'hash-mode'}")
+    print("\n  ✅  omen_tensor_unify: all tests passed\n")
+    print("  Ready for the real world:")
+    print(f"    · PredicateVocab: {pv.vocab_size()} predicates (500+ built-in)")
+    print(f"    · BPESymbolMapper: GPT-2 BPE {'loaded' if bpe.is_bpe_loaded else 'hash-mode'}")
     print(f"    · TensorUnifyEngine: GPU-vectorized join, ~100x vs Python loops")
-    print(f"    · PythonASTParser: {len(facts)} фактів з ~20 рядків коду")
-    print(f"    · ScalableKB: hybrid tensor+symbolic, {len(skb)} фактів")
+    print(f"    · PythonASTParser: {len(facts)} facts from ~20 lines of code")
+    print(f"    · ScalableKB: hybrid tensor+symbolic, {len(skb)} facts")
 
 
 if __name__ == "__main__":

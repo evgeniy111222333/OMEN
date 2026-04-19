@@ -1,29 +1,29 @@
 """
-omen_osf_decoder.py — Hierarchical Decoder (H3 + H4 рівні OSF)
-===============================================================
+omen_osf_decoder.py — Hierarchical Decoder (OSF H3 + H4 levels)
+================================================================
 OMEN Synthesis Framework: Expression Level + Token Level.
 
-Замінює простий TokenDecoder — генерує токени через деревоподібну структуру.
+Replaces the simple TokenDecoder and generates tokens through a tree-like structure.
 
-Математика:
+Mathematics:
   P(T|plan) = Π_{n∈nodes(T)} P(production_n | context(n), plan)
 
-  де production_n — граматичне правило розкриття вузла n.
+  where `production_n` is the grammar rule that expands node `n`.
 
-Два під-рівні:
+Two sub-levels:
   H3 (Expression Level):
-    PlanSequence → template для кожного оператора
+    PlanSequence -> template for each operator
     template_i ∈ R^{template_len × d_tok}
 
   H4 (Token Level):
-    template → конкретні токени (лм-голова)
-    Кожен токен кондиціонується на: [h_tok; z_intent; op_emb; template]
+    template -> concrete tokens (LM head)
+    Each token is conditioned on: [h_tok; z_intent; op_emb; template]
 
-Структурний агент вирішує порядок розкриття вузлів (Structural Agent).
-На кожному кроці може запитати S-Core (via Prolog KB) допустимі типи.
+The structural agent decides the node expansion order.
+At each step it may query S-Core (via Prolog KB) for valid types.
 
-Інтеграція:
-  PlanSequence + h_tok → HierarchicalDecoder → logits (B, T, V)
+Integration:
+  PlanSequence + h_tok -> HierarchicalDecoder -> logits (B, T, V)
 """
 
 from __future__ import annotations
@@ -43,12 +43,12 @@ from omen_osf_planner import PlanSequence
 
 class StructuralAgent(nn.Module):
     """
-    Вирішує ПОРЯДОК розкриття вузлів синтаксичного дерева.
+    Decide the ORDER in which syntax-tree nodes are expanded.
 
-    Стан: (op_type_emb, context_h, depth)
-    Дії: {top_down, bottom_up, left_to_right, right_to_left}
+    State: (op_type_emb, context_h, depth)
+    Actions: {top_down, bottom_up, left_to_right, right_to_left}
 
-    Повертає expansion order (ваги для зважування шаблонів).
+    Returns an expansion order as weights used to mix templates.
     """
 
     N_ORDERS = 4
@@ -79,13 +79,13 @@ class StructuralAgent(nn.Module):
 
 class TemplateGenerator(nn.Module):
     """
-    H3: PlanOperator → expression template.
+    H3: PlanOperator -> expression template.
 
-    Кожен оператор розкривається у «шаблон» — послідовність d_tok-векторів
-    довжиною template_len. Далі HierarchicalDecoder використовує ці шаблони
-    як додаткові ключі/значення для cross-attention у TokenDecoder.
+    Each operator expands into a template, i.e. a sequence of d_tok vectors
+    with length `template_len`. `HierarchicalDecoder` then uses these templates
+    as extra keys/values for cross-attention inside the TokenDecoder.
 
-    op_emb (B, d_plan) + z_intent (B, d_intent) → template (B, template_len, d_tok)
+    op_emb (B, d_plan) + z_intent (B, d_intent) -> template (B, template_len, d_tok)
     """
 
     def __init__(
@@ -99,7 +99,7 @@ class TemplateGenerator(nn.Module):
         super().__init__()
         self.template_len = template_len
 
-        # Проекція оператора у template-простір
+        # Project the operator into template space.
         d_in = d_plan + d_intent
         self.template_proj = nn.Sequential(
             nn.Linear(d_in, d_tok * 2),
@@ -109,7 +109,7 @@ class TemplateGenerator(nn.Module):
         )
         self.norm = nn.LayerNorm(d_tok)
 
-        # Позиційні embedding для template
+        # Positional embeddings for the template.
         self.pos_emb = nn.Embedding(template_len, d_tok)
 
     def forward(
@@ -118,14 +118,14 @@ class TemplateGenerator(nn.Module):
         z_intent: torch.Tensor,   # (B, d_intent)
     ) -> torch.Tensor:
         """
-        op_embs  : (B, K, d_plan)   — K операторів плану
+        op_embs  : (B, K, d_plan)   — K plan operators
         z_intent : (B, d_intent)
-        Returns  : (B, K·template_len, d_tok) — розгорнуті шаблони
+        Returns  : (B, K·template_len, d_tok) — flattened templates
         """
         B, K, d_plan = op_embs.shape
         d_tok        = self.pos_emb.embedding_dim
 
-        # Розширюємо z_intent на K операторів
+        # Broadcast z_intent across K operators.
         z_exp = z_intent.unsqueeze(1).expand(-1, K, -1)   # (B, K, d_intent)
 
         inp      = torch.cat([op_embs, z_exp], dim=-1)    # (B, K, d_plan+d_intent)
@@ -134,11 +134,11 @@ class TemplateGenerator(nn.Module):
         tmpl_flat = self.template_proj(inp_flat)          # (B·K, d_tok·T_len)
         tmpl = tmpl_flat.view(B * K, self.template_len, d_tok)
 
-        # Позиційні ембеддинги
+        # Positional embeddings.
         pos  = self.pos_emb(torch.arange(self.template_len, device=op_embs.device))
         tmpl = self.norm(tmpl + pos)                      # (B·K, T_len, d_tok)
 
-        # Reshape → (B, K·T_len, d_tok)
+        # Reshape -> (B, K·T_len, d_tok)
         tmpl = tmpl.view(B, K * self.template_len, d_tok)
         return tmpl
 
@@ -151,20 +151,20 @@ class HierarchicalDecoder(nn.Module):
     """
     H3 + H4: PlanSequence → logits (B, T, vocab_size)
 
-    Архітектура:
-      1. TemplateGenerator: plan ops → templates (B, K·T_len, d_tok)
-      2. StructuralAgent: визначає expansion order (ваги)
-      3. Cross-attention: h_tok ← templates (вводимо план у декодер)
-      4. Plan-guided projection: z_intent + template → додатковий контекст
-      5. LM Head: → logits (B, T, V)
+    Architecture:
+      1. TemplateGenerator: plan ops -> templates (B, K·T_len, d_tok)
+      2. StructuralAgent: determines expansion order (weights)
+      3. Cross-attention: h_tok <- templates (inject the plan into the decoder)
+      4. Plan-guided projection: z_intent + template -> extra context
+      5. LM Head -> logits (B, T, V)
 
-    Виходи:
-      logits: (B, T, vocab_size)  — ті самі що TokenDecoder (dropout-in)
+    Outputs:
+      logits: (B, T, vocab_size)  — same shape as TokenDecoder
       struct_loss: scalar         — structural consistency loss
 
-    Математика P(T|plan) факторизується по вузлах:
+    P(T|plan) is factorized over nodes:
       ≈ CrossEntropy(logits, targets)  + λ_struct·L_struct
-    де L_struct = ||h_tok − proj(template)||² (консистентність структури)
+    where L_struct = ||h_tok − proj(template)||² enforces structural consistency
     """
 
     def __init__(
@@ -184,10 +184,10 @@ class HierarchicalDecoder(nn.Module):
         self.d_tok         = d_tok
         self.template_len  = template_len
 
-        # Проекція plan embeddings → d_tok
+        # Project plan embeddings -> d_tok.
         self.plan_proj  = nn.Linear(d_plan, d_tok, bias=False)
 
-        # Проекція z_intent → d_tok
+        # Project z_intent -> d_tok.
         self.intent_proj = nn.Linear(d_intent, d_tok, bias=False)
 
         # Template Generator (H3)
@@ -223,7 +223,7 @@ class HierarchicalDecoder(nn.Module):
         # Fusion gate: combines h_tok with plan-context
         self.gate = nn.Linear(d_tok * 2, d_tok)
 
-        # Structural consistency: h_tok → template space (для L_struct)
+        # Structural consistency: h_tok -> template space for L_struct.
         self.struct_proj = nn.Linear(d_tok, d_tok)
         self.struct_norm = nn.LayerNorm(d_tok)
 
@@ -236,7 +236,7 @@ class HierarchicalDecoder(nn.Module):
         self,
         h_tok:       torch.Tensor,       # (B, T, d_tok)  — TokenEncoder output
         z_intent:    torch.Tensor,       # (B, d_intent)
-        plan:        PlanSequence,       # план від SymbolicPlanner
+        plan:        PlanSequence,       # plan produced by SymbolicPlanner
         tgt_tokens:  Optional[torch.Tensor] = None,  # (B, T) — for causal mask
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -247,11 +247,11 @@ class HierarchicalDecoder(nn.Module):
         B, T, D = h_tok.shape
         device  = h_tok.device
 
-        # ── H3: генеруємо шаблони ─────────────────────────────────────────────
+        # ── H3: generate templates ───────────────────────────────────────────
         plan_embs = plan.embeddings.to(device)                   # (K, d_plan)
         K = plan_embs.size(0)
 
-        # Розширюємо на batch
+        # Broadcast across the batch.
         plan_embs_b = plan_embs.unsqueeze(0).expand(B, -1, -1)  # (B, K, d_plan)
 
         # Templates: base continuous templates + grammar-aligned discrete productions.
@@ -281,12 +281,13 @@ class HierarchicalDecoder(nn.Module):
         bank = self.production_bank[op_type_ids].unsqueeze(0).expand(B, -1, -1, -1, -1)
         discrete_templates = torch.einsum("bkp,bkptd->bktd", prod_w, bank)
 
-        # ── Structural Agent ──────────────────────────────────────────────────
-        # Ваги для зважування template позицій (soft expansion order).
-        # BUG FIX: StructuralAgent ініціалізовано з Linear(d_plan + d_tok, ...),
-        # тому op_emb MАЄ бути (B, d_plan) — до plan_proj. Раніше передавався
-        # plan_proj(mean) → (B, d_tok), що давало Linear((d_tok+d_tok)=64, ...)
-        # але очікувалось (d_plan+d_tok)=48 → RuntimeError.
+        # ── Structural Agent ─────────────────────────────────────────────────
+        # Weights used to mix template positions (soft expansion order).
+        # BUG FIX: StructuralAgent is initialized with Linear(d_plan + d_tok, ...),
+        # so `op_emb` MUST stay in shape (B, d_plan) before plan_proj.
+        # Previously, `plan_proj(mean)` with shape (B, d_tok) was passed in,
+        # which built Linear((d_tok+d_tok)=64, ...) while the module expected
+        # (d_plan+d_tok)=48, causing a RuntimeError.
         op_mean_raw = plan_embs_b.mean(1)                            # (B, d_plan) — raw
         order_w     = self.struct_agent(op_mean_raw, ctx_mean)       # (B, N_ORDERS)
         order_bias  = torch.einsum("bo,otd->btd", order_w, self.order_bank).unsqueeze(1)
@@ -294,11 +295,11 @@ class HierarchicalDecoder(nn.Module):
             B, K * self.template_len, self.d_tok
         )
 
-        # ── H4: Cross-attention: h_tok ← templates ───────────────────────────
+        # ── H4: Cross-attention: h_tok <- templates ──────────────────────────
         h_norm    = self.cross_norm(h_tok)
         h_crossed, _ = self.cross_attn(h_norm, templates_w, templates_w)  # (B,T,d_tok)
 
-        # Intent context: broadcast z_intent → (B, 1, d_tok) + add to h
+        # Intent context: broadcast z_intent -> (B, 1, d_tok) and add it to h.
         intent_ctx = self.intent_proj(z_intent).unsqueeze(1)    # (B, 1, d_tok)
         h_with_intent = h_tok + h_crossed + intent_ctx          # (B, T, d_tok)
 
@@ -306,8 +307,8 @@ class HierarchicalDecoder(nn.Module):
         gate = torch.sigmoid(self.gate(torch.cat([h_tok, h_with_intent], dim=-1)))
         h_fused = gate * h_with_intent + (1.0 - gate) * h_tok
 
-        # ── Structural Consistency Loss L_struct ──────────────────────────────
-        # Мета: h_tok ≈ proj(template_mean) — декодер «розуміє» шаблони
+        # ── Structural Consistency Loss L_struct ─────────────────────────────
+        # Goal: h_tok ≈ proj(template_mean), so the decoder "understands" templates.
         tmpl_mean  = templates_w.mean(1)                         # (B, d_tok)
         struct_pred = self.struct_proj(h_fused.mean(1))          # (B, d_tok)
         struct_pred = self.struct_norm(struct_pred)

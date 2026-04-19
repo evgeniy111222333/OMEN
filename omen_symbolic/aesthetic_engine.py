@@ -1,23 +1,23 @@
 """
 aesthetic_engine.py — Aesthetic Evolution Engine (AEE)
 
-Повна реалізація концепції:
-  · Популяція ініціалізується з ДВОХ джерел:
-      1. Кандидати від AME/CWE/OEE (зовнішній потік).
-      2. Найкращі правила поточного LTM (за естетичною оцінкою) — "генний пул".
-  · Персистентний _gene_pool зберігається між викликами evolve() і
-    поповнюється щоразу найкращими виживачами.
-  · Оператори відбору:
-      - Crossover: тіло від R1, голова від R2 (якщо змінні уніфікуються).
-      - Mutation: випадкова заміна предиката або додавання/видалення літерала.
-      - Selection: U_total(R) = U_VeM(R) + γ·A(R), зберігаються найкращі.
-  · Естетична функція A(R):
-      A_sym     — симетрія відносно перестановки змінних голови
-      A_compr   — MDL компресія (1 / (1 + bits/32))
-      A_novel   — 1 − max_{R'∈LTM} sim(R, R')  (унікальність структури)
-      A_elegance — utility / MDL (щільність інформації)
+Full concept implementation:
+  · The population is initialized from TWO sources:
+      1. Candidates from AME/CWE/OEE (external stream).
+      2. The best rules from the current LTM (by aesthetic score), i.e. the "gene pool".
+  · Persistent `_gene_pool` is kept across `evolve()` calls and
+    is replenished each time with the best survivors.
+  · Selection operators:
+      - Crossover: body from R1, head from R2, if variables unify.
+      - Mutation: random predicate replacement or literal add/remove.
+      - Selection: U_total(R) = U_VeM(R) + γ·A(R), and the best rules survive.
+  · Aesthetic function A(R):
+      A_sym      — symmetry under head-variable permutation
+      A_compr    — MDL compression (1 / (1 + bits/32))
+      A_novel    — 1 − max_{R'∈LTM} sim(R, R')  (structural uniqueness)
+      A_elegance — utility / MDL (information density)
 
-Математична модель:
+Mathematical model:
   A(R) = 0.25·A_sym + 0.25·A_compr + 0.25·A_novel + 0.25·A_elegance
   U_total(R) = U_VeM(R) + γ · A(R)
 """
@@ -36,12 +36,12 @@ from omen_symbolic.abduction_search import rule_template_signature
 from omen_symbolic.creative_types import RuleCandidate
 
 
-# ─── Структурна подібність правил ────────────────────────────────────────────
+# ─── Structural rule similarity ──────────────────────────────────────────────
 
 def _rule_similarity(left: Any, right: Any) -> float:
     """
-    Структурна подібність між двома правилами [0, 1].
-    Враховує: однаковий head.pred, різницю в довжині тіла, перетин предикатів тіла.
+    Structural similarity between two rules in the [0, 1] range.
+    Accounts for matching `head.pred`, body-length difference, and body-predicate overlap.
     """
     score = 0.0
     score += 1.0 if int(left.head.pred) == int(right.head.pred) else 0.0
@@ -118,10 +118,10 @@ def _permute_rule_args(rule: Any, left: int, right: int) -> Any:
     )
 
 
-# ─── Уніфікація змінних для crossover ────────────────────────────────────────
+# ─── Variable unification for crossover ─────────────────────────────────────
 
 def _var_names(rule: Any) -> set:
-    """Збирає всі імена змінних у правилі."""
+    """Collect all variable names used in a rule."""
     names: set = set()
     for atom in (rule.head,) + tuple(getattr(rule, "body", ())):
         for arg in getattr(atom, "args", ()):
@@ -132,8 +132,8 @@ def _var_names(rule: Any) -> set:
 
 def _can_crossover(left: Any, right: Any) -> bool:
     """
-    Перевіряє, чи можна схрестити two правила:
-    вимагає перетину змінних між тілом left і головою right (змінні уніфікуються).
+    Check whether two rules can be crossed over.
+    Requires shared variables between the body of `left` and the head of `right`.
     """
     left_body_vars = set()
     for atom in getattr(left, "body", ()):
@@ -144,34 +144,34 @@ def _can_crossover(left: Any, right: Any) -> bool:
     for arg in getattr(right.head, "args", ()):
         if hasattr(arg, "name") and not hasattr(arg, "val"):
             right_head_vars.add(str(arg.name))
-    # Схрещуємо якщо є хоч якийсь перетин або обидва мають змінні
+    # Allow crossover if there is any overlap or both rules have variables.
     return bool(left_body_vars & right_head_vars) or bool(left_body_vars and right_head_vars)
 
 
-# ─── Головний клас ────────────────────────────────────────────────────────────
+# ─── Main class ──────────────────────────────────────────────────────────────
 
 class AestheticEvolutionEngine:
     """
-    Естетична еволюція правил.
+    Aesthetic evolution of rules.
 
-    Параметри
+    Parameters
     ----------
     population_size : int
-        Розмір популяції (включає і кандидатів, і насіння з LTM).
+        Population size, including candidates and LTM seeds.
     generations : int
-        Кількість еволюційних поколінь за один виклик evolve().
+        Number of evolutionary generations per `evolve()` call.
     gamma : float
-        Вага естетичного доданку в U_total = U_VeM + γ·A(R).
+        Weight of the aesthetic term in U_total = U_VeM + γ·A(R).
     mutation_rate : float
-        Ймовірність мутації після crossover.
+        Mutation probability after crossover.
     crossover_rate : float
-        Ймовірність crossover (інакше — лише мутація).
+        Probability of crossover; otherwise only mutation is used.
     max_selected : int
-        Кількість правил, що повертаються після відбору.
+        Number of rules returned after selection.
     ltm_seed_ratio : float
-        Частка популяції [0,1], що засівається правилами LTM.
+        Fraction of the population [0,1] seeded from LTM rules.
     gene_pool_size : int
-        Розмір персистентного gene pool між викликами.
+        Size of the persistent gene pool across calls.
     """
 
     def __init__(
@@ -194,7 +194,7 @@ class AestheticEvolutionEngine:
         self.ltm_seed_ratio = float(max(0.0, min(1.0, ltm_seed_ratio)))
         self.gene_pool_size = max(int(gene_pool_size), self.population_size)
 
-        # Персистентний gene pool між викликами evolve()
+        # Persistent gene pool across evolve() calls.
         self._gene_pool: List[RuleCandidate] = []
 
     def export_state(self) -> Dict[str, Any]:
@@ -212,13 +212,14 @@ class AestheticEvolutionEngine:
             gene_pool = list(gene_pool_blob)
         self._gene_pool = gene_pool[: self.gene_pool_size]
 
-    # ─── Естетична функція A(R) ───────────────────────────────────────────────
+    # ─── Aesthetic function A(R) ─────────────────────────────────────────────
 
     @staticmethod
     def _symmetry_score(rule: Any) -> float:
         """
-        A_sym ≈ Corr(R, permute(R)): кореляція правила з аргументно-переставленими
-        варіантами. Це ближче до концепції, ніж проста перевірка head[0]==head[-1].
+        A_sym ≈ Corr(R, permute(R)): correlation with argument-permuted
+        versions of the rule. This is closer to the concept than simply checking
+        `head[0] == head[-1]`.
         """
         max_arity = max(
             [len(tuple(getattr(rule.head, "args", ())))]
@@ -241,7 +242,7 @@ class AestheticEvolutionEngine:
 
     @staticmethod
     def _compression_score(rule: Any, compression_delta: Optional[float] = None) -> float:
-        """A_compr: якщо доступна оцінка ΔMDL, використовуємо її; інакше fallback по довжині."""
+        """A_compr: use ΔMDL when available, otherwise fall back to rule length."""
         if compression_delta is not None:
             bits = max(float(rule.description_length_bits()), 1.0)
             scaled = float(compression_delta) / bits
@@ -257,7 +258,7 @@ class AestheticEvolutionEngine:
     ) -> float:
         """
         A_novel = 1 − max_{R'∈LTM} sim(R, R').
-        Правило унікальне, якщо воно максимально відрізняється від усіх наявних.
+        A rule is novel when it differs as much as possible from existing rules.
         """
         if not existing_rules:
             return 1.0
@@ -281,7 +282,7 @@ class AestheticEvolutionEngine:
 
     @staticmethod
     def _elegance_score(rule: Any, utility: float) -> float:
-        """A_elegance = utility / MDL: щільність інформації."""
+        """A_elegance = utility / MDL, i.e. information density."""
         return float(utility) / max(float(rule.description_length_bits()), 1.0)
 
     def _aesthetic_value(
@@ -302,13 +303,13 @@ class AestheticEvolutionEngine:
             + 0.25 * self._elegance_score(rule, utility)
         )
 
-    # ─── Crossover і Mutation ─────────────────────────────────────────────────
+    # ─── Crossover and mutation ──────────────────────────────────────────────
 
     @staticmethod
     def _crossover(left: Any, right: Any) -> Any:
         """
-        Схрещування: голова від right, тіло від left (якщо змінні уніфікуються).
-        Це реалізує логічну рекомбінацію правил.
+        Crossover: head from `right`, body from `left`, if variables unify.
+        This implements logical recombination of rules.
         """
         body = tuple(getattr(left, "body", ())) or tuple(getattr(right, "body", ()))
         return type(left)(
@@ -324,9 +325,7 @@ class AestheticEvolutionEngine:
         alt_body_atom: Optional[Any] = None,
         alt_preds: Optional[Sequence[int]] = None,
     ) -> Any:
-        """
-        Мутація: заміна предиката, додавання або видалення літерала.
-        """
+        """Mutation: predicate replacement, or literal add/remove."""
         body = list(getattr(rule, "body", ()))
         mutation_ops: List[str] = []
         if alt_preds:
@@ -364,7 +363,7 @@ class AestheticEvolutionEngine:
             use_count=int(getattr(rule, "use_count", 0)),
         )
 
-    # ─── Ініціалізація популяції з LTM ───────────────────────────────────────
+    # ─── Population initialization from LTM ─────────────────────────────────
 
     def _seed_from_ltm(
         self,
@@ -373,9 +372,9 @@ class AestheticEvolutionEngine:
         n_seeds: int,
     ) -> List[RuleCandidate]:
         """
-        Відбирає n_seeds правил з LTM за естетичною цінністю (utility=1.0 як плейсхолдер,
-        оскільки LTM правила вже пройшли VeM).
-        Це реалізує засів популяції з кращих наявних правил.
+        Select `n_seeds` rules from LTM by aesthetic value (`utility=1.0` as a placeholder,
+        since LTM rules have already passed through VeM).
+        This seeds the population with the best existing rules.
         """
         if not ltm_rules or n_seeds <= 0:
             return []
@@ -402,24 +401,24 @@ class AestheticEvolutionEngine:
         return seeds
 
     def _restore_from_gene_pool(self, n: int) -> List[RuleCandidate]:
-        """Повертає n найкращих правил з персистентного gene pool."""
+        """Return the top `n` rules from the persistent gene pool."""
         if not self._gene_pool or n <= 0:
             return []
         sorted_pool = sorted(self._gene_pool, key=lambda c: c.score, reverse=True)
         return sorted_pool[:n]
 
     def _update_gene_pool(self, candidates: List[RuleCandidate]) -> None:
-        """Поповнює gene pool виживачами, обмежуючи розмір gene_pool_size."""
+        """Refresh the gene pool with survivors while respecting `gene_pool_size`."""
         pool_hashes = {c.clause for c in self._gene_pool}
         for candidate in candidates:
             if candidate.clause not in pool_hashes:
                 self._gene_pool.append(candidate)
                 pool_hashes.add(candidate.clause)
-        # Відсортувати і обрізати
+        # Sort and truncate.
         self._gene_pool.sort(key=lambda c: c.score, reverse=True)
         self._gene_pool = self._gene_pool[: self.gene_pool_size]
 
-    # ─── Головний метод еволюції ──────────────────────────────────────────────
+    # ─── Main evolution method ───────────────────────────────────────────────
 
     def evolve(
         self,
@@ -431,40 +430,40 @@ class AestheticEvolutionEngine:
         compression_fn: Optional[Callable[[Any], float]] = None,
     ) -> List[RuleCandidate]:
         """
-        Еволюція популяції правил.
+        Evolve a population of rules.
 
-        Параметри
+        Parameters
         ----------
         candidates : Sequence[RuleCandidate]
-            Кандидати від AME / CWE / OEE.
+            Candidates from AME / CWE / OEE.
         existing_rules : Sequence[Any]
-            Наявні правила LTM (для оцінки новизни та як gene pool).
+            Existing LTM rules, used for novelty scoring and as a gene pool.
         utility_fn : Callable
-            Функція VeM.score_batch — повертає utility для списку правил.
+            VeM.score_batch-like function that returns utility for a list of rules.
         ltm_rules : Sequence[Any], optional
-            Правила LTM для засіву популяції (якщо None — використовує existing_rules).
+            LTM rules used to seed the population. If None, `existing_rules` are used.
         """
         effective_ltm = list(ltm_rules or existing_rules)
 
-        # ── Формуємо початкову популяцію ─────────────────────────────────────
-        # 1. Зовнішні кандидати (AME/CWE/OEE)
+        # ── Build the initial population ─────────────────────────────────────
+        # 1. External candidates (AME/CWE/OEE)
         external = list(candidates[: self.population_size])
 
-        # 2. Насіння з LTM (ltm_seed_ratio частина популяції)
+        # 2. LTM seeds (`ltm_seed_ratio` fraction of the population)
         n_ltm_seeds = max(1, int(self.population_size * self.ltm_seed_ratio))
         ltm_seeds = self._seed_from_ltm(effective_ltm, existing_rules, n_ltm_seeds)
 
-        # 3. Відновлення з персистентного gene pool
+        # 3. Restore candidates from the persistent gene pool.
         n_pool = max(1, self.population_size // 4)
         pool_seeds = self._restore_from_gene_pool(n_pool)
 
-        # Об'єднуємо і обрізаємо до population_size
+        # Merge and cap to `population_size`.
         population: List[RuleCandidate] = (external + ltm_seeds + pool_seeds)[: self.population_size]
 
         if not population:
             return []
 
-        # Пул атомів і предикатів для мутацій
+        # Pool of atoms and predicates for mutation.
         body_atoms = [atom for rule in effective_ltm for atom in getattr(rule, "body", ())]
         head_pred_by_arity: Dict[int, List[int]] = {}
         for rule in effective_ltm:
@@ -475,9 +474,9 @@ class AestheticEvolutionEngine:
             if pred not in head_pred_by_arity[arity]:
                 head_pred_by_arity[arity].append(pred)
 
-        # ── Еволюційні покоління ──────────────────────────────────────────────
+        # ── Evolutionary generations ─────────────────────────────────────────
         for _gen in range(self.generations):
-            # Оцінюємо поточну популяцію через VeM
+            # Score the current population through VeM.
             clauses = [c.clause for c in population]
             utilities = list(utility_fn(clauses))
 
@@ -510,18 +509,18 @@ class AestheticEvolutionEngine:
                     )
                 )
 
-            # Відбір виживачів (еліта = половина популяції)
+            # Survivor selection (elite = half the population).
             rescored.sort(key=lambda item: item.score, reverse=True)
             n_survivors = max(2, self.population_size // 2)
             survivors = rescored[:n_survivors]
             population = list(survivors)
 
-            # Відтворення: crossover + mutation до population_size
+            # Reproduction: crossover + mutation until population_size.
             while len(population) < self.population_size:
                 seed = random.choice(survivors)
                 new_rule = seed.clause
 
-                # Crossover: перевіряємо уніфікованість змінних
+                # Crossover: check whether variables can unify.
                 if random.random() < self.crossover_rate and len(survivors) > 1:
                     partner = random.choice(survivors)
                     if _can_crossover(seed.clause, partner.clause):
@@ -529,7 +528,7 @@ class AestheticEvolutionEngine:
                     elif _can_crossover(partner.clause, seed.clause):
                         new_rule = self._crossover(partner.clause, seed.clause)
 
-                # Mutation
+                # Mutation.
                 if random.random() < self.mutation_rate:
                     alt_atom = random.choice(body_atoms) if body_atoms else None
                     alt_preds = head_pred_by_arity.get(int(new_rule.head.arity()), [])
@@ -549,7 +548,7 @@ class AestheticEvolutionEngine:
                     )
                 )
 
-        # ── Фінальний відбір кращих унікальних правил ─────────────────────────
+        # ── Final selection of the best unique rules ─────────────────────────
         best_by_template: Dict[Any, RuleCandidate] = {}
         for candidate in population:
             template = rule_template_signature(candidate.clause.head, tuple(candidate.clause.body))
@@ -559,14 +558,14 @@ class AestheticEvolutionEngine:
         ranked = sorted(best_by_template.values(), key=lambda item: item.score, reverse=True)
         selected = ranked[: self.max_selected]
 
-        # Оновлюємо персистентний gene pool найкращими виживачами
+        # Update the persistent gene pool with the best survivors.
         all_survivors = sorted(population, key=lambda c: c.score, reverse=True)
         self._update_gene_pool(all_survivors[: max(self.max_selected * 2, 4)])
 
         return selected
 
     def gene_pool_stats(self) -> Dict[str, float]:
-        """Статистика gene pool для моніторингу."""
+        """Gene-pool statistics for monitoring."""
         if not self._gene_pool:
             return {"size": 0.0, "mean_score": 0.0, "max_score": 0.0}
         scores = [c.score for c in self._gene_pool]

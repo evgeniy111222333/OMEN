@@ -1,35 +1,35 @@
 """
-OMEN v2 — legacy reference architecture for OMEN
+OMEN v2 - legacy reference architecture for OMEN
 ================================================
-Цей файл зберігає ранній «чистий» варіант OMEN як дослідницький reference.
+This file preserves an early "clean" version of OMEN as a research reference.
 
-Canonical runtime stack для поточної системи:
+Canonical runtime stack for the current system:
   omen_scale.OMENScale
 
-Тут лишається історично важлива реалізація:
+It remains here as a historically important implementation of:
   · DualStreamAttention
   · GraphAttentionEncoder
   · CausalGraphDecoder
-  · ранні M-Core / Curiosity / S-Core ідеї
+  · early M-Core / Curiosity / S-Core ideas
 
-Розширення v1 трьома новими фундаментальними компонентами:
+v1 extended with three new foundational components:
 
-  M-Core  : Tensor Product Memory — голографічна пам'ять у VRAM
-             (read/write без backprop, O(H·d²) незалежно від N фактів)
+  M-Core  : Tensor Product Memory - holographic memory in VRAM
+             (read/write without backprop, O(H·d²) independent of N facts)
 
   Curiosity Engine : Epistemic Gap Detector + Counterfactual Rollouts
-             (E(z) = diag(∇_z L_world)², активується при ||E(z)|| > τ)
+             (E(z) = diag(∇_z L_world)², activated when ||E(z)|| > τ)
 
-  S-Core  : Symbolic Core — робоча пам'ять + LTM правил + Abduction Engine
-             (нейро-символьний інтерфейс через Gumbel-Softmax + GNN)
+  S-Core  : Symbolic Core - working memory + LTM rules + Abduction Engine
+             (neuro-symbolic interface via Gumbel-Softmax + GNN)
 
-Формула:
+Formula:
   L_OMEN = L_CE + γ·||z - (z_sim + v_mem)||² + δ·||∇_z WorldRNN||²
           + η·KL(Q(z|o) || Read(M,z)) - α·I(z;M)
           + β·KL(Q(z|o) || P(z|S-Core(G)))
           + λ_sym·Σ Usage(R)·Complexity(R)
 
-Стек: PyTorch 2.x — нуль зовнішніх солверів.
+Stack: PyTorch 2.x - zero external solvers.
 """
 
 LEGACY_RUNTIME = True
@@ -58,7 +58,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 @dataclass
 class OMENv2Config:
-    # Трансформер
+    # Transformer
     vocab_size:       int   = 256
     d_model:          int   = 128
     d_latent:         int   = 64
@@ -70,24 +70,24 @@ class OMENv2Config:
     sparsity_lambda:  float = 5e-4
 
     # M-Core
-    mem_heads:        int   = 8     # H голів тензорної пам'яті
-    mem_write_tau:    float = 0.3   # поріг упевненості (нижче → писати)
-    mem_cache_size:   int   = 512   # кеш останніх z для швидкого recall
+    mem_heads:        int   = 8     # H tensor-memory heads
+    mem_write_tau:    float = 0.3   # confidence threshold (below -> write)
+    mem_cache_size:   int   = 512   # cache of recent z states for fast recall
 
     # Curiosity
-    epistemic_tau:    float = 0.3   # поріг ||E(z)|| для активації модуля
+    epistemic_tau:    float = 0.3   # ||E(z)|| threshold for module activation
     epistemic_exact_grad: bool = False
-    n_counterfactual: int   = 2     # кількість контрфактичних роловтів
+    n_counterfactual: int   = 2     # number of counterfactual rollouts
 
     # S-Core
-    sym_vocab:        int   = 64    # розмір словника символів
-    sym_embed_dim:    int   = 32    # розмірність символьних ембеддингів
-    sym_gnn_layers:   int   = 2     # глибина GNN
-    sym_max_facts:    int   = 32    # макс. фактів у WM
-    abduct_candidates: int  = 8     # кандидати для абдукції
-    ltm_max_rules:    int   = 256   # макс. правил у LTM
+    sym_vocab:        int   = 64    # symbolic vocabulary size
+    sym_embed_dim:    int   = 32    # symbolic embedding dimension
+    sym_gnn_layers:   int   = 2     # GNN depth
+    sym_max_facts:    int   = 32    # max facts in WM
+    abduct_candidates: int  = 8     # abduction candidates
+    ltm_max_rules:    int   = 256   # max rules in LTM
 
-    # Коефіцієнти лосу
+    # Loss coefficients
     alpha:     float = 0.1    # Epistemic bonus
     beta:      float = 0.05   # World / Symbolic consistency
     gamma:     float = 0.1    # Structural / Memory reward
@@ -95,14 +95,14 @@ class OMENv2Config:
     eta:       float = 0.05   # Memory Recall Loss
     lam_sym:   float = 0.02   # Symbolic rule regularizer
 
-    # OMEN-Scale MDL (використовується omen_scale.py)
+    # OMEN-Scale MDL (used by omen_scale.py)
     # L_scale = λ_tok·(1/T)·Σ||z_t||² + λ_conc·(1/|C|)·Σ||c||²
-    lambda_tok:  float = 1e-4   # штраф на токен-норми (тип. = 1e-4)
-    lambda_conc: float = 1e-3   # штраф на концепт-норми (тип. = 1e-3)
+    lambda_tok:  float = 1e-4   # penalty on token norms (typ. = 1e-4)
+    lambda_conc: float = 1e-3   # penalty on concept norms (typ. = 1e-3)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1.  БАЗОВІ БЛОКИ (Dual-Stream Attention + OMENBlock) — з v1
+# 1.  BASE BUILDING BLOCKS (Dual-Stream Attention + OMENBlock) - from v1
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DualStreamAttention(nn.Module):
@@ -115,7 +115,7 @@ class DualStreamAttention(nn.Module):
         self.log_mask = nn.Parameter(torch.zeros(1, cfg.n_heads, cfg.seq_len, cfg.seq_len))
         self.gate = nn.Linear(cfg.d_model * 2, cfg.d_model)
         # OPT-5: inplace dropout
-        self.drop = nn.Dropout(cfg.dropout, inplace=False)  # attention weights — НЕ inplace (softmax output shared)
+        self.drop = nn.Dropout(cfg.dropout, inplace=False)  # attention weights - NOT inplace (softmax output is shared)
         self.sparsity_lambda = cfg.sparsity_lambda
 
     def forward(self, x, causal_mask):
@@ -124,12 +124,12 @@ class DualStreamAttention(nn.Module):
                    for t in self.to_qkv(x).chunk(3, dim=-1)]
         scale = math.sqrt(self.dh)
 
-        # OPT-QK: (q @ k^T)/scale обчислюється ОДИН раз — спільний для обох стрімів.
-        # Раніше: 2× O(B·h·T²·dh) matmul (text + causal).
-        # Тепер:  1× matmul + дешеве поелементне множення на M.
+        # OPT-QK: (q @ k^T)/scale is computed ONCE and shared by both streams.
+        # Before: 2x O(B·h·T²·dh) matmul (text + causal).
+        # Now:    1x matmul + cheap elementwise multiplication by M.
         qk = (q @ k.transpose(-2, -1)) / scale                    # (B, h, T, T)
 
-        # Маска — обчислюється один раз і ділиться між стрімами
+        # The mask is computed once and shared between streams.
         cm = causal_mask[:T, :T] if causal_mask is not None else None
 
         # Text stream
@@ -155,7 +155,7 @@ class OMENBlock(nn.Module):
         self.norm1 = nn.LayerNorm(cfg.d_model)
         self.attn  = DualStreamAttention(cfg)
         self.norm2 = nn.LayerNorm(cfg.d_model)
-        # OPT-5: inplace=True — не виділяємо новий тензор на кожен dropout
+        # OPT-5: inplace=True - do not allocate a new tensor for every dropout.
         self.ffn   = nn.Sequential(
             nn.Linear(cfg.d_model, 4 * cfg.d_model), nn.GELU(),
             nn.Dropout(cfg.dropout, inplace=True),
@@ -212,30 +212,31 @@ class WorldRNN(nn.Module):
     def simulate_sequence(self, z0, actions, teacher_forcing_ratio: float = 0.0,
                           teacher_states: Optional[torch.Tensor] = None):
         """
-        OPT-2: Pre-embed всі дії одним викликом до входу в цикл.
-        Embedding lookup виноситься за межі for-loop:
-          Раніше: T × (embed_lookup + GRUCell + Linear)
-          Тепер:  1 × embed_lookup_batch  +  T × (GRUCell + Linear)
-        На T=8, B=8: ~5% прискорення за рахунок зменшення диспетчеризації.
+        OPT-2: Pre-embed all actions with one call before entering the loop.
+        Embedding lookup is moved outside the for-loop:
+          Before: T x (embed_lookup + GRUCell + Linear)
+          Now:    1 x embed_lookup_batch + T x (GRUCell + Linear)
+        At T=8, B=8 this gives ~5% speedup by reducing dispatch overhead.
 
         FIX Bug1 (world loss 17x drift):
-          Попередній код:  z0 if t == 0 else traj[-1]
-          Після кроку 0 GRU отримував власний попередній вихід traj[-1] замість
-          початкового концепту z0. За T=8 кроків похибка накопичувалася
-          (~+74% L_world), а не зменшувалась. Рішення — завжди подавати z0:
-          GRU-прихований стан h вже несе "пам'ять" про попередні кроки,
-          тому z0 як "anchor input" не заважає динаміці, але усуває дрейф.
+          Previous code: z0 if t == 0 else traj[-1]
+          After step 0 the GRU received its own previous output traj[-1]
+          instead of the initial concept z0. Over T=8 steps the error
+          accumulated (~+74% L_world) instead of shrinking. The fix is to
+          always feed z0:
+          the GRU hidden state h already carries "memory" of previous steps,
+          so z0 as an anchor input does not hurt the dynamics but removes drift.
         """
         B, T   = actions.shape
-        a_all  = self.act_emb(actions)                     # (B, T, d_latent) — один виклик
+        a_all  = self.act_emb(actions)                     # (B, T, d_latent) - one call
         h      = self.h0.expand(B, -1).contiguous()
         traj   = []
         z_prev = z0
         if teacher_states is not None and teacher_states.shape[:2] != (B, T):
             raise ValueError("teacher_states must have shape (B, T, d_latent)")
         for t in range(T):
-            # FIXED: завжди z0 (а не traj[-1]) — GRU h несе динаміку,
-            # z0 — стабільний anchor. Усуває 17x дрейф world loss.
+            # FIXED: always z0 (not traj[-1]) - GRU h carries the dynamics,
+            # z0 is a stable anchor. This removes the 17x world-loss drift.
             z_in = z_prev
             if teacher_states is not None:
                 z_teacher = teacher_states[:, t]
@@ -284,17 +285,17 @@ class CausalGraphDecoder(nn.Module):
 
 class TensorProductMemory(nn.Module):
     """
-    Голографічна пам'ять: M ∈ R^{H × d × d}
-    Розмір ФІКСОВАНИЙ незалежно від кількості записів.
+    Holographic memory: M ∈ R^{H × d × d}
+    The size is FIXED regardless of the number of stored items.
 
-    Запис : M_h ← M_h + λ·(k ⊗ v)          [без backprop на M]
-    Читання: v_ret = Σ_h M_h · k             [O(H·d²)]
+    Write: M_h ← M_h + λ·(k ⊗ v)          [without backprop through M]
+    Read:  v_ret = Σ_h M_h · k            [O(H·d²)]
     """
 
     def __init__(self, cfg: OMENv2Config):
         super().__init__()
         d, H = cfg.d_latent, cfg.mem_heads
-        # Пам'ять: параметр, але оновлюється не градієнтом, а прямим записом
+        # Memory buffer: updated by direct writes rather than gradients.
         self.register_buffer("memory", torch.zeros(H, d, d))
         self.key_proj = nn.Linear(d, d * H, bias=False)
         self.val_proj = nn.Linear(d, d * H, bias=False)
@@ -302,33 +303,33 @@ class TensorProductMemory(nn.Module):
         self.d, self.H = d, H
         self.write_tau = cfg.mem_write_tau
 
-        # LRU-кеш станів (для швидкого episodic recall)
+        # LRU cache of states for fast episodic recall.
         self.cache: deque = deque(maxlen=cfg.mem_cache_size)
         self.n_writes = 0
 
-    # ── Читання ──────────────────────────────────────────────────────────────
+    # -- Read ------------------------------------------------------------------
     def read(self, z_query: torch.Tensor) -> torch.Tensor:
         """z_query: (B, d) → v_retrieved: (B, d)"""
-        # FIX: write() виконує self.memory += delta під @no_grad, що все одно
-        # інкрементує version-counter і ламає autograd backward.
-        # .detach() ізолює buffer від version-перевірки autograd.
-        # Градієнти через key_proj і out_proj (trainable) зберігаються повністю.
+        # FIX: write() performs self.memory += delta under @no_grad, which still
+        # increments the version counter and breaks autograd backward.
+        # .detach() isolates the buffer from autograd version checks.
+        # Gradients through key_proj and out_proj (trainable) remain intact.
         k = self.key_proj(z_query).view(-1, self.H, self.d)      # (B, H, d)
         v = torch.einsum('bhd,hde->bhe', k, self.memory.detach())
         return self.out_proj(v.mean(1))                            # (B, d)
 
-    # ── Запис (без градієнта, як гіпокамп) ───────────────────────────────────
+    # -- Write (no gradient, like a hippocampus) -------------------------------
     @torch.no_grad()
     def write(self, z_state: torch.Tensor,
               z_value: torch.Tensor,
               confidence: torch.Tensor) -> None:
         """
         confidence: (B,) ∈ [0,1]
-        Записуємо лише якщо модель «здивована» (1 - conf > write_tau)
+        Write only when the model is "surprised" (`1 - conf > write_tau`).
 
-        ВАЖЛИВО: `.copy_()` замість `+=` — `+=` інкрементує version_counter
-        основного тензора, що ламає autograd.backward() (version mismatch).
-        `.copy_()` оновлює дані БЕЗ зміни version_counter.
+        IMPORTANT: use `.copy_()` instead of `+=` - `+=` increments the main
+        tensor's version counter, which breaks `autograd.backward()`
+        (version mismatch). `.copy_()` updates data without changing it.
         """
         lam = (1.0 - confidence).clamp(0, 1)                      # (B,)
         mask = lam > self.write_tau
@@ -347,16 +348,16 @@ class TensorProductMemory(nn.Module):
         new_mem = self.memory + delta / (mask.sum().float() + 1e-6)
         self.memory.data.copy_(new_mem)
 
-        # Додаємо в LRU-кеш для episodic recall
+        # Add to the LRU cache for episodic recall.
         for i in range(z_s.size(0)):
             self.cache.append((z_s[i].detach(), z_v[i].detach()))
 
         self.n_writes += mask.sum().item()
 
-    # ── Episodic recall (k-NN у кеші) ────────────────────────────────────────
+    # -- Episodic recall (k-NN in cache) ---------------------------------------
     @torch.no_grad()
     def episodic_recall(self, z_query: torch.Tensor, k: int = 4) -> torch.Tensor:
-        """Повертає середнє значення k найближчих записів у кеші"""
+        """Return the mean value of the k nearest cached entries."""
         if len(self.cache) == 0:
             return torch.zeros_like(z_query)
         cache_keys = torch.stack([c[0] for c in self.cache], 0).to(z_query.device)
@@ -377,15 +378,15 @@ class TensorProductMemory(nn.Module):
 class EpistemicGapDetector(nn.Module):
     """
     E(z) = diag(∇_z L_world)²
-    Де велике E_i — там модель «не розуміє» каузальний зв'язок.
-    Повертає (epistemic_map, gap_norm, hot_dims).
+    Large E_i means the model does not understand the causal relationship there.
+    Returns `(epistemic_map, gap_norm, hot_dims)`.
     """
 
     def __init__(self, cfg: OMENv2Config):
         super().__init__()
         self.tau = cfg.epistemic_tau
         self.exact_grad = bool(getattr(cfg, "epistemic_exact_grad", False))
-        # Вивчена проекція для агрегації епістемічного сигналу
+        # Learned projection for aggregating the epistemic signal.
         self.aggregator = nn.Linear(cfg.d_latent, cfg.d_latent)
         self.d = cfg.d_latent
 
@@ -393,19 +394,19 @@ class EpistemicGapDetector(nn.Module):
                 world_rnn: WorldRNN,
                 z_sim: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        z      : (B, d) — поточний стан, requires_grad=True
-        z_sim  : (B, d) — передбачений симулятором стан
+        z      : (B, d) - current state, requires_grad=True
+        z_sim  : (B, d) - simulator-predicted state
         Returns:
-          E        : (B, d) — епістемічна карта
-          gap_norm : (B,)   — норма прогалини
-          hot_dims : (B, d) — binary mask найгарячіших вимірів
+          E        : (B, d) - epistemic map
+          gap_norm : (B,)   - gap norm
+          hot_dims : (B, d) - binary mask of hottest dimensions
         """
-        # OPT-EGD: замість torch.autograd.grad() (окремий backward-пас ≈ +30–50% часу батчу)
-        # використовуємо замкнуту формулу градієнту MSE:
+        # OPT-EGD: instead of torch.autograd.grad() (a separate backward pass,
+        # roughly +30-50% of batch time), use the closed-form MSE gradient:
         #   L = (1/B)·Σ_b ||z_b − z_sim_b||²   →   ∂L/∂z_b = (2/B)·(z_b − z_sim_b)
         #   E = (∂L/∂z)² ∝ (z − z_sim)²
-        # Пропорційність: константа (4/B²) одинакова для всіх вимірів → hot_dims та
-        # gap_norm обчислюються коректно. Повний autograd.grad більше не потрібен.
+        # Proportionality: the constant (4/B²) is the same for all dimensions,
+        # so hot_dims and gap_norm remain correct. Full autograd.grad is unnecessary.
         if self.exact_grad and torch.is_grad_enabled() and z.requires_grad:
             world_loss = F.mse_loss(z, z_sim)
             grad_z = torch.autograd.grad(
@@ -422,7 +423,7 @@ class EpistemicGapDetector(nn.Module):
             E        = diff.pow(2)                                 # (B, d)
             gap_norm = E.sum(-1).sqrt()                            # (B,)
 
-        # Топ-25% найгарячіших вимірів
+        # Top 25% hottest dimensions.
         threshold = E.quantile(0.75, dim=-1, keepdim=True)
         hot_dims  = (E >= threshold).float()
 
@@ -431,20 +432,20 @@ class EpistemicGapDetector(nn.Module):
 
 class CuriosityModule(nn.Module):
     """
-    Якщо ||E(z)|| > τ:
-      1. Формує Query q (проекція hot_dims → семантичний запит)
-      2. Генерує n контрфактичних роловтів через WorldRNN
-      3. Повертає curiosity_loss та збагачений z_curious
+    If `||E(z)|| > τ`:
+      1. Form query q (projection from hot_dims -> semantic query)
+      2. Generate n counterfactual rollouts through WorldRNN
+      3. Return curiosity_loss and enriched z_curious
     """
 
     def __init__(self, cfg: OMENv2Config):
         super().__init__()
         d = cfg.d_latent
-        self.query_proj  = nn.Linear(d, d)         # hot_dims → запит
-        self.fusion      = nn.Linear(d * 2, d)     # злиття z + відповіді з пам'яті
+        self.query_proj  = nn.Linear(d, d)         # hot_dims -> query
+        self.fusion      = nn.Linear(d * 2, d)     # fuse z with memory response
         self.n_cf        = cfg.n_counterfactual
         self.tau         = cfg.epistemic_tau
-        self.unknown_flag_count = 0                # лічильник UNKNOWN_EXCEPTION
+        self.unknown_flag_count = 0                # UNKNOWN_EXCEPTION counter
 
     def forward(self, z: torch.Tensor,
                 E: torch.Tensor,
@@ -462,17 +463,17 @@ class CuriosityModule(nn.Module):
         if not active.any():
             return z, torch.tensor(0.0, device=z.device)
 
-        # ── Query формується з гарячих вимірів ───────────────────────────────
+        # -- Build query from hot dimensions -----------------------------------
         query = self.query_proj(z * hot_dims)                      # (B, d)
 
-        # ── Читання з M-Core ──────────────────────────────────────────────────
+        # -- Read from M-Core --------------------------------------------------
         v_mem = memory.read(query)                                 # (B, d)
 
-        # Episodic recall як доповнення
+        # Episodic recall as a complement.
         v_ep  = memory.episodic_recall(query, k=4)                # (B, d)
         v_combined = (v_mem + v_ep) * 0.5
 
-        # ── Counterfactual rollouts ───────────────────────────────────────────
+        # -- Counterfactual rollouts -------------------------------------------
         cf_loss = torch.tensor(0.0, device=z.device)
         if self.n_cf > 0 and self.training:
             if counterfactual_actions is not None and counterfactual_actions.numel() > 0:
@@ -489,19 +490,19 @@ class CuriosityModule(nn.Module):
             z_cf_traj = world_rnn.simulate_sequence(
                 z.detach(), noise_actions)                         # (B, n_cf, d)
 
-            # Контрфактичний ланцюжок має відповідати збагаченому z+v_mem
+            # The counterfactual trajectory should match the enriched z+v_mem.
             z_target = (z + v_combined).detach()
             cf_loss  = F.mse_loss(z_cf_traj.mean(1), z_target)
 
-        # ── Детектуємо UNKNOWN_EXCEPTION (порожня пам'ять, великий gap) ──────
+        # -- Detect UNKNOWN_EXCEPTION (empty memory, large gap) ----------------
         mem_signal_norm = v_combined.norm(dim=-1)                  # (B,)
         unknown = active & (mem_signal_norm < 1e-3)
         if unknown.any():
             self.unknown_flag_count += unknown.sum().item()
 
-        # ── Збагачення стану ──────────────────────────────────────────────────
+        # -- State enrichment --------------------------------------------------
         z_enriched = self.fusion(torch.cat([z, v_combined], dim=-1))
-        # Залишаємо незмінними ті елементи батчу, де gap < τ
+        # Leave batch elements unchanged where gap < τ.
         z_out = torch.where(active.unsqueeze(-1), z_enriched, z)
 
         return z_out, cf_loss
@@ -511,12 +512,12 @@ class CuriosityModule(nn.Module):
 # 4.  S-CORE: SYMBOLIC CORE
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── 4.1  Символьні структури ─────────────────────────────────────────────────
+# -- 4.1 Symbolic structures --------------------------------------------------
 
 @dataclass(frozen=True)
 class SymFact:
-    """Факт у вигляді триплета (суб'єкт, предикат, об'єкт)"""
-    subj: int   # індекс у sym_vocab
+    """Fact represented as a triplet: (subject, predicate, object)."""
+    subj: int   # index in sym_vocab
     pred: int
     obj:  int
 
@@ -526,12 +527,12 @@ class SymFact:
 
 @dataclass
 class SymRule:
-    """Правило: IF умови → THEN висновки"""
+    """Rule: IF conditions -> THEN conclusions."""
     conditions:  Tuple[SymFact, ...]
     conclusions: Tuple[SymFact, ...]
-    weight:      float = 1.0    # важливість (зростає з використанням)
-    use_count:   int   = 0      # лічильник використань
-    complexity:  int   = 0      # кількість символів
+    weight:      float = 1.0    # importance (grows with usage)
+    use_count:   int   = 0      # usage counter
+    complexity:  int   = 0      # number of symbols
 
     def __post_init__(self):
         self.complexity = len(self.conditions) + len(self.conclusions)
@@ -540,26 +541,26 @@ class SymRule:
         return hash((self.conditions, self.conclusions))
 
 
-# ── 4.2  Робоча пам'ять ──────────────────────────────────────────────────────
+# -- 4.2 Working memory -------------------------------------------------------
 
 class WorkingMemory:
-    """Граф поточного контексту (факти + індекс для швидкого пошуку)"""
+    """Graph of the current context (facts + index for fast lookup)."""
 
     def __init__(self, max_facts: int = 32):
-        # OPT-WM: deque для O(1) popleft + set для O(1) membership / remove
+        # OPT-WM: deque for O(1) popleft + set for O(1) membership / remove.
         from collections import deque as _deque
-        self.facts:     _deque                    = _deque(maxlen=None)  # upbound вручну
+        self.facts:     _deque                    = _deque(maxlen=None)  # upper bound enforced manually
         self._fact_set: set                       = set()
         self.pred_idx:  Dict[int, set]            = defaultdict(set)
         self.max_facts = max_facts
 
     def add(self, fact: SymFact) -> bool:
-        if fact in self._fact_set:               # O(1) замість O(n) list scan
+        if fact in self._fact_set:               # O(1) instead of O(n) list scan
             return False
         if len(self.facts) >= self.max_facts:
-            removed = self.facts[0]              # peek oldest — O(1) для deque
-            self.facts.popleft()                 # O(1) замість O(n) list.pop(0)
-            self._fact_set.discard(removed)      # O(1) замість O(n) list.remove
+            removed = self.facts[0]              # peek oldest - O(1) for deque
+            self.facts.popleft()                 # O(1) instead of O(n) list.pop(0)
+            self._fact_set.discard(removed)      # O(1) instead of O(n) list.remove
             self.pred_idx[removed.pred].discard(removed)  # O(1)
         self.facts.append(fact)
         self._fact_set.add(fact)
@@ -581,12 +582,12 @@ class WorkingMemory:
     def __len__(self): return len(self.facts)
 
 
-# ── 4.3  Довготривала символьна пам'ять + Уніфікація ─────────────────────────
+# -- 4.3 Long-term symbolic memory + unification ------------------------------
 
 class LongTermMemory:
     """
-    База правил — хеш-таблиця {frozen(conditions) → SymRule}.
-    Уніфікація через точне зіставлення (з wildcards: pred=-1 = будь-який).
+    Rule base stored as a hash table: {frozen(conditions) -> SymRule}.
+    Unification uses exact matching (with wildcards: pred=-1 = any).
     """
 
     def __init__(self, max_rules: int = 256):
@@ -599,14 +600,14 @@ class LongTermMemory:
             self.rules[h].use_count += 1
             return False
         if len(self.rules) >= self.max_rules:
-            # Видаляємо найменш використовуване правило
+            # Remove the least-used rule.
             worst = min(self.rules.values(), key=lambda r: r.use_count)
             del self.rules[hash(worst)]
         self.rules[h] = rule
         return True
 
     def match(self, wm: WorkingMemory) -> List[SymRule]:
-        """Повертає всі правила, умови яких унуфіковані з WM"""
+        """Return all rules whose conditions unify with WM."""
         matched = []
         for rule in self.rules.values():
             if self._unify(rule.conditions, wm):
@@ -616,8 +617,8 @@ class LongTermMemory:
     def _unify(self, conditions: Tuple[SymFact, ...], wm: WorkingMemory) -> bool:
         for cond in conditions:
             found = False
-            # OPT-UNIFY: звужуємо пул через pred_idx замість повного перебору.
-            # Wildcard pred=-1 → fallback на весь _fact_set.
+            # OPT-UNIFY: narrow the pool via pred_idx instead of full scanning.
+            # Wildcard pred=-1 -> fall back to the full _fact_set.
             if cond.pred >= 0:
                 pool = wm.pred_idx.get(cond.pred, ())
             else:
@@ -634,18 +635,18 @@ class LongTermMemory:
         return True
 
     def complexity_penalty(self) -> float:
-        """Σ Usage(R) · Complexity(R) — регуляризатор S-Core"""
+        """Σ Usage(R) · Complexity(R) - S-Core regularizer."""
         return sum(r.use_count * r.complexity for r in self.rules.values())
 
     def __len__(self): return len(self.rules)
 
 
-# ── 4.4  Graph Neural Network (символьний → нейронний) ───────────────────────
+# -- 4.4 Graph Neural Network (symbolic -> neural) ----------------------------
 
 class SymbolicGNN(nn.Module):
     """
-    Перетворює граф фактів у вектор z_sym ∈ R^{d_latent}.
-    Факти → ембеддинги → message passing → pooling.
+    Convert a fact graph into a vector `z_sym ∈ R^{d_latent}`.
+    Facts -> embeddings -> message passing -> pooling.
     """
 
     def __init__(self, cfg: OMENv2Config):
@@ -666,7 +667,7 @@ class SymbolicGNN(nn.Module):
         if not facts:
             return torch.zeros(1, self.to_latent.out_features, device=device)
 
-        # Вузли — унікальні суб'єкти та об'єкти
+        # Nodes are unique subjects and objects.
         nodes: Dict[int, torch.Tensor] = {}
         for f in facts:
             for sym_id in (f.subj, f.obj):
@@ -675,7 +676,7 @@ class SymbolicGNN(nn.Module):
                                        device=device)
                     nodes[sym_id] = self.sym_emb(idx).squeeze(0)
 
-        # Message passing по ребрах (фактах)
+        # Message passing over edges (facts).
         for layer in self.msg_layers:
             new_nodes = {k: v.clone() for k, v in nodes.items()}
             for f in facts:
@@ -692,13 +693,13 @@ class SymbolicGNN(nn.Module):
         return z_sym
 
 
-# ── 4.5  Abduction Engine ─────────────────────────────────────────────────────
+# -- 4.5 Abduction Engine -----------------------------------------------------
 
 class AbductionHead(nn.Module):
     """
-    Нейромережевий генератор кандидатів правил.
+    Neural candidate-rule generator.
     R* = argmin [ Length(R) + λ·PredError(R, Trace) ]
-    Реалізація: нейромережа пропонує кандидати → символьна оцінка → вибір.
+    Implementation: the network proposes candidates -> symbolic scoring -> selection.
     """
 
     def __init__(self, cfg: OMENv2Config):
@@ -707,31 +708,31 @@ class AbductionHead(nn.Module):
         sv = cfg.sym_vocab
         self.n_cand = cfg.abduct_candidates
 
-        # Мережа → розподіл над sym_vocab для кожного слоту факту
+        # Network -> distribution over sym_vocab for each fact slot.
         self.rule_gen = nn.Sequential(
             nn.Linear(d, d * 2), nn.GELU(),
-            nn.Linear(d * 2, sv * 3 * 2)  # 2 факти × 3 слоти × vocab
+            nn.Linear(d * 2, sv * 3 * 2)  # 2 facts x 3 slots x vocab
         )
         self.sv = sv
 
     def forward(self, z: torch.Tensor) -> List[SymRule]:
         """
-        z: (1, d) — поточний стан
-        Returns список кандидатів-правил (без backprop на LTM)
+        z: (1, d) - current state
+        Returns a list of candidate rules (without backprop through LTM).
         """
         logits = self.rule_gen(z.squeeze(0))                       # (sv*6,)
         logits = logits.view(2, 3, self.sv)                        # (2 facts, 3 slots, vocab)
 
         rules = []
         for _ in range(self.n_cand):
-            # Gumbel-Softmax для диференційованої дискретизації
+            # Gumbel-Softmax for differentiable discretization.
             cond_idx = F.gumbel_softmax(logits[0], tau=1.0, hard=True).argmax(-1)
             conc_idx = F.gumbel_softmax(logits[1], tau=1.0, hard=True).argmax(-1)
 
             cond = SymFact(cond_idx[0].item(), cond_idx[1].item(), cond_idx[2].item())
             conc = SymFact(conc_idx[0].item(), conc_idx[1].item(), conc_idx[2].item())
 
-            # Принцип Оккама: довжина правила = 2 (мінімальна)
+            # Occam's principle: rule length = 2 (minimal).
             rule = SymRule(conditions=(cond,), conclusions=(conc,))
             rules.append(rule)
 
@@ -740,8 +741,8 @@ class AbductionHead(nn.Module):
 
 class SymbolicCore(nn.Module):
     """
-    Повний S-Core:
-      Нейронний z → Символьний граф G → Reasoning → G' → z_sym
+    Full S-Core:
+      Neural z -> symbolic graph G -> reasoning -> G' -> z_sym
     """
 
     def __init__(self, cfg: OMENv2Config):
@@ -749,16 +750,16 @@ class SymbolicCore(nn.Module):
         d  = cfg.d_latent
         sv = cfg.sym_vocab
 
-        # Нейронний → символьний (perception)
-        self.perceive = nn.Linear(d, sv * 3)           # → розподіл над фактами
+        # Neural -> symbolic (perception)
+        self.perceive = nn.Linear(d, sv * 3)           # -> distribution over facts
 
-        # GNN: символьний → нейронний (grounding)
+        # GNN: symbolic -> neural (grounding)
         self.gnn = SymbolicGNN(cfg)
 
         # Abduction Engine
         self.abduction = AbductionHead(cfg)
 
-        # Символьна консистентність: скільки z_sym "пояснює" z
+        # Symbolic consistency: how much z_sym "explains" z.
         self.sym_consistency = nn.Linear(d, d)
 
         self.wm  = WorkingMemory(cfg.sym_max_facts)
@@ -769,7 +770,7 @@ class SymbolicCore(nn.Module):
         self._step = 0
 
     def perceive_graph(self, z: torch.Tensor) -> List[SymFact]:
-        """z: (B, d) → список фактів для WM"""
+        """z: (B, d) -> list of facts for WM."""
         B = z.size(0)
         logits = self.perceive(z.mean(0, keepdim=True)).view(3, self.sv)
         # Gumbel → hard fact
@@ -778,7 +779,7 @@ class SymbolicCore(nn.Module):
         return [SymFact(*indices)]
 
     def reason(self) -> List[SymFact]:
-        """Застосувати правила LTM до WM → нові факти"""
+        """Apply LTM rules to WM and derive new facts."""
         new_facts = []
         matched = self.ltm.match(self.wm)
         for rule in matched:
@@ -791,8 +792,8 @@ class SymbolicCore(nn.Module):
 
     def abduce_and_learn(self, z: torch.Tensor, error: torch.Tensor) -> int:
         """
-        Запускаємо Abduction якщо помилка велика.
-        Повертає кількість доданих правил.
+        Run abduction when the error is large.
+        Return the number of added rules.
         """
         if error.item() < 0.5:
             return 0
@@ -820,14 +821,14 @@ class SymbolicCore(nn.Module):
         for f in new_facts:
             self.wm.add(f)
 
-        # 2. Reasoning: LTM → нові факти в WM
+        # 2. Reasoning: LTM -> new facts in WM
         inferred = self.reason()
         all_facts = self.wm.facts
 
         # 3. Grounding: G' → z_sym
         z_sym = self.gnn(all_facts, device).expand(B, -1)          # (B, d)
 
-        # 4. Abduction (раз на кілька кроків)
+        # 4. Abduction (once every few steps)
         if self._step % 5 == 0:
             self.abduce_and_learn(z, world_error)
 
@@ -843,7 +844,7 @@ class SymbolicCore(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5.  ОНОВЛЕНИЙ LOSS: L_OMEN_AGI
+# 5.  UPDATED LOSS: L_OMEN_AGI
 # ══════════════════════════════════════════════════════════════════════════════
 
 class OMENAGILoss(nn.Module):
@@ -861,7 +862,7 @@ class OMENAGILoss(nn.Module):
         super().__init__()
         self.cfg = cfg
         d = cfg.d_latent
-        # Структурний енкодер Program(y)
+        # Structural encoder Program(y)
         self.prog_enc = nn.Sequential(
             nn.Embedding(cfg.vocab_size, d),
         )
@@ -892,14 +893,14 @@ class OMENAGILoss(nn.Module):
         L_ce = F.cross_entropy(
             logits.reshape(-1, cfg.vocab_size), targets.reshape(-1), ignore_index=0)
 
-        # 2. KL (Оккамів регуляризатор на z)
+        # 2. KL (Occam regularizer on z)
         kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(-1).mean()
 
         # 3. Memory-augmented consistency: ||z - (z_sim + v_mem)||²
         z_target = (z_sim + v_mem).detach()
         L_mem_consist = F.mse_loss(z, z_target)
 
-        # 4. Складність WorldRNN (скінченні різниці)
+        # 4. WorldRNN complexity (finite differences)
         with torch.no_grad():
             eps = 1e-2
             dz = torch.randn_like(z) * eps
@@ -909,14 +910,14 @@ class OMENAGILoss(nn.Module):
             L_complex = ((zn1 - zn2) / eps).pow(2).mean()
 
         # 5. Memory Recall Loss: KL(Q(z) || Read(M,z))
-        # Апроксимація: MSE між z та v_mem (якщо v_mem ≈ 0 → великий штраф)
+        # Approximation: MSE between z and v_mem (if v_mem ~= 0 -> large penalty)
         v_mem_sig = v_mem.detach().norm(dim=-1, keepdim=True).clamp(min=1e-4)
         L_recall = F.mse_loss(z, (v_mem / v_mem_sig).detach())
 
-        # 6. Novelty bonus: -I(z; M) ≈ -‖v_mem‖ (більша пам'ять → більший бонус)
+        # 6. Novelty bonus: -I(z; M) ~= -‖v_mem‖ (more memory -> larger bonus)
         I_zm = v_mem.norm(dim=-1).mean()
 
-        # 7. Symbolic Grounding (з S-Core)
+        # 7. Symbolic grounding (from S-Core)
         L_sym_ground = sym_loss
 
         total = (L_ce
@@ -930,8 +931,8 @@ class OMENAGILoss(nn.Module):
                  + sparsity
                  + curiosity_l * 0.1)
 
-        # L_scale: MDL-регуляризатор (не дає "розмазати" інфо по вектору)
-        # Σ||z_t||² / B — однаковий для токен і латент в v2 (один простір)
+        # L_scale: MDL regularizer (prevents "smearing" information across the vector)
+        # Σ||z_t||² / B - identical for token and latent in v2 (one shared space)
         L_scale = cfg.lambda_tok * z.pow(2).mean()
         total   = total + L_scale
 
@@ -947,21 +948,21 @@ class OMENAGILoss(nn.Module):
             "ltm_pen":     ltm_penalty,
             "curiosity":   curiosity_l.item(),
             "sparsity":    sparsity.item() if torch.is_tensor(sparsity) else sparsity,
-            "l_scale":     L_scale.item(),   # MDL-регуляризатор OMEN-Scale
+            "l_scale":     L_scale.item(),   # OMEN-Scale MDL regularizer
         }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 6.  OMENv2 — ПОВНА МОДЕЛЬ
+# 6.  OMENv2 - FULL MODEL
 # ══════════════════════════════════════════════════════════════════════════════
 
 class OMENv2(nn.Module):
     """
-    Повний цикл:
+    Full cycle:
       Abduce (encoder) →
       M-Core recall →
       S-Core reasoning →
-      Curiosity (якщо gap великий) →
+      Curiosity (if the gap is large) →
       Deduce (WorldRNN) →
       Induce (decoder + L_OMEN_AGI)
     """
@@ -980,40 +981,40 @@ class OMENv2(nn.Module):
 
     def forward(self, src: torch.Tensor,
                 tgt: torch.Tensor) -> Dict:
-        # ── Abduce ───────────────────────────────────────────────────────────
+        # -- Abduce ------------------------------------------------------------
         z, mu, logvar, enc_sp = self.encoder(src)
 
-        # ── M-Core: читаємо пам'ять ─────────────────────────────────────────
+        # -- M-Core: read memory -----------------------------------------------
         v_mem = self.memory.read(z)                                # (B, d)
 
-        # ── WorldRNN: симулюємо (останні 8 кроків для швидкості) ────────────
+        # -- WorldRNN: simulate (last 8 steps for speed) -----------------------
         sim_tgt = tgt[:, -8:] if tgt.size(1) > 8 else tgt
         z_sim_traj = self.world_rnn.simulate_sequence(z, sim_tgt)
         z_sim = z_sim_traj[:, -1]                                  # (B, d)
 
-        # ── Epistemic Gap ────────────────────────────────────────────────────
+        # -- Epistemic gap -----------------------------------------------------
         E, gap_norm, hot_dims = self.epistemic.compute(z, self.world_rnn, z_sim)
 
-        # ── Curiosity ────────────────────────────────────────────────────────
+        # -- Curiosity ---------------------------------------------------------
         z_enriched, cf_loss = self.curiosity(
             z, E, hot_dims, gap_norm, self.memory, self.world_rnn)
 
-        # ── S-Core ───────────────────────────────────────────────────────────
+        # -- S-Core ------------------------------------------------------------
         world_err = F.mse_loss(z_sim, z.detach()).detach()
         z_sym, sym_loss = self.s_core(z_enriched, world_err)
 
-        # z після збагачення: нейронний + символьний + пам'ять
+        # z after enrichment: neural + symbolic + memory
         z_final = z_enriched + 0.1 * z_sym + 0.1 * v_mem
 
-        # ── M-Core: запис відкладений — повертаємо аргументи ───────────────
+        # -- M-Core: deferred write - return the arguments ---------------------
         conf = (1.0 - gap_norm.clamp(0, 1))
         write_args = (z.detach(), z_sim.detach(), conf.detach())
 
-        # ── Decode ───────────────────────────────────────────────────────────
+        # -- Decode ------------------------------------------------------------
         logits, dec_sp = self.decoder(tgt, z_final)
         sparsity = enc_sp + dec_sp
 
-        # ── Loss ─────────────────────────────────────────────────────────────
+        # -- Loss --------------------------------------------------------------
         ltm_pen = self.s_core.rule_regularizer(self.cfg)
         out = self.loss_fn(logits, tgt, z_final, mu, logvar,
                            z_sim, v_mem, z_sym, sym_loss,
@@ -1025,7 +1026,7 @@ class OMENv2(nn.Module):
         out["n_rules"]    = len(self.s_core.ltm)
         out["n_writes"]   = self.memory.n_writes
         out["unknown_ex"] = self.curiosity.unknown_flag_count
-        out["write_args"] = write_args  # (z, z_sim, conf) — застосувати після backward
+        out["write_args"] = write_args  # (z, z_sim, conf) - apply after backward
         return out
 
     @torch.no_grad()
@@ -1033,26 +1034,26 @@ class OMENv2(nn.Module):
                  temperature: float = 0.8,
                  dynamic_reasoning: bool = True) -> torch.Tensor:
         """
-        Генерує max_new токенів після prompt.
+        Generate `max_new` tokens after the prompt.
 
-        dynamic_reasoning=True (за замовчуванням):
-          На КОЖНОМУ кроці перекодуємо поточний контекст, оновлюємо
-          z_sym (S-Core) та v_mem (M-Core) → z_final змінюється по ходу
-          генерації, відображаючи нараховане знання.
+        dynamic_reasoning=True (default):
+          At EVERY step, re-encode the current context and update
+          z_sym (S-Core) and v_mem (M-Core), so z_final changes during
+          generation and reflects accumulated knowledge.
 
-          Це відповідає «повільному контуру» (Curiosity + S-Core + M-Core):
-            ctx_t → Encoder → z_ctx
-            z_ctx → S-Core  → z_sym   (застосування verified правил з LTM)
-            z_ctx → M-Core  → v_mem   (episodic recall)
+          This matches the "slow loop" (Curiosity + S-Core + M-Core):
+            ctx_t -> Encoder -> z_ctx
+            z_ctx -> S-Core  -> z_sym   (apply verified rules from LTM)
+            z_ctx -> M-Core  -> v_mem   (episodic recall)
             z_final = z_ctx + 0.1·z_sym + 0.1·v_mem
 
         dynamic_reasoning=False:
-          Класичний режим: z_final обчислюється один раз по prompt
-          і залишається фіксованим (швидший, менш точний).
+          Classic mode: z_final is computed once from the prompt
+          and remains fixed (faster, less accurate).
         """
         self.eval()
 
-        # ── Ініціальний стан (використовується якщо dynamic=False) ───────────
+        # -- Initial state (used when dynamic=False) ---------------------------
         z, _, _, _ = self.encoder(prompt)
         v_mem      = self.memory.read(z)
         z_sym, _   = self.s_core(z, torch.tensor(0.0, device=z.device))
@@ -1063,7 +1064,7 @@ class OMENv2(nn.Module):
             ctx = generated[:, -self.cfg.seq_len:]
 
             if dynamic_reasoning:
-                # ── reasoning_step: перекодуємо + оновлюємо S-Core / M-Core ──
+                # -- reasoning_step: re-encode + update S-Core / M-Core --------
                 z_ctx, _, _, _ = self.encoder(ctx)
                 z_sym_step, _  = self.s_core(
                     z_ctx, torch.tensor(0.0, device=z_ctx.device))
@@ -1094,7 +1095,7 @@ class OMENv2(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 7.  ДАТАСЕТИ
+# 7.  DATASETS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def make_counting(n, sl):
@@ -1122,9 +1123,9 @@ def make_python(n, sl):
 
 def make_rule_transfer(n, sl):
     """
-    Задача з явним переносом правила:
-    Послідовності виду [A, op, B, =, C] де op ∈ {+, -, *}
-    Модель ПОВИННА вивести правило, а не запам'ятати конкретний приклад.
+    Task with explicit rule transfer:
+    sequences of the form [A, op, B, =, C], where op ∈ {+, -, *}
+    The model MUST infer the rule rather than memorize a specific example.
     """
     data = []
     for _ in range(n):
@@ -1134,15 +1135,15 @@ def make_rule_transfer(n, sl):
         if op == 0:   C = (A + B) % 200 + 10
         elif op == 1: C = abs(A - B) + 10
         else:         C = (A * B) % 200 + 10
-        # Кодуємо як послідовність чисел + паддинг
+        # Encode as a sequence of numbers + padding.
         seq = [A, 100+op, B, 200, C] + [0]*(sl - 5)
         data.append(torch.tensor(seq[:sl], dtype=torch.long))
     return data
 
 def collate(batch):
-    # Підтримуємо два формати:
-    #   1) List[Tensor]               — синтетичний датасет (make_counting, …)
-    #   2) List[Tuple[Tensor,Tensor]] — реальний текст (load_text_corpus → (src, tgt))
+    # Support two formats:
+    #   1) List[Tensor]               - synthetic dataset (make_counting, ...)
+    #   2) List[Tuple[Tensor,Tensor]] - real text (load_text_corpus -> (src, tgt))
     if isinstance(batch[0], (tuple, list)):
         src = torch.stack([item[0] for item in batch])
         tgt = torch.stack([item[1] for item in batch])
@@ -1152,7 +1153,7 @@ def collate(batch):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 8.  ТРЕНУВАЛЬНИЙ ЦИКЛ
+# 8.  TRAINING LOOP
 # ══════════════════════════════════════════════════════════════════════════════
 
 def train_epoch(model: OMENv2, dataset, optimizer, batch_size=16, max_batches=8):
@@ -1173,7 +1174,7 @@ def train_epoch(model: OMENv2, dataset, optimizer, batch_size=16, max_batches=8)
         out["total"].backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-        # Консолідація пам'яті після backward (як гіпокамп після досвіду)
+        # Consolidate memory after backward, like a hippocampus after experience.
         model.memory.write(*out["write_args"])
 
         for k, v in out.items():
@@ -1194,25 +1195,25 @@ def train_epoch(model: OMENv2, dataset, optimizer, batch_size=16, max_batches=8)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 9.  INLINE ТЕСТИ
+# 9.  INLINE TESTS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_tests(cfg: OMENv2Config) -> None:
     sep = lambda s: print(f"\n{'═'*72}\n  {s}\n{'═'*72}")
 
-    # T0: Параметри
-    sep("TEST 0 · Параметри та VRAM footprint")
+    # T0: Parameters
+    sep("TEST 0 · Parameters and VRAM footprint")
     model = OMENv2(cfg).to(DEVICE)
     n_par = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Пристрій : {DEVICE}")
-    print(f"  Параметри: {n_par:,}")
+    print(f"  Device    : {DEVICE}")
+    print(f"  Parameters: {n_par:,}")
     print("  Memory report:")
     print(model.memory_report())
     assert n_par > 0
     print("  [PASS]")
 
-    # T1: Forward pass — форма + нові поля
-    sep("TEST 1 · OMENv2 Forward (всі компоненти)")
+    # T1: Forward pass - shape + new fields
+    sep("TEST 1 · OMENv2 Forward (all components)")
     B, T = 4, cfg.seq_len - 1
     src = torch.randint(1, 200, (B, T)).to(DEVICE)
     tgt = torch.randint(1, 200, (B, T)).to(DEVICE)
@@ -1222,10 +1223,10 @@ def run_tests(cfg: OMENv2Config) -> None:
 
     for key in ("total", "ce", "kl", "mem_consist", "recall",
                 "sym_ground", "gap_norm", "n_rules", "n_writes"):
-        assert key in out, f"FAIL: відсутній ключ {key}"
+        assert key in out, f"FAIL: missing key {key}"
     assert out["logits"].shape == (B, T, cfg.vocab_size)
     assert out["z"].shape == (B, cfg.d_latent)
-    print(f"  Forward час    : {fwd_ms:.0f} ms")
+    print(f"  Forward time   : {fwd_ms:.0f} ms")
     print(f"  CE loss init   : {out['ce']:.3f}")
     print(f"  Gap norm       : {out['gap_norm']:.4f}")
     print(f"  Memory writes  : {out['n_writes']}")
@@ -1233,8 +1234,8 @@ def run_tests(cfg: OMENv2Config) -> None:
     print(f"  UNKNOWN flags  : {out['unknown_ex']}")
     print("  [PASS]")
 
-    # T2: Backward — WorldRNN має отримати grad
-    sep("TEST 2 · Backward — grad flow через M-Core + S-Core")
+    # T2: Backward - WorldRNN must receive gradients
+    sep("TEST 2 · Backward - grad flow through M-Core + S-Core")
     model.train()
     out2 = model(src, tgt)
     out2["total"].backward()
@@ -1248,34 +1249,34 @@ def run_tests(cfg: OMENv2Config) -> None:
     print(f"  Encoder grad norm  : {enc_grad:.4f}")
     print(f"  WorldRNN grad norm : {wrnn_grad:.4f}")
     print(f"  S-Core grad norm   : {sco_grad:.4f}")
-    assert enc_grad  > 0, "FAIL: encoder без граду"
-    assert sco_grad  > 0, "FAIL: S-Core без граду"
+    assert enc_grad  > 0, "FAIL: encoder has no gradients"
+    assert sco_grad  > 0, "FAIL: S-Core has no gradients"
     model.zero_grad()
     print("  [PASS]")
 
-    # T3: TensorProductMemory — запис/читання
+    # T3: TensorProductMemory - write/read
     sep("TEST 3 · TensorProductMemory — write / read / episodic")
     mem = model.memory
     mem_before = mem.memory.norm().item()
 
     z_test = torch.randn(8, cfg.d_latent).to(DEVICE)
     v_test = torch.randn(8, cfg.d_latent).to(DEVICE)
-    conf   = torch.tensor([0.1]*4 + [0.9]*4, device=DEVICE)  # перші 4 — записуємо
+    conf   = torch.tensor([0.1]*4 + [0.9]*4, device=DEVICE)  # first 4 should be written
     mem.write(z_test, v_test, conf)
 
     mem_after = mem.memory.norm().item()
-    assert mem_after > mem_before, "FAIL: пам'ять не змінилася після write"
-    assert mem.n_writes >= 4, f"FAIL: очікували ≥4 записів, отримали {mem.n_writes}"
+    assert mem_after > mem_before, "FAIL: memory did not change after write"
+    assert mem.n_writes >= 4, f"FAIL: expected >=4 writes, got {mem.n_writes}"
 
     v_ret = mem.read(z_test[:2])
-    assert v_ret.shape == (2, cfg.d_latent), "FAIL: форма read"
+    assert v_ret.shape == (2, cfg.d_latent), "FAIL: read shape"
 
     v_ep = mem.episodic_recall(z_test[:2], k=3)
-    assert v_ep.shape == (2, cfg.d_latent), "FAIL: форма episodic_recall"
+    assert v_ep.shape == (2, cfg.d_latent), "FAIL: episodic_recall shape"
 
     footprint = mem.memory_footprint_bytes()
     print(f"  M-Core before write norm : {mem_before:.4f}")
-    print(f"  M-Core after write norm  : {mem_after:.4f}  (змінилася ✓)")
+    print(f"  M-Core after write norm  : {mem_after:.4f}  (changed ✓)")
     print(f"  n_writes                 : {mem.n_writes}")
     print(f"  read shape               : {tuple(v_ret.shape)} ✓")
     print(f"  episodic_recall shape    : {tuple(v_ep.shape)} ✓")
@@ -1290,42 +1291,42 @@ def run_tests(cfg: OMENv2Config) -> None:
     E, gap_norm, hot_dims = model.epistemic.compute(z_r, model.world_rnn, z_s)
     assert E.shape == (B, cfg.d_latent), "FAIL: E shape"
     assert gap_norm.shape == (B,), "FAIL: gap_norm shape"
-    assert (E >= 0).all(), "FAIL: E < 0 (квадрат має бути ≥ 0)"
-    assert hot_dims.sum() > 0, "FAIL: немає гарячих вимірів"
+    assert (E >= 0).all(), "FAIL: E < 0 (square must be >= 0)"
+    assert hot_dims.sum() > 0, "FAIL: no hot dimensions"
     print(f"  E shape          : {tuple(E.shape)} ✓")
     print(f"  gap_norm mean    : {gap_norm.mean():.4f}")
-    print(f"  hot_dims active  : {hot_dims.mean():.2%} вимірів")
+    print(f"  hot_dims active  : {hot_dims.mean():.2%} of dimensions")
     print("  [PASS]")
 
-    # T5: S-Core — символьне виведення
+    # T5: S-Core - symbolic inference
     sep("TEST 5 · SymbolicCore — Perception → Reason → Abduce")
     sc = model.s_core
     sc.ltm.rules.clear()
 
-    # Вручну додамо правило в LTM
+    # Add a rule to LTM manually.
     r = SymRule(
         conditions=(SymFact(1, 0, 2),),
         conclusions=(SymFact(1, 1, 3),)
     )
     sc.ltm.add_rule(r)
 
-    # Додамо відповідний факт в WM
+    # Add the corresponding fact to WM.
     sc.wm.clear()
     sc.wm.add(SymFact(1, 0, 2))
 
     matched = sc.ltm.match(sc.wm)
     inferred = sc.reason()
-    print(f"  LTM правил        : {len(sc.ltm)}")
-    print(f"  Matched правила   : {len(matched)}")
-    print(f"  Виведені факти    : {inferred}")
-    assert len(matched) >= 1, "FAIL: уніфікація не спрацювала"
+    print(f"  LTM rules         : {len(sc.ltm)}")
+    print(f"  Matched rules     : {len(matched)}")
+    print(f"  Inferred facts    : {inferred}")
+    assert len(matched) >= 1, "FAIL: unification did not fire"
 
-    # Абдукція
+    # Abduction
     z_abd = torch.randn(1, cfg.d_latent, device=DEVICE)
     err_high = torch.tensor(2.0)
     n_added = sc.abduce_and_learn(z_abd, err_high)
-    print(f"  Доданих правил (абдукція): {n_added}")
-    print(f"  LTM після абдукції: {len(sc.ltm)}")
+    print(f"  Added rules (abduction): {n_added}")
+    print(f"  LTM after abduction: {len(sc.ltm)}")
     print("  [PASS]")
 
     # T6: CuriosityModule
@@ -1333,18 +1334,18 @@ def run_tests(cfg: OMENv2Config) -> None:
     model.train()
     z_c = torch.randn(B, cfg.d_latent, device=DEVICE)
     E_c, gn_c, hd_c = model.epistemic.compute(z_c, model.world_rnn, z_c * 2)
-    # Форсуємо активацію curiosity (gap_norm > tau)
+    # Force curiosity activation (gap_norm > tau).
     gn_forced = torch.ones(B, device=DEVICE) * (cfg.epistemic_tau + 0.5)
     z_enr, cf_l = model.curiosity(z_c, E_c, hd_c, gn_forced, model.memory, model.world_rnn)
     assert z_enr.shape == (B, cfg.d_latent), "FAIL: z_enr shape"
-    assert not math.isnan(cf_l.item()), "FAIL: NaN у curiosity loss"
+    assert not math.isnan(cf_l.item()), "FAIL: NaN in curiosity loss"
     print(f"  z_enr shape      : {tuple(z_enr.shape)} ✓")
     print(f"  counterfactual L : {cf_l.item():.4f}")
     print(f"  UNKNOWN flags    : {model.curiosity.unknown_flag_count}")
     print("  [PASS]")
 
-    # T7: Мінімальне навчання (25 ітерацій)
-    sep("TEST 7 · Навчання 25 ітерацій — зниження CE + зростання LTM")
+    # T7: Minimal training (25 iterations)
+    sep("TEST 7 · Training for 25 iterations - CE down + LTM up")
     model.train()
     ds  = make_counting(128, cfg.seq_len)
     opt = AdamW(model.parameters(), lr=3e-4)
@@ -1363,25 +1364,25 @@ def run_tests(cfg: OMENv2Config) -> None:
     first5 = sum(hist_ce[:5]) / 5
     last5  = sum(hist_ce[-5:]) / 5
     max_rules = max(hist_rules)
-    print(f"  CE (перші 5)    : {first5:.3f}")
-    print(f"  CE (останні 5)  : {last5:.3f}")
-    print(f"  Макс. LTM правил: {max_rules}")
-    assert last5 < first5, "FAIL: CE не знижується"
+    print(f"  CE (first 5)    : {first5:.3f}")
+    print(f"  CE (last 5)     : {last5:.3f}")
+    print(f"  Max LTM rules   : {max_rules}")
+    assert last5 < first5, "FAIL: CE is not decreasing"
     print("  [PASS]")
 
-    # T8: Генерація
-    sep("TEST 8 · Генерація токенів (dynamic_reasoning=True/False)")
+    # T8: Generation
+    sep("TEST 8 · Token generation (dynamic_reasoning=True/False)")
     model.eval()
     pr = torch.randint(10, 100, (1, 8), device=DEVICE)
 
-    # dynamic_reasoning=True — S-Core + M-Core на кожному кроці
+    # dynamic_reasoning=True - S-Core + M-Core at every step
     with torch.no_grad():
         gen_dyn = model.generate(pr, max_new=16, dynamic_reasoning=True)
     assert gen_dyn.shape == (1, 24), f"FAIL: gen_dyn shape {gen_dyn.shape}"
     print(f"  Prompt          : {pr[0].tolist()}")
     print(f"  Output (dynamic): {gen_dyn[0, 8:].tolist()}")
 
-    # dynamic_reasoning=False — класичний (z_final фіксований)
+    # dynamic_reasoning=False - classic mode (fixed z_final)
     with torch.no_grad():
         gen_static = model.generate(pr, max_new=16, dynamic_reasoning=False)
     assert gen_static.shape == (1, 24), f"FAIL: gen_static shape {gen_static.shape}"
@@ -1389,7 +1390,7 @@ def run_tests(cfg: OMENv2Config) -> None:
     print("  [PASS]")
 
     print(f"\n{'═'*72}")
-    print("  ✅  Всі 9 тестів пройдено успішно")
+    print("  ✅  All 9 tests passed successfully")
     print(f"{'═'*72}\n")
 
 
@@ -1446,7 +1447,7 @@ def benchmark(cfg: OMENv2Config, epochs: int = 6) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 11.  ABLATION: OMENv2 vs CE-only vs v1 (без пам'яті)
+# 11.  ABLATION: OMENv2 vs CE-only vs v1 (without memory)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def ablation(cfg: OMENv2Config) -> None:
@@ -1501,7 +1502,7 @@ if __name__ == "__main__":
         alpha=0.1, beta=0.05, gamma=0.1, delta=1e-3,
         eta=0.05, lam_sym=0.02,
         epistemic_tau=0.3,
-        # OMEN-Scale MDL (новий)
+        # OMEN-Scale MDL (new)
         lambda_tok=1e-4, lambda_conc=1e-3,
     )
 
@@ -1509,7 +1510,7 @@ if __name__ == "__main__":
     benchmark(cfg, epochs=6)
     ablation(cfg)
 
-    # ── OMEN-Scale (ієрархічний, 3 рівні) ─────────────────────────────────────
-    # Запустити: python omen_scale.py
-    print("\n  Для запуску OMEN-Scale (Token→Concept→Symbolic):")
+    # -- OMEN-Scale (hierarchical, 3 levels) ----------------------------------
+    # Run: python omen_scale.py
+    print("\n  To run OMEN-Scale (Token→Concept→Symbolic):")
     print("    python omen_scale.py\n")

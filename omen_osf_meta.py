@@ -1,34 +1,34 @@
 """
 omen_osf_meta.py — Synthesis Meta-Controller (OSF)
-===================================================
-OMEN Synthesis Framework: мета-контролер стратегії генерації.
+==================================================
+OMEN Synthesis Framework: meta-controller for generation strategy.
 
-Вибирає стратегію σ ∈ {Fast, Careful, Exploratory} на основі задачі.
+Chooses a strategy σ ∈ {Fast, Careful, Exploratory} from task state.
 
-Математика (REINFORCE):
-  π_meta(σ|s_task) — policy над стратегіями
+REINFORCE formulation:
+  π_meta(σ|s_task) — policy over strategies
   L_meta = E_{σ~π_meta}[−R(σ) + β·Cost(σ)]
 
-  R(σ)    — якість результату (якість генерації)
-  Cost(σ) — обчислювальна вартість (час, ресурси)
-  β       — баланс якість/вартість
+  R(σ)    — output quality (generation quality)
+  Cost(σ) — computational cost (time, resources)
+  β       — quality/cost tradeoff
 
-Три стратегії:
-  Fast        : без планування, прямий decode (σ=0)
-    Cost=0.1  → мало часу, нижча якість
+Three strategies:
+  Fast        : no planning, direct decode (σ=0)
+    Cost=0.1  -> little time, lower quality
   Careful     : 1 Planning + Simulation + 1 Reflection (σ=1)
-    Cost=0.5  → середній баланс (за замовчуванням)
-  Exploratory : Multi-plan beam + повна рефлексія + 3 спроби (σ=2)
-    Cost=1.0  → багато часу, найвища якість
+    Cost=0.5  -> balanced default
+  Exploratory : multi-plan beam + full reflection + 3 attempts (σ=2)
+    Cost=1.0  -> high time cost, highest quality
 
-Стан s_task включає:
-  - task_difficulty: оцінка складності (з gap_norm та план_depth)
-  - quality_estimate: поточна якість (з CE loss)
-  - resources_used: скільки вже витрачено
+State `s_task` includes:
+  - task_difficulty: complexity estimate (from gap_norm and plan_depth)
+  - quality_estimate: current quality (from CE loss)
+  - resources_used: how much has already been spent
 
-Інтеграція:
-  OSFSynthesizer.forward() запитує SynthesisMetaController.select_strategy()
-  Стратегія визначає кількість ітерацій рефлексії та глибину планування.
+Integration:
+  OSFSynthesizer.forward() calls `SynthesisMetaController.select_strategy()`
+  The strategy controls reflection count and planning depth.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ from torch.distributions import Categorical
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1.  СТРАТЕГІЇ
+# 1. STRATEGIES
 # ══════════════════════════════════════════════════════════════════════════════
 
 STRATEGY_FAST        = 0
@@ -57,18 +57,18 @@ STRATEGY_NAMES = {
     STRATEGY_EXPLORATORY: "Exploratory",
 }
 
-# Вартість кожної стратегії (REINFORCE Cost term)
+# Cost of each strategy (REINFORCE cost term).
 STRATEGY_COSTS = torch.tensor([0.1, 0.5, 1.0])
 
 
 @dataclass
 class StrategyConfig:
-    """Конфігурація параметрів для обраної стратегії."""
+    """Configuration parameters for a selected strategy."""
     strategy_id:    int
-    plan_depth:     int     # max_depth для SymbolicPlanner
-    n_reflections:  int     # кількість ітерацій ReflectionModule
-    sim_steps:      int     # кроків симуляції WorldSimulator
-    confidence_tau: float   # поріг впевненості для прийняття результату
+    plan_depth:     int     # max_depth for SymbolicPlanner
+    n_reflections:  int     # number of ReflectionModule iterations
+    sim_steps:      int     # number of WorldSimulator simulation steps
+    confidence_tau: float   # confidence threshold for accepting the result
 
 
 STRATEGY_CONFIGS: Dict[int, StrategyConfig] = {
@@ -86,7 +86,7 @@ STRATEGY_CONFIGS: Dict[int, StrategyConfig] = {
 
 @dataclass
 class MetaTrajectory:
-    """Статистика траєкторії мета-контролера."""
+    """Meta-controller trajectory statistics."""
     strategy_id:    int
     strategy_name:  str
     quality_reward: float
@@ -101,14 +101,14 @@ class MetaTrajectory:
 
 class TaskStateEncoder(nn.Module):
     """
-    Кодує стан задачі у векторне представлення для π_meta.
+    Encode the task state into a vector representation for π_meta.
 
-    Стан s_task = (gap_norm, ce_loss, plan_depth, n_rules, n_writes)
+    State s_task = (gap_norm, ce_loss, plan_depth, n_rules, n_writes)
     """
 
     def __init__(self, d_state: int = 32, dropout: float = 0.1):
         super().__init__()
-        # Скалярні ознаки → d_state
+        # Scalar features -> d_state.
         self.encoder = nn.Sequential(
             nn.Linear(8, d_state),
             nn.GELU(),
@@ -149,14 +149,14 @@ class TaskStateEncoder(nn.Module):
 
 class SynthesisMetaController(nn.Module):
     """
-    Мета-контролер стратегії генерації OSF.
+    Meta-controller for OSF generation strategy.
 
-    Вибирає σ ∈ {Fast, Careful, Exploratory} через Actor-Critic.
+    Chooses σ ∈ {Fast, Careful, Exploratory} through Actor-Critic.
 
     Actor:  π_meta(σ|s_task) = softmax(W_actor · s_task)
-    Critic: V_meta(s_task)   = W_critic · s_task  (baseline для REINFORCE)
+    Critic: V_meta(s_task)   = W_critic · s_task as the REINFORCE baseline
 
-    Навчання (REINFORCE):
+    Training (REINFORCE):
       A(s, σ) = R(σ) − β·Cost(σ) − V(s)   (advantage)
       L_actor = -E[log π_meta(σ|s) · A(s, σ)] − entropy_beta·H(π_meta)
       L_critic = E[(R(σ) − β·Cost(σ) − V(s))²]
@@ -166,7 +166,7 @@ class SynthesisMetaController(nn.Module):
     def __init__(
         self,
         d_state:      int   = 32,
-        beta:         float = 0.1,     # баланс якість/вартість
+        beta:         float = 0.1,     # quality/cost balance
         entropy_beta: float = 0.01,    # exploration bonus
         dropout:      float = 0.1,
     ):
@@ -183,7 +183,7 @@ class SynthesisMetaController(nn.Module):
         # Critic V_meta(s)
         self.critic = nn.Linear(d_state, 1)
 
-        # Лічильники для статистики
+        # Counters for statistics.
         self._strategy_counts = [0] * N_STRATEGIES
         self._total_reward    = 0.0
         self._n_episodes      = 0
@@ -200,12 +200,12 @@ class SynthesisMetaController(nn.Module):
         latent_norm: float = 0.0,
     ) -> Tuple[StrategyConfig, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Вибирає стратегію σ.
+        Select a strategy σ.
 
         Returns:
-          cfg      : StrategyConfig для обраної стратегії
-          log_prob : log π_meta(σ|s) — для REINFORCE backward
-          value    : V_meta(s) — baseline
+          cfg      : StrategyConfig for the selected strategy
+          log_prob : log π_meta(σ|s) for REINFORCE backward
+          value    : V_meta(s), the baseline
         """
         s = self.state_enc(
             gap_norm,
@@ -245,9 +245,7 @@ class SynthesisMetaController(nn.Module):
         strategy_id: int,
         entropy: torch.Tensor | None = None,
     ) -> MetaTrajectory:
-        """
-        Перевизначена версія з реальною ентропією policy distribution.
-        """
+        """Version that uses the true entropy of the policy distribution."""
         device = log_prob.device
         cost = STRATEGY_COSTS[strategy_id].to(device)
         r_net = quality_reward - self.beta * cost.item()

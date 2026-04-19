@@ -1,24 +1,24 @@
 """
-omen_osf_planner.py — Symbolic Planner (H2 рівень OSF)
-=======================================================
+omen_osf_planner.py — Symbolic Planner (OSF H2 level)
+=====================================================
 OMEN Synthesis Framework: Plan Level.
 
-Будує символьний план з IntentState через нейрокерований пошук.
+Builds a symbolic plan from `IntentState` through neural-guided search.
 
-Математика (GOLOG/PDDL-стиль):
+Mathematics (GOLOG/PDDL style):
   pre(aᵢ) ⊆ WMᵢ
   WM_{i+1} = (WMᵢ \ del(aᵢ)) ∪ add(aᵢ)
   goal ⊆ WM_{K+1}
 
-  Нейропошук (як AlphaGo):
-    π_plan(a|s) — нейрополітика наступної дії
-    V_plan(s)   — ціннісна мережа для відсікання
+  Neural search (similar to AlphaGo):
+    π_plan(a|s) — neural policy for the next action
+    V_plan(s)   — value network for pruning
 
   L_plan = -E_{τ~π_plan}[R_plan(τ)] + α_plan·Length(τ)
 
-Інтеграція:
-  IntentState → SymbolicPlanner → PlanSequence
-  PlanSequence → HierarchicalDecoder (omen_osf_decoder.py)
+Integration:
+  IntentState -> SymbolicPlanner -> PlanSequence
+  PlanSequence -> HierarchicalDecoder (omen_osf_decoder.py)
 """
 
 from __future__ import annotations
@@ -33,12 +33,12 @@ import torch.nn.functional as F
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1.  ОПЕРАТОРИ ПЛАНУ  (GOLOG-стиль, без зовнішніх солверів)
+# 1. PLAN OPERATORS (GOLOG-style, without external solvers)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass(frozen=True)
 class PlanFact:
-    """Факт у WM плановика: (predicate_id, arg)."""
+    """Fact in the planner WM: `(predicate_id, arg)`."""
     pred: int
     arg:  int
     def __repr__(self) -> str:
@@ -48,12 +48,12 @@ class PlanFact:
 @dataclass
 class PlanOperator:
     """
-    Оператор плану aᵢ:
-      preconditions : факти що мають бути у WM (pre)
-      add_effects   : факти що додаються після застосування
-      del_effects   : факти що видаляються після застосування
-      embedding     : (d_plan,) — нейронне представлення оператора
-      op_type       : рядковий тип (для інтерпретації декодером)
+    Plan operator aᵢ:
+      preconditions : facts that must be present in WM (pre)
+      add_effects   : facts added after application
+      del_effects   : facts removed after application
+      embedding     : (d_plan,) — neural representation of the operator
+      op_type       : string type used by the decoder for interpretation
     """
     op_id:         int
     op_type:       str                          # "define", "call", "assign", …
@@ -76,20 +76,20 @@ class PlanOperator:
 
 @dataclass
 class PlanState:
-    """Стан планувальника у момент t."""
-    wm:        Set[PlanFact]              # поточна WorkingMemory
-    depth:     int                        # глибина пошуку
-    z_ctx:     Optional[torch.Tensor]     # (1, d_plan) — контекст на цей момент
+    """Planner state at time step `t`."""
+    wm:        Set[PlanFact]              # current WorkingMemory
+    depth:     int                        # search depth
+    z_ctx:     Optional[torch.Tensor]     # (1, d_plan) — context at this step
 
 
 @dataclass
 class PlanSequence:
     """
-    Вихід SymbolicPlanner.
-    operators  : послідовність застосованих операторів
-    embeddings : (K, d_plan) — тензорне представлення (для HierarchicalDecoder)
-    goal_reached: чи була ціль досягнута
-    plan_loss  : L_plan (REINFORCE)
+    Output of `SymbolicPlanner`.
+    operators   : sequence of applied operators
+    embeddings  : (K, d_plan) — tensor representation for HierarchicalDecoder
+    goal_reached: whether the goal was reached
+    plan_loss   : L_plan (REINFORCE)
     """
     operators:    List[PlanOperator]
     embeddings:   torch.Tensor           # (K, d_plan)
@@ -100,25 +100,25 @@ class PlanSequence:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2.  НЕЙРОПОЛІТИКА ПЛАНУВАННЯ
+# 2. NEURAL PLANNING POLICY
 # ══════════════════════════════════════════════════════════════════════════════
 
 class PlanPolicyNet(nn.Module):
     """
-    π_plan(a|s): нейромережа → розподіл над операторами.
+    π_plan(a|s): neural network -> distribution over operators.
 
-    Стан s кодується як:
+    State `s` is encoded as:
       [z_intent; z_ctx; wm_features; depth_embed]
-    де wm_features = mean-pool embedding фактів у WM.
+    where `wm_features` is the mean-pooled embedding of facts in WM.
 
-    Архітектура: 2-шаровий MLP з gating.
+    Architecture: a 2-layer MLP with gating.
     """
 
     def __init__(self, d_intent: int, d_plan: int, n_operators: int, dropout: float = 0.1):
         super().__init__()
         d_in = d_intent + d_plan + d_plan + 16  # intent + ctx + wm + depth
 
-        self.depth_embed = nn.Embedding(32, 16)  # до 32 кроків
+        self.depth_embed = nn.Embedding(32, 16)  # up to 32 steps
 
         self.register_buffer("_depth_ids", torch.arange(32, dtype=torch.long), persistent=False)
 
@@ -128,7 +128,7 @@ class PlanPolicyNet(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(d_plan * 2, n_operators),
         )
-        # Ціннісна мережа V(s)
+        # Value network V(s).
         self.critic = nn.Sequential(
             nn.Linear(d_in, d_plan),
             nn.GELU(),
@@ -184,18 +184,18 @@ class PlanPolicyNet(nn.Module):
 
 class SymbolicPlanner(nn.Module):
     """
-    Нейрокерований символьний планувальник.
+    Neural-guided symbolic planner.
 
-    Розв'язує: знайти a₁,...,aK ∈ A такі що:
+    Solves: find a₁,...,aK ∈ A such that
       pre(aᵢ) ⊆ WMᵢ,  goal ⊆ WM_{K+1}
 
-    Нейрокерування: замість сліпого перебору використовує π_plan + V_plan.
+    Neural guidance: uses π_plan + V_plan instead of blind enumeration.
 
-    Оператори генеруються нейромережею (OpratorGenerator) з IntentState —
-    це дозволяє адаптувати план під контекст задачі.
+    Operators are generated by a neural network (OperatorGenerator) from IntentState,
+    which lets the planner adapt to task context.
     """
 
-    # 8 базових типів операторів (domain-agnostic)
+    # Eight base operator types (domain-agnostic).
     OP_TYPES = ["define", "call", "assign", "return",
                 "branch", "loop", "import", "yield"]
 
@@ -203,10 +203,10 @@ class SymbolicPlanner(nn.Module):
         self,
         d_intent:     int,
         d_plan:       int,
-        n_operators:  int   = 32,    # розмір бібліотеки операторів
-        max_depth:    int   = 6,     # максимальна глибина плану
-        beam_width:   int   = 3,     # ширина Beam Search
-        alpha_plan:   float = 0.1,   # штраф за довжину плану
+        n_operators:  int   = 32,    # size of the operator library
+        max_depth:    int   = 6,     # maximum plan depth
+        beam_width:   int   = 3,     # beam-search width
+        alpha_plan:   float = 0.1,   # penalty for plan length
         dropout:      float = 0.1,
     ):
         super().__init__()
@@ -238,16 +238,16 @@ class SymbolicPlanner(nn.Module):
             nn.Linear(d_plan * 2, 3 * 4 * 2),  # 3 effect-sets × 4 facts × 2 slots
         )
 
-        # Context GRU: відстежує контекст вздовж плану
+        # Context GRU tracks context along the plan.
         self.ctx_gru = nn.GRUCell(d_plan, d_plan)
         self.ctx_h0  = nn.Parameter(torch.zeros(1, d_plan))
 
     # ── WM → embedding ──────────────────────────────────────────────────────
     def _wm_embed(self, wm: Set[PlanFact], device) -> torch.Tensor:
-        """Кодує WorkingMemory у (1, d_plan) через mean-pool."""
+        """Encode WorkingMemory into `(1, d_plan)` through mean pooling."""
         if not wm:
             return torch.zeros(1, self.d_plan, device=device)
-        facts = list(wm)[:16]  # обмеження для швидкості
+        facts = list(wm)[:16]  # cap for speed
         preds = torch.tensor([f.pred % 512 for f in facts], device=device)
         args  = torch.tensor([f.arg  % 512 for f in facts], device=device)
         emb   = torch.cat([
@@ -257,7 +257,7 @@ class SymbolicPlanner(nn.Module):
         return emb.mean(0, keepdim=True)  # (1, d_plan)
 
     def _goal_facts(self, intent_state: "IntentState") -> Tuple[int, Tuple[PlanFact, ...]]:
-        """Виводить компактну символічну ціль з intent distribution."""
+        """Derive a compact symbolic goal from the intent distribution."""
         goal_id = int(intent_state.goal_probs[:1].mean(0).argmax().item())
         declared = PlanFact(301, goal_id)
         composed = PlanFact(302, goal_id)
@@ -303,8 +303,8 @@ class SymbolicPlanner(nn.Module):
         device: torch.device,
     ) -> List[PlanOperator]:
         """
-        Будує бібліотеку операторів із реальною pre/add/del-семантикою для пошуку.
-        Нейромережа все ще задає embeddings та side effects, але core переходи вже не сліпі.
+        Build an operator library with real pre/add/del semantics for search.
+        The neural network still sets embeddings and side effects, but core transitions are no longer blind.
         """
         start = PlanFact(300, goal_id)
         declared = PlanFact(301, goal_id)
@@ -405,26 +405,26 @@ class SymbolicPlanner(nn.Module):
         hit = sum(1 for fact in goal_facts if fact in wm)
         return hit / float(len(goal_facts))
 
-    # ── Генератор параметрів оператора ──────────────────────────────────────
+    # ── Operator parameter generator ────────────────────────────────────────
     @torch.no_grad()
     def _gen_op_effects(
         self, z_intent: torch.Tensor, op_emb: torch.Tensor,
     ) -> Tuple[Tuple[PlanFact,...], Tuple[PlanFact,...], Tuple[PlanFact,...]]:
         """
-        Нейромережа генерує pre/add/del для обраного оператора.
-        Повертає кортежі PlanFact — дискретизується через argmax.
+        The neural network generates pre/add/del for the selected operator.
+        Returns `PlanFact` tuples discretized through argmax.
         """
         inp    = torch.cat([z_intent, op_emb], dim=-1)   # (1, d_intent + d_plan)
         params = self.op_param_gen(inp).squeeze(0)       # (3·4·2,)
         params = params.view(3, 4, 2)                    # (3 sets, 4 facts, 2 slots)
 
         def to_facts(matrix: torch.Tensor) -> Tuple[PlanFact, ...]:
-            # matrix: (4, 2) → 4 факти, кожен (pred, arg)
+            # matrix: (4, 2) -> 4 facts, each in (pred, arg) form
             indices = matrix.abs().mul(128).long() % 128
             return tuple(
                 PlanFact(int(indices[i, 0]), int(indices[i, 1]))
                 for i in range(4)
-                if indices[i, 0] > 0  # skip нульові факти
+                if indices[i, 0] > 0  # skip zero facts
             )
 
         return to_facts(params[0]), to_facts(params[1]), to_facts(params[2])
@@ -458,7 +458,7 @@ class SymbolicPlanner(nn.Module):
             del_list.append(self._decode_plan_facts(indices[op_idx, 2]))
         return pre_list, add_list, del_list
 
-    # ── Основний метод: побудова плану ───────────────────────────────────────
+    # ── Main method: build a plan ───────────────────────────────────────────
     def forward(
         self,
         intent_state: "IntentState",
@@ -469,9 +469,9 @@ class SymbolicPlanner(nn.Module):
         """
         intent_state.z_intent: (B, d_intent)
 
-        Greedy rollout з REINFORCE-лосом.
-        Для batch > 1: незалежні плани на кожен елемент батчу.
-        Повертає план для першого елементу батчу (решта — для лосу).
+        Greedy rollout with REINFORCE loss.
+        For batch > 1, builds independent plans for each batch element.
+        Returns the plan for the first batch element; the rest only affect the loss.
         """
         return self._forward_beam(
             intent_state,
@@ -488,8 +488,8 @@ class SymbolicPlanner(nn.Module):
         prover=None,
     ) -> PlanSequence:
         """
-        Реальний search-based planner поверх Working Memory.
-        Beam search іде по символічних станах, а policy/value лише направляють розширення.
+        Real search-based planner on top of Working Memory.
+        Beam search moves over symbolic states, while policy/value only guide expansion.
         """
         device = intent_state.z_intent.device
         z_intent = intent_state.z_intent[:1]

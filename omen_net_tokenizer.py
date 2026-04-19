@@ -63,33 +63,29 @@ def _masked_sequence_cross_entropy(
 
 class ByteContextEncoder(nn.Module):
     """
-    Контекстний енкодер f_θ — СПРАВЖНІЙ байт-рівень.
+    Context encoder f_θ operating at the TRUE byte level.
 
-    Замість того щоб приймати вже токенізовані int-індекси з vocab≥50k
-    (що нічим не відрізняється від звичайного Embedding+Transformer),
-    цей енкодер:
+    Instead of consuming pre-tokenized integer ids with vocab >= 50k
+    (which would be little different from a standard Embedding+Transformer),
+    this encoder:
 
-      1. Приймає bytes (B, T) ∈ [0, 255]  — сирі UTF-8 байти.
-      2. Проектує кожен байт у d_tok-простір через малий Embedding(256, d_tok).
-      3. Пропускає через n_layers LlamaDecoderBlock із двонапрямною увагою.
-      4. (Опціонально) сегментує за пробілами / пунктуацією і робить mean-pool
-         в межах сегменту → семантичний концепт для EpistemicQuantizer.
+      1. Accepts bytes `(B, T) ∈ [0, 255]` - raw UTF-8 bytes.
+      2. Projects each byte into `d_tok` via a small `Embedding(256, d_tok)`.
+      3. Passes them through `n_layers` of `LlamaDecoderBlock` with bidirectional attention.
+      4. Optionally segments on whitespace / punctuation and mean-pools
+         inside each segment to form a semantic concept for `EpistemicQuantizer`.
 
-    Якщо передаються вже токенізовані дані (vocab_size > 256), енкодер
-    автоматично переходить у режим сумісності (legacy mode): приймає токени
-    і не виконує сегментацію. Це забезпечує зворотну сумісність із тестами.
+    If already-tokenized data is passed in (`vocab_size > 256`), the encoder
+    falls back to compatibility mode: it accepts tokens and skips segmentation.
 
-    Математика:
-      Вхід X = (x_1,...,x_T) ∈ {0..255}^T    (байти)
+    Mathematics:
+      input X = (x_1,...,x_T) ∈ {0..255}^T    (bytes)
       h_i = f_θ(x_i, context(x_{<i}))         (contextual encoding)
       c_j = mean_{i ∈ seg_j} h_i              (segment pooling)
-      → Z = (c_1,...,c_N)  N ≤ T              (концептні вектори для Q)
-
-    У режимі сумісності (is_byte_mode=False):
-      h_i = f_θ(token_i)  без сегментації
+      -> Z = (c_1,...,c_N)  N ≤ T             (concept vectors for Q)
     """
 
-    # Байти, які трактуються як роздільники сегментів
+    # Bytes treated as segment delimiters.
     SEGMENT_BYTES: frozenset = frozenset(
         b' \t\n\r.,;:!?()[]{}"\''
         + b'+-*/=<>|&^~%@#$\\'
@@ -103,9 +99,9 @@ class ByteContextEncoder(nn.Module):
                  dropout: float = 0.1,
                  segment_pool: bool = True):
         super().__init__()
-        assert d_tok % n_heads == 0, f"d_tok={d_tok} не ділиться на n_heads={n_heads}"
+        assert d_tok % n_heads == 0, f"d_tok={d_tok} is not divisible by n_heads={n_heads}"
 
-        # Byte-mode є безумовним: NET завжди працює на UTF-8 байтах [0..255].
+        # Byte mode is unconditional: NET always works on UTF-8 bytes [0..255].
         self.byte_vocab    = 256
         self.segment_pool  = segment_pool
         self.d_tok         = d_tok
@@ -125,9 +121,9 @@ class ByteContextEncoder(nn.Module):
         self.drop = nn.Dropout(dropout)
         self.n_layers = n_layers
 
-        # ── OPT-1: Pre-computed lookup table для векторизованого segment_pool ──
-        # Замість Python double-loop (O(B·T)) → tensor lookup + cumsum (O(1) Python)
-        # register_buffer: auto-переноситься на правильний device разом з моделлю
+        # OPT-1: precomputed lookup table for vectorized segment_pool.
+        # Instead of a Python double loop (O(B·T)), use tensor lookup + cumsum.
+        # register_buffer moves to the correct device together with the model.
         _seg_lut = torch.zeros(256, dtype=torch.bool)
         for _sb in self.SEGMENT_BYTES:
             if 0 <= _sb < 256:
@@ -141,11 +137,11 @@ class ByteContextEncoder(nn.Module):
         summarize_attn: bool = False,
     ):
         """
-        tokens : (B, T) ∈ [0, vocab_size)
-        Returns: (B, T, d_tok)  — у byte-режимі розмір T збережено (без pooling)
-                                   щоб зберегти сумісність із рештою pipeline.
-        Segment-aware mean-pooling відбувається всередині через residual:
-        кожна позиція отримує вектор, що змішує байти свого сегменту.
+        `tokens`: `(B, T) ∈ [0, vocab_size)`.
+        Returns `(B, T, d_tok)`. In byte mode, T is preserved (no outer pooling)
+        to remain compatible with the rest of the pipeline.
+        Segment-aware mean pooling happens internally through a residual path:
+        each position receives a vector mixed with the bytes from its segment.
         """
         B, T = tokens.shape
 
@@ -178,35 +174,35 @@ class ByteContextEncoder(nn.Module):
     def _segment_pool(self, h: torch.Tensor,
                       bytes_: torch.Tensor) -> torch.Tensor:
         """
-        Диференційоване сегментне усереднення.
-        out[b,i] = α·h[b,i] + (1-α)·mean(h[b, seg(i)])
+        Differentiable segment averaging.
+        `out[b,i] = α·h[b,i] + (1-α)·mean(h[b, seg(i)])`
 
-        OPT-1: межі сегментів обчислюються через tensor lookup + cumsum
-        замість Python double-loop for b in B: for i in T:
-        Складність: O(B·T) Python → O(1) Python + GPU kernels
+        OPT-1: segment boundaries are computed via tensor lookup + cumsum
+        instead of a nested Python loop over batch and time.
+        Complexity: O(B·T) Python -> O(1) Python + GPU kernels.
         """
         B, T, D = h.shape
         ALPHA   = 0.5
 
         with torch.no_grad():
-            # ── Векторизоване визначення меж сегментів ────────────────────────
-            # _seg_lut[byte] == True  ⟺  byte є роздільником сегменту
+            # Vectorized segment-boundary detection.
+            # _seg_lut[byte] == True means the byte is a segment delimiter.
             clamped   = bytes_.clamp(0, 255)                        # (B, T)
             boundary  = self._seg_lut[clamped]                      # (B, T) bool
-            # cumsum по часовій осі: seg_ids[b,i] = кількість роздільників до i
+            # cumsum along time: seg_ids[b,i] = number of delimiters up to i
             seg_ids   = boundary.long().cumsum(dim=1)               # (B, T)
-            # Зміщуємо батчі щоб уникнути колізій між прикладами
+            # Offset batches to avoid collisions between examples.
             offsets   = torch.arange(B, device=h.device).unsqueeze(1) * (T + 1)
             seg_ids   = (seg_ids + offsets).reshape(B * T)          # (B*T,)
             n_segs    = seg_ids.max().item() + 1
 
-            # Лічильники елементів у кожному сегменті (для нормування)
+            # Element counts in each segment (for normalization).
             seg_cnt = torch.zeros(n_segs, dtype=h.dtype, device=h.device)
             seg_cnt.scatter_add_(0, seg_ids,
                                  torch.ones(B * T, dtype=h.dtype, device=h.device))
             seg_cnt.clamp_(min=1)
 
-        # ── Диференційований scatter_add: сума по сегментах ───────────────────
+        # Differentiable scatter_add: sum within segments.
         flat_h  = h.reshape(B * T, D)
         expand  = seg_ids.unsqueeze(1).expand(-1, D)
         seg_sum = torch.zeros(n_segs, D, dtype=h.dtype, device=h.device)
@@ -222,8 +218,8 @@ class ByteContextEncoder(nn.Module):
                       max_len: int,
                       pad: int = 0) -> torch.Tensor:
         """
-        Утиліта: рядок → тензор байтів (1, max_len).
-        Використовується під час інференсу замість BPE токенайзера.
+        Utility: string -> byte tensor `(1, max_len)`.
+        Used at inference time instead of a BPE tokenizer.
         """
         raw = text.encode("utf-8")[:max_len]
         arr = list(raw) + [pad] * (max_len - len(raw))
@@ -231,7 +227,7 @@ class ByteContextEncoder(nn.Module):
 
     @staticmethod
     def bytes_to_text(byte_ids: torch.Tensor) -> str:
-        """Тензор байтів → рядок (обрізає лише trailing pad=0)."""
+        """Byte tensor -> string, trimming only trailing pad=0."""
         raw = bytes(byte_ids.view(-1).tolist()).rstrip(b"\x00")
         return raw.decode("utf-8", errors="replace")
 
@@ -243,18 +239,18 @@ class ByteContextEncoder(nn.Module):
 
 class EpistemicQuantizer(nn.Module):
     """
-    Динамічний словник + VQ-VAE (EMA) + Straight-Through Estimator.
+    Dynamic vocabulary + VQ-VAE (EMA) + Straight-Through Estimator.
 
-    Квантування (косинусна подібність):
+    Quantization (cosine similarity):
       z_i = argmax_{v∈V}  (e_v ⊤ f_θ(x_i)) / (||e_v|| · ||f_θ(x_i)||)
 
-    Якщо max_sim < τ → новий токен:
-      e_new = f_θ(x_i)   (до досягнення net_max_vocab)
+    If `max_sim < τ`, create a new token:
+      e_new = f_θ(x_i)   (until reaching net_max_vocab)
 
     STE (Straight-Through Estimator):
-      z_q = sg(e_{z_i} - f_θ(x_i)) + f_θ(x_i)    ← gradient проходить через f_θ
+      z_q = sg(e_{z_i} - f_θ(x_i)) + f_θ(x_i)    <- gradient flows through f_θ
 
-    EMA оновлення кодбуку (стабільніше за SGD на кодбук):
+    EMA codebook update (more stable than SGD on the codebook):
       n_i  ← γ·n_i  + (1−γ)·N_i
       s_i  ← γ·s_i  + (1−γ)·S_i
       e_i  ← s_i / n_i
@@ -262,9 +258,9 @@ class EpistemicQuantizer(nn.Module):
     Commitment loss (VQ-VAE):
       L_vq = ||sg(z_q) - f_θ(x)||² + β_commit · ||z_q - sg(f_θ(x))||²
 
-    S-Core інтеграція:
-      Кожен новий токен реєструється як символьний факт.
-      При наявності зовнішнього KnowledgeBase → виклик kb.add_concept_fact()
+    S-Core integration:
+      Every new token is registered as a symbolic fact.
+      If an external KnowledgeBase is present -> call `kb.add_concept_fact()`.
     """
 
     def __init__(self,
@@ -284,85 +280,81 @@ class EpistemicQuantizer(nn.Module):
         self.d_tok        = d_tok
         self.max_vocab    = max_vocab
         self.tau          = tau
-        self.tau_init     = tau          # зберігаємо початкове значення для adaptive scheduling
+        self.tau_init     = tau          # keep the initial value for adaptive scheduling
         self.tau_min      = tau_min
         self.tau_schedule = tau_schedule
         self.ema_decay    = ema_decay
         self.beta_commit  = beta_commit
 
-        # Кодбук (тільки active[:current_size] є валідними)
+        # Codebook (only active[:current_size] is valid).
         self.codebook = nn.Embedding(max_vocab, d_tok)
         nn.init.normal_(self.codebook.weight, std=d_tok ** -0.5)
 
-        # EMA буфери (не параметри — оновлюються через no_grad)
+        # EMA buffers (not parameters - updated through no_grad).
         self.register_buffer("cluster_count", torch.ones(max_vocab))
         self.register_buffer("cluster_sum",   self.codebook.weight.clone().detach())
         self.register_buffer("current_size",  torch.tensor(init_vocab, dtype=torch.long))
 
-        # Статистика
+        # Statistics.
         self.n_new_tokens   = 0
         self.n_quant_calls  = 0
         self.kb: Optional[object] = None
 
-        # OPT-CB: кеш нормованого кодбуку; інвалідується після EMA/restart
+        # OPT-CB: cache the normalized codebook; invalidate after EMA/restart.
         self._cb_norm_cache: Optional[torch.Tensor] = None
 
-        # ── global_usage: швидкий EMA для крос-батч dead-code детекції ────────
+        # global_usage: fast EMA for cross-batch dead-code detection.
         self.register_buffer("global_usage",
                              torch.ones(max_vocab) * 0.1)
         self._ema_step: int = 0
 
-        # ── K-means++ буфер для ініціалізації кодбуку ─────────────────────────
-        # Протягом warmup_steps збираємо encoder outputs → k-means++ центри.
-        # Це вирішує проблему "мертвих кодів з нуля": кодбук стартує в реальних
-        # кластерах даних, а не у random-нормальних точках.
-        # Експеримент: k-means warmup → +16 Used, +0.46H над random init.
+        # K-means++ buffer for codebook initialization.
+        # During warmup_steps we collect encoder outputs and build k-means++ centers.
+        # This prevents "dead codes from birth": the codebook starts in real data
+        # clusters instead of random normal points.
         self._kmeans_buffer: List[torch.Tensor] = []
         self._kmeans_done: bool = False
 
-        # ── EMA freeze після restart (Bug7 fix) ────────────────────────────────
-        # Проблема: після interp restart EMA decay=0.95 перетягує код назад до
-        # collapse center за ~4 кроки (якщо весь батч призначається до коду 0).
-        # Фікс: після restart фіксуємо кодбук-запис на _ema_freeze_steps кроків,
-        # щоб він накопичив реальні assignments перш ніж EMA почне його зміщувати.
-        # _restart_step[i] = global step коли код i був рестартований (−1000 = ніколи).
+        # EMA freeze after restart (Bug7 fix).
+        # Problem: after interpolation restart, EMA decay=0.95 pulls the code back
+        # to the collapse center after ~4 steps if the whole batch is assigned to code 0.
+        # Fix: freeze the restarted codebook entry for _ema_freeze_steps so it can
+        # accumulate real assignments before EMA starts moving it again.
+        # _restart_step[i] = global step when code i was restarted (-1000 = never).
         self._ema_freeze_steps: int = 20
         self.register_buffer("_restart_step",
                              torch.full((max_vocab,), -1000, dtype=torch.long))
         self.gumbel_tau: float = 0.7
 
-        # OPT-RST: _restart_dead_codes_ema містить дорогу gram-матрицю (64×64) і
-        # codebook similarity (B*T × V) — разом ~970 MFLOPs на strong config.
-        # Throttle до кожних _restart_interval кроків: якість = майже та сама
-        # (dead codes живуть 10–15 кроків, 4 кроки затримки не критичні),
-        # але економія ~75% часу цього блоку.
-        self._restart_interval: int = 4   # кожні 4 кроки = 75% часу зекономлено
+        # OPT-RST: _restart_dead_codes_ema contains an expensive gram matrix
+        # and codebook-similarity step. Throttle it to every _restart_interval
+        # steps for most of the benefit at much lower cost.
+        self._restart_interval: int = 4   # every 4 steps ~= 75% time saved
 
-    # ── Допоміжне: нормований кодбук (з кешем) ───────────────────────────────
+    # Helper: normalized codebook with cache.
     def _normed_codebook(self) -> torch.Tensor:
-        """Повертає нормовані вектори активних кодбук-записів (з кешем)."""
-        # OPT-CB: F.normalize(V×d) виклик на кожен forward — дорогий.
-        # Кешуємо після першого обчислення; _ema_update/_restart_dead_codes_ema
-        # інвалідують кеш через self._cb_norm_cache = None.
+        """Return normalized vectors for active codebook entries, using a cache."""
+        # OPT-CB: calling F.normalize(Vxd) on every forward is expensive.
+        # Cache after the first computation; invalidate in EMA/restart paths.
         if self._cb_norm_cache is not None:
             return self._cb_norm_cache
         active = self.codebook.weight[:self.current_size]           # (V_cur, d)
         self._cb_norm_cache = F.normalize(active, dim=-1)
         return self._cb_norm_cache
 
-    # ── Форвард ───────────────────────────────────────────────────────────────
+    # Forward.
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         """
-        x : (B, T, d_tok)  — вихід ByteContextEncoder
+        `x`: `(B, T, d_tok)` - output of `ByteContextEncoder`.
         Returns:
-          z_q    : (B, T, d_tok)  — квантовані вектори (STE)
-          indices: (B, T)         — індекси кодбуку для кожної позиції
-          info   : dict з vq_loss, commit_loss, n_new_tokens, usage_entropy
+          z_q    : (B, T, d_tok) - quantized vectors (STE)
+          indices: (B, T)        - codebook indices for each position
+          info   : dict with vq_loss, commit_loss, n_new_tokens, usage_entropy
         """
         B, T, D = x.shape
         self.n_quant_calls += 1
 
-        # ── 1. Косинусна подібність ────────────────────────────────────────────
+        # 1. Cosine similarity.
         x_flat = x.reshape(-1, D)                                   # (B*T, d)
         x_norm = F.normalize(x_flat, dim=-1)                        # (B*T, d)
         cb_norm = self._normed_codebook()                            # (V_cur, d)
@@ -370,21 +362,20 @@ class EpistemicQuantizer(nn.Module):
 
         max_sims, indices = sims.max(dim=-1)                        # (B*T,)
 
-        # ── 2. Динамічний словник: нові токени при low similarity ──────────────
+        # 2. Dynamic vocabulary: add new tokens for low-similarity regions.
         n_new = 0
         if self.training:
             low_sim_mask = max_sims < self.tau
             if low_sim_mask.any() and self.current_size < self.max_vocab:
                 N_samples = x_flat.shape[0]           # B*T
                 V_cur     = self.current_size.item()
-                max_new_per_step = min(2, self.max_vocab - V_cur)  # ≤2/крок: повільний ріст
+                max_new_per_step = min(2, self.max_vocab - V_cur)  # <=2/step: slow growth
 
-                # ── Gate 0: Warmup ────────────────────────────────────────────
-                # Перші warmup_steps кроків — ніякого росту.
+                # Gate 0: warmup. No growth during the first warmup_steps.
                 if self._ema_step <= self.warmup_steps:
                     max_new_per_step = 0
 
-                # ── Gate 1: Coverage ───────────────────────────────────────────
+                # Gate 1: coverage.
                 if max_new_per_step > 0:
                     coverage = N_samples / max(V_cur, 1)
                     if coverage < 2.0:
@@ -392,32 +383,22 @@ class EpistemicQuantizer(nn.Module):
                     elif coverage < 4.0:
                         max_new_per_step = min(2, self.max_vocab - V_cur)
 
-                # ── Gate 2: Dead-percentage ────────────────────────────────────
-                # Поріг знижено 50%→35%: якщо >35% кодів мертві — рециклюємо, не ростемо.
-                # Детекція мертвих: global_usage < 0.10 (узгоджено з _restart_dead_codes_ema).
-                # При encoder-collapse нові токени одразу стають dead → ростемо
-                # лише якщо поточний словник дійсно добре використовується (Used/V > 65%).
+                # Gate 2: dead-percentage.
+                # If >35% of codes are dead, recycle instead of growing.
                 if max_new_per_step > 0 and V_cur > 0:
                     dead_by_ema = (self.global_usage[:V_cur] < 0.10).sum().item()
                     dead_pct    = dead_by_ema / max(V_cur, 1)
                     if dead_pct > 0.35:
                         max_new_per_step = 0
 
-                # ── Gate 3: Hard batch usage ───────────────────────────────────
-                # FIX Bug9: global_usage скидається до 0.15 після кожного restart,
-                # тому dead% завжди < 35% одразу після restart → Gate 2 завжди пропускає.
-                # Результат: V зростає ~2/крок навіть при encoder-collapse (MeanSim=0.99),
-                # створюючи 1444 токени де використовується лише 6.
-                #
-                # FIX: перевіряємо РЕАЛЬНЕ використання в ПОТОЧНОМУ батчі (hard assignments).
-                # indices вже обчислено (крок 1). hard_used_pct — частка кодів що
-                # отримали ≥1 assignment у цьому батчі. Якщо < 40% → ще не готові рости.
-                # Цей gate не обходиться restart-ом бо рахує реальні assignments тут і зараз.
+                # Gate 3: hard batch usage.
+                # Check REAL usage in the CURRENT batch via hard assignments.
+                # If <40% of codes are actually used, do not grow yet.
                 if max_new_per_step > 0 and V_cur > 0:
                     hard_counts   = torch.bincount(
                         indices.clamp(0, V_cur - 1), minlength=V_cur).float()
                     hard_used_pct = (hard_counts > 0).float().mean().item()
-                    if hard_used_pct < 0.40:     # < 40% кодів реально використано → стоп
+                    if hard_used_pct < 0.40:     # <40% of codes are truly used -> stop
                         max_new_per_step = 0
 
                 low_vecs = x_flat[low_sim_mask]                     # (M, d)
@@ -427,16 +408,16 @@ class EpistemicQuantizer(nn.Module):
                 for _ in range(max_new_per_step):
                     if self.current_size >= self.max_vocab:
                         break
-                    # Порівнюємо кандидатів з поточним кодбуком + щойно доданими
+                    # Compare candidates against the current codebook + newly added items.
                     cb_cur = self._normed_codebook()                # (V_cur, d)
                     all_ref = (torch.cat([cb_cur] + added_norms, 0)
                                if added_norms else cb_cur)
                     sims_cand = (low_norm @ all_ref.t()).max(dim=-1).values  # (M,)
-                    # Найвіддаленіший від усього поточного кодбуку
+                    # Pick the item farthest from the whole current codebook.
                     best_idx  = sims_cand.argmin().item()
                     best_sim  = sims_cand[best_idx].item()
                     if best_sim >= self.tau:
-                        break                                       # вже достатньо схожий
+                        break                                       # already similar enough
                     new_vec  = low_vecs[best_idx].detach()
                     new_norm = F.normalize(new_vec.unsqueeze(0), dim=-1)
                     idx = self.current_size.item()
@@ -444,12 +425,12 @@ class EpistemicQuantizer(nn.Module):
                         self.codebook.weight.data[idx].copy_(new_vec)
                         self.cluster_sum[idx]     = new_vec
                         self.cluster_count[idx]   = 1.0
-                        self.global_usage[idx]    = 0.1   # початкове значення — не "dead"
+                        self.global_usage[idx]    = 0.1   # initial value - not yet "dead"
                     self.current_size += 1
                     n_new += 1
                     self.n_new_tokens += 1
                     added_norms.append(new_norm)
-                    # Контекст: 2 найближчих вже існуючих токени → Horn-правило
+                    # Context: 2 nearest existing tokens -> Horn rule.
                     ctx_top: list = []
                     if idx >= 2:
                         existing = F.normalize(
@@ -459,13 +440,13 @@ class EpistemicQuantizer(nn.Module):
                     self._register_concept_in_kb(idx, context_indices=ctx_top)
 
                 if n_new > 0:
-                    # Перерахуємо подібності з новими записами
-                    self._cb_norm_cache = None      # OPT-CB: нові токени → інвалідуємо
+                    # Recompute similarities with the new entries.
+                    self._cb_norm_cache = None      # OPT-CB: new tokens -> invalidate
                     cb_norm  = self._normed_codebook()
                     sims     = x_norm @ cb_norm.t()
                     max_sims, indices = sims.max(dim=-1)
 
-        # ── 3. Квантовані вектори ──────────────────────────────────────────────
+        # 3. Quantized vectors.
         v_cur = self.current_size.item()
         active_codebook = self.codebook.weight[:v_cur]
         hard_assign = F.one_hot(indices, num_classes=v_cur).to(x_flat.dtype)
@@ -474,44 +455,37 @@ class EpistemicQuantizer(nn.Module):
         z_q_flat    = assign_st @ active_codebook
         z_q         = z_q_flat.reshape(B, T, D)
 
-        # ── 4. STE: градієнт через f_θ ────────────────────────────────────────
+        # 4. STE: keep gradients flowing through f_θ.
         z_q_ste = x + (z_q - x).detach() + (z_q - z_q.detach())
 
-        # ── 5. EMA оновлення кодбуку ───────────────────────────────────────────
-        # ВАЖЛИВО: при EMA-оновленні кодбуку (без градієнта) НЕ додаємо
-        # explicit codebook_loss — це створює конфліктуючі сигнали оновлення
-        # і дестабілізує навчання (EMA тягне кодбук в одну сторону, SGD — в іншу).
-        # Стандарт VQ-VAE з EMA: лише commitment loss (encoder → codebook).
+        # 5. EMA codebook update.
+        # IMPORTANT: under EMA updates (no gradient), do NOT add an explicit
+        # codebook loss. That would create conflicting update signals and destabilize training.
+        # Standard EMA VQ-VAE uses commitment loss only.
         vq_loss = torch.tensor(0.0, device=x.device)
         if self.training:
             with torch.no_grad():
                 self._ema_step += 1
-                # ── K-means++ ініціалізація кодбуку ───────────────────────────
-                # Протягом перших warmup_steps кроків збираємо encoder outputs.
-                # На кроці warmup_steps → запускаємо k-means++ → замінюємо кодбук
-                # реальними кластерами даних. Після цього dead codes практично зникають
-                # бо кожен код стоїть у реальному центрі кластера, а не в random точці.
+                # K-means++ codebook initialization from collected encoder outputs.
                 if not self._kmeans_done:
                     self._kmeans_buffer.append(
-                        x_flat.detach()[:min(32, x_flat.size(0))]  # макс 32 зразки/крок
+                        x_flat.detach()[:min(32, x_flat.size(0))]  # max 32 samples/step
                     )
                     if self._ema_step >= self.warmup_steps:
                         self._kmeans_init_codebook()
                         self._kmeans_done = True
                 self._ema_update(x_flat.detach(), indices)
                 self._update_global_usage(indices)
-                # OPT-RST: throttle restart — дорогий (gram + codebook sim) кожен крок.
-                # Кожні _restart_interval кроків = 75% часу зекономлено без втрати якості
-                # (dead code виявляється за ~10 кроків, 4 кроки затримки не критичні).
+                # OPT-RST: throttle restart; the gram/codebook-sim block is expensive.
                 if self._ema_step % self._restart_interval == 0:
                     self._restart_dead_codes_ema(x_flat.detach())
-            # Commitment loss: тягне encoder до найближчого кодбук-вектора
+            # Commitment loss pulls the encoder toward the nearest codebook vector.
             # L_commit = β · ||z_e - sg(e)||²
             commit      = F.mse_loss(x_flat, z_q_flat.detach())
             codebook_lr = F.mse_loss(z_q_flat, x_flat.detach())
             vq_loss     = self.beta_commit * commit + 0.25 * codebook_lr
 
-        # ── 7. Usage entropy (оцінка якості використання словника) ───────────
+        # 7. Usage entropy (how well the vocabulary is used).
         usage_entropy = self._usage_entropy(indices, B * T)
 
         # ── 8. Encoder diversity loss (anti-collapse) ──────────────────────────
@@ -519,37 +493,19 @@ class EpistemicQuantizer(nn.Module):
                         if self.training
                         else torch.zeros(1, device=x.device).squeeze())
 
-        # ── 8b. Soft-entropy loss (диференційована ентропія) ──────────────────
-        # ПРОБЛЕМА: l_code у NETLoss = torch.tensor(constant.item()) → 0 градієнту.
-        # РІШЕННЯ: soft assignments через temperature → справжній градієнт.
-        #
-        # Математика: soft_p_v = mean_i softmax(norm(sim(x_i, e_v)) / τ_soft)
-        #             H_soft = -Σ_v soft_p_v · log(soft_p_v)
-        #             L_soft_H = max(0, 1 - H_soft/log(V))  → штраф за collapse
-        #
-        # FIX Bug5: стара формула -(H_soft/H_max) давала loss=-1 при collapse.
-        # ПРАВИЛЬНА формула: max(0, 1 - H/H_max)
-        #   · collapse (small H): loss ≈ 1  → великий штраф → encoder диверсифікується
-        #   · рівномірний (H≈H_max): loss ≈ 0 → немає зайвого штрафу
-        #
-        # FIX Bug8 (NEW): без row-нормалізації sims_soft, при random кодбуку
-        # всі рядки ≈ 0 → softmax ≈ uniform → H_soft ≈ H_max → loss ≈ 0 ЗАВЖДИ.
-        # ТЕСТ: collapsed encoder + random codebook → loss=0.007 (стара) vs 0.59 (нова).
-        # РІШЕННЯ: нормалізуємо кожен рядок sims_soft (z-score) перед softmax.
-        # Це перетворює near-zero similarities у значущий peaked розподіл,
-        # де найближчий кодбук-вектор отримує помітно вищу probability.
+        # 8b. Soft-entropy loss (differentiable entropy).
+        # Problem: l_code in NETLoss is a constant tensor -> zero gradient.
+        # Solution: soft assignments through temperature provide a real gradient.
+        # We use a normalized-entropy penalty to fight codebook collapse.
         soft_entropy_loss = torch.zeros(1, device=x.device).squeeze()
         if self.training:
             V_cur = self.current_size.item()
             if V_cur >= 2:
-                # cb_norm вже обчислено (з кешем), але детачимо кодбук:
-                # EMA кодбук не має навчатись через SGD (конфліктні сигнали)
+                # cb_norm is already available via cache, but detach the codebook:
+                # EMA codebook entries should not be trained via SGD too.
                 cb_for_soft = F.normalize(active_codebook, dim=-1)
-                soft_tau_temp = 0.5                         # температура soft-quantizer
-                # OPT-SOFT: subsample x_norm до _SOFT_N позицій замість усіх B*T.
-                # Для B=8, T=512: B*T=4096 → _SOFT_N=256 → 16× менше MACs у matmul.
-                # Якість: оцінка ентропії на 256 випадкових позиціях практично еквівалентна
-                # (закон великих чисел, 256 >> V_cur для типових розмірів словника).
+                soft_tau_temp = 0.5                         # soft-quantizer temperature
+                # OPT-SOFT: subsample x_norm to _SOFT_N positions instead of all B*T.
                 _SOFT_N = 256
                 _n_avail = x_norm.size(0)
                 if _n_avail > _SOFT_N:
@@ -557,15 +513,14 @@ class EpistemicQuantizer(nn.Module):
                     x_norm_soft = x_norm[_perm]             # (256, d)
                 else:
                     x_norm_soft = x_norm
-                sims_soft = x_norm_soft @ cb_for_soft.t()  # (≤256, V_cur), grad через x_norm_soft
-                # FIX Bug8: row-normalization — перетворює near-zero sims у peaked розподіл.
-                # Без цього: random codebook → all sims ≈ 0 → uniform softmax → H_soft≈H_max → loss≈0.
+                sims_soft = x_norm_soft @ cb_for_soft.t()  # (<=256, V_cur), gradients through x_norm_soft
+                # FIX Bug8: row normalization turns near-zero similarities into a peaked distribution.
                 sims_norm = (sims_soft
                              - sims_soft.mean(dim=-1, keepdim=True)
                              ) / (sims_soft.std(dim=-1, keepdim=True) + 1e-6)
                 soft_assign = F.softmax(sims_norm / soft_tau_temp, dim=-1)  # (≤256, V_cur)
-                avg_usage   = soft_assign.mean(dim=0)       # (V_cur,) — очікуване використання
-                H_soft      = -(avg_usage * (avg_usage + 1e-8).log()).sum()  # диференційована H
+                avg_usage   = soft_assign.mean(dim=0)       # (V_cur,) - expected usage
+                H_soft      = -(avg_usage * (avg_usage + 1e-8).log()).sum()  # differentiable entropy
                 H_soft_max  = math.log(max(V_cur, 2))
                 entropy_pen = (1.0 - H_soft / (H_soft_max + 1e-8)).clamp(min=0.0)
                 diversity_pen = torch.zeros(1, device=x.device).squeeze()
@@ -575,10 +530,7 @@ class EpistemicQuantizer(nn.Module):
                     diversity_pen = cb_pair[off_diag].pow(2).mean()
                 soft_entropy_loss = entropy_pen + 0.1 * diversity_pen
 
-        # ── 9. Adaptive τ scheduling (після warmup) ────────────────────────────
-        # τ знижується коли H/H_max < 0.55 (мало активних кодів)
-        # τ підвищується коли H/H_max > 0.65 (словник добре використовується)
-        # Це реалізує "калібрацію порогу подиву" з архітектурного опису.
+        # 9. Adaptive τ scheduling after warmup.
         if self.training and self._ema_step > self.warmup_steps:
             H_max = math.log(max(self.current_size.item(), 2))
             self._adaptive_tau_step(usage_entropy, H_max)
@@ -590,43 +542,43 @@ class EpistemicQuantizer(nn.Module):
             "vocab_size":       self.current_size.item(),
             "mean_sim":         max_sims.mean().item(),
             "enc_div_loss":     enc_div_loss,
-            "soft_entropy_loss": soft_entropy_loss,   # ← новий диференційований сигнал
+            "soft_entropy_loss": soft_entropy_loss,   # new differentiable signal
         }
 
-    # ── Restart мертвих кодів (dead code collapse prevention) ────────────────
+    # Restart dead codes (dead-code collapse prevention).
     @torch.no_grad()
     def _restart_dead_codes(self,
                             x_flat:  torch.Tensor,
                             indices: torch.Tensor,
                             min_usage: float = 1.0) -> int:
         """
-        Перезапускає кодбук-вектори, яким не було призначено жодного прикладу
-        в цьому батчі. Ініціалізуємо їх випадковим encoder-вектором з найбільшою
-        відстанню до поточного кодбуку (hard example mining).
+        Restart codebook vectors that received no assignments in this batch.
+        Reinitialize them from encoder vectors that are farthest from the current
+        codebook (hard-example mining).
 
-        VQ-VAE проблема: після кількох кроків певні коди більше не «виграють»
-        жодного прикладу. Без перезапуску словник поступово вироджується.
+        In VQ-VAE, some codes can stop "winning" any examples. Without restart,
+        the vocabulary gradually degenerates.
 
-        Повертає кількість перезапущених кодів.
+        Returns the number of restarted codes.
         """
         V = self.current_size.item()
         if V == 0:
             return 0
 
         counts = torch.bincount(indices.clamp(0, V - 1).view(-1), minlength=V).float()
-        dead_mask = counts < min_usage            # індекси кодів без призначень
+        dead_mask = counts < min_usage            # indices of codes with no assignments
 
         n_dead = dead_mask.sum().item()
         if n_dead == 0:
             return 0
 
-        # Обираємо encoder-вектори з найбільшою помилкою (найвіддаленіші від кодбуку)
+        # Pick encoder vectors with the largest error (farthest from the codebook).
         cb_norm = F.normalize(self.codebook.weight[:V], dim=-1)
         x_norm  = F.normalize(x_flat, dim=-1)
-        # Найменша подібність до будь-якого кодбук-вектора = найбільша помилка
+        # Smallest similarity to any codebook vector = largest error.
         sims_all   = x_norm @ cb_norm.t()              # (N, V)
         worst_sims, _ = sims_all.max(dim=-1)           # (N,)
-        # Перші n_dead прикладів з найнижчою подібністю
+        # Top n_dead examples with the lowest similarity.
         n_restart = min(int(n_dead), x_flat.size(0))
         _, hard_idx = worst_sims.topk(n_restart, largest=False)
 
@@ -639,42 +591,37 @@ class EpistemicQuantizer(nn.Module):
 
         return n_restart
 
-    # ── EMA оновлення ─────────────────────────────────────────────────────────
+    # EMA update.
     @torch.no_grad()
     def _ema_update(self, x_flat: torch.Tensor, indices: torch.Tensor) -> None:
-        """EMA оновлення активних записів кодбуку.
+        """EMA update of active codebook entries.
 
-        FIX Bug7: коди що були нещодавно рестартовані (_restart_step протягом
-        _ema_freeze_steps кроків) НЕ оновлюються через EMA. Це захищає їх від
-        повернення до collapse center до того, як вони накопичать реальні assignments.
-        Тест показав: без freeze → re-collapse за 4 кроки. З freeze (20 кроків) →
-        код залишається в interp-позиції і поступово отримує власні assignments.
+        FIX Bug7: codes that were restarted recently are NOT updated through EMA
+        for _ema_freeze_steps. This prevents them from being dragged back to the
+        collapse center before they collect real assignments.
         """
         V = self.current_size.item()
         γ = self.ema_decay
 
-        # OPT-EMA: scatter_add замість (B*T, V) one-hot матриці.
-        # Стара схема: zeros(B*T, V) → scatter_(1,...) → sum(0)/matmul
-        #   → ~7.5 MB aloc + ~970 MFLOPs (B*T=4096, V=462, d=512 на strong config).
-        # Нова: scatter_add_ безпосередньо на (V,) та (V, d) — 0 зайвих алокацій.
+        # OPT-EMA: scatter_add instead of a (B*T, V) one-hot matrix.
         idx_clamped = indices.clamp(0, V - 1)                       # (B*T,)
 
-        # N_i = кількість прикладів, призначених до кластера i
+        # N_i = number of examples assigned to cluster i.
         N = torch.zeros(V, device=x_flat.device, dtype=x_flat.dtype)
         N.scatter_add_(0, idx_clamped,
                        torch.ones(idx_clamped.size(0),
                                   device=x_flat.device, dtype=x_flat.dtype))
 
-        # S_i = сума векторів, призначених до кластера i
+        # S_i = sum of vectors assigned to cluster i.
         D = x_flat.size(1)
         S = torch.zeros(V, D, device=x_flat.device, dtype=x_flat.dtype)
         S.scatter_add_(0,
                        idx_clamped.unsqueeze(1).expand(-1, D),
                        x_flat)
 
-        # ── Freeze маска: коди під захистом після restart ─────────────────────
+        # Freeze mask: codes protected after restart.
         frozen_mask = (self._ema_step - self._restart_step[:V]) < self._ema_freeze_steps
-        # Зберігаємо стан захищених кодів до EMA
+        # Save protected-code state before EMA.
         frozen_idx = frozen_mask.nonzero(as_tuple=True)[0] if frozen_mask.any() else None
         if frozen_idx is not None and len(frozen_idx) > 0:
             saved_count = self.cluster_count[frozen_idx].clone()
@@ -685,53 +632,51 @@ class EpistemicQuantizer(nn.Module):
         self.cluster_count[:V] = γ * self.cluster_count[:V] + (1 - γ) * N
         self.cluster_sum[:V]   = γ * self.cluster_sum[:V]   + (1 - γ) * S
 
-        # Оновлення кодбуку (Laplace smoothing у знаменнику)
+        # Update the codebook (Laplace smoothing in the denominator).
         updated = (self.cluster_sum[:V]
                    / (self.cluster_count[:V].unsqueeze(1) + 1e-5))
         self.codebook.weight.data[:V].copy_(updated)
 
-        # ── Відновлюємо захищені коди (скасовуємо EMA для них) ───────────────
+        # Restore protected codes (cancel EMA for them).
         if frozen_idx is not None and len(frozen_idx) > 0:
             self.cluster_count[frozen_idx] = saved_count
             self.cluster_sum[frozen_idx]   = saved_sum
             self.codebook.weight.data[frozen_idx].copy_(saved_w)
 
-        self._cb_norm_cache = None      # OPT-CB: кодбук змінився → інвалідуємо
+        self._cb_norm_cache = None      # OPT-CB: codebook changed -> invalidate
 
-    # ── K-means++ ініціалізація ───────────────────────────────────────────────
+    # K-means++ initialization.
     @torch.no_grad()
     def _kmeans_init_codebook(self) -> None:
         """
-        K-means++ ініціалізація кодбуку з реальних encoder outputs.
+        K-means++ codebook initialization from real encoder outputs.
 
-        Запускається одноразово після warmup_steps кроків.
-        До цього кодбук = random normal → більшість кодів поза реальним
-        розподілом encoder → вони ніколи не "виграють" → dead codes.
+        Runs once after warmup_steps.
+        Before that, the codebook is random normal, so many codes lie outside the
+        actual encoder distribution and never "win", becoming dead codes.
 
-        K-means++ гарантує:
-          · Кожен центр у реальному кластері даних.
-          · Максимальне рознесення центрів (greedy farthest-first).
-
-        Експеримент показав: +16 Used, +0.46H порівняно з random init.
+        K-means++ gives:
+          · each center inside a real data cluster
+          · maximal spread between centers (greedy farthest-first)
         """
         if not self._kmeans_buffer:
             return
 
         all_x = torch.cat(self._kmeans_buffer, dim=0)   # (N, D)
-        all_x = F.normalize(all_x, dim=-1)              # косинусний простір
+        all_x = F.normalize(all_x, dim=-1)              # cosine space
         V     = self.current_size.item()
         N     = all_x.size(0)
         if N < V:
-            return   # недостатньо даних
+            return   # not enough data
 
-        # K-means++ вибір центрів
+        # K-means++ center selection.
         perm    = torch.randperm(N)
-        centers = [all_x[perm[0]]]                      # перший центр — випадковий
+        centers = [all_x[perm[0]]]                      # first center is random
 
         for _ in range(V - 1):
-            c_stack = torch.stack(centers)               # (k, D) — вже нормовані
-            sims    = (all_x @ c_stack.t()).max(dim=-1).values  # (N,) max sim до існуючих
-            dists   = (1.0 - sims).clamp(min=0)         # косинусна відстань
+            c_stack = torch.stack(centers)               # (k, D) - already normalized
+            sims    = (all_x @ c_stack.t()).max(dim=-1).values  # (N,) max sim to existing centers
+            dists   = (1.0 - sims).clamp(min=0)         # cosine distance
             probs   = dists ** 2
             s       = probs.sum()
             if s < 1e-9:
@@ -740,62 +685,52 @@ class EpistemicQuantizer(nn.Module):
             chosen  = torch.multinomial(probs, 1).item()
             centers.append(all_x[chosen])
 
-        centers_t = torch.stack(centers)                # (K, D) — K ≤ V
-        actual_V  = min(len(centers), V)               # FIX: early break → K < V
+        centers_t = torch.stack(centers)                # (K, D) - K <= V
+        actual_V  = min(len(centers), V)               # FIX: early break -> K < V
 
-        # Оновлюємо кодбук in-place (requires_grad → no_grad)
+        # Update the codebook in-place (requires_grad -> no_grad).
         self.codebook.weight.data[:actual_V].copy_(centers_t[:actual_V])
         self.cluster_sum[:actual_V].copy_(centers_t[:actual_V])
         self.cluster_count[:actual_V].fill_(1.0)
-        self.global_usage[:actual_V].fill_(0.15)       # не мертві одразу
+        self.global_usage[:actual_V].fill_(0.15)       # not dead immediately
 
         self._kmeans_buffer.clear()
 
-    # ── global_usage EMA (швидший, крос-батч) ─────────────────────────────
+    # global_usage EMA (faster, cross-batch).
     @torch.no_grad()
     def _update_global_usage(self, indices: torch.Tensor) -> None:
         """
-        Оновлює global_usage швидким EMA (decay=0.9) по крос-батч статистиці.
+        Update global_usage with a fast EMA (decay=0.9) over cross-batch statistics.
 
-        global_usage[i] ∈ [0, 1] — нормована частота використання коду i.
-        Використовується замість per-batch bincount у _restart_dead_codes_ema.
-
-        Перевага над cluster_count:
-          · cluster_count decay = ema_decay (0.99 → дуже повільно реагує)
-          · global_usage decay = 0.9 → код "мертвіє" за ~10 кроків без використання
+        global_usage[i] ∈ [0, 1] is the normalized usage frequency of code i.
+        It is used instead of per-batch bincount in _restart_dead_codes_ema.
         """
         V = self.current_size.item()
         if V == 0:
             return
         N = indices.view(-1).shape[0]
         counts = torch.bincount(indices.clamp(0, V - 1).view(-1), minlength=V).float()
-        freq   = counts / max(N, 1)                      # нормована частота [0,1]
+        freq   = counts / max(N, 1)                      # normalized frequency [0,1]
         DECAY  = 0.9
         self.global_usage[:V] = DECAY * self.global_usage[:V] + (1 - DECAY) * freq
 
-    # ── НОВИЙ: EMA-based dead code restart ────────────────────────────────────
+    # New: EMA-based dead-code restart.
     @torch.no_grad()
     def _restart_dead_codes_ema(self,
                                 x_flat: torch.Tensor,
                                 dead_threshold: float = 0.10) -> int:
         """
-        Перезапускає "мертві" коди на основі global_usage.
+        Restart "dead" codes based on global_usage.
 
-        Ключові покращення (підтверджені експериментом):
-          · dead_threshold підвищено 0.05 → 0.10: детектує dead коди за ~7 кроків
-            замість ~15. Експеримент показав: thr=0.10 → Used=194 (+21 над default).
-          · Після restart: global_usage=0.15 (не 0.1) — захищає від негайного
-            повторного restart ще ~10 кроків.
-          · Protection buffer: коди щойно додані (usage=0.15) мають більше часу
-            щоб набрати статистику перед наступним restart-циклом.
+        Key improvements:
+          · dead_threshold raised from 0.05 to 0.10 for faster dead-code detection
+          · after restart, global_usage=0.15 protects codes from immediate re-restart
+          · newly added codes get more time to accumulate statistics
 
-        COLLAPSE-AWARE RESTART (нова логіка):
-          При encoder-collapse всі x_flat майже однакові → перезапуск мертвих кодів
-          encoder-виходами нічого не дає (нові коди відразу collapse до того самого).
-          FIX: виявляємо collapse (mean_sim > 0.90) і використовуємо RANDOM unit vectors
-          замість encoder-виходів для частини кодів. Це зберігає різноманітність кодбуку,
-          що є необхідною умовою для soft_entropy_loss та commit_loss надавати
-          значущий градієнт у бік виходу з collapse.
+        Collapse-aware restart:
+          when encoder outputs are almost identical, restarting from encoder vectors
+          does not help. In that regime, use random or perturbed directions to keep
+          the codebook diverse enough for recovery.
         """
         V = self.current_size.item()
         if V == 0:
@@ -806,16 +741,15 @@ class EpistemicQuantizer(nn.Module):
         if n_dead == 0:
             return 0
 
-        # ── Виявлення encoder collapse ─────────────────────────────────────────
-        # mean_sim > 0.90 → encoder вивів майже однакові вектори для всіх позицій.
-        # Samples: обмежуємо 64 токени для ефективності
+        # Detect encoder collapse.
+        # mean_sim > 0.90 means the encoder emits almost identical vectors.
         N_samp  = min(64, x_flat.size(0))
         x_samp  = F.normalize(x_flat[:N_samp], dim=-1)          # (N_samp, d)
-        # Середня подібність між парами (включає i==j → 1.0, але це лише зміщення)
+        # Mean pairwise similarity (includes i==j -> 1.0, which is just an offset).
         gram    = x_samp @ x_samp.t()                            # (N_samp, N_samp)
         off_diag_mask = ~torch.eye(N_samp, dtype=torch.bool, device=x_flat.device)
         encoder_mean_sim = gram[off_diag_mask].mean().item() if N_samp > 1 else 0.0
-        is_collapsed = encoder_mean_sim > 0.90                   # поріг collapse
+        is_collapsed = encoder_mean_sim > 0.90                   # collapse threshold
 
         cb_norm   = F.normalize(self.codebook.weight[:V], dim=-1)
         x_norm_r  = F.normalize(x_flat, dim=-1)
@@ -827,34 +761,24 @@ class EpistemicQuantizer(nn.Module):
         dead_indices = dead_mask.nonzero(as_tuple=True)[0][:n_restart]
         for i, dead_code_idx in enumerate(dead_indices):
             if is_collapsed:
-                # FIX Bug3 (оновлено): при collapse random вектори НІКОЛИ не отримують
-                # assignment (sim до active ~0.93, sim до random ~0.33 → random програє).
-                # Стара стратегія «interp між двома кодами» при ЕКСТРЕМАЛЬНОМУ collapse
-                # (MeanSim>0.97) не допомагає — всі коди в тій самій точці,
-                # interp = та сама точка → нові коди одразу мертві.
-                #
-                # FIX Bug10 (NEW): розрізняємо два рівні collapse:
-                #   · Помірний (0.90<sim<0.97): interp добре працює (доведено тестами)
-                #   · Екстремальний (sim≥0.97): використовуємо perturbation у ортогональний
-                #     підпростір відносно collapsed centroid.
-                #     perturb = centroid + α * ort_noise (α=0.2–0.5)
-                #     Sim до centroid = cos(α) ≈ 0.975 > random 0.33 → виграє NN.
-                #     Але різні perturb вектори відрізняються → enc_div_loss отримує
-                #     значущий градієнт що тягне encoder з collapsed manifold.
+                # Distinguish moderate vs extreme collapse.
+                # For extreme collapse, perturb around an orthogonal direction
+                # relative to the collapsed centroid so the new codes are still
+                # close enough to be selected, but diverse enough to matter.
                 if encoder_mean_sim >= 0.97:
-                    # Екстремальний collapse: збурення в ортогональний напрямок
+                    # Extreme collapse: perturb in an orthogonal direction.
                     centroid = F.normalize(self.codebook.weight[:V].mean(0), dim=0)
                     noise    = torch.randn_like(centroid)
-                    # Проеціюємо noise на простір ортогональний до centroid
+                    # Project noise into the subspace orthogonal to the centroid.
                     ort_noise = noise - (noise @ centroid) * centroid
                     ort_noise = F.normalize(ort_noise, dim=0)
-                    # α: рівномірно в [0.15, 0.45] → sim до centroid ≈ [0.98, 0.99]
+                    # α uniformly in [0.15, 0.45] -> sim to centroid ~= [0.98, 0.99]
                     alpha_ort = 0.15 + torch.rand(1, device=x_flat.device).item() * 0.30
                     perturb_vec = F.normalize(centroid + alpha_ort * ort_noise, dim=-1)
                     self.codebook.weight.data[dead_code_idx].copy_(perturb_vec)
                     self.cluster_sum[dead_code_idx]     = perturb_vec
                 else:
-                    # Помірний collapse: стара interp стратегія (підтверджена тестами)
+                    # Moderate collapse: reuse the older interpolation strategy.
                     i1 = torch.randint(0, V, (1,), device=x_flat.device).item()
                     i2 = torch.randint(0, V, (1,), device=x_flat.device).item()
                     alpha = torch.rand(1, device=x_flat.device).item()
@@ -866,36 +790,33 @@ class EpistemicQuantizer(nn.Module):
                     self.codebook.weight.data[dead_code_idx].copy_(interp_vec)
                     self.cluster_sum[dead_code_idx]     = interp_vec
             else:
-                # Нормальний режим: restart з "найважчого" encoder-виходу
+                # Normal regime: restart from the "hardest" encoder output.
                 src = x_flat[hard_idx[i]]
                 self.codebook.weight.data[dead_code_idx].copy_(src)
                 self.cluster_sum[dead_code_idx]     = src
 
             self.cluster_count[dead_code_idx]   = 1.0
-            # 0.15 > 0.10 (threshold) → захищений від негайного повторного restart
+            # 0.15 > 0.10 (threshold) -> protected from immediate re-restart
             self.global_usage[dead_code_idx]    = 0.15
-            # FIX Bug7: реєструємо крок restart → EMA freeze на _ema_freeze_steps кроків
+            # FIX Bug7: record the restart step -> EMA freeze for _ema_freeze_steps
             self._restart_step[dead_code_idx]   = self._ema_step
 
-        self._cb_norm_cache = None      # OPT-CB: кодбук змінився → інвалідуємо
+        self._cb_norm_cache = None      # OPT-CB: codebook changed -> invalidate
         return n_restart
 
-    # ── S-Core: реєстрація нового концепту з Horn-правилом ───────────────────
+    # S-Core: register a new concept with a Horn rule.
     def _register_concept_in_kb(self,
                                 token_idx: int,
                                 context_indices: Optional[list] = None) -> None:
         """
-        Реєструє новий токен у KB як Horn-правило, а не просто факт.
+        Register a new token in the KB as a Horn rule rather than a plain fact.
 
-        Стратегія абдукції (3 рівні):
-          1. Базовий факт: net_token(token_idx)
-          2. Якщо є context_indices (індекси сусідніх токенів у словнику):
+        Abduction strategy:
+          1. Base fact: `net_token(token_idx)`
+          2. If context_indices are available:
                net_derived(new_idx, ctx_a) :- net_token(ctx_a), net_token(ctx_b)
-             → «новий концепт ≡ комбінація відомих концептів»
-          3. Якщо контексту немає → лише факт.
-
-        NET_TOKEN_PRED = 100  (net_token/1)
-        NET_RULE_PRED  = 101  (net_derived/2)
+             -> "new concept = combination of known concepts"
+          3. Without context, fall back to a fact only.
         """
         if self.kb is None:
             return
@@ -904,10 +825,10 @@ class EpistemicQuantizer(nn.Module):
         except Exception:
             pass
 
-    # ── Utility: usage entropy ────────────────────────────────────────────────
+    # Utility: usage entropy.
     @torch.no_grad()
     def _usage_entropy(self, indices: torch.Tensor, n: int) -> float:
-        """Ентропія використання кодбуку (0 = один токен, log(V) = рівномірно)."""
+        """Codebook usage entropy (0 = one token, log(V) = uniform use)."""
         V = self.current_size.item()
         if V == 0:
             return 0.0
@@ -921,33 +842,22 @@ class EpistemicQuantizer(nn.Module):
                              x_flat:    torch.Tensor,
                              sample_n:  int = 64) -> torch.Tensor:
         """
-        Середня попарна косинусна подібність між sample_n encoder outputs.
+        Mean pairwise cosine similarity between `sample_n` encoder outputs.
 
-        Вища = більша схожість = encoder collapse (MeanSim ~0.99 = катастрофа).
-        Мінімізуємо → encoder навчається генерувати різноманітні вектори.
-
-        Градієнт проходить через x_flat → ByteContextEncoder.
-        Діапазон: [-1, 1], ціль: < 0.5 (краще < 0.3 для кодового корпусу).
-
-        Ефективність: O(N²) де N=sample_n≤64 → ≤4096 mult per step (швидко).
-
-        FIX: використовуємо ВИПАДКОВІ індекси замість перших N.
-        Причина: перші N токенів з одного батч-елементу сильно корельовані
-        між собою (послідовний текст), що заниженно оцінює collapse між
-        різними елементами батчу. Випадкова вибірка дає репрезентативну
-        оцінку різноманітності МІЖ батч-елементами.
+        Higher values mean higher similarity and therefore a stronger collapse signal.
+        Minimize it to encourage the encoder to produce diverse vectors.
         """
         N = min(x_flat.size(0), sample_n)
         if N < 2:
             return torch.zeros(1, device=x_flat.device, requires_grad=x_flat.requires_grad).squeeze()
-        # Випадкова вибірка (замість перших N) → кращий cross-batch diversity estimate
+        # Random sampling instead of first-N gives a better cross-batch diversity estimate.
         perm = torch.randperm(x_flat.size(0), device=x_flat.device)[:N]
         x_s      = F.normalize(x_flat[perm], dim=-1)              # (N, d)
         pairwise = x_s @ x_s.t()                                   # (N, N)
         mask     = ~torch.eye(N, dtype=torch.bool, device=x_s.device)
         return pairwise[mask].mean()
 
-    # ── MDL штраф на словник ──────────────────────────────────────────────────
+    # MDL penalty on the vocabulary.
     def vocab_description_bits(self) -> torch.Tensor:
         """Fixed-code dictionary length in bits under a universal code."""
         active_w = self.codebook.weight[:self.current_size]
@@ -972,23 +882,23 @@ class EpistemicQuantizer(nn.Module):
     # ── Adaptive τ scheduling ────────────────────────────────────────────────
     def _adaptive_tau_step(self, usage_entropy: float, H_max: float) -> None:
         """
-        Адаптивне налаштування τ — «калібрація порогу подиву».
+        Adaptive tuning of τ - calibration of the "surprise threshold".
 
-        Реалізує описану в специфікації поведінку:
-          · H/H_max < 0.55 → мало активних кодів → знижуємо τ (легше створювати концепти)
-          · H/H_max > 0.65 → словник добре використовується → підвищуємо τ (консервативно)
-          · Зміна ±0.005/крок — плавна адаптація без стрибків
+        Behavior:
+          · H/H_max < 0.55 -> few active codes -> lower τ
+          · H/H_max > 0.65 -> vocabulary used well -> raise τ
+          · changes of ±0.005/step give smooth adaptation
 
-        τ ∈ [tau_min, tau_init]  (задається у конфігурації)
+        τ ∈ [tau_min, tau_init]
         """
         if not self.tau_schedule or H_max < 1e-6:
             return
         ratio = usage_entropy / H_max
-        if ratio < 0.50:                                  # дуже мало активних кодів
+        if ratio < 0.50:                                  # very few active codes
             self.tau = max(self.tau_min, self.tau - 0.005)
-        elif ratio < 0.55:                                # трохи мало
+        elif ratio < 0.55:                                # slightly too few
             self.tau = max(self.tau_min, self.tau - 0.002)
-        elif ratio > 0.70:                                # добре використовується
+        elif ratio > 0.70:                                # used well
             self.tau = min(self.tau_init, self.tau + 0.003)
 
     def extra_repr(self) -> str:
@@ -1002,19 +912,19 @@ class EpistemicQuantizer(nn.Module):
 
 class ByteDecoder(nn.Module):
     """
-    Декодер g_φ: реконструює оригінальну послідовність з квантованих векторів.
+    Decoder g_φ reconstructing the original sequence from quantized vectors.
 
-    Вхід:
-      tgt      : (B, T)          — цільові токени (для авторегресивного навчання)
-      z_final  : (B, d_latent)   — концепт-рівень (умовна інформація)
-      h_q      : (B, T, d_tok)   — квантовані вектори (пропускаються через cross-attn)
+    Inputs:
+      tgt      : (B, T)        - target tokens (for autoregressive training)
+      z_final  : (B, d_latent) - concept-level conditioning
+      h_q      : (B, T, d_tok) - quantized vectors passed through cross-attention
 
-    Архітектура:
-      1. Embed tgt → (B, T, d_tok)
-      2. + cross-attn(tgt, h_q)   ← квантована контекстна пам'ять
-      3. + cross-attn(tgt, z_ctx) ← концепт-рівень інжектується через z_final
-      4. LlamaDecoderBlock × n_layers
-      5. lm_head → (B, T, vocab_size)
+    Architecture:
+      1. Embed tgt -> (B, T, d_tok)
+      2. + cross-attn(tgt, h_q)   <- quantized contextual memory
+      3. + cross-attn(tgt, z_ctx) <- concept-level signal injected through z_final
+      4. LlamaDecoderBlock x n_layers
+      5. lm_head -> (B, T, vocab_size)
 
     L_rec = CrossEntropy(g_φ(h_q, z_final), original_tokens)
     """
@@ -1032,22 +942,22 @@ class ByteDecoder(nn.Module):
         self.embed   = nn.Embedding(vocab_size, d_tok)
         nn.init.normal_(self.embed.weight, std=d_tok ** -0.5)
 
-        # Проекція z_final (d_latent → d_tok) для cross-attention
+        # Project z_final (d_latent -> d_tok) for cross-attention.
         self.z_proj  = nn.Linear(d_latent, d_tok, bias=False)
 
-        # Cross-attention: tgt ← h_q (квантовані вектори)
+        # Cross-attention: tgt <- h_q (quantized vectors)
         self.hq_norm  = RMSNorm(d_tok)
         self.hq_xattn = LlamaAttention(
             d_tok, n_heads, dropout=dropout,
             causal=False, cross_attn=True, kv_dim=d_tok)
 
-        # Cross-attention: tgt ← z_ctx (концепт-рівень)
+        # Cross-attention: tgt <- z_ctx (concept-level signal)
         self.z_norm   = RMSNorm(d_tok)
         self.z_xattn  = LlamaAttention(
             d_tok, n_heads, dropout=dropout,
             causal=False, cross_attn=True, kv_dim=d_tok)
 
-        # Self-attention + FFN блоки
+        # Self-attention + FFN blocks.
         self.blocks   = nn.ModuleList([
             LlamaDecoderBlock(d_tok, n_heads, dropout)
             for _ in range(n_layers)
@@ -1097,28 +1007,28 @@ class ByteDecoder(nn.Module):
         """
         Returns:
           logits : (B, T, vocab_size)
-          l_rec  : scalar  — reconstruction loss
+          l_rec  : scalar - reconstruction loss
         """
         B, T = tgt.shape
 
-        # ── 1. Token embedding ────────────────────────────────────────────────
+        # 1. Token embedding.
         x = self.drop(self.embed(tgt))                              # (B, T, d_tok)
 
-        # ── 2. Cross-attn: з квантованими векторами h_q ───────────────────────
+        # 2. Cross-attn: use quantized vectors h_q.
         x = x + self.hq_xattn(self.hq_norm(x), context=h_q)
 
-        # ── 3. Cross-attn: концепт z_final → d_tok контекст ──────────────────
+        # 3. Cross-attn: inject concept z_final into d_tok context.
         x = x + self._broadcast_z_context(z_final, T, dtype=x.dtype)
 
-        # ── 4. Self-attention блоки ────────────────────────────────────────────
+        # 4. Self-attention blocks.
         for blk in self.blocks:
             x = blk(x)
 
-        # ── 5. Logits ─────────────────────────────────────────────────────────
+        # 5. Logits.
         logits = self.lm_head(self.out_norm(x))                     # (B, T, V)
 
-        # ── 6. L_rec: авторегресивна помилка відновлення ──────────────────────
-        # Зсуваємо: logits[0..T-2] → targets[1..T-1]
+        # 6. L_rec: autoregressive reconstruction loss.
+        # Shift: logits[0..T-2] -> targets[1..T-1]
         if return_recon_loss:
             target_slice = tgt[:, 1:]
             valid_mask = _sequence_valid_mask_from_trailing_padding(target_slice)
@@ -1137,27 +1047,21 @@ class ByteDecoder(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3b.  SemanticFeedbackLoss  (S-Core → NET зворотний зв'язок)
+# 3b.  SemanticFeedbackLoss  (S-Core -> NET feedback)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SemanticFeedbackLoss(nn.Module):
     """
     L_semantic = −E_{(v1,v2)~S-Core} [ cos(e_v1, e_v2) · Score(v1, v2) ]
 
-    Вирішує проблему «статистичних, а не семантичних» токенів:
-    S-Core виявляє пари концептів з логічним зв'язком (synonym, implies)
-    і змушує NET наближати їх вектори пропорційно до сили зв'язку.
+    This addresses the problem of "statistical rather than semantic" tokens:
+    S-Core finds concept pairs with a logical relation (synonym, implies)
+    and pushes NET to bring their vectors closer in proportion to that relation.
 
     MDL_total = MDL_NET − λ_sem · I(Z; Γ)
 
-    де I(Z; Γ) апроксимується через зважену косинусну подібність:
+    where I(Z; Γ) is approximated through weighted cosine similarity:
       I(Z; Γ) ≈ Σ_{(v1,v2)} Score(v1,v2) · cos(e_{v1}, e_{v2})
-
-    Score(v1,v2) — сила логічного зв'язку, виведена S-Core:
-      · implies(v1 → v2):      score = 0.9
-      · synonym(v1 ≡ v2):      score = 0.7
-
-    Підключається до NETLoss через lambda_semantic.
     """
 
     def __init__(self, lambda_semantic: float = 0.01):
@@ -1168,13 +1072,13 @@ class SemanticFeedbackLoss(nn.Module):
                 codebook:    torch.Tensor,          # (V_cur, d_tok)
                 pair_indices: List[Tuple[int, int, float]]) -> torch.Tensor:
         """
-        codebook     : активна частина кодбуку EpistemicQuantizer (V, d)
-        pair_indices : [(tok_idx_1, tok_idx_2, score), ...]
-                       від DifferentiableProver.semantic_feedback_pairs()
-                       або вбудованого KB-аналізу.
+        codebook     : active part of the `EpistemicQuantizer` codebook `(V, d)`
+        pair_indices : `[(tok_idx_1, tok_idx_2, score), ...]`
+                       from `DifferentiableProver.semantic_feedback_pairs()`
+                       or built-in KB analysis.
 
-        Returns: L_semantic (scalar, від'ємний означає «токени вже подібні»,
-                 мінімізуємо → наближаємо семантично пов'язані вектори).
+        Returns: `L_semantic` (scalar). Negative values mean the tokens are already
+        similar; minimizing it pulls semantically related vectors together.
         """
         if not pair_indices or codebook.shape[0] < 2:
             return torch.zeros(1, device=codebook.device,
@@ -1182,7 +1086,7 @@ class SemanticFeedbackLoss(nn.Module):
 
         device = codebook.device
         V      = codebook.shape[0]
-        cb_n   = F.normalize(codebook, dim=-1)   # (V, d) нормований
+        cb_n   = F.normalize(codebook, dim=-1)   # (V, d) normalized
         valid_pairs = [
             (int(i1), int(i2), float(score))
             for (i1, i2, score) in pair_indices
@@ -1196,7 +1100,7 @@ class SemanticFeedbackLoss(nn.Module):
         scores = torch.tensor([item[2] for item in valid_pairs], dtype=cb_n.dtype, device=device)
         cos_sim = (cb_n.index_select(0, idx1) * cb_n.index_select(0, idx2)).sum(dim=-1)
         avg_sem = (cos_sim * scores).mean()
-        # −λ · I(Z;Γ): мінімізація → максимізація cosine з S-Core-вагами
+        # -λ · I(Z;Γ): minimizing this maximizes cosine similarity weighted by S-Core.
         return -self.lambda_semantic * avg_sem
 
 
@@ -1208,16 +1112,11 @@ class NETLoss(nn.Module):
     """
     L_NET = L_code + L_rec + L_vocab + λ_vq·L_vq + L_semantic
 
-    L_code   ≈ Length(Z)        — ентропійна оцінка (нормована)
-    L_vq                        — commitment loss (STE-сигнал)
-    L_rec   ≈ Distortion(X,X̂) — CrossEntropy відновлення
-    L_vocab ≈ Complexity(V)    — MDL вартість словника
-    L_semantic                  — S-Core семантичний зворотний зв'язок:
-                                  −λ_sem · I(Z;Γ)
-
-    Повний MDL функціонал:
-      L_NET = L_code + L_rec + L_vocab + λ_vq·L_vq
-            − λ_sem · Σ_{(v1,v2)} Score(v1,v2)·cos(e_v1, e_v2)
+    L_code    ≈ Length(Z)         - normalized entropy estimate
+    L_vq                           - commitment loss (STE signal)
+    L_rec     ≈ Distortion(X,X̂)  - reconstruction cross-entropy
+    L_vocab   ≈ Complexity(V)     - MDL vocabulary cost
+    L_semantic                    - S-Core semantic feedback: -λ_sem · I(Z;Γ)
     """
 
     def __init__(self,
@@ -1230,7 +1129,7 @@ class NETLoss(nn.Module):
         self.lambda_voc      = lambda_voc
         self.lambda_vq       = lambda_vq
         self.lambda_enc_div  = lambda_enc_div
-        self.lambda_soft_H   = lambda_soft_H   # ← вага диференційованої soft-entropy
+        self.lambda_soft_H   = lambda_soft_H   # weight of differentiable soft entropy
         self.sem_loss_fn     = SemanticFeedbackLoss(lambda_semantic)
 
     def forward(self,
@@ -1240,9 +1139,9 @@ class NETLoss(nn.Module):
                 sem_pairs:     Optional[List[Tuple[int, int, float]]] = None,
                 ) -> Dict:
         """
-        sem_pairs : [(tok_idx_1, tok_idx_2, score), ...] від S-Core.
-                    Якщо None → L_semantic = 0.
-        Returns dict з усіма складовими та total.
+        sem_pairs : [(tok_idx_1, tok_idx_2, score), ...] from S-Core.
+                    If `None`, then `L_semantic = 0`.
+        Return a dict with all components plus the total.
         """
         if l_rec is None:
             l_rec = torch.zeros((), device=quantizer.codebook.weight.device, dtype=quantizer.codebook.weight.dtype)
@@ -1250,7 +1149,7 @@ class NETLoss(nn.Module):
         l_vq    = vq_info["vq_loss"]
         l_vocab = quantizer.vocab_mdl_penalty(self.lambda_voc)
 
-        # ── L_code: ентропійна оцінка H(Z) ───────────────────────────────────
+        # L_code: entropy estimate H(Z).
         H_nats = vq_info["usage_entropy"]
         V      = max(vq_info["vocab_size"], 2)
         H_max  = math.log(V)
@@ -1259,29 +1158,25 @@ class NETLoss(nn.Module):
             dtype=l_rec.dtype, device=l_rec.device
         )
 
-        # ── L_semantic: S-Core зворотній зв'язок ─────────────────────────────
+        # L_semantic: S-Core feedback.
         if sem_pairs:
             active_codebook = quantizer.codebook.weight[:quantizer.current_size]
             l_semantic = self.sem_loss_fn(active_codebook, sem_pairs)
-            # Переносимо на той самий device що й l_rec
+            # Move to the same device as l_rec.
             l_semantic = l_semantic.to(l_rec.device)
         else:
             l_semantic = torch.zeros(1, device=l_rec.device).squeeze()
 
-        # ── L_enc_div: encoder diversity anti-collapse ────────────────────────
-        # Мінімізуємо середню попарну косинусну подібність encoder outputs.
-        # Якщо encoder collapse (MeanSim~0.99) → цей loss тягне вектори нарізно.
+        # L_enc_div: anti-collapse encoder diversity term.
+        # Minimize average pairwise cosine similarity between encoder outputs.
         raw_enc_div = vq_info.get("enc_div_loss", 0.0)
         if torch.is_tensor(raw_enc_div):
             l_enc_div = raw_enc_div.to(l_rec.device)
         else:
             l_enc_div = torch.tensor(float(raw_enc_div), device=l_rec.device)
 
-        # ── L_soft_H: диференційована soft-entropy (ключовий anti-collapse сигнал) ──
-        # l_code вище — КОНСТАНТА (torch.tensor з .item()) → нульовий градієнт.
-        # soft_entropy_loss — справжній тензор з градієнтом через encoder outputs.
-        # Максимізує ентропію розподілу soft-assignments по кодбуку.
-        # Ефективний навіть при повному collapse (на відміну від pairwise cosine).
+        # L_soft_H: differentiable soft entropy - the key anti-collapse signal.
+        # Unlike l_code, this is a real tensor with gradients through encoder outputs.
         raw_soft_H = vq_info.get("soft_entropy_loss", 0.0)
         if torch.is_tensor(raw_soft_H):
             l_soft_H = raw_soft_H.to(l_rec.device)
@@ -1325,18 +1220,18 @@ class NETLoss(nn.Module):
 
 class NeuralEpistemicTokenizer(nn.Module):
     """
-    Повний Neural Epistemic Tokenizer.
+    Full Neural Epistemic Tokenizer.
 
-    Замінює TokenEncoder + TokenDecoder в OMENScale:
+    Replaces TokenEncoder + TokenDecoder in OMENScale:
       encode(src) → h_tok, vq_indices, vq_info
       decode(tgt, z_final, h_tok) → logits, l_rec
 
-    Параметри беруться з OMENScaleConfig:
+    Parameters are taken from OMENScaleConfig:
       vocab_size, d_tok, n_heads_tok, net_byte_layers, net_dec_layers
       net_init_vocab, net_max_vocab, net_tau, net_ema_decay
       d_latent, dropout, lambda_voc
 
-    Архітектурний потік:
+    Architectural flow:
       src → ByteContextEncoder → h_ctx (B,T,d_tok)
           → EpistemicQuantizer → h_q (B,T,d_tok), vq_indices, vq_info
       tgt → ByteDecoder(h_q, z_final) → logits (B,T,V), l_rec
@@ -1346,15 +1241,14 @@ class NeuralEpistemicTokenizer(nn.Module):
         super().__init__()
 
         self.cfg = cfg
-        # Визначаємо ефективний vocab для ByteContextEncoder:
-        # якщо cfg.vocab_size ≤ 256 — справжній byte mode (256)
-        # інакше — legacy mode із ПОВНИМ vocab (наприклад, 4096 у demo).
-        # ВАЖЛИВО: НЕ робимо min(vocab_size, 256) — це призводить до
-        # примусового byte-mode і clamp(0,255) для токенів > 255,
-        # що колапсує 94% токенів в одну позицію і вбиває кодбук.
+        # Effective vocab for ByteContextEncoder:
+        # if cfg.vocab_size <= 256 -> true byte mode (256)
+        # otherwise -> legacy mode with the FULL vocab.
+        # IMPORTANT: do NOT use min(vocab_size, 256), because that forces byte mode
+        # and clamps tokens >255 into one bucket, collapsing the codebook.
         byte_vocab = 256
 
-        # ── f_θ: ByteContextEncoder ───────────────────────────────────────────
+        # f_θ: ByteContextEncoder
         self.byte_encoder = ByteContextEncoder(
             vocab_size = byte_vocab,
             d_tok      = cfg.d_tok,
@@ -1363,7 +1257,7 @@ class NeuralEpistemicTokenizer(nn.Module):
             dropout    = cfg.dropout,
         )
 
-        # ── Q: EpistemicQuantizer ─────────────────────────────────────────────
+        # Q: EpistemicQuantizer
         self.quantizer = EpistemicQuantizer(
             d_tok        = cfg.d_tok,
             init_vocab   = cfg.net_init_vocab,
@@ -1375,7 +1269,7 @@ class NeuralEpistemicTokenizer(nn.Module):
             tau_min      = getattr(cfg, 'net_tau_min', 0.70),
         )
 
-        # ── g_φ: ByteDecoder ──────────────────────────────────────────────────
+        # g_φ: ByteDecoder
         self.byte_decoder = ByteDecoder(
             vocab_size = cfg.vocab_size,
             d_tok      = cfg.d_tok,
@@ -1385,7 +1279,7 @@ class NeuralEpistemicTokenizer(nn.Module):
             dropout    = cfg.dropout,
         )
 
-        # ── Функція витрат ────────────────────────────────────────────────────
+        # Loss function
         self.loss_fn = NETLoss(
             lambda_voc      = cfg.lambda_voc,
             lambda_semantic = getattr(cfg, 'lambda_semantic', 0.01),
@@ -1393,7 +1287,7 @@ class NeuralEpistemicTokenizer(nn.Module):
             lambda_soft_H   = getattr(cfg, 'lambda_soft_H',  2.0),   # FIX Bug2: 0.5→2.0
         )
 
-    # ── encode ────────────────────────────────────────────────────────────────
+    # encode
     def encode(
         self,
         src: torch.Tensor,
@@ -1401,13 +1295,13 @@ class NeuralEpistemicTokenizer(nn.Module):
         summarize_attn: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         """
-        src : (B, T) — вхідна послідовність
+        src : (B, T) - input sequence
         Returns:
-          h_q       : (B, T, d_tok)  — квантовані вектори (подаються у Perceiver)
-          vq_indices: (B, T)         — дискретні індекси (можна аналізувати)
-          vq_info   : dict           — статистика квантування
+          h_q       : (B, T, d_tok) - quantized vectors (fed into the Perceiver)
+          vq_indices: (B, T)        - discrete indices (useful for analysis)
+          vq_info   : dict          - quantization statistics
         """
-        # f_θ: контекстне кодування
+        # f_θ: contextual encoding
         if return_attn:
             h_ctx, attn_maps = self.byte_encoder(
                 src,
@@ -1417,14 +1311,14 @@ class NeuralEpistemicTokenizer(nn.Module):
         else:
             h_ctx = self.byte_encoder(src)                             # (B, T, d_tok)
             attn_maps = None
-        # Q: квантування
+        # Q: quantization
         h_q, vq_indices, vq_info = self.quantizer(h_ctx)          # STE
         if attn_maps is not None:
             vq_info["attention_maps"] = attn_maps
             vq_info["h_ctx"] = h_ctx
         return h_q, vq_indices, vq_info
 
-    # ── decode ────────────────────────────────────────────────────────────────
+    # decode
     def decode(self,
                tgt:     torch.Tensor,
                z_final: torch.Tensor,
@@ -1433,9 +1327,9 @@ class NeuralEpistemicTokenizer(nn.Module):
                return_recon_loss: bool = True,
                return_logits: bool = True) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
-        tgt     : (B, T) — цільова послідовність
-        z_final : (B, d_latent) — концепт-рівень
-        h_q     : (B, T, d_tok) — квантовані вектори з encode()
+        tgt     : (B, T) - target sequence
+        z_final : (B, d_latent) - concept-level signal
+        h_q     : (B, T, d_tok) - quantized vectors from encode()
         Returns:
           logits : (B, T, vocab_size)
           l_rec  : scalar reconstruction loss
@@ -1448,50 +1342,46 @@ class NeuralEpistemicTokenizer(nn.Module):
             return_logits=return_logits,
         )
 
-    # ── compute_net_loss ──────────────────────────────────────────────────────
+    # compute_net_loss
     def compute_loss(self,
                      vq_info:   Dict,
                      l_rec:     Optional[torch.Tensor],
                      sem_pairs: Optional[List[Tuple[int, int, float]]] = None,
                      ) -> Dict:
         """
-        Обчислює повний L_NET з семантичним feedback від S-Core.
+        Compute the full `L_NET` with semantic feedback from S-Core.
 
-        sem_pairs : [(tok_idx_1, tok_idx_2, score), ...] від prover.semantic_feedback_pairs()
-                    Якщо None → L_semantic = 0 (режим без S-Core).
+        sem_pairs : [(tok_idx_1, tok_idx_2, score), ...] from
+                    `prover.semantic_feedback_pairs()`.
+                    If None, then `L_semantic = 0` (no-S-Core mode).
         """
         return self.loss_fn(vq_info, l_rec, self.quantizer, sem_pairs=sem_pairs)
 
-    # ── Stage-1 non-autoregressive reconstruction loss ────────────────────────
+    # Stage-1 non-autoregressive reconstruction loss.
     def stage1_rec_loss(self, h_q: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
         """
-        Non-autoregressive reconstruction loss для Stage 1 pretraining.
+        Non-autoregressive reconstruction loss for Stage 1 pretraining.
 
-        ПРОБЛЕМА: ByteDecoder містить causal self-attention по tgt токенах.
-        Протягом навчання decoder може навчитись передбачати tgt[i+1] з tgt[0..i]
-        БЕЗ використання h_q (стандартна language model). Як тільки decoder знаходить
-        цей «bypass», градієнт через h_q до encoder слабшає → encoder collapse.
+        Problem: `ByteDecoder` contains causal self-attention over tgt tokens.
+        During training it can learn to predict tgt[i+1] from tgt[0..i]
+        without using h_q at all, weakening the gradient to the encoder and
+        causing encoder collapse.
 
-        FIX: обчислюємо ДОДАТКОВУ позиційну реконструкцію: h_q[i] → src[i].
-        Тут НЕМАЄ causal context — decoder не може bypass-ити h_q.
-        Кожна позиція мусить закодувати власний байт у своєму z_q вектору.
-
-        L_rec_nonauto = CrossEntropy(lm_head(norm(h_q)), src)  (позиційно)
-
-        Ця loss додається до стандартного l_rec із вагою λ=0.5 у pretrain_net.
-        У Stage 2 (joint training) НЕ використовується — там є z_final контекст.
+        Fix: add an extra positional reconstruction path: h_q[i] -> src[i].
+        There is NO causal context here, so the decoder cannot bypass h_q.
+        Each position must encode its own byte in its z_q vector.
         """
         dec = self.byte_decoder
-        logits = dec.lm_head(dec.out_norm(h_q))          # (B, T, V) — без causal bypass
+        logits = dec.lm_head(dec.out_norm(h_q))          # (B, T, V) - no causal bypass
         valid_mask = _sequence_valid_mask_from_trailing_padding(src)
         return _masked_sequence_cross_entropy(logits, src, valid_mask)
 
-    # ── Utility: зв'язати Q з KB ──────────────────────────────────────────────
+    # Utility: connect Q to the KB.
     def attach_kb(self, kb) -> None:
-        """Підключає omen_prolog.KnowledgeBase для S-Core інтеграції."""
+        """Attach `omen_prolog.KnowledgeBase` for S-Core integration."""
         self.quantizer.kb = kb
 
-    # ── Звіт ─────────────────────────────────────────────────────────────────
+    # Report.
     def tokenizer_report(self) -> str:
         q = self.quantizer
         n_enc  = sum(p.numel() for p in self.byte_encoder.parameters())
@@ -1509,13 +1399,13 @@ class NeuralEpistemicTokenizer(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 6.  INLINE ТЕСТИ
+# 6.  INLINE TESTS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_net_tests() -> None:
     """
-    Комплексне тестування NET без залежності від OMENScaleConfig.
-    Запускається через:  python omen_net_tokenizer.py
+    Comprehensive NET test suite without depending on OMENScaleConfig.
+    Run via: `python omen_net_tokenizer.py`
     """
     import time
     sep = lambda s: print(f"\n{'═'*68}\n  {s}\n{'═'*68}")
@@ -1529,21 +1419,21 @@ def run_net_tests() -> None:
     B, T   = 4, 32
 
     # ─── T1: ByteContextEncoder ───────────────────────────────────────────────
-    sep("T1 · ByteContextEncoder — контекстне кодування")
+    sep("T1 · ByteContextEncoder - contextual encoding")
     enc = ByteContextEncoder(VOCAB, D_TOK, n_layers=2, n_heads=N_H).to(DEVICE)
     tokens = torch.randint(0, VOCAB, (B, T), device=DEVICE)
     h = enc(tokens)
     assert h.shape == (B, T, D_TOK), f"FAIL: shape {h.shape}"
-    # Перевіряємо, що різні токени дають різні вектори
+    # Check that different tokens produce different vectors.
     h0, h1 = h[0, 0], h[0, 1]
     cos_sim = F.cosine_similarity(h0.unsqueeze(0), h1.unsqueeze(0)).item()
     print(f"  output shape   : {tuple(h.shape)} ✓")
-    print(f"  cos_sim(pos0, pos1) : {cos_sim:.4f}  (< 1 → контекст залежить від позиції)")
-    assert cos_sim < 0.999, "FAIL: всі вектори однакові"
+    print(f"  cos_sim(pos0, pos1) : {cos_sim:.4f}  (< 1 -> context depends on position)")
+    assert cos_sim < 0.999, "FAIL: all vectors are identical"
     print("  [PASS]")
 
-    # ─── T2: EpistemicQuantizer — базове квантування ──────────────────────────
-    sep("T2 · EpistemicQuantizer — базове квантування + STE")
+    # ─── T2: EpistemicQuantizer - basic quantization ───────────────────────────
+    sep("T2 · EpistemicQuantizer - basic quantization + STE")
     q = EpistemicQuantizer(D_TOK, init_vocab=32, max_vocab=128, tau=0.80).to(DEVICE)
     q.train()
 
@@ -1554,10 +1444,10 @@ def run_net_tests() -> None:
     assert idx.shape == (B, T),        f"FAIL: idx shape {idx.shape}"
     assert idx.max() < q.current_size, f"FAIL: idx {idx.max()} ≥ vocab_size"
 
-    # STE: градієнт має проходити через x
+    # STE: gradients must flow through x.
     z_q.sum().backward()
-    assert x.grad is not None, "FAIL: немає градієнту через STE"
-    assert not torch.isnan(x.grad).any(), "FAIL: NaN у градієнті"
+    assert x.grad is not None, "FAIL: no gradient through STE"
+    assert not torch.isnan(x.grad).any(), "FAIL: NaN in gradient"
 
     print(f"  z_q shape      : {tuple(z_q.shape)} ✓")
     print(f"  indices max    : {idx.max().item()} < {q.current_size.item()} ✓")
@@ -1567,10 +1457,10 @@ def run_net_tests() -> None:
     print(f"  mean_sim       : {info['mean_sim']:.4f}")
     print("  [PASS]")
 
-    # ─── T3: EpistemicQuantizer — динамічний словник ──────────────────────────
-    sep("T3 · EpistemicQuantizer — динамічне розширення словника")
+    # ─── T3: EpistemicQuantizer - dynamic vocabulary ───────────────────────────
+    sep("T3 · EpistemicQuantizer - dynamic vocabulary growth")
     q2 = EpistemicQuantizer(D_TOK, init_vocab=4, max_vocab=64,
-                            tau=0.99, warmup_steps=0).to(DEVICE)   # warmup=0 для тесту
+                            tau=0.99, warmup_steps=0).to(DEVICE)   # warmup=0 for the test
     q2.train()
 
     total_new = 0
@@ -1579,14 +1469,14 @@ def run_net_tests() -> None:
         _, _, info2 = q2(x2)
         total_new += info2["n_new_tokens"]
 
-    print(f"  Початковий vocab : 4")
-    print(f"  Кінцевий vocab   : {q2.current_size.item()}")
-    print(f"  Нових токенів    : {total_new}")
-    assert q2.current_size > 4, "FAIL: словник не розширився"
+    print(f"  Initial vocab : 4")
+    print(f"  Final vocab   : {q2.current_size.item()}")
+    print(f"  New tokens    : {total_new}")
+    assert q2.current_size > 4, "FAIL: vocabulary did not grow"
     print("  [PASS]")
 
     # ─── T4: ByteDecoder ──────────────────────────────────────────────────────
-    sep("T4 · ByteDecoder — реконструкція + l_rec")
+    sep("T4 · ByteDecoder - reconstruction + l_rec")
     dec = ByteDecoder(VOCAB, D_TOK, D_LAT, n_layers=2, n_heads=N_H).to(DEVICE)
     h_q     = torch.randn(B, T, D_TOK, device=DEVICE)
     z_final = torch.randn(B, D_LAT, device=DEVICE)
@@ -1594,19 +1484,19 @@ def run_net_tests() -> None:
 
     logits, l_rec = dec(tgt_tok, z_final, h_q)
     assert logits.shape == (B, T, VOCAB), f"FAIL: logits {logits.shape}"
-    assert not torch.isnan(l_rec), "FAIL: NaN у l_rec"
+    assert not torch.isnan(l_rec), "FAIL: NaN in l_rec"
     print(f"  logits shape : {tuple(logits.shape)} ✓")
     print(f"  l_rec        : {l_rec.item():.4f}")
 
     # Backward
     l_rec.backward()
     grad_sum = sum(p.grad.norm().item() for p in dec.parameters() if p.grad is not None)
-    assert grad_sum > 0, "FAIL: немає градієнтів у ByteDecoder"
+    assert grad_sum > 0, "FAIL: no gradients in ByteDecoder"
     print(f"  grad_sum     : {grad_sum:.4f} ✓")
     print("  [PASS]")
 
     # ─── T5: NETLoss ──────────────────────────────────────────────────────────
-    sep("T5 · NETLoss — всі три компоненти")
+    sep("T5 · NETLoss - all three components")
     q3 = EpistemicQuantizer(D_TOK, 16, 64, 0.80).to(DEVICE)
     q3.train()
     xr = torch.randn(B, T, D_TOK, device=DEVICE, requires_grad=True)
@@ -1620,7 +1510,7 @@ def run_net_tests() -> None:
     assert not math.isnan(out3["net_vq"])
     assert not math.isnan(out3["net_rec"])
     assert not math.isnan(out3["net_vocab_pen"])
-    assert out3["net_total"].item() > out3["net_rec"], "FAIL: L_vocab/L_code не входять у L_NET"
+    assert out3["net_total"].item() > out3["net_rec"], "FAIL: L_vocab/L_code are not included in L_NET"
     assert out3["net_stage_aux"] > out3["net_aux"], "FAIL: stage aux should include vocab MDL on top of global aux"
     print(f"  L_vq       : {out3['net_vq']:.4f}")
     print(f"  L_rec      : {out3['net_rec']:.4f}")
@@ -1632,8 +1522,8 @@ def run_net_tests() -> None:
     print(f"  entropy    : {out3['net_entropy']:.4f}")
     print("  [PASS]")
 
-    # ─── T6: NeuralEpistemicTokenizer — інтеграційний тест ───────────────────
-    sep("T6 · NeuralEpistemicTokenizer — encode → decode → loss")
+    # ─── T6: NeuralEpistemicTokenizer - integration test ──────────────────────
+    sep("T6 · NeuralEpistemicTokenizer - encode -> decode -> loss")
 
     class _FakeCfg:
         vocab_size = VOCAB; d_tok = D_TOK; d_latent = D_LAT
@@ -1655,19 +1545,19 @@ def run_net_tests() -> None:
     assert h_q.shape   == (B, T, D_TOK)
     assert vq_idx.shape == (B, T)
     assert logits2.shape == (B, T, VOCAB)
-    assert "attention_maps" in vq_info, "FAIL: attention maps не повернулись з encode(return_attn=True)"
-    assert "h_ctx" in vq_info, "FAIL: raw encoder hidden не повернувся з encode(return_attn=True)"
+    assert "attention_maps" in vq_info, "FAIL: attention maps were not returned by encode(return_attn=True)"
+    assert "h_ctx" in vq_info, "FAIL: raw encoder hidden state was not returned by encode(return_attn=True)"
     assert vq_info["attention_maps"].shape[:3] == (B, _FakeCfg.net_byte_layers, N_H)
     assert not net_loss_dict["net_total"].isnan()
 
-    # Перевірка backward через весь NET
+    # Full backward check across the whole NET.
     net_loss_dict["net_total"].backward()
     grad_enc = sum(p.grad.norm().item() for p in net.byte_encoder.parameters()
                    if p.grad is not None)
     grad_dec = sum(p.grad.norm().item() for p in net.byte_decoder.parameters()
                    if p.grad is not None)
-    assert grad_enc > 0, "FAIL: немає градієнту у ByteContextEncoder"
-    assert grad_dec > 0, "FAIL: немає градієнту у ByteDecoder"
+    assert grad_enc > 0, "FAIL: no gradients in ByteContextEncoder"
+    assert grad_dec > 0, "FAIL: no gradients in ByteDecoder"
 
     print(f"  h_q shape     : {tuple(h_q.shape)} ✓")
     print(f"  vq_idx shape  : {tuple(vq_idx.shape)} ✓")
@@ -1679,13 +1569,13 @@ def run_net_tests() -> None:
     print(net.tokenizer_report())
     print("  [PASS]")
 
-    # ─── T7: S-Core інтеграція ────────────────────────────────────────────────
-    sep("T7 · S-Core інтеграція — реєстрація концептів у KB")
+    # ─── T7: S-Core integration ───────────────────────────────────────────────
+    sep("T7 · S-Core integration - concept registration in KB")
     try:
         from omen_prolog import KnowledgeBase   # type: ignore
         kb = KnowledgeBase()
         net.attach_kb(kb)
-        # Форсуємо нові токени
+        # Force creation of new tokens.
         q_stest = EpistemicQuantizer(D_TOK, 2, 64, tau=0.99).to(DEVICE)
         q_stest.kb = kb
         q_stest.train()
@@ -1693,25 +1583,25 @@ def run_net_tests() -> None:
             x_s = torch.randn(2, 8, D_TOK, device=DEVICE)
             q_stest(x_s)
         n_facts = kb.n_facts()
-        print(f"  KB facts після реєстрації концептів: {n_facts}")
-        assert n_facts >= 0   # може бути 0 якщо vocab не росте
+        print(f"  KB facts after concept registration: {n_facts}")
+        assert n_facts >= 0   # may be 0 if the vocab does not grow
         print("  [PASS]")
     except Exception as e:
-        print(f"  S-Core інтеграція: {e}  (пропускаємо)")
+        print(f"  S-Core integration: {e}  (skipping)")
 
-    # ─── T8: MDL ефект — великий словник = більший штраф ─────────────────────
-    sep("T8 · MDL ефект — Complexity(V) зростає з розміром словника")
+    # ─── T8: MDL effect - larger vocabulary means larger penalty ──────────────
+    sep("T8 · MDL effect - Complexity(V) grows with vocabulary size")
     q_small = EpistemicQuantizer(D_TOK, 4,  64, 0.80).to(DEVICE)
     q_large = EpistemicQuantizer(D_TOK, 32, 64, 0.80).to(DEVICE)
     pen_small = q_small.vocab_mdl_penalty(1e-3).item()
     pen_large = q_large.vocab_mdl_penalty(1e-3).item()
     print(f"  penalty(V=4)  : {pen_small:.6f}")
     print(f"  penalty(V=32) : {pen_large:.6f}")
-    assert pen_large > pen_small, "FAIL: більший словник має більший штраф"
+    assert pen_large > pen_small, "FAIL: larger vocabulary should have a larger penalty"
     print("  [PASS]")
 
     print(f"\n{'═'*68}")
-    print("  ✅  Всі 8 NET тестів пройдено успішно")
+    print("  ✅  All 8 NET tests passed successfully")
     print(f"{'═'*68}\n")
 
 

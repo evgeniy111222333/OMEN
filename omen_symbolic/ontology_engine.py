@@ -1,27 +1,27 @@
 """
 ontology_engine.py — Ontology Expansion Engine (OEE)
 
-Повна реалізація концепції з нейромережевим спрямованим пошуком:
+Full implementation of the concept with neural guided search:
 
-  · PredicateLatentModel — нейромережа, що відображає стан KB → h ∈ ℝ^d_latent.
-    Входи: агрегат ембеддингів існуючих предикатів (з AME HypergraphGNN) + gap_norm.
-    Виходи: h (латентний опис нового предиката), arity_logits, interaction_scores,
-            confidence, context_input (для online training).
-    Cross-attention: h запитує ембеддинги існуючих предикатів для визначення
-    партнерів взаємодії P_new.
+  · PredicateLatentModel maps the KB state to h ∈ R^d_latent.
+    Inputs: pooled embeddings of existing predicates (from AME HypergraphGNN) + gap_norm.
+    Outputs: h (latent description of the new predicate), arity_logits, interaction_scores,
+            confidence, context_input (for online training).
+    Cross-attention: h queries embeddings of existing predicates to identify
+    P_new interaction partners.
 
-  · RuleHypothesisSampler — генерує та ранжує кандидатні правила за:
+  · RuleHypothesisSampler generates and ranks candidate rules by:
       argmax_{Γ_new} [Consistency(Γ ∪ Γ_new, Data) − λ · Complexity(Γ_new)]
-    де Consistency = |FC_sandbox(Γ ∪ {r}) ∩ Data| − |FC(Γ) ∩ Data|,
-        Complexity  = MDL_bits(r).
-    Шаблони: unary_link, transitive, bridge_goal, fact_coverage.
+    where Consistency = |FC_sandbox(Γ ∪ {r}) ∩ Data| − |FC(Γ) ∩ Data|,
+          Complexity  = MDL_bits(r).
+    Templates: unary_link, transitive, bridge_goal, fact_coverage.
 
-  · Online learning: VeM зворотний зв'язок оновлює PredicateLatentModel через
-    контрастивний лос на буфері context-input векторів.
-    Прийняті правила → позитивні пари (h кластеризуються).
-    Відхилені → негативні пари (відштовхуються від прийнятих).
+  · Online learning: VeM feedback updates PredicateLatentModel through
+    a contrastive loss over the context-input buffer.
+    Accepted rules -> positive pairs (h vectors cluster).
+    Rejected rules -> negative pairs (repelled from accepted ones).
 
-Математична модель:
+Mathematical model:
   P_new* = argmax_P [max_{Γ_new} (Consistency(Γ ∪ Γ_new, Data) − λ · Complexity(Γ_new))]
 """
 
@@ -41,23 +41,23 @@ import torch.nn.functional as F
 from omen_symbolic.creative_types import RuleCandidate
 
 
-# ─── Латентна модель нового предиката ────────────────────────────────────────
+# ─── Latent Model Of A New Predicate ─────────────────────────────────────────
 
 class PredicateLatentModel(nn.Module):
     """
-    Нейромережа для спрямованого пошуку нового предиката P_new.
+    Neural network for guided search over a new predicate P_new.
 
-    Архітектура:
-      context_encoder : (embed_dim + 1) → d_latent   (pooled embeds + gap_norm)
-      h_decoder       : d_latent → d_latent           (латентний вектор h P_new)
-      arity_head      : d_latent → max_arity          (передбачення арності)
-      attn_query/key  : cross-attention h → pred_embeds (interaction scores)
-      confidence_head : d_latent → 1                  (впевненість моделі)
+    Architecture:
+      context_encoder : (embed_dim + 1) -> d_latent   (pooled embeds + gap_norm)
+      h_decoder       : d_latent -> d_latent          (latent vector h for P_new)
+      arity_head      : d_latent -> max_arity         (arity prediction)
+      attn_query/key  : cross-attention h -> pred_embeds (interaction scores)
+      confidence_head : d_latent -> 1                 (model confidence)
 
-    Навчання:
-      Онлайн контрастивний лос на буфері (context_input, accepted).
-      Прийняті VeM правила → позитивні пари (h мають кластеризуватись).
-      Відхилені → негативні пари (h відштовхуються від прийнятих).
+    Training:
+      Online contrastive loss over the buffer (context_input, accepted).
+      Accepted VeM rules -> positive pairs (h vectors should cluster).
+      Rejected rules -> negative pairs (repelled from accepted ones).
     """
 
     def __init__(
@@ -108,8 +108,8 @@ class PredicateLatentModel(nn.Module):
         state_z: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Будує вхідний контекст-вектор (embed_dim + 1 + state_dim,).
-        Повертає сирий вектор — зберігається для online training.
+        Build the input context vector (embed_dim + 1 + state_dim,).
+        Returns the raw vector stored for online training.
         """
         if pred_embeddings.size(0) == 0:
             pooled = torch.zeros(self.embed_dim, dtype=torch.float32)
@@ -180,18 +180,18 @@ class PredicateLatentModel(nn.Module):
         return h, arity_logits, interaction_scores, confidence, context_input
 
 
-# ─── Гіпотеза правила ────────────────────────────────────────────────────────
+# ─── Rule Hypothesis ─────────────────────────────────────────────────────────
 
 @dataclass
 class _RuleHypothesis:
-    """Одна гіпотеза правила з оцінкою Consistency − λ · Complexity."""
+    """A single rule hypothesis scored by Consistency − λ · Complexity."""
     clause: Any
     consistency: float       # |FC_sandbox ∩ Data| − |FC_baseline ∩ Data|
     complexity: float        # MDL_bits(rule)
     score: float             # consistency − lambda * complexity
     pred_id: int
     interaction_preds: Tuple[int, ...]
-    template: str            # назва шаблону для діагностики
+    template: str            # template name for diagnostics
     coverage_gain: float = 0.0
     novelty_gain: float = 0.0
     bundle_score: float = 0.0
@@ -211,16 +211,16 @@ class PredicateVocabEntry:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-# ─── Генератор та ранжировщик гіпотез ────────────────────────────────────────
+# ─── Hypothesis Generator And Ranker ─────────────────────────────────────────
 
 class RuleHypothesisSampler:
     """
-    Генерує та ранжує кандидатні правила для нового предиката P_new.
+    Generate and rank candidate rules for a new predicate P_new.
 
-    Реалізує оптимізацію:
+    Implements the optimization:
       argmax_{Γ_new} [Consistency(Γ ∪ Γ_new, Data) − λ · Complexity(Γ_new)]
 
-    Шаблони:
+    Templates:
       1. unary_link    : P_new(X,...) :- P_interact(X,...)
       2. transitive    : P_new(X,Z)   :- P_a(X,Y), P_b(Y,Z)
       3. bridge_goal   : P_goal(...)  :- P_new(...)
@@ -1055,7 +1055,7 @@ class RuleHypothesisSampler:
         target_facts: Optional[Sequence[Any]] = None,
     ) -> List[_RuleHypothesis]:
         """
-        Генерує гіпотези за всіма шаблонами і ранжує за
+        Generate hypotheses from all templates and rank them by
         argmax [Consistency − λ · Complexity].
         """
         if not current_facts:
@@ -1115,7 +1115,7 @@ class RuleHypothesisSampler:
             explanation_targets.append(target)
             seen_targets.add(target)
 
-        # Індекс фактів по предикату
+        # Index facts by predicate
         ip_facts_map: Dict[int, List[Any]] = defaultdict(list)
         for f in current_facts:
             ip_facts_map[int(getattr(f, "pred", -1))].append(f)
@@ -1126,8 +1126,8 @@ class RuleHypothesisSampler:
             if facts
         }
 
-        # ── Шаблон 1: unary_link ─────────────────────────────────────────────
-        # P_new(X,...) :- P_interact(X,...) — новий предикат як структурний псевдонім
+        # ── Template 1: unary_link ────────────────────────────────────────────
+        # P_new(X,...) :- P_interact(X,...) - new predicate as a structural alias
         for i, (ip, _) in enumerate(zip(interaction_preds, interaction_scores)):
             if i >= self.max_interaction_preds:
                 break
@@ -1154,8 +1154,8 @@ class RuleHypothesisSampler:
             except Exception:
                 continue
 
-        # ── Шаблон 2: transitive ─────────────────────────────────────────────
-        # P_new(X,Z) :- P_a(X,Y), P_b(Y,Z) — транзитивна ланка
+        # ── Template 2: transitive ────────────────────────────────────────────
+        # P_new(X,Z) :- P_a(X,Y), P_b(Y,Z) - transitive link
         if arity >= 2 and len(interaction_preds) >= 2 and len(vars_) >= 3:
             x, y, z = vars_[0], vars_[1], vars_[2]
             p_a, p_b = interaction_preds[0], interaction_preds[1]
@@ -1178,8 +1178,8 @@ class RuleHypothesisSampler:
             except Exception:
                 pass
 
-        # ── Шаблон 2b: pair_factor ───────────────────────────────────────────
-        # P_new(...) :- P_a(...), P_b(...) — загальніша second-order факторизація
+        # ── Template 2b: pair_factor ──────────────────────────────────────────
+        # P_new(...) :- P_a(...), P_b(...) - more general second-order factorization
         top_preds = list(interaction_preds[: self.max_interaction_preds])
         for idx, p_a in enumerate(top_preds):
             for p_b in top_preds[idx + 1 :]:
@@ -1214,8 +1214,8 @@ class RuleHypothesisSampler:
                 except Exception:
                     continue
 
-        # ── Шаблон 3: bridge_goal ────────────────────────────────────────────
-        # P_goal(...) :- P_new(...) — bridge від нового предиката до цільового
+        # ── Template 3: bridge_goal ───────────────────────────────────────────
+        # P_goal(...) :- P_new(...) - bridge from the new predicate to the goal
         if goal is not None:
             try:
                 goal_arity = len(tuple(getattr(goal, "args", ())))
@@ -1240,7 +1240,7 @@ class RuleHypothesisSampler:
             except Exception:
                 pass
 
-        # ── Шаблон 3b: goal_factorization ────────────────────────────────────
+        # ── Template 3b: goal_factorization ───────────────────────────────────
         # P_goal(...) :- P_new(...), P_interact(...)
         if goal is not None:
             goal_arity = len(tuple(getattr(goal, "args", ())))
@@ -1273,8 +1273,8 @@ class RuleHypothesisSampler:
                 except Exception:
                     continue
 
-        # ── Шаблон 3c: inverse_alias ──────────────────────────────────────────
-        # P_interact(...) :- P_new(...) — існуючий предикат як прояв нового концепту
+        # ── Template 3c: inverse_alias ────────────────────────────────────────
+        # P_interact(...) :- P_new(...) - existing predicate as an instance of the new concept
         for p_a in top_preds[: self.max_interaction_preds]:
             a_arity = int(pred_arity_map.get(int(p_a), arity))
             if a_arity > arity:
@@ -1300,7 +1300,7 @@ class RuleHypothesisSampler:
             except Exception:
                 continue
 
-        # ── Шаблон 3d/3e: bridge_target / target_factorization ───────────────────────────────
+        # ── Template 3d/3e: bridge_target / target_factorization ──────────────
         for target in explanation_targets:
             target_pred = int(getattr(target, "pred", -1))
             target_arity = len(tuple(getattr(target, "args", ())))
@@ -1349,8 +1349,8 @@ class RuleHypothesisSampler:
                 except Exception:
                     continue
 
-        # ── Шаблон 4: fact_coverage ──────────────────────────────────────────
-        # P_new(X,...) :- P_unexplained(X,...) — пояснення непоясненого факту
+        # ── Template 4: fact_coverage ─────────────────────────────────────────
+        # P_new(X,...) :- P_unexplained(X,...) - explanation of an unexplained fact
         unexplained = [f for f in current_facts if f not in baseline]
         if unexplained:
             uf = unexplained[0]
@@ -1376,8 +1376,8 @@ class RuleHypothesisSampler:
             except Exception:
                 pass
 
-        # Відкритий second-order search: не спирається на фіксований список шаблонів,
-        # а перебирає вільні head/body-композиції з P_new та існуючих предикатів.
+        # Open second-order search: do not rely on a fixed template list,
+        # instead enumerate free head/body compositions over P_new and existing predicates.
         self._open_second_order_search(
             hypotheses,
             seen,
@@ -1406,7 +1406,7 @@ class RuleHypothesisSampler:
             explanation_targets,
         )
 
-        # Ранжуємо: argmax [Consistency − λ · Complexity]
+        # Rank by: argmax [Consistency − λ · Complexity]
         hypotheses.sort(
             key=lambda hyp: (max(hyp.score, hyp.bundle_score), hyp.coverage_gain, hyp.novelty_gain),
             reverse=True,
@@ -1441,36 +1441,36 @@ class RuleHypothesisSampler:
         return selected[: self.max_hypotheses]
 
 
-# ─── Буфер зворотного зв'язку ────────────────────────────────────────────────
+# ─── Feedback Buffer ─────────────────────────────────────────────────────────
 
 @dataclass
 class _FeedbackRecord:
-    """Запис для online learning: збережений вхід context_encoder + рішення VeM."""
+    """Record for online learning: stored context_encoder input + VeM decision."""
     context_input: torch.Tensor   # (embed_dim + 1,)
     gap_norm: float
-    accepted: bool                # True = VeM прийняв, False = відхилив
+    accepted: bool                # True = accepted by VeM, False = rejected
 
 
-# ─── Головний клас OEE ───────────────────────────────────────────────────────
+# ─── Main OEE Class ──────────────────────────────────────────────────────────
 
 class OntologyExpansionEngine:
     """
-    Повна нейро-символьна реалізація OEE.
+    Full neuro-symbolic implementation of OEE.
 
-    Параметри
+    Parameters
     ----------
-    gap_threshold            : поріг gap_norm для тригера
-    contradiction_threshold  : поріг кількості суперечностей (з CWE)
-    max_new_preds            : максимум нових предикатів за виклик
-    predicate_start          : початковий ID (900_000 щоб не перетинатись з KB)
-    d_latent                 : розмірність h ∈ ℝ^d_latent
-    consistency_lambda       : λ у Consistency − λ·Complexity
-    online_lr                : lr для онлайн навчання
-    feedback_buffer_size     : розмір FIFO-буфера зворотного зв'язку
-    train_every_n_calls      : частота кроків online training
-    forward_chain_depth      : глибина sandbox forward-chain для Consistency
-    max_interaction_preds    : top-k предикатів для взаємодії (cross-attention)
-    max_hypotheses           : максимум гіпотез на один новий предикат
+    gap_threshold            : gap_norm threshold that triggers the module
+    contradiction_threshold  : contradiction-count threshold (from CWE)
+    max_new_preds            : maximum number of new predicates per call
+    predicate_start          : starting ID (900_000 to avoid KB collisions)
+    d_latent                 : dimensionality of h ∈ R^d_latent
+    consistency_lambda       : lambda in Consistency − lambda·Complexity
+    online_lr                : learning rate for online training
+    feedback_buffer_size     : size of the feedback FIFO buffer
+    train_every_n_calls      : frequency of online-training steps
+    forward_chain_depth      : sandbox forward-chain depth for Consistency
+    max_interaction_preds    : top-k predicates used for interaction (cross-attention)
+    max_hypotheses           : maximum hypotheses per new predicate
     """
 
     def __init__(
@@ -1506,12 +1506,12 @@ class OntologyExpansionEngine:
         self._cluster_counts: Dict[Tuple[int, ...], float] = defaultdict(float)
         self._last_cluster_key: Tuple[int, ...] = tuple()
 
-        # Нейромережева компонента (ліниво ініціалізується при першому виклику)
+        # Neural component (lazily initialized on the first call)
         self._latent_model: Optional[PredicateLatentModel] = None
         self._latent_model_embed_dim: int = 0
         self._optimizer: Optional[torch.optim.Adam] = None
 
-        # Генератор гіпотез правил
+        # Rule-hypothesis generator
         self._sampler = RuleHypothesisSampler(
             consistency_lambda=consistency_lambda,
             max_interaction_preds=max_interaction_preds,
@@ -1523,7 +1523,7 @@ class OntologyExpansionEngine:
             bundle_seed_k=oee_bundle_seed_k,
         )
 
-        # Буфер для online learning
+        # Buffer for online learning
         self._feedback_buffer: Deque[_FeedbackRecord] = deque(maxlen=feedback_buffer_size)
         self._call_count: int = 0
         self._online_train_steps: int = 0
@@ -1531,13 +1531,13 @@ class OntologyExpansionEngine:
         self._last_online_train_loss: float = 0.0
         self._last_online_train_buffer_size: float = 0.0
 
-        # Стан останнього виклику (для record_feedback)
+        # State from the most recent call (used by record_feedback)
         self._last_context_input: Optional[torch.Tensor] = None
         self._last_gap_norm: float = 0.0
         self._last_pred_ids: List[int] = []
         self._last_h: Optional[torch.Tensor] = None
 
-        # Статистика прийнятих предикатів
+        # Statistics for accepted predicates
         self._accepted_pred_ids: List[int] = []
         self._predicate_vocab: Dict[int, PredicateVocabEntry] = {}
 
@@ -1647,10 +1647,10 @@ class OntologyExpansionEngine:
             self._latent_model_embed_dim = 0
             self._optimizer = None
 
-    # ─── Ініціалізація моделі ─────────────────────────────────────────────────
+    # ─── Model Initialization ─────────────────────────────────────────────────
 
     def _ensure_model(self, embed_dim: int) -> PredicateLatentModel:
-        """Ліниво будує або перебудовує модель при зміні embed_dim."""
+        """Lazily build or rebuild the model when embed_dim changes."""
         if self._latent_model is None or self._latent_model_embed_dim != embed_dim:
             self._latent_model = PredicateLatentModel(
                 embed_dim=embed_dim,
@@ -1699,7 +1699,7 @@ class OntologyExpansionEngine:
     def predicate_vocab(self) -> Dict[int, PredicateVocabEntry]:
         return dict(self._predicate_vocab)
 
-    # ─── Спостереження кластерного тиску ─────────────────────────────────────
+    # ─── Cluster-Pressure Observation ─────────────────────────────────────────
 
     def observe_gap_cluster(
         self,
@@ -1707,7 +1707,7 @@ class OntologyExpansionEngine:
         hot_dims: Sequence[int],
         z: Optional[torch.Tensor] = None,
     ) -> None:
-        """Накопичує gap_norm по кластерах латентного простору стану z."""
+        """Accumulate gap_norm over clusters in the latent state space of z."""
         if hot_dims:
             cluster = tuple(sorted(int(dim) for dim in hot_dims[:4]))
         elif z is not None and z.numel() > 0:
@@ -1723,7 +1723,7 @@ class OntologyExpansionEngine:
         self._cluster_pressure[cluster] += float(gap_norm)
         self._cluster_counts[cluster] += 1.0
 
-    # ─── Зворотний зв'язок від VeM ────────────────────────────────────────────
+    # ─── VeM Feedback ─────────────────────────────────────────────────────────
 
     def record_feedback(
         self,
@@ -1735,11 +1735,11 @@ class OntologyExpansionEngine:
         supporting_rules: Optional[Sequence[Any]] = None,
     ) -> None:
         """
-        Реєструє результат VeM для останнього виклику generate_candidates.
+        Register the VeM outcome for the most recent generate_candidates call.
 
-        Зберігає context_input у буфер для online learning.
-        Градієнти течуть через context_encoder → h_decoder під час тренування,
-        оскільки ми ре-форвардимо збережені вхідні вектори через поточні параметри.
+        Stores context_input in the online-learning buffer.
+        Gradients flow through context_encoder -> h_decoder during training
+        because we re-forward the saved input vectors through current parameters.
         """
         if self._last_context_input is not None:
             self._feedback_buffer.append(_FeedbackRecord(
@@ -1778,18 +1778,18 @@ class OntologyExpansionEngine:
                 metadata=entry_meta,
             )
 
-    # ─── Online learning ──────────────────────────────────────────────────────
+    # ─── Online Learning ──────────────────────────────────────────────────────
 
     def _online_train_step(self, model: PredicateLatentModel) -> float:
         """
-        Один крок онлайн навчання на буфері зворотного зв'язку.
+        One online-training step over the feedback buffer.
 
-        Контрастивний лос на h-просторі:
-          · Прийняті правила: h_acc_i · h_acc_j > 0.5  (кластеризація)
-          · Прийняті vs відхилені: h_acc · h_rej < -0.2 (відштовхування)
+        Contrastive loss in h-space:
+          · Accepted rules: h_acc_i · h_acc_j > 0.5  (clustering)
+          · Accepted vs rejected: h_acc · h_rej < -0.2 (repulsion)
 
-        Градієнти течуть через context_encoder + h_decoder, оскільки
-        ми ре-форвардимо збережені context_input вектори через поточну модель.
+        Gradients flow through context_encoder + h_decoder because
+        we re-forward the saved context_input vectors through the current model.
         """
         self._last_online_train_applied = 0.0
         self._last_online_train_loss = 0.0
@@ -1814,14 +1814,14 @@ class OntologyExpansionEngine:
 
             loss = torch.zeros(1, requires_grad=True).squeeze()
 
-            # Позитивні пари: прийняті h мають кластеризуватись (sim > 0.5)
+            # Positive pairs: accepted h vectors should cluster (sim > 0.5)
             if len(accepted_recs) >= 2:
                 sim = acc_n @ acc_n.T                   # (n_acc, n_acc)
                 eye = torch.eye(len(accepted_recs), dtype=torch.bool)
                 off = sim.masked_fill(eye, 1.0)
                 loss = loss + (0.5 - off).clamp(min=0.0).mean()
 
-            # Негативні пари: прийняті vs відхилені (sim < -0.2)
+            # Negative pairs: accepted vs rejected (sim < -0.2)
             if rejected_recs:
                 n_neg = min(len(rejected_recs), len(accepted_recs))
                 rej_inp = torch.stack([r.context_input for r in rejected_recs[:n_neg]])
@@ -1848,14 +1848,14 @@ class OntologyExpansionEngine:
 
         return loss_val
 
-    # ─── Генерація нових ID предикатів ───────────────────────────────────────
+    # ─── New Predicate-ID Generation ──────────────────────────────────────────
 
     def _new_predicate_id(self) -> int:
         pred = self._next_predicate_id
         self._next_predicate_id += 1
         return pred
 
-    # ─── Публічний API ───────────────────────────────────────────────────────
+    # ─── Public API ───────────────────────────────────────────────────────────
 
     def generate_candidates(
         self,
@@ -1867,19 +1867,19 @@ class OntologyExpansionEngine:
         paradox_facts: Optional[Sequence[Any]] = None,
         target_facts: Optional[Sequence[Any]] = None,
         state_z: Optional[torch.Tensor] = None,
-        # Нові параметри для нейромережевого пошуку (з AME / CreativeCycleCoordinator)
+        # New parameters for neural search (from AME / CreativeCycleCoordinator)
         predicate_embeddings: Optional[Dict[int, torch.Tensor]] = None,
         kb: Optional[Any] = None,
         existing_rules: Optional[Sequence[Any]] = None,
     ) -> List[RuleCandidate]:
         """
-        Генерує кандидатні правила з новим предикатом.
+        Generate candidate rules with a new predicate.
 
-        Тригер: gap_norm ≥ gap_threshold АБО contradiction_count ≥ threshold.
+        Trigger: gap_norm >= gap_threshold OR contradiction_count >= threshold.
 
-        Режими:
-          Neural  (повний): predicate_embeddings + kb → PredicateLatentModel → argmax
-          Heuristic (fallback): evристика якщо ембеддинги недоступні
+        Modes:
+          Neural (full): predicate_embeddings + kb -> PredicateLatentModel -> argmax
+          Heuristic (fallback): heuristic path when embeddings are unavailable
         """
         self._call_count += 1
         self._last_online_train_applied = 0.0
@@ -1896,7 +1896,7 @@ class OntologyExpansionEngine:
         ):
             return []
 
-        # Online training кожен train_every_n_calls виклик
+        # Run online training every train_every_n_calls calls
         if (
             self._latent_model is not None
             and self._call_count % self.train_every_n_calls == 0
@@ -1949,7 +1949,7 @@ class OntologyExpansionEngine:
             max_candidates=max_candidates,
         )
 
-    # ─── Нейромережевий режим ─────────────────────────────────────────────────
+    # ─── Neural Mode ──────────────────────────────────────────────────────────
 
     def _neural_generate(
         self,
@@ -1966,14 +1966,14 @@ class OntologyExpansionEngine:
         state_z: Optional[torch.Tensor],
     ) -> List[RuleCandidate]:
         """
-        Повний нейро-символьний пошук P_new:
+        Full neuro-symbolic search for P_new:
 
-        1. Матриця ембеддингів з AME predicate_embeddings.
-        2. PredicateLatentModel → h, arity_logits, interaction_scores.
-           h відображає "ідеальну роль" нового предиката в KB.
-        3. Top-k взаємодіючих предикатів через cross-attention.
-        4. RuleHypothesisSampler → шаблони + оцінка argmax [C − λ·MDL].
-        5. RuleCandidate з повними метаданими → AEE для еволюційного відбору.
+        1. Embedding matrix from AME predicate_embeddings.
+        2. PredicateLatentModel -> h, arity_logits, interaction_scores.
+           h represents the "ideal role" of the new predicate in the KB.
+        3. Top-k interacting predicates via cross-attention.
+        4. RuleHypothesisSampler -> templates + argmax [C − λ·MDL] scoring.
+        5. RuleCandidate with full metadata -> AEE for evolutionary selection.
         """
         pred_ids = list(predicate_embeddings.keys())
         if not pred_ids:
@@ -1994,8 +1994,8 @@ class OntologyExpansionEngine:
             [predicate_embeddings[p].detach() for p in pred_ids], dim=0
         )  # (n_pred, embed_dim)
 
-        # Фокусуємо модель на предикатах з поточного непоясненого контексту, а
-        # кластерний тиск z лишається окремим тригером для запуску OEE.
+        # Focus the model on predicates from the current unexplained context;
+        # z-cluster pressure remains a separate OEE trigger.
         focus_preds: set[int] = {int(getattr(fact, "pred", -1)) for fact in context_facts}
         if goal is not None:
             focus_preds.add(int(getattr(goal, "pred", -1)))
@@ -2013,15 +2013,15 @@ class OntologyExpansionEngine:
                 emb_tensor, gap_norm, unexplained_mask, state_z=state_z
             )
 
-        # Зберігаємо стан для record_feedback
+        # Persist state for record_feedback
         self._last_context_input = context_input.detach()
         self._last_gap_norm = gap_norm
         self._last_h = h.detach()
 
-        # Арність: 1, 2 або 3
+        # Arity: 1, 2, or 3
         arity = int(arity_logits.argmax().item()) + 1
 
-        # Top-k взаємодіючих предикатів (cross-attention output)
+        # Top-k interacting predicates (cross-attention output)
         n_top = min(self._sampler.max_interaction_preds, len(pred_ids))
         if interaction_scores.numel() >= n_top:
             top_idx = interaction_scores.topk(n_top).indices.tolist()
@@ -2051,7 +2051,7 @@ class OntologyExpansionEngine:
                 },
             )
 
-            # argmax [Consistency − λ · Complexity] по шаблонах
+            # argmax [Consistency − λ · Complexity] over templates
             hypotheses = self._sampler.sample(
                 pred_id=pred_id,
                 arity=arity,
@@ -2064,7 +2064,7 @@ class OntologyExpansionEngine:
             )
 
             for hyp in hypotheses:
-                # Загальна оцінка кандидата: gap-сигнал + argmax-оцінка гіпотези
+                # Global candidate score: gap signal + argmax-scored hypothesis
                 effective_hypothesis_score = max(hyp.score, hyp.bundle_score)
                 candidate_score = float(gap_norm + contradiction_count) + max(effective_hypothesis_score, 0.0)
                 all_candidates.append(RuleCandidate(
@@ -2095,14 +2095,14 @@ class OntologyExpansionEngine:
 
         self._last_pred_ids = new_pred_ids
 
-        # Фінальний відбір: argmax hypothesis_score (Consistency − λ·Complexity)
+        # Final selection: argmax hypothesis_score (Consistency − λ·Complexity)
         all_candidates.sort(
             key=lambda c: float(c.metadata.get("effective_hypothesis_score", 0.0)),
             reverse=True,
         )
         return all_candidates[:max_candidates]
 
-    # ─── Евристичний fallback ─────────────────────────────────────────────────
+    # ─── Heuristic Fallback ───────────────────────────────────────────────────
 
     def _heuristic_generate(
         self,
@@ -2115,8 +2115,8 @@ class OntologyExpansionEngine:
         max_candidates: int,
     ) -> List[RuleCandidate]:
         """
-        Евристичний генератор (збережено для зворотної сумісності).
-        Використовується коли AME ембеддинги недоступні.
+        Heuristic generator kept for backward compatibility.
+        Used when AME embeddings are unavailable.
         """
         from omen_prolog import HornClause, Var
 
@@ -2205,7 +2205,7 @@ class OntologyExpansionEngine:
 
         return candidates[:max_candidates]
 
-    # ─── Статистика ───────────────────────────────────────────────────────────
+    # ─── Statistics ───────────────────────────────────────────────────────────
 
     def stats(self) -> Dict[str, float]:
         buf = list(self._feedback_buffer)
@@ -2251,11 +2251,11 @@ class OntologyExpansionEngine:
             "oee_consistency_cache_misses": float(self._sampler._last_consistency_cache_misses),
         }
 
-    # ─── Публічні властивості ─────────────────────────────────────────────────
+    # ─── Public Properties ────────────────────────────────────────────────────
 
     @property
     def last_h(self) -> Optional[torch.Tensor]:
-        """Останній латентний вектор h (для діагностики / ICE)."""
+        """Last latent vector h (for diagnostics / ICE)."""
         return self._last_h
 
     @property

@@ -1,27 +1,27 @@
 """
 counterfactual_engine.py — Counterfactual World Engine (CWE)
 
-Повна реалізація концепції:
-  · Повний набір операторів Invert(Γ_mod):
-      - swap_args          : A(X,Y)      → A(Y,X)          (симетрія)
-      - complement_head    : A ← B       → ¬A ← B          (через complement-предикат)
-      - drop_body_literal  : A ← B,C     → A ← B           (ослаблення умови)
-      - add_body_literal   : A ← B       → A ← B,C         (посилення умови)
-      - swap_head_pred     : A(X) ← B    → A'(X) ← B       (заміна висновку)
-      - permute_body       : A ← B,C     → A ← C,B         (переставлення тіла)
+Full concept implementation:
+  · Full operator set for Invert(Γ_mod):
+      - swap_args          : A(X,Y)      -> A(Y,X)          (symmetry)
+      - complement_head    : A <- B      -> ¬A <- B         (via complement predicate)
+      - drop_body_literal  : A <- B,C    -> A <- B          (condition weakening)
+      - add_body_literal   : A <- B      -> A <- B,C        (condition strengthening)
+      - swap_head_pred     : A(X) <- B   -> A'(X) <- B      (replace conclusion)
+      - permute_body       : A <- B,C    -> A <- C,B        (permute body)
 
-  · Greedy argmin оптимізація підмножини Γ_mod ⊆ Γ:
+  · Greedy argmin optimization over subset Γ_mod ⊆ Γ:
       score(Γ_mod) = Complexity(Γ_mod) − λ · Surprise(ForwardChain(Γ~))
-      де Complexity(Γ_mod) = Σ MDL_bits(R), Surprise = |novel| + λ·|contradictions|.
-      Жадібно нарощуємо Γ_mod, кожен крок обираючи трансформацію з найкращим
-      покращенням score, аж до max_rule_mods кроків.
+      where Complexity(Γ_mod) = Σ MDL_bits(R), and Surprise = |novel| + λ·|contradictions|.
+      Γ_mod is grown greedily, choosing the transformation with the best score
+      improvement at each step, up to `max_rule_mods`.
 
-  · Complement-предикат (¬A ← B):
-      COMPLEMENT_OFFSET = 600_000.  ¬p(X) реалізується як предикат
-      (600_000 + p)(X).  Суперечність виявляється коли одночасно виводяться
-      p(X) і (600_000+p)(X) з однаковими аргументами.
+  · Complement predicate (¬A <- B):
+      COMPLEMENT_OFFSET = 600_000. ¬p(X) is represented as predicate
+      (600_000 + p)(X). A contradiction is detected when both
+      p(X) and (600_000+p)(X) are derived with the same arguments.
 
-Математична модель:
+Mathematical model:
   Γ~ = (Γ \ Γ_mod) ∪ Invert(Γ_mod)
   Γ_mod* = argmin_{Γ_mod ⊆ Γ} [Complexity(Γ_mod) − λ · Surprise(ForwardChain(Γ~))]
 """
@@ -36,22 +36,22 @@ import torch
 
 from omen_symbolic.creative_types import CounterfactualResult, RuleCandidate
 
-# Предикат-complement для реалізації ¬A ← B
+# Complement predicate used to implement ¬A <- B.
 COMPLEMENT_OFFSET: int = 600_000
 
 
-# ─── Дескриптор однієї атомарної трансформації ───────────────────────────────
+# ─── Descriptor of one atomic transformation ────────────────────────────────
 
 @dataclass
 class _Transform:
-    """Одна атомарна трансформація правила clause → result."""
-    original: Any          # оригінальне правило з Γ
-    result: Any            # трансформоване правило, що входить в Invert(Γ_mod)
-    op: str                # ім'я оператора
-    mdl_cost: float        # MDL bits оригінального правила (= Complexity вкладу в Γ_mod)
+    """One atomic transformation from `clause` to `result`."""
+    original: Any          # original rule from Γ
+    result: Any            # transformed rule included in Invert(Γ_mod)
+    op: str                # operator name
+    mdl_cost: float        # MDL bits of the original rule (= Complexity contribution to Γ_mod)
 
 
-# ─── Допоміжні функції для побудови правил ────────────────────────────────────
+# ─── Helper functions for rule construction ─────────────────────────────────
 
 def _make_clause(template: Any, head: Any, body: Tuple[Any, ...]) -> Any:
     return type(template)(
@@ -102,10 +102,10 @@ def _subset_has_distinct_originals(subset: Sequence["_Transform"]) -> bool:
     return len(originals) == len(subset)
 
 
-# ─── Повний набір операторів Invert ──────────────────────────────────────────
+# ─── Full Invert operator set ────────────────────────────────────────────────
 
 def _op_swap_args(clause: Any) -> Iterator[Any]:
-    """Переставляє аргументи голови у зворотному порядку: A(X,Y) → A(Y,X)."""
+    """Swap head arguments in reverse order: A(X,Y) -> A(Y,X)."""
     args = tuple(getattr(clause.head, "args", ()))
     if len(args) < 2:
         return
@@ -118,19 +118,19 @@ def _op_swap_args(clause: Any) -> Iterator[Any]:
 
 def _op_complement_head(clause: Any) -> Iterator[Any]:
     """
-    ¬A ← B: замінює голову на complement-предикат (COMPLEMENT_OFFSET + pred).
-    Реалізує трансформацію A ← B  →  ¬A ← B із концепції.
+    ¬A <- B: replace the head with a complement predicate (COMPLEMENT_OFFSET + pred).
+    Implements the concept transformation A <- B  ->  ¬A <- B.
     """
     pred = int(clause.head.pred)
     if pred >= COMPLEMENT_OFFSET:
-        return  # вже complement — не вкладаємо двічі
+        return  # already complement; do not wrap twice
     comp_pred = COMPLEMENT_OFFSET + pred
     new_head = _make_atom(clause.head, comp_pred, tuple(clause.head.args))
     yield _make_clause(clause, new_head, tuple(clause.body))
 
 
 def _op_drop_body_literal(clause: Any) -> Iterator[Any]:
-    """A ← B,C  →  A ← B: прибирає кожен літерал тіла по черзі."""
+    """A <- B,C  ->  A <- B: remove body literals one at a time."""
     body = tuple(getattr(clause, "body", ()))
     if len(body) < 2:
         return
@@ -140,7 +140,7 @@ def _op_drop_body_literal(clause: Any) -> Iterator[Any]:
 
 
 def _op_add_body_literal(clause: Any, pool_atoms: Sequence[Any]) -> Iterator[Any]:
-    """A ← B  →  A ← B,C: додає атом із пулу до тіла (посилення умови)."""
+    """A <- B  ->  A <- B,C: add a pooled atom to the body (strengthen the condition)."""
     body = tuple(getattr(clause, "body", ()))
     if len(body) >= 3:
         return
@@ -156,7 +156,7 @@ def _op_add_body_literal(clause: Any, pool_atoms: Sequence[Any]) -> Iterator[Any
 
 
 def _op_swap_head_pred(clause: Any, alt_preds: Sequence[int]) -> Iterator[Any]:
-    """A(X) ← B  →  A'(X) ← B: замінює предикат голови на alt_pred з тієї ж арності."""
+    """A(X) <- B  ->  A'(X) <- B: replace the head predicate with an alt_pred of equal arity."""
     head_pred = int(clause.head.pred)
     arity = len(tuple(getattr(clause.head, "args", ())))
     for alt in alt_preds:
@@ -168,7 +168,7 @@ def _op_swap_head_pred(clause: Any, alt_preds: Sequence[int]) -> Iterator[Any]:
 
 
 def _op_permute_body(clause: Any) -> Iterator[Any]:
-    """A ← B,C  →  A ← C,B: циклічний зсув тіла."""
+    """A <- B,C  ->  A <- C,B: cyclic body shift."""
     body = tuple(getattr(clause, "body", ()))
     if len(body) < 2:
         return
@@ -177,24 +177,24 @@ def _op_permute_body(clause: Any) -> Iterator[Any]:
         yield _make_clause(clause, clause.head, rotated)
 
 
-# ─── Головний клас ────────────────────────────────────────────────────────────
+# ─── Main class ──────────────────────────────────────────────────────────────
 
 class CounterfactualWorldEngine:
     """
-    Генератор 'неможливих' гіпотез через argmin-оптимізацію підмножини Γ_mod ⊆ Γ.
+    Generator of "impossible" hypotheses through argmin optimization over Γ_mod ⊆ Γ.
 
-    Параметри
+    Parameters
     ----------
     max_rule_mods : int
-        Максимальна кількість правил у Γ_mod (розмір підмножини).
-        Жадібний пошук зупиняється після max_rule_mods кроків.
+        Maximum number of rules in Γ_mod, i.e. subset size.
+        Greedy search stops after `max_rule_mods` steps.
     max_candidates : int
-        Скільки правил з Γ розглядати як кандидати для включення в Γ_mod.
+        Number of rules from Γ considered as Γ_mod candidates.
     surprise_lambda : float
-        λ у формулі: score = Complexity(Γ_mod) − λ · Surprise(Γ~).
-        Більший λ — агресивніший пошук суперечностей.
+        λ in the formula: score = Complexity(Γ_mod) − λ · Surprise(Γ~).
+        Larger λ makes contradiction search more aggressive.
     max_transforms_per_rule : int
-        Максимальна кількість трансформацій на одне правило.
+        Maximum number of transformations per rule.
     """
 
     def __init__(
@@ -209,7 +209,7 @@ class CounterfactualWorldEngine:
         self.surprise_lambda = float(max(surprise_lambda, 1e-6))
         self.max_transforms_per_rule = max(int(max_transforms_per_rule), 1)
 
-    # ─── Клонування KB у sandbox ─────────────────────────────────────────────
+    # ─── Clone KB into a sandbox ─────────────────────────────────────────────
 
     @staticmethod
     def _temporary_sandbox_device(kb: Any) -> Optional[torch.device]:
@@ -297,25 +297,25 @@ class CounterfactualWorldEngine:
 
     @staticmethod
     def _clone_kb(kb: Any) -> Any:
-        """Повністю клонує KB: факти + правила зі статусами."""
+        """Fully clone the KB: facts plus rules with statuses."""
         clone = CounterfactualWorldEngine._make_empty_sandbox(kb)
         CounterfactualWorldEngine._copy_kb_into_sandbox(kb, clone, preserve_status=True)
         return clone
 
-    # ─── Побудова sandbox KB з Γ_mod ─────────────────────────────────────────
+    # ─── Build sandbox KB from Γ_mod ─────────────────────────────────────────
 
     @staticmethod
     def _build_sandbox(kb: Any, gamma_mod: Sequence[_Transform]) -> Any:
         """
         Γ~ = (Γ \ Γ_mod) ∪ Invert(Γ_mod).
-        Видаляє оригінали і додає трансформовані правила.
+        Remove originals and add transformed rules.
         """
-        # Клонуємо базову KB
+        # Clone the base KB.
         from omen_prolog import _clone_rule_records
         sandbox = CounterfactualWorldEngine._make_empty_sandbox(kb)
         CounterfactualWorldEngine._copy_kb_into_sandbox(kb, sandbox, preserve_status=True)
 
-        # Множина оригіналів, що виключаються (Γ \ Γ_mod)
+        # Set of originals removed from the sandbox (Γ \ Γ_mod).
         excluded: FrozenSet[Any] = frozenset(t.original for t in gamma_mod)
 
         if excluded:
@@ -352,13 +352,13 @@ class CounterfactualWorldEngine:
                     1 for record in sandbox._records.values() if record.status.value == "verified"
                 )
 
-        # Додаємо Invert(Γ_mod)
+        # Add Invert(Γ_mod).
         for t in gamma_mod:
             sandbox.add_rule(t.result)
 
         return sandbox
 
-    # ─── Вимірювання Surprise і Complexity ───────────────────────────────────
+    # ─── Measure Surprise and Complexity ─────────────────────────────────────
 
     @staticmethod
     def _measure_surprise(
@@ -372,8 +372,8 @@ class CounterfactualWorldEngine:
         baseline_index: Optional[Dict[Tuple[int, Tuple[Any, ...]], Any]] = None,
     ) -> Tuple[float, Tuple[Any, ...], List[Tuple[Any, Any]]]:
         """
-        Повертає (surprise_score, novel_facts, contradictions).
-        Surprise = |novel| + λ·|contradictions|  (λ застосується в _score).
+        Return (surprise_score, novel_facts, contradictions).
+        Surprise = |novel| + λ·|contradictions|, with λ applied inside `_score`.
         """
         derived = sandbox.forward_chain(
             max(int(max_depth), 1),
@@ -387,8 +387,8 @@ class CounterfactualWorldEngine:
         baseline_list = tuple(baseline) if baseline_list is None else baseline_list
         baseline_index = _build_fact_index(baseline_list) if baseline_index is None else baseline_index
 
-        # Complement-суперечності: p(X) та ¬p(X) як усередині sandbox,
-        # так і відносно базового виводу Γ.
+        # Complement contradictions: p(X) and ¬p(X), both within the sandbox
+        # and relative to the baseline Γ derivation.
         complement_pairs: Dict[FrozenSet[Any], Tuple[Any, Any]] = {}
         for (pred, args), fact in derived_index.items():
             complement_key = _complement_signature(pred, args)
@@ -404,7 +404,7 @@ class CounterfactualWorldEngine:
                 complement_pairs[key] = (fact, known)
         complement_contradictions = list(complement_pairs.values())
 
-        # Класичні суперечності через conflict_fn
+        # Classic contradictions via conflict_fn.
         classic_contradictions: List[Tuple[Any, Any]] = []
         for fact in novel:
             for known in baseline_list:
@@ -416,7 +416,7 @@ class CounterfactualWorldEngine:
 
     @staticmethod
     def _complexity(gamma_mod: Sequence[_Transform]) -> float:
-        """Complexity(Γ_mod) = Σ MDL_bits(оригінального правила)."""
+        """Complexity(Γ_mod) = Σ MDL_bits(original rule)."""
         return sum(t.mdl_cost for t in gamma_mod)
 
     def _score(
@@ -428,13 +428,13 @@ class CounterfactualWorldEngine:
     ) -> float:
         """
         score = Complexity(Γ_mod) − λ · Surprise(Γ~)
-        Мінімізуємо: мала складність + велика surprise = хороший результат.
+        We minimize it, so low complexity plus high surprise is desirable.
         """
         surprise = novel_count + float(contradiction_count) + max(float(world_surprise), 0.0)
         complexity = self._complexity(gamma_mod)
         return complexity - self.surprise_lambda * surprise
 
-    # ─── Генерація всіх атомарних трансформацій ──────────────────────────────
+    # ─── Generate all atomic transformations ─────────────────────────────────
 
     def _all_transforms(
         self,
@@ -443,8 +443,8 @@ class CounterfactualWorldEngine:
         alt_pred_map: Dict[int, List[int]],
     ) -> List[_Transform]:
         """
-        Генерує всі атомарні трансформації для кожного правила.
-        Повертає відсортований список _Transform за зростанням MDL (дешеві — перші).
+        Generate all atomic transformations for each rule.
+        Returns `_Transform` sorted by MDL in ascending order, i.e. cheap changes first.
         """
         transforms: List[_Transform] = []
         seen_results: set = set()
@@ -480,11 +480,11 @@ class CounterfactualWorldEngine:
                     mdl_cost=mdl,
                 ))
 
-        # Сортуємо за MDL (дешеві модифікації перші — мінімальна складність)
+        # Sort by MDL so cheap modifications come first.
         transforms.sort(key=lambda t: t.mdl_cost)
         return transforms
 
-    # ─── Жадібний пошук оптимального Γ_mod ──────────────────────────────────
+    # ─── Greedy search for optimal Γ_mod ─────────────────────────────────────
 
     def _evaluate_subset(
         self,
@@ -530,17 +530,17 @@ class CounterfactualWorldEngine:
         world_surprise_fn: Optional[Callable[[Sequence[Any], Tuple[Any, ...], Any], float]] = None,
     ) -> Tuple[List[_Transform], float, Tuple[Any, ...], List[Tuple[Any, Any]], float, int]:
         """
-        Greedy argmin пошук Γ_mod* ⊆ Γ.
+        Greedy argmin search for Γ_mod* ⊆ Γ.
 
-        Алгоритм:
-          1. Починаємо з Γ_mod = {} (порожня підмножина).
-          2. На кожному кроці (до max_rule_mods ітерацій):
-             a. Для кожної трансформації t ∉ Γ_mod, обчислюємо
+        Algorithm:
+          1. Start with Γ_mod = {} (the empty subset).
+          2. At each step, up to `max_rule_mods` iterations:
+             a. For every transformation t ∉ Γ_mod, compute
                 score(Γ_mod ∪ {t}) = Complexity(Γ_mod ∪ {t}) − λ·Surprise(Γ~∪{t}).
-             b. Обираємо t* = argmin score.
-             c. Якщо score(Γ_mod ∪ {t*}) < score(Γ_mod): додаємо t* і продовжуємо.
-                Інакше: зупиняємось (немає покращення).
-          3. Повертаємо найкращий Γ_mod і відповідний результат.
+             b. Select t* = argmin score.
+             c. If score(Γ_mod ∪ {t*}) < score(Γ_mod), add t* and continue.
+                Otherwise stop because no improvement remains.
+          3. Return the best Γ_mod and its result.
         """
         candidate_pool = list(transforms[: self.max_candidates])
         gamma_mod: List[_Transform] = []
@@ -583,7 +583,7 @@ class CounterfactualWorldEngine:
         return gamma_mod, best_score, best_novel, best_contradictions, best_world_surprise, evaluated_subsets
 
 
-    # ─── Публічний API ───────────────────────────────────────────────────────
+    # ─── Public API ──────────────────────────────────────────────────────────
 
     def explore(
         self,
@@ -594,10 +594,10 @@ class CounterfactualWorldEngine:
         world_surprise_fn: Optional[Callable[[Sequence[Any], Tuple[Any, ...], Any], float]] = None,
     ) -> CounterfactualResult:
         """
-        Головний метод: знаходить оптимальний Γ_mod* через greedy argmin.
+        Main method: find optimal Γ_mod* through greedy argmin.
 
-        Повертає CounterfactualResult з кандидатами-правилами (мітка 'counterfactual'),
-        novel_facts, contradictions (включаючи complement-суперечності).
+        Returns `CounterfactualResult` with rule candidates labeled `counterfactual`,
+        plus `novel_facts` and `contradictions`, including complement contradictions.
         """
         rules = list(getattr(kb, "rules", ()))
         if not rules:
@@ -611,18 +611,18 @@ class CounterfactualWorldEngine:
             track_epistemic=False,
         )
 
-        # Пул атомів для _op_add_body_literal
+        # Atom pool for _op_add_body_literal.
         pool_atoms = _collect_pool_atoms(rules)
 
-        # Карта: arity → [pred_id, ...] для _op_swap_head_pred
+        # Map: arity -> [pred_id, ...] for _op_swap_head_pred.
         alt_pred_map = _build_arity_pred_map(rules)
 
-        # Всі атомарні трансформації
+        # All atomic transformations.
         transforms = self._all_transforms(rules, pool_atoms, alt_pred_map)
         if not transforms:
             return CounterfactualResult()
 
-        # Жадібний пошук оптимального Γ_mod*
+        # Greedy search for optimal Γ_mod*.
         gamma_mod, best_score, novel, contradictions, world_surprise, evaluated_subsets = self._bounded_exact_search(
             kb,
             transforms,
@@ -680,10 +680,10 @@ class CounterfactualWorldEngine:
         )
 
 
-# ─── Утиліти ──────────────────────────────────────────────────────────────────
+# ─── Utilities ───────────────────────────────────────────────────────────────
 
 def _collect_pool_atoms(rules: Sequence[Any]) -> List[Any]:
-    """Збирає тіла усіх правил у єдиний пул атомів для add_body_literal."""
+    """Collect bodies of all rules into a single atom pool for add_body_literal."""
     seen: set = set()
     pool: List[Any] = []
     for rule in rules:
@@ -695,7 +695,7 @@ def _collect_pool_atoms(rules: Sequence[Any]) -> List[Any]:
 
 
 def _build_arity_pred_map(rules: Sequence[Any]) -> Dict[int, List[int]]:
-    """Будує відображення arity → [список pred_id] для swap_head_pred."""
+    """Build the mapping arity -> [pred_id list] for swap_head_pred."""
     result: Dict[int, List[int]] = {}
     for rule in rules:
         arity = len(tuple(getattr(rule.head, "args", ())))
@@ -708,7 +708,7 @@ def _build_arity_pred_map(rules: Sequence[Any]) -> Dict[int, List[int]]:
 
 
 def _detect_op(original: Any, result: Any) -> str:
-    """Визначає ім'я застосованого оператора за різницею original → result."""
+    """Infer the applied operator name from the original -> result difference."""
     orig_pred = int(original.head.pred)
     res_pred = int(result.head.pred)
     if res_pred >= COMPLEMENT_OFFSET and res_pred == COMPLEMENT_OFFSET + orig_pred:

@@ -1,20 +1,20 @@
 """
-omen_osf_intent.py — Intent Encoder (H1 рівень OSF)
-=====================================================
-OMEN Synthesis Framework: перший рівень ієрархічної генерації.
+omen_osf_intent.py — Intent Encoder (OSF H1 level)
+==================================================
+OMEN Synthesis Framework: the first level of hierarchical generation.
 
-Intent Level (H1): перетворює z_final (Perceiver output) на символьну ціль.
+Intent Level (H1): transforms `z_final` (Perceiver output) into a symbolic goal.
 
-Математична модель:
+Mathematical model:
   g = IntentEncoder(z) ∈ R^{d_intent}
-  P(H1|context) = Gumbel-Softmax(W·z) над n_goals цілей
+  P(H1|context) = Gumbel-Softmax(W·z) over `n_goals` goals
 
-  Символьні цілі G = {g₁, ..., g_K} — domain-agnostic оператори:
-    "реалізувати функцію X", "згенерувати текст стилю Y", ...
+  Symbolic goals G = {g₁, ..., g_K} are domain-agnostic operators:
+    "implement function X", "generate text in style Y", ...
 
-Інтеграція:
-  OMENScale.forward() → Perceiver → z_final → IntentEncoder → IntentState
-  IntentState → SymbolicPlanner (omen_osf_planner.py)
+Integration:
+  OMENScale.forward() -> Perceiver -> z_final -> IntentEncoder -> IntentState
+  IntentState -> SymbolicPlanner (omen_osf_planner.py)
 """
 
 from __future__ import annotations
@@ -28,19 +28,19 @@ import torch.nn.functional as F
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1.  СТРУКТУРИ ДАНИХ
+# 1. DATA STRUCTURES
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class IntentState:
     """
-    Вихід IntentEncoder — H1 рівень OSF.
+    Output of `IntentEncoder`, i.e. the OSF H1 level.
 
     Fields:
-      goal_vector  : (B, d_intent) — зважена сума goal embeddings
-      goal_probs   : (B, n_goals)  — soft розподіл цілей
-      goal_entropy : (B,)          — ентропія H(π_goal) = невизначеність
-      z_intent     : (B, d_intent) — уточненийIntent-вектор (z + goal context)
+      goal_vector  : (B, d_intent) — weighted sum of goal embeddings
+      goal_probs   : (B, n_goals)  — soft distribution over goals
+      goal_entropy : (B,)          — entropy H(π_goal), i.e. uncertainty
+      z_intent     : (B, d_intent) — refined intent vector (z + goal context)
     """
     goal_vector:  torch.Tensor
     goal_probs:   torch.Tensor
@@ -64,18 +64,18 @@ class IntentEncoder(nn.Module):
     """
     z_final (B, d_latent) → IntentState
 
-    Архітектура:
-      z_final → MLP → goal_logits (B, n_goals)
-                    → Gumbel-Softmax → goal_soft (B, n_goals)
-                    → @ G           → goal_vector (B, d_intent)
+    Architecture:
+      z_final -> MLP -> goal_logits (B, n_goals)
+                    -> Gumbel-Softmax -> goal_soft (B, n_goals)
+                    -> @ G            -> goal_vector (B, d_intent)
       z_intent = LayerNorm( MLP([z_final; goal_vector]) )
 
-    Gumbel-Softmax (training): диференційована дискретизація.
-    Argmax (inference): детерміноване призначення цілі.
+    Gumbel-Softmax (training): differentiable discretization.
+    Argmax (inference): deterministic goal assignment.
 
     Regularization:
       L_intent = −H(goal_probs) / log(n_goals)
-      Штрафує collapse до однієї цілі (підтримує різноманіття).
+      Penalizes collapse to a single goal and preserves diversity.
     """
 
     def __init__(
@@ -112,7 +112,7 @@ class IntentEncoder(nn.Module):
         )
         self.norm = nn.LayerNorm(d_intent)
 
-        # Проекція z_final → d_intent (для skip-connection)
+        # Project z_final -> d_intent for the skip connection.
         self.skip_proj = nn.Linear(d_latent, d_intent, bias=False)
 
     def forward(self, z_final: torch.Tensor) -> IntentState:
@@ -131,7 +131,7 @@ class IntentEncoder(nn.Module):
             # Inference: sharpened softmax
             goal_soft = F.softmax(goal_logits / 0.5, dim=-1)
 
-        # Entropy H(π_goal) — міра невизначеності про ціль
+        # Entropy H(π_goal) measures uncertainty about the goal.
         goal_probs   = F.softmax(goal_logits, dim=-1)            # (B, n_goals)
         goal_entropy = -(goal_probs * (goal_probs + 1e-10).log()).sum(-1)  # (B,)
 
@@ -142,7 +142,7 @@ class IntentEncoder(nn.Module):
         # ── Refined intent: z + goal context ────────────────────────────────
         z_concat = torch.cat([z_final, goal_vector], dim=-1)     # (B, d_lat + d_intent)
         z_intent = self.intent_refine(z_concat)                   # (B, d_intent)
-        # Skip connection: проектований z_final + рафінований intent
+        # Skip connection: projected z_final plus refined intent.
         z_intent = self.norm(z_intent + self.skip_proj(z_final))  # (B, d_intent)
 
         return IntentState(
@@ -155,9 +155,9 @@ class IntentEncoder(nn.Module):
     def intent_loss(self, state: IntentState) -> torch.Tensor:
         """
         L_intent = −mean_entropy / log(n_goals)
-        Мінімізуємо: заохочуємо РІЗНОМАНІТНІСТЬ цілей (anti-collapse).
+        Minimize it to encourage GOAL DIVERSITY (anti-collapse).
         """
         mean_H   = state.goal_entropy.mean()
         max_H    = math.log(self.n_goals + 1e-10)
-        # Повертаємо негативну нормовану ентропію (менше = гірше)
+        # Return normalized negative entropy (smaller = worse).
         return -(mean_H / max_H).clamp(-1.0, 1.0)

@@ -1,25 +1,25 @@
 """
 omen_osf_simulator.py — World Simulator + Reflection Module (OSF)
-==================================================================
-OMEN Synthesis Framework: виконання в уяві + самовиправлення.
+=================================================================
+OMEN Synthesis Framework: imagined execution plus self-repair.
 
 WorldSimulator:
-  Виконує «код» (як послідовність latent-дій) через WorldRNN.
-  Порівнює отриману трасу з очікуваною (з плану або прикладів).
+  Executes "code" (as a sequence of latent actions) through WorldRNN.
+  Compares the resulting trace with the expected one (from a plan or examples).
 
   L_sim = E[Σ_t ||State_real(t) − Simulate(code, State(t−1))||²]
 
 ReflectionModule:
-  Якщо симуляція виявляє невідповідність → локалізує помилку
-  і генерує мінімальне виправлення.
+  If simulation detects a mismatch, it localizes the error
+  and generates a minimal fix.
 
   Δ* = argmin_Δ [ Size(Δ)  s.t. Verify(Apply(code, Δ)) = ∅ ]
 
-  Пошук Δ спрямовується нейромережею → soft minimum description length.
+  Search for Δ is guided by a neural network toward a soft minimum description length.
 
-Інтеграція:
-  OSFSynthesizer.forward() викликає WorldSimulator і (якщо L_sim > τ) ReflectionModule.
-  Результати входять до J_OSF як L_sim і L_refl.
+Integration:
+  OSFSynthesizer.forward() calls WorldSimulator and, if `L_sim > τ`, ReflectionModule.
+  Their outputs contribute to J_OSF as L_sim and L_refl.
 """
 
 from __future__ import annotations
@@ -34,29 +34,29 @@ from omen_osf_planner import PlanFact, PlanSequence
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1.  СТРУКТУРИ
+# 1. STRUCTURES
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class SimResult:
-    """Результат WorldSimulator."""
-    trace:          torch.Tensor   # (B, T_sim, d_latent) — симульована траса
-    expected_trace: torch.Tensor   # (B, T_sim, d_latent) — очікувана траса
-    mismatch_mask:  torch.Tensor   # (B, T_sim) bool — де є невідповідність
+    """Result produced by WorldSimulator."""
+    trace:          torch.Tensor   # (B, T_sim, d_latent) — simulated trace
+    expected_trace: torch.Tensor   # (B, T_sim, d_latent) — expected trace
+    mismatch_mask:  torch.Tensor   # (B, T_sim) bool — locations with mismatch
     l_sim:          torch.Tensor   # scalar
 
 
 @dataclass
 class PatchResult:
-    """Результат ReflectionModule."""
-    patch_emb:  torch.Tensor   # (B, d_latent) — latent представлення патчу
-    patch_score: torch.Tensor  # (B,) — ймовірність успіху патчу
+    """Result produced by ReflectionModule."""
+    patch_emb:  torch.Tensor   # (B, d_latent) — latent patch representation
+    patch_score: torch.Tensor  # (B,) — probability of patch success
     l_refl:     torch.Tensor   # scalar — Cost(Δ)
 
 
 @dataclass
 class SymbolicVerifyResult:
-    """Результат symbolic verification плану."""
+    """Result of symbolic plan verification."""
     mismatch_mask: torch.Tensor   # (B, T_plan) bool
     goal_progress: torch.Tensor   # (B,)
     progress_trace: torch.Tensor  # (B, T_plan)
@@ -69,17 +69,17 @@ class SymbolicVerifyResult:
 
 class WorldSimulator(nn.Module):
     """
-    Симулює виконання «коду» (latent action sequence) через WorldRNN.
+    Simulate execution of "code" (a latent action sequence) through WorldRNN.
 
-    Очікувана траса будується з PlanSequence:
-      кожен PlanOperator → action_id → WorldRNN крок
+    The expected trace is built from PlanSequence:
+      each PlanOperator -> action_id -> one WorldRNN step
 
-    Симульована траса:
-      z0, a₁, a₂, ..., a_T → (z₁_sim, z₂_sim, ..., z_T_sim)
+    Simulated trace:
+      z0, a₁, a₂, ..., a_T -> (z₁_sim, z₂_sim, ..., z_T_sim)
 
-    L_sim = (1/T) Σ_t ||z_t_sim − z_t_expected||² (Huber loss для стабільності)
+    L_sim = (1/T) Σ_t ||z_t_sim − z_t_expected||², using Huber loss for stability.
 
-    mismatch_tau: поріг для визначення «помилки» у трасі.
+    `mismatch_tau` is the threshold used to define a trace error.
     """
 
     def __init__(
@@ -93,11 +93,11 @@ class WorldSimulator(nn.Module):
         self.n_action_vocab = n_action_vocab
         self.mismatch_tau  = mismatch_tau
 
-        # Проекція план-embedding → action_id (для WorldRNN)
+        # Project plan embeddings -> action_id for WorldRNN.
         # plan_emb (d_plan) → action embedding space
         self.plan_to_action = nn.Linear(d_latent, n_action_vocab, bias=False)
 
-        # Очікувана траса: з plan → target sequence у latent space
+        # Expected trace: map the plan into a latent-space target sequence.
         self.plan_to_target = nn.Sequential(
             nn.Linear(d_latent, d_latent * 2),
             nn.GELU(),
@@ -107,14 +107,14 @@ class WorldSimulator(nn.Module):
 
     def forward(
         self,
-        z0:          torch.Tensor,    # (B, d_latent) — початковий стан
-        plan:        PlanSequence,    # план (K операторів)
-        world_rnn:   nn.Module,       # WorldRNN з omen_v2.py
+        z0:          torch.Tensor,    # (B, d_latent) — initial state
+        plan:        PlanSequence,    # plan with K operators
+        world_rnn:   nn.Module,       # WorldRNN from omen_v2.py
     ) -> SimResult:
         """
         z0       : (B, d_latent)
-        plan     : PlanSequence з K операторами
-        world_rnn: навчений симулятор світу (вже є в OMENScale)
+        plan     : PlanSequence with K operators
+        world_rnn: trained world simulator already present in OMENScale
 
         Returns: SimResult
         """
@@ -123,10 +123,10 @@ class WorldSimulator(nn.Module):
         plan_emb = plan.embeddings.to(device)                  # (K, d_plan)
         K        = plan_emb.size(0)
 
-        # ── Проекція plan → d_latent (якщо d_plan ≠ d_latent) ────────────────
-        # Якщо розмірності різні — лінійна проекція. Якщо однакові — skip.
+        # ── Project plan -> d_latent when d_plan ≠ d_latent ─────────────────
+        # If dimensions differ, use a linear projection; otherwise skip it.
         if plan_emb.size(-1) != self.d_latent:
-            # Паддинг або проекція
+            # Padding or projection.
             pad = self.d_latent - plan_emb.size(-1)
             if pad > 0:
                 plan_lat = F.pad(plan_emb, (0, pad))          # (K, d_latent)
@@ -135,32 +135,32 @@ class WorldSimulator(nn.Module):
         else:
             plan_lat = plan_emb
 
-        # ── Очікувана траса: P_target_k = LayerNorm(MLP(plan_lat_k)) ─────────
+        # ── Expected trace: P_target_k = LayerNorm(MLP(plan_lat_k)) ──────────
         plan_lat_flat  = plan_lat.view(K, -1)                 # (K, d_latent)
         targets_flat   = self.plan_to_target(plan_lat_flat)   # (K, d_latent)
         targets_flat   = self.target_norm(targets_flat)
 
-        # Розширюємо на batch
+        # Broadcast across the batch.
         expected = targets_flat.unsqueeze(0).expand(B, -1, -1).contiguous()  # (B, K, d_lat)
 
-        # ── Симульована траса через WorldRNN ──────────────────────────────────
-        # Перетворюємо plan_emb у action_ids через argmax logits.
-        # CRITICAL FIX: n_action_vocab (WorldSimulator) може відрізнятись від
-        # world_rnn.act_emb.num_embeddings (WorldRNN ініціалізований з vocab_size
-        # основної моделі). Без clamp → IndexError при action_id ≥ act_emb.num_embeddings.
-        # Рішення: clamp через % до фактичного розміру act_emb.
+        # ── Simulated trace through WorldRNN ─────────────────────────────────
+        # Convert plan_emb to action_ids through argmax logits.
+        # CRITICAL FIX: n_action_vocab (WorldSimulator) may differ from
+        # world_rnn.act_emb.num_embeddings (WorldRNN initialized from the base
+        # model vocabulary size). Without clamping, action_id ≥ act_emb.num_embeddings
+        # would raise IndexError. The fix uses modulo against the real act_emb size.
         action_logits    = self.plan_to_action(plan_lat)            # (K, n_action_vocab)
-        act_vocab_actual = world_rnn.act_emb.num_embeddings         # справжній розмір
+        act_vocab_actual = world_rnn.act_emb.num_embeddings         # actual size
         action_ids       = action_logits.argmax(-1) % act_vocab_actual  # (K,) safe
         action_seq       = action_ids.unsqueeze(0).expand(B, -1)    # (B, K)
 
         # simulate_sequence(z0, actions) → (B, K, d_latent)
         simulated = world_rnn.simulate_sequence(z0, action_seq)
 
-        # ── L_sim: Huber loss між traced та expected ──────────────────────────
+        # ── L_sim: Huber loss between traced and expected ────────────────────
         l_sim = F.huber_loss(simulated, expected.detach(), delta=1.0)
 
-        # ── Mismatch mask: де похибка > mismatch_tau ─────────────────────────
+        # ── Mismatch mask: where error > mismatch_tau ────────────────────────
         diff          = (simulated - expected.detach()).pow(2).sum(-1)  # (B, K)
         mismatch_mask = diff > (self.mismatch_tau ** 2)                # (B, K) bool
 
@@ -178,19 +178,19 @@ class WorldSimulator(nn.Module):
 
 class ReflectionModule(nn.Module):
     """
-    Виявляє та виправляє невідповідності у згенерованому виводі.
+    Detect and repair mismatches in generated output.
 
-    Задача мінімальної правки:
+    Minimal-edit objective:
       Δ* = argmin_Δ [ Size(Δ)  s.t. Verify(Apply(code, Δ)) = ∅ ]
 
-    Реалізація:
-      1. Ідентифікуємо hot spots з mismatch_mask
-      2. PatchNet генерує патч Δ у latent space
-      3. PatchScore оцінює ймовірність успіху патчу
-      4. L_refl = MDL(Δ) = ||patch_emb||₁ (мінімальне розширення)
-         плюс штраф якщо patch_score < verify_tau
+    Implementation:
+      1. Identify hot spots from mismatch_mask
+      2. PatchNet generates patch Δ in latent space
+      3. PatchScore estimates the probability of patch success
+      4. L_refl = MDL(Δ) = ||patch_emb||₁ as the minimal extension
+         plus a penalty when patch_score < verify_tau
 
-    Verify наближається через: patch_score > verify_tau
+    Verification is approximated by: patch_score > verify_tau
     """
 
     def __init__(
@@ -203,14 +203,14 @@ class ReflectionModule(nn.Module):
         self.verify_tau  = verify_tau
         self.lambda_mdl  = lambda_mdl
 
-        # PatchNet: виявляє патч Δ з hot spots
+        # PatchNet detects patch Δ from hot spots.
         self.patch_net = nn.Sequential(
             nn.Linear(d_latent * 2, d_latent * 2),
             nn.GELU(),
             nn.Linear(d_latent * 2, d_latent),
         )
 
-        # PatchScorer: оцінює ймовірність успіху (0=fail, 1=success)
+        # PatchScorer estimates success probability (0=fail, 1=success).
         self.patch_scorer = nn.Sequential(
             nn.Linear(d_latent * 2, d_latent),
             nn.GELU(),
@@ -218,7 +218,7 @@ class ReflectionModule(nn.Module):
             nn.Sigmoid(),
         )
 
-        # Verify: чи всі mismatch виправлені
+        # Verify: whether all mismatches are repaired.
         self.verify_net = nn.Sequential(
             nn.Linear(d_latent, d_latent // 2),
             nn.GELU(),
@@ -230,20 +230,20 @@ class ReflectionModule(nn.Module):
 
     def forward(
         self,
-        z:          torch.Tensor,    # (B, d_latent) — поточний latent
+        z:          torch.Tensor,    # (B, d_latent) — current latent state
         sim_result: SimResult,
     ) -> PatchResult:
         """
         z          : (B, d_latent)
-        sim_result : SimResult від WorldSimulator
+        sim_result : SimResult from WorldSimulator
 
         Returns: PatchResult
         """
         device = z.device
         B      = z.size(0)
 
-        # ── Виявляємо гарячі позиції ─────────────────────────────────────────
-        # Зважуємо симульовану трасу за mismatch_mask
+        # ── Detect hot positions ─────────────────────────────────────────────
+        # Weight the simulated trace by mismatch_mask.
         mask_f  = sim_result.mismatch_mask.float()              # (B, K)
         trace   = sim_result.trace                               # (B, K, d_lat)
 
@@ -263,12 +263,12 @@ class ReflectionModule(nn.Module):
         score_in    = torch.cat([patch_emb, z], dim=-1)         # (B, 2·d_lat)
         patch_score = self.patch_scorer(score_in).squeeze(-1)   # (B,)
 
-        # ── L_refl = MDL(Δ) + штраф за низький score ─────────────────────────
+        # ── L_refl = MDL(Δ) + penalty for low score ──────────────────────────
         #
-        # MDL(Δ): наближаємо через L1-норму patch (менший патч = простіша правка)
+        # Approximate MDL(Δ) with patch L1 norm (smaller patch = simpler fix).
         mdl_patch = patch_emb.abs().mean()                       # scalar
 
-        # Верифікація: якщо patch_score < verify_tau → штраф
+        # Verification: if patch_score < verify_tau, apply a penalty.
         verify_penalty = F.relu(
             torch.tensor(self.verify_tau, device=device) - patch_score
         ).mean()
@@ -288,9 +288,9 @@ class ReflectionModule(nn.Module):
         patch:      PatchResult,
     ) -> torch.Tensor:
         """
-        Застосовує патч до latent стану.
-        Тільки для позицій з patch_score > verify_tau.
-        Повертає покращений z.
+        Apply a patch to the latent state.
+        Only positions with patch_score > verify_tau are updated.
+        Returns the improved z.
         """
         accept = (patch.patch_score > self.verify_tau).float()  # (B,)
         z_patched = z + accept.unsqueeze(-1) * patch.patch_emb
@@ -299,10 +299,10 @@ class ReflectionModule(nn.Module):
 
 class SymbolicPlanVerifier(nn.Module):
     """
-    Lightweight symbolic verifier для PlanSequence.
+    Lightweight symbolic verifier for PlanSequence.
 
-    Перевіряє, чи кожен оператор застосовний до поточного WM, і оцінює
-    реальний прогрес до goal_facts без участі WorldRNN.
+    Checks whether each operator is applicable to the current WM and measures
+    real progress toward goal_facts without involving WorldRNN.
     """
 
     def __init__(self, invalid_penalty: float = 1.0):

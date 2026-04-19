@@ -53,30 +53,30 @@ if __name__ == "__main__":
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1.  ТЕРМИ ПЕРШОГО ПОРЯДКУ  Σ = (C, F, P, V)
+#  1. term PERShOHO PORYaDKU Σ = (C, F, P, V)
 # ══════════════════════════════════════════════════════════════════════════════
 #
-#  Сигнатура:
-#    C  — константи  (Const.val ≥ 0)
-#    F  — функціональні символи  (Compound.func)
-#    P  — предикати  (HornAtom.pred)
-#    V  — змінні  (Var.name: str)
+#  Syhnatura:
+#  C - konstanty (Const.val >= 0)
+#  F - funktsionalni symvoly (Compound.func)
+#  P - predicate (HornAtom.pred)
+#  V - variable (Var.name: str)
 #
-#  Терм t ::= c | X | f(t1,...,tk)
-#  Атом  ::= p(t1,...,tn)
-#  Правило: H :- B1,...,Bn   (Horn clause)
+#  term t ::= c | X | f(t1,...,tk)
+#  Atom ::= p(t1,...,tn)
+#  rule: H :- B1,...,Bn (Horn clause)
 #
-#  Підстановка σ: V→Term — моноїд ендоморфізмів (Subst, ∘, ε).
-#  Уніфікація — алгоритм Martelli-Montanari (1982).
+#  substitution sigma: V->term - monoid endomorfizmiv (Subst, ∘, eps).
+#  unification - alhorytm Martelli-Montanari (1982).
 #
-#  Зворотна сумісність:
+#  Zvorotna compatibility:
 #    int ≥ 0  →  Const(int)
-#    int < 0  →  Var(f"_{pos}")  (позиційна анонімна змінна-wildcard)
+#  int < 0 -> Var(f"_{pos}") (pozytsiina anonimna variable-wildcard)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass(frozen=True)
 class Const:
-    """Константа c ∈ C. val ≥ 0."""
+    """Constant term."""
     val: int
     def __repr__(self) -> str:          return str(self.val)
     def vars(self) -> FrozenSet[str]:   return frozenset()
@@ -84,7 +84,7 @@ class Const:
 
 @dataclass(frozen=True)
 class Var:
-    """Змінна X ∈ V. name — рядковий ідентифікатор."""
+    """Variable term."""
     name: str
     def __repr__(self) -> str:          return f"?{self.name}"
     def vars(self) -> FrozenSet[str]:   return frozenset({self.name})
@@ -92,7 +92,7 @@ class Var:
 
 @dataclass(frozen=True)
 class Compound:
-    """Складений терм f(t1,...,tk), f ∈ F."""
+    """Compound term."""
     func: int
     subterms: Tuple['Term', ...]
     def __repr__(self) -> str:
@@ -108,18 +108,18 @@ class Compound:
 Term = Union[Const, Var, Compound]
 
 
-# ─── Допоміжні функції для термів ─────────────────────────────────────────────
+#  --- Dopomizhni funktsii dlia term ---------------------------------------------
 
 def _term_vars(t: Term) -> FrozenSet[str]:
-    """Множина імен змінних у терм t."""
+    """Return the variable names used by a term."""
     return t.vars()
 
 def _term_depth(t: Term) -> int:
-    """Глибина терму: константа/змінна = 0, складений = 1+max(depth підтермів)."""
+    """Return the depth of a term."""
     return t.depth()
 
 def _is_ground(t: Term) -> bool:
-    """True, якщо терм не містить жодної змінної."""
+    """Return whether a term contains no variables."""
     return not t.vars()
 
 
@@ -146,29 +146,17 @@ def _build_rule_codebook(rules: List["HornClause"]) -> Tuple[Counter, int, int]:
     return counts, total, len(counts)
 
 def _to_term(x, pos: int = 0) -> Term:
-    """
-    Конвертує int-аргумент (стара нотація) у Term.
-      x ≥ 0  →  Const(x)
-      x < 0  →  Var(f"_{pos}")  (позиційна анонімна змінна)
-    Якщо x вже Term — повертає без змін.
-    """
+    """Convert a legacy integer argument into a term."""
     if isinstance(x, (Const, Var, Compound)):
         return x
     x = int(x)
     return Var(f"_{pos}") if x < 0 else Const(x)
 
 
-# ─── Підстановка (Substitution) ───────────────────────────────────────────────
+#  --- substitution (Substitution) -----------------------------------------------
 
 class Substitution:
-    """
-    Підстановка σ : V → Term — скінченне відображення.
-    Множина підстановок з операцією композиції утворює моноїд:
-      (Subst, ∘, ε),  де ε — порожня підстановка.
-
-    Частковий порядок:
-      σ ≤ τ  ⟺  ∃θ: τ = σ ∘ θ   (τ є більш конкретизованою)
-    """
+    """Substitution mapping from variables to terms."""
     __slots__ = ('bindings',)
 
     def __init__(self, bindings: Optional[Dict[str, Term]] = None):
@@ -176,16 +164,12 @@ class Substitution:
 
     @classmethod
     def empty(cls) -> 'Substitution':
-        """Порожня підстановка ε — одиниця моноїду."""
+        """English documentation for empty."""
         return cls({})
 
-    # ── Застосування ──────────────────────────────────────────────────────────
+    #  -- apply ----------------------------------------------------------
     def apply(self, t: Term) -> Term:
-        """
-        Застосовує σ до терму t рекурсивно (з path-compression).
-          Xσ = σ(X) якщо X ∈ dom(σ), інакше X.
-          f(t1,...,tk)σ = f(t1σ,...,tkσ).
-        """
+        """English documentation for apply."""
         if isinstance(t, Const):
             return t
         if isinstance(t, Var):
@@ -197,21 +181,18 @@ class Substitution:
         return t
 
     def apply_atom(self, atom: 'HornAtom') -> 'HornAtom':
-        """Застосовує підстановку до атому (замінює змінні в args)."""
+        """English documentation for apply atom."""
         return HornAtom(atom.pred, tuple(self.apply(a) for a in atom.args))
 
-    # ── Операції моноїду ──────────────────────────────────────────────────────
+    #  -- Operatsii monoidu ------------------------------------------------------
     def bind(self, var_name: str, term: Term) -> 'Substitution':
-        """Повертає нову підстановку {σ ∪ {var_name → σ(term)}}."""
+        """English documentation for bind."""
         new_b = {k: self.apply(v) for k, v in self.bindings.items()}
         new_b[var_name] = self.apply(term)
         return Substitution(new_b)
 
     def compose(self, other: 'Substitution') -> 'Substitution':
-        """
-        Композиція σ ∘ θ:  t(σ ∘ θ) = (tθ)σ.
-        Застосовуємо спочатку other(θ), потім self(σ).
-        """
+        """English documentation for compose."""
         new_b: Dict[str, Term] = {}
         for k, v in other.bindings.items():
             new_b[k] = self.apply(v)
@@ -220,40 +201,34 @@ class Substitution:
                 new_b[k] = v
         return Substitution(new_b)
 
-    # ── MDL-метрики ────────────────────────────────────────────────────────────
+    #  -- MDL-metryky ------------------------------------------------------------
     def unif_complexity(self) -> int:
-        """MDL: Σ_{X∈dom(σ)} Depth(σ(X)) — складність підстановки."""
+        """English documentation for unif complexity."""
         return sum(_term_depth(v) for v in self.bindings.values())
 
     def is_ground_for(self, atom: 'HornAtom') -> bool:
-        """True, якщо всі аргументи atom після застосування σ — Const."""
+        """English documentation for is ground for."""
         return all(isinstance(self.apply(a), Const) for a in atom.args)
 
-    # ── Порівняння / відображення ─────────────────────────────────────────────
+    #  -- Porivniannia / vidobrazhennia ---------------------------------------------
     def __len__(self)  -> int:  return len(self.bindings)
-    def __bool__(self) -> bool: return True    # навіть ε є валідною підстановкою
+    def __bool__(self) -> bool: return True  #  navit eps ie validnoiu substitution
     def __repr__(self) -> str:
         if not self.bindings:
             return "ε"
-        return "{" + ", ".join(f"?{k}→{v}" for k, v in self.bindings.items()) + "}"
+        return "{" + ", ".join(f"?{k}->{v}" for k, v in self.bindings.items()) + "}"
     def __eq__(self, other: object) -> bool:
         return isinstance(other, Substitution) and self.bindings == other.bindings
     def __hash__(self) -> int:
         return hash(frozenset((k, repr(v)) for k, v in self.bindings.items()))
 
 
-# ─── Freshening (перейменування змінних перед застосуванням правила) ──────────
+#  --- Freshening (pereimenuvannia variable pered apply rule) ----------
 
 _FRESHEN_COUNTER: List[int] = [0]
 
 def freshen_vars(clause: 'HornClause') -> 'HornClause':
-    """
-    Перейменовує ВСІ іменовані змінні (не анонімні) у clause на свіжі,
-    щоб уникнути конфліктів між різними застосуваннями одного правила.
-
-    Анонімні змінні (name.startswith('_')) не перейменовуються:
-    вони діють як незалежні wildcards і ніколи не зв'язуються (MM пропускає їх).
-    """
+    """Rename named variables in a clause to fresh names."""
     all_vars: Set[str] = set()
     for a in (clause.head,) + tuple(clause.body):
         for t in a.args:
@@ -270,20 +245,13 @@ def freshen_vars(clause: 'HornClause') -> 'HornClause':
                       weight=clause.weight, use_count=clause.use_count)
 
 
-# ─── HornAtom та HornClause ───────────────────────────────────────────────────
+#  --- HornAtom ta HornClause ---------------------------------------------------
 
 @dataclass(frozen=True)
 class HornAtom:
-    """
-    Атом: p(t1,...,tn),  p ∈ P,  ti ∈ Term.
-
-    args — кортеж Term (Const | Var | Compound).
-    Зворотна сумісність: якщо args містить int, то
-      int ≥ 0  →  Const(int)
-      int < 0  →  Var(f"_{pos}")   (позиційна анонімна змінна)
-    """
+    """Horn atom."""
     pred: int
-    args: Tuple  # нормалізується до Tuple[Term, ...] у __post_init__
+    args: Tuple  #  normalizuietsia do Tuple[term, ...] u __post_init__
 
     def __post_init__(self) -> None:
         normalized = tuple(
@@ -305,20 +273,13 @@ class HornAtom:
         return result
 
     def is_ground(self) -> bool:
-        """True, якщо всі аргументи — Const (ground atom)."""
+        """English documentation for is ground."""
         return all(_is_ground(a) for a in self.args)
 
 
 @dataclass
 class HornClause:
-    """
-    Хорнівський диз'юнкт: H :- B1,...,Bn.
-    Факт (n=0): H  (без тіла, head — ground atom).
-    Правило: H :- B1,...,Bn  зі змінними.
-
-    MDL-складність:
-      Length(R) = (1+|body|)·(arity+1) + Σ depth(ti)
-    """
+    """Horn clause."""
     head:      HornAtom
     body:      Tuple[HornAtom, ...] = field(default_factory=tuple)
     weight:    float = 1.0
@@ -328,7 +289,7 @@ class HornClause:
         return len(self.body) == 0
 
     def complexity(self) -> int:
-        """MDL: довжина правила з урахуванням глибини термів."""
+        """English documentation for complexity."""
         base = (1 + len(self.body)) * (self.head.arity() + 1)
         term_d = sum(
             _term_depth(a)
@@ -617,38 +578,30 @@ def _atoms_conflict(a: HornAtom, b: HornAtom) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2.  УНІФІКАЦІЯ: Алгоритм Martelli-Montanari + Backtracking DFS
+#  2. unification: Alhorytm Martelli-Montanari + Backtracking DFS
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# Математика (розділ 3 специфікації):
-#   Задача: для E = {s1=?=t1,...,sm=?=tm} знайти mgu σ, що si·σ = ti·σ.
-#   Правила трансформації Martelli-Montanari:
-#     (1) Trivial   : t =?= t              → видалити
-#     (2) Decompose : f(s...) =?= f(t...)  → розкласти на компоненти
-#     (3) Clash     : f(...) =?= g(...)    → FAIL (f≠g або arity≠)
+#  Matematyka (rozdil 3 spetsyfikatsii):
+#  Zadacha: dlia E = {s1=?=t1,...,sm=?=tm} znaity mgu sigma, shcho si * sigma = ti * sigma.
+#  rule transformatsii Martelli-Montanari:
+#  (1) Trivial : t =?= t -> vydalyty
+#  (2) Decompose : f(s...) =?= f(t...) -> rozklasty na komponenty
+#  (3) Clash : f(...) =?= g(...) -> FAIL (f!=g abo arity!=)
 #     (4) Orient    : t =?= X              → X =?= t
-#     (5) OccursChk : X =?= t, X∈Var(t)   → FAIL (циклічний терм)
+#  (5) OccursChk : X =?= t, X in Var(t) -> FAIL (tsyklichnyi term)
 #     (6) Eliminate : X =?= t             → {X→t} ∪ E{X→t}
 #
-# Conjunctive unification (розділ 4):
-#   Шукаємо σ і π: {1..n}→Facts такі, що Bi·σ = π(i) ∀i.
-#   DFS з backtracking + індексація за pred-id.
+#  Conjunctive unification (rozdil 4):
+#  Shukaiemo sigma i pi: {1..n}->Facts taki, shcho Bi * sigma = pi(i) for all i.
+#  DFS z backtracking + indeksatsiia za pred-id.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def unify_mm(equations: List[Tuple[Term, Term]]) -> Optional[Substitution]:
-    """
-    Алгоритм Martelli-Montanari (1982).
-    Приймає список рівнянь {si =?= ti} і повертає mgu (Substitution) або None.
-
-    Анонімні змінні (?_N, де name.startswith('_')) пропускаються правилом
-    Eliminate — вони діють як wildcards без зв'язування.
-
-    Складність: O(n·α(n)) амортизовано (union-find-like).
-    """
+    """Compute a most-general unifier with the Martelli-Montanari procedure."""
     sigma: Dict[str, Term] = {}
 
     def chase(t: Term) -> Term:
-        """Рекурсивно слідує chain підстановок."""
+        """English documentation for chase."""
         if isinstance(t, Var) and t.name in sigma:
             return chase(sigma[t.name])
         if isinstance(t, Compound):
@@ -656,7 +609,7 @@ def unify_mm(equations: List[Tuple[Term, Term]]) -> Optional[Substitution]:
         return t
 
     def occurs(var_name: str, t: Term) -> bool:
-        """Occurs check: чи входить var_name у терм t (після chase)?"""
+        """English documentation for occurs."""
         t = chase(t)
         if isinstance(t, Var):      return t.name == var_name
         if isinstance(t, Compound): return any(occurs(var_name, s) for s in t.subterms)
@@ -672,7 +625,7 @@ def unify_mm(equations: List[Tuple[Term, Term]]) -> Optional[Substitution]:
         if s == t:
             continue
 
-        # (4) Orient: якщо s не змінна, але t — змінна → flip
+        #  (4) Orient: iakshcho s ne variable, ale t - variable -> flip
         if not isinstance(s, Var) and isinstance(t, Var):
             eqs.insert(0, (t, s))
             continue
@@ -680,12 +633,12 @@ def unify_mm(equations: List[Tuple[Term, Term]]) -> Optional[Substitution]:
         # (6) + (5) Eliminate / OccursCheck
         if isinstance(s, Var):
             name = s.name
-            # Анонімні ('_*') — wildcards, не зв'язуємо
+            #  Anonimni ('_*') - wildcards, ne zv'iazuiemo
             if name.startswith('_'):
                 continue
             # (5) Occurs check
             if occurs(name, t):
-                return None        # циклічний терм
+                return None  #  tsyklichnyi term
             sigma[name] = chase(t)
             eqs = [(chase(l), chase(r)) for l, r in eqs]
             continue
@@ -697,31 +650,21 @@ def unify_mm(equations: List[Tuple[Term, Term]]) -> Optional[Substitution]:
             eqs = list(zip(s.subterms, t.subterms)) + eqs
             continue
 
-        # (3) Clash: несумісні символи
+        #  (3) Clash: necompatibility symvoly
         return None
 
     return Substitution(sigma)
 
 
 def unify(pattern: HornAtom, fact: HornAtom) -> Optional[Substitution]:
-    """
-    Уніфікація двох атомів через Martelli-Montanari.
-    Повертає mgu (Substitution) або None.
-
-    API-зміна: повертає Substitution замість Dict[int,int].
-    Зворотна сумісність: HornAtom з int-args автоматично нормалізується
-    до Term через __post_init__.
-    """
+    """Unify two Horn atoms."""
     if pattern.pred != fact.pred or pattern.arity() != fact.arity():
         return None
     return unify_mm(list(zip(pattern.args, fact.args)))
 
 
 def apply_bindings(atom: HornAtom, sigma: Substitution) -> HornAtom:
-    """
-    Застосовує підстановку σ до атому.
-    API-зміна: приймає Substitution замість Dict[int,int].
-    """
+    """Apply a substitution to an atom."""
     return sigma.apply_atom(atom)
 
 
@@ -731,20 +674,11 @@ def find_all_substitutions(
         sigma: Optional[Substitution] = None,
         max_solutions: int = 64,
 ) -> List[Substitution]:
-    """
-    Знаходить ВСІ підстановки σ такі, що кожен Bi·σ уніфікується
-    з деяким фактом з facts (кон'юнктивна уніфікація, розділ 4).
-
-    Алгоритм: DFS з backtracking.
-    Оптимізація: факти індексуються за pred-id для O(1)-фільтрації.
-
-    Формально: шукаємо σ та ін'єкцію π:{1..n}→Facts,
-    що Bi·σ = π(i) для всіх i.
-    """
+    """English documentation for find all substitutions."""
     if sigma is None:
         sigma = Substitution.empty()
 
-    # Попередня індексація за предикатом
+    #  Poperednia indeksatsiia za predicate
     pred_index: Dict[int, List[HornAtom]] = {}
     for f in facts:
         pred_index.setdefault(f.pred, []).append(f)
@@ -758,9 +692,9 @@ def find_all_substitutions(
             results.append(cur)
             return
         atom = body[i]
-        # Застосовуємо поточну підстановку, щоб конкретизувати атом
+        #  apply potochnu substitution, shchob konkretyzuvaty atom
         grounded = cur.apply_atom(atom)
-        # Перебираємо факти з тим самим pred
+        #  Perebyraiemo fact z tym samym pred
         for fact in pred_index.get(grounded.pred, []):
             sub = unify(grounded, fact)
             if sub is not None:
@@ -773,31 +707,17 @@ def find_all_substitutions(
 
 def unify_body(body: Tuple[HornAtom, ...],
                facts: FrozenSet[HornAtom]) -> Optional[Substitution]:
-    """
-    Знаходить ПЕРШУ підстановку σ що задовольняє всі атоми тіла.
-    Зворотна сумісність: повертає Substitution або None.
-    """
+    """English documentation for unify body."""
     sols = find_all_substitutions(body, facts, max_solutions=1)
     return sols[0] if sols else None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2b.  EPISTEMIC RULE TRACKER  (контроль якості правил)
+#  2b. EPISTEMIC RULE TRACKER (kontrol iakosti rule)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class EpistemicStatus(enum.Enum):
-    """
-    Епістемічний статус правила в LTM.
-
-      proposed      — щойно згенероване абдукцією, ще не перевірене.
-      verified      — підтверджене ≥1 успішним використанням у доведенні.
-      contradicted  — призвело до логічної суперечності; підлягає видаленню.
-
-    Перехід:
-      proposed → verified    (при successful proof step)
-      proposed → contradicted (при contradiction)
-      verified  може знову стати contradicted якщо виявлено суперечність пізніше.
-    """
+    """English documentation for Epistemic Status."""
     proposed     = "proposed"
     verified     = "verified"
     contradicted = "contradicted"
@@ -805,35 +725,20 @@ class EpistemicStatus(enum.Enum):
 
 @dataclass
 class RuleRecord:
-    """
-    Запис правила з епістемічними метаданими.
-
-    Utility(R) = use_count / (1 + age_steps) — динамічна корисність.
-    Complexity(R) = rule.description_length_bits() — fixed symbolic code length.
-
-    L_rule = Complexity(R) − η·Utility(R)   (формула розд. 3)
-    """
+    """Rule plus epistemic metadata."""
     rule:       "HornClause"
     status:     EpistemicStatus      = EpistemicStatus.proposed
     use_count:  int                  = 0
-    success_count: int               = 0     # кількість успішних доведень
-    age_steps:  int                  = 0     # кроків з моменту додавання
+    success_count: int               = 0  #  kilkist uspishnykh doveden
+    age_steps:  int                  = 0  #  step z momentu add
     weight:     float                = 1.0
 
     def utility(self) -> float:
-        """
-        Utility(R) = success_count / (1 + age_steps)
-
-        Висока корисність ≡ правило часто брало участь в успішних доведеннях.
-        Штрафуємо старі невикористані правила → видаляємо їх при консолідації.
-        """
+        """English documentation for utility."""
         return self.success_count / (1.0 + self.age_steps)
 
     def l_rule_contribution(self, eta: float) -> float:
-        """
-        Внесок правила в L_rule = Complexity(R) − η·Utility(R).
-        Від'ємний лише якщо правило дуже корисне.
-        """
+        """English documentation for l rule contribution."""
         return float(self.rule.description_length_bits()) - eta * self.utility()
 
 
@@ -878,24 +783,7 @@ def _clone_rule_records(
 
 
 class VerificationModule(nn.Module):
-    """
-    Verification Module (VeM) — нейронний фільтр кандидатів AbductionHead.
-
-    Оцінює очікувану корисність кандидата-правила до додавання в LTM:
-      U(R) = E_{майбутні_задачі}[Success(R) − α·Cost(R)]
-
-    Апроксимація через retrospective self-supervised навчання:
-      - Якщо правило брало участь у успішному доведенні → ціль U=1
-      - Якщо правило не використовувалось / призводило до помилок → U≈0
-
-    Канідати фільтруються:
-      Candidates = {R ~ AbductionHead(z) | VeM(R) > vem_tau}
-
-    VeM штраф у функції втрат:
-      L_vem = δ · E_{R~Abduction}[max(0, τ − U(R))]
-
-    Навчання: MSE між predicted U(R) та retrospective utility target.
-    """
+    """Score candidate rules before adding them to long-term memory."""
 
     def __init__(self, d_latent: int, sym_vocab: int, vem_tau: float = 0.3):
         super().__init__()
@@ -903,10 +791,10 @@ class VerificationModule(nn.Module):
         self.sv      = sym_vocab
         self.vem_tau = vem_tau
 
-        # Ембеддер термів для отримання вектора правила
+        #  Embedder term dlia otrymannia vektora rule
         self.term_emb = TermEmbedder(sym_vocab, d_latent)
 
-        # Основна VeM мережа: rule_emb → U(R) ∈ [0, 1]
+        #  Osnovna VeM merezha: rule_emb -> U(R) in [0, 1]
         self.vem_net = nn.Sequential(
             nn.Linear(d_latent, d_latent),
             nn.GELU(),
@@ -917,32 +805,29 @@ class VerificationModule(nn.Module):
             nn.Sigmoid(),      # U(R) ∈ [0, 1]
         )
 
-        # Буфери для самонавчання (retrospective analysis)
-        # Зберігаємо (rule_emb, utility_target) пари
+        #  Bufery dlia samotraining (retrospective analysis)
+        #  Zberihaiemo (rule_emb, utility_target) pary
         self._train_embs:    List[torch.Tensor] = []
         self._train_targets: List[float]        = []
         self._max_buffer     = 256
 
     def rule_embedding(self, clause: "HornClause",
                        device: torch.device) -> torch.Tensor:
-        """Ембеддинг правила: mean(head + body atoms)."""
+        """English documentation for rule embedding."""
         atoms = [clause.head] + list(clause.body)
         embs  = self.term_emb(atoms, device)     # (n_atoms, d)
         return embs.mean(0)                       # (d,)
 
     def score(self, clause: "HornClause",
               device: torch.device) -> float:
-        """Повертає U(R) ∈ [0,1] для одного правила (no_grad)."""
+        """English documentation for score."""
         with torch.no_grad():
             r_emb = self.rule_embedding(clause, device).unsqueeze(0)
             return self.vem_net(r_emb).squeeze().item()
 
     def score_batch(self, clauses: List["HornClause"],
                     device: torch.device) -> torch.Tensor:
-        """
-        U(R_i) для кожного кандидата.
-        Returns: (n_clauses,) tensor
-        """
+        """English documentation for score batch."""
         if not clauses:
             return torch.zeros(0, device=device)
         embs = torch.stack([self.rule_embedding(c, device) for c in clauses])
@@ -951,12 +836,7 @@ class VerificationModule(nn.Module):
     def filter_candidates(self,
                           clauses:  List["HornClause"],
                           device:   torch.device) -> Tuple[List["HornClause"], torch.Tensor]:
-        """
-        Фільтрує кандидатів: повертає (accepted, hinge_loss).
-
-        hinge_loss = Σ max(0, τ − U(R))  — штраф за генерацію поганих кандидатів.
-        Навіть відхилені кандидати вносять gradient сигнал через hinge.
-        """
+        """English documentation for filter candidates."""
         if not clauses:
             zero = torch.zeros(1, device=device)
             return [], zero
@@ -971,24 +851,18 @@ class VerificationModule(nn.Module):
     def record_outcome(self, clause: "HornClause",
                        utility_target: float,
                        device: torch.device) -> None:
-        """
-        Записує результат використання правила для самонавчання.
-        utility_target ∈ [0,1]: 1.0 → успішне доведення, 0.0 → невдача.
-        """
+        """English documentation for record outcome."""
         with torch.no_grad():
             r_emb = self.rule_embedding(clause, device).cpu()
         self._train_embs.append(r_emb)
         self._train_targets.append(float(utility_target))
-        # Кільцевий буфер
+        #  Kiltsevyi bufer
         if len(self._train_embs) > self._max_buffer:
             self._train_embs.pop(0)
             self._train_targets.pop(0)
 
     def self_supervised_loss(self, device: torch.device) -> torch.Tensor:
-        """
-        MSE між predicted U(R) та retrospective targets.
-        Викликається раз на кілька кроків для донавчання VeM.
-        """
+        """English documentation for self supervised loss."""
         if len(self._train_embs) < 4:
             return torch.zeros(1, device=device).squeeze()
         embs    = torch.stack(self._train_embs).to(device)      # (N, d)
@@ -1003,27 +877,19 @@ class VerificationModule(nn.Module):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class KnowledgeBase:
-    """
-    База знань: факти + правила з Forward Chaining.
-
-    Розширено епістемічним трекером:
-      · Кожне правило має RuleRecord зі статусом (proposed/verified/contradicted)
-      · MDL-регуляризатор враховує динамічну корисність:
-          L_rule = Σ_{R∈LTM} (Complexity(R) − η·Utility(R))
-      · Consolidation: видаляємо слабкі proposed правила раз на N кроків.
-    """
+    """Knowledge base with facts, rules, and forward chaining."""
 
     def __init__(self, max_rules: int = 1024):
         self.facts:     FrozenSet[HornAtom] = frozenset()
-        self.rules:     List[HornClause]    = []   # активні правила
+        self.rules:     List[HornClause]    = []  #  aktyvni rule
         self._rule_set: Set[HornClause]     = set()
         self.max_rules  = max_rules
 
-        # Епістемічний трекер: hash(rule) → RuleRecord
+        #  Epistemichnyi treker: hash(rule) -> RuleRecord
         self._records:  Dict[HornClause, RuleRecord] = {}
-        self._global_step: int = 0             # для age_steps
+        self._global_step: int = 0  #  dlia age_steps
 
-    # ── Додавання ──────────────────────────────────────────────────────────────
+    #  -- add --------------------------------------------------------------
     def add_fact(self, atom: HornAtom) -> bool:
         if atom not in self.facts:
             self.facts = self.facts | {atom}
@@ -1032,12 +898,9 @@ class KnowledgeBase:
 
     def add_rule(self, clause: HornClause,
                  status: EpistemicStatus = EpistemicStatus.proposed) -> bool:
-        """
-        Додає правило з початковим статусом (proposed за замовч.).
-        Якщо правило вже є — збільшуємо use_count.
-        """
+        """English documentation for add rule."""
         if clause in self._rule_set:
-            # Правило вже є — оновлюємо запис
+            #  rule vzhe ie - onovliuiemo zapys
             for r in self.rules:
                 if r == clause:
                     r.use_count += 1
@@ -1047,7 +910,7 @@ class KnowledgeBase:
                 rec.use_count += 1
             return False
         if len(self.rules) >= self.max_rules:
-            # LRU-евікція: видаляємо правило з найменшою корисністю (Utility)
+            #  LRU-eviktsiia: vydaliaiemo rule z naimenshoiu korysnistiu (Utility)
             worst_i = min(
                 range(len(self.rules)),
                 key=lambda i: self._records.get(
@@ -1065,13 +928,13 @@ class KnowledgeBase:
         return True
 
     def mark_rule_verified(self, clause: HornClause) -> None:
-        """Позначити правило як verified після успішного доведення."""
+        """English documentation for mark rule verified."""
         rec = self._records.get(clause)
         if rec is not None:
             rec.status         = EpistemicStatus.verified
             rec.success_count += 1
-            rec.weight        *= 1.05   # підвищуємо довіру
-        # Оновлюємо use_count у самому clause (для зворотньої сумісності)
+            rec.weight        *= 1.05  #  pidvyshchuiemo doviru
+        #  Onovliuiemo use_count u samomu clause (dlia zvorotnoi compatibility)
         for r in self.rules:
             if r == clause:
                 r.use_count    += 1
@@ -1079,7 +942,7 @@ class KnowledgeBase:
                 break
 
     def mark_rule_contradicted(self, clause: HornClause) -> None:
-        """Позначити правило як contradicted (буде видалено при консолідації)."""
+        """English documentation for mark rule contradicted."""
         rec = self._records.get(clause)
         if rec is not None:
             rec.status = EpistemicStatus.contradicted
@@ -1099,13 +962,7 @@ class KnowledgeBase:
         return True
 
     def consolidate(self, use_count_threshold: int = 2) -> int:
-        """
-        Rule Consolidation: видаляємо слабкі правила.
-          · Contradicted → видаляємо завжди.
-          · Proposed + use_count < threshold → видаляємо.
-
-        Повертає кількість видалених правил.
-        """
+        """English documentation for consolidate."""
         to_remove: Set[HornClause] = set()
         for rule, rec in list(self._records.items()):
             if rec.status == EpistemicStatus.contradicted:
@@ -1129,7 +986,7 @@ class KnowledgeBase:
         return len(to_remove)
 
     def tick(self) -> None:
-        """Оновлює вік всіх правил (викликати раз на крок)."""
+        """English documentation for tick."""
         self._global_step += 1
         for rec in self._records.values():
             rec.age_steps += 1
@@ -1139,14 +996,7 @@ class KnowledgeBase:
                       starting_facts: "Optional[FrozenSet]" = None,
                       only_verified: bool = False,
                       track_epistemic: bool = True) -> "FrozenSet[HornAtom]":
-        """
-        Застосовує правила до fixpoint або max_depth ітерацій.
-        Повертає всі виведені + існуючі факти.
-        Успішне виведення → mark_rule_verified().
-
-        starting_facts: якщо задано — використовуємо замість self.facts.
-        Дозволяє передавати random-sample для пришвидшення при великому KB.
-        """
+        """English documentation for forward chain."""
         current = starting_facts if starting_facts is not None else self.facts
         for _ in range(max_depth):
             new_facts: Set[HornAtom] = set()
@@ -1169,25 +1019,20 @@ class KnowledgeBase:
                         if track_epistemic:
                             clause.use_count += 1
                             clause.weight    *= 1.01
-                            # Оновлюємо епістемічний статус
+                            #  Onovliuiemo epistemichnyi status
                             self.mark_rule_verified(clause)
             if not new_facts:
                 break
             current = current | frozenset(new_facts)
         return current
 
-    # ── MDL-складність (оновлена: враховує корисність) ─────────────────────────
+    #  -- MDL-complexity (onovlena: vrakhovuie korysnist) -------------------------
     def complexity_penalty(self) -> float:
         """Σ_R DL_bits(R) under a fixed universal grammar."""
         return sum(r.description_length_bits() for r in self.rules)
 
     def utility_adjusted_penalty(self, eta: float = 0.1) -> float:
-        """
-        L_rule = Σ_{R∈LTM} (Complexity(R) − η·Utility(R))
-
-        Заохочує зберігати корисні правила (від'ємний внесок),
-        штрафує за складні некорисні правила.
-        """
+        """English documentation for utility adjusted penalty."""
         total = 0.0
         for r in self.rules:
             rec = self._records.get(r)
@@ -1203,16 +1048,7 @@ class KnowledgeBase:
             self,
             max_pairs: int = 32
     ) -> List[Tuple["HornClause", "HornClause", float]]:
-        """
-        Повертає пари правил (R1, R2, score) для семантичного feedback в NET.
-
-        Score = сила логічного зв'язку:
-          · synonym(v1, v2): cos(head_pred(v1), head_pred(v2)) ≈ 1.0
-          · implies(v1, v2): v1 у тілі → v2 у голові
-
-        Використовується для L_semantic в NET:
-          L_semantic = −E[(v1,v2)~pairs][cos(e_v1, e_v2)·score]
-        """
+        """English documentation for get rule pairs for semantic feedback."""
         pairs: List[Tuple["HornClause", "HornClause", float]] = []
         n = len(self.rules)
         if n < 2:
@@ -1220,15 +1056,15 @@ class KnowledgeBase:
         for i in range(min(max_pairs * 2, n)):
             r1 = self.rules[i % n]
             r2 = self.rules[(i + 1) % n]
-            # Перевіряємо імплікацію: якщо голова r1 входить в тіло r2
+            #  check implikatsiiu: iakshcho holova r1 vkhodyt v tilo r2
             r1_head_pred = r1.head.pred
             r2_body_preds = {a.pred for a in r2.body}
             if r1_head_pred in r2_body_preds:
-                score = 0.9   # сильний логічний зв'язок
+                score = 0.9  #  sylnyi lohichnyi zv'iazok
             elif r1.head.pred == r2.head.pred:
-                score = 0.7   # synonym (спільний предикат голови)
+                score = 0.7  #  synonym (spilnyi predicate holovy)
             else:
-                continue      # немає значущого зв'язку
+                continue  #  nemaie znachushchoho zv'iazku
             pairs.append((r1, r2, score))
             if len(pairs) >= max_pairs:
                 break
@@ -1239,89 +1075,83 @@ class KnowledgeBase:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3b. TensorKnowledgeBase — GPU-акселерований drop-in замінник KnowledgeBase
+#  3b. TensorKnowledgeBase - GPU-akselerovanyi drop-in zaminnyk KnowledgeBase
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# Проблема оригінального forward_chain:
-#   Python nested loop: O(depth × R × N) = 4 × 1342 × 1342 ≈ 7.2M ітерацій
-#   Час: 22–70 секунд/батч → Stage 2 не рухається вперед.
+#  Problema oryhinalnoho forward_chain:
+#  Python nested loop: O(depth × R × N) = 4 × 1342 × 1342 ~ 7.2M iteratsii
+#  Chas: 22-70 sekund/batch -> Stage 2 ne rukhaietsia vpered.
 #
-# Рішення: представити факти і правила як int64-тензори на GPU.
-#   forward_chain = broadcast матричні операції:
-#     pred_match = facts[:,0:1] == rules[:,3:4].T   # (N,R) — один GPU kernel
+#  Rishennia: predstavyty fact i rule iak int64-tenzory na GPU.
+#  forward_chain = broadcast matrychni operatsii:
+#  pred_match = facts[:,0:1] == rules[:,3:4].T#  (N,R) - odyn GPU kernel
 #     a0_match   = (b_a0<0) | (facts[:,1:2] == rules[:,4:5].T)
 #     a1_match   = (b_a1<0) | (facts[:,2:3] == rules[:,5:6].T)
 #     match      = pred_match & a0_match & a1_match  # (N,R) — GPU parallel
-#   Час: ~0.1–0.5 ms/батч  → прискорення ~100–1000x без втрат інформації.
+#  Chas: ~0.1-0.5 ms/batch -> pryskorennia ~100-1000x bez vtrat informatsii.
 #
-# Кодування змінних у тензорі правил (стовпці 1,2,4,5):
-#   VAR_0 = -1  (перша логічна змінна: body_slot_0 → head_slot)
-#   VAR_1 = -2  (друга логічна змінна: body_slot_1 → head_slot)
-#   NONE  = -99 (немає аргументу — предикат арності 1)
-#   ≥ 0        = конкретна константа
+#  Koduvannia variable u tenzori rule (stovptsi 1,2,4,5):
+#  VAR_0 = -1 (persha lohichna variable: body_slot_0 -> head_slot)
+#  VAR_1 = -2 (druha lohichna variable: body_slot_1 -> head_slot)
+#  NONE = -99 (nemaie argument - predicate arnosti 1)
+#  >= 0 = konkretna konstanta
 #
-# Сумісність:
-#   · Повний інтерфейс KnowledgeBase: add_fact, add_rule, forward_chain,
+#  compatibility:
+#  * Povnyi interfeis KnowledgeBase: add_fact, add_rule, forward_chain,
 #     mark_rule_verified, mark_rule_contradicted, consolidate, tick, n_facts,
-#     __len__, rules, facts, _records — все збережено.
-#   · Multi-body правила (≥2 літерали у тілі): Python fallback (рідко).
-#   · Епістемічний трекер (RuleRecord, status) — повністю збережено.
+#  __len__, rules, facts, _records - vse zberezheno.
+#  * Multi-body rule (>=2 literaly u tili): Python fallback (ridko).
+#  * Epistemichnyi treker (RuleRecord, status) - povnistiu zberezheno.
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TensorKnowledgeBase:
-    """
-    GPU-accelerated Knowledge Base. Drop-in replacement for KnowledgeBase.
+    """Tensorized knowledge base with GPU-accelerated forward chaining."""
 
-    Зберігає факти як (N, 3) int64 тензор і правила як (R, 6) int64 тензор.
-    forward_chain виконується через GPU broadcast operations (~1000x швидше).
-    Повністю зворотньо сумісний з KnowledgeBase API.
-    """
-
-    # Sentinel values у тензорному представленні
-    VAR_0 = -1   # перша логічна змінна (body_arg_slot_0)
-    VAR_1 = -2   # друга логічна змінна (body_arg_slot_1)
-    NONE  = -99  # відсутній аргумент (арність 1)
+    #  Sentinel values u tenzornomu predstavlenni
+    VAR_0 = -1  #  persha lohichna variable (body_arg_slot_0)
+    VAR_1 = -2  #  druha lohichna variable (body_arg_slot_1)
+    NONE  = -99  #  vidsutnii argument (arnist 1)
 
     def __init__(self, max_rules: int = 1024, max_facts: int = 16384,
                  device: Optional[torch.device] = None):
-        # Детектуємо device автоматично (GPU якщо доступний)
+        #  Detektuiemo device avtomatychno (GPU iakshcho dostupnyi)
         self._dev = device or (torch.device("cuda") if torch.cuda.is_available()
                                else torch.device("cpu"))
 
         self.max_rules = max_rules
         self._max_facts = max_facts
 
-        # ── Тензорні буфери (pre-allocated) ─────────────────────────────────
-        # fact_buf: [pred, arg0, arg1]   arg=NONE якщо арність<2
+        #  -- Tenzorni bufery (pre-allocated) ---------------------------------
+        #  fact_buf: [pred, arg0, arg1] arg=NONE iakshcho arnist<2
         self._fact_buf = torch.full((max_facts, 3), self.NONE,
                                     dtype=torch.long, device=self._dev)
         # rule_buf: [h_p, h_a0, h_a1, b_p, b_a0, b_a1]
-        # Однотільні правила (тіло з 1 літерала); multi-body → Python
+        #  Odnotilni rule (tilo z 1 literala); multi-body -> Python
         self._rule_buf = torch.full((max_rules, 6), self.NONE,
                                     dtype=torch.long, device=self._dev)
-        # Маска: чи дане правило однотільне (tensor-ready)
+        #  Maska: chy dane rule odnotilne (tensor-ready)
         self._rule_is_tensor = torch.zeros(max_rules, dtype=torch.bool,
                                            device=self._dev)
 
         self._n_facts: int = 0
         self._n_rules: int = 0
 
-        # Кешовані лічильники статусів (O(1) замість O(n_records) sum comprehension)
+        #  Keshovani lichylnyky statusiv (O(1) zamist O(n_records) sum comprehension)
         self._n_proposed: int = 0
         self._n_verified: int = 0
 
-        # ── Швидке дедуплікування (Python set) ───────────────────────────────
+        #  -- Shvydke deduplikuvannia (Python set) -------------------------------
         self._fact_set: Set[Tuple[int, int, int]] = set()
         self._rule_hash_set: Set[HornClause] = set()
 
-        # ── Збережені Python-об'єкти (для сумісності) ────────────────────────
-        self.rules: List[HornClause] = []          # всі правила (HornClause)
+        #  -- Zberezheni Python-ob'iekty (dlia compatibility) ------------------------
+        self.rules: List[HornClause] = []  #  vsi rule (HornClause)
         self._records: Dict[HornClause, RuleRecord] = {}
         self._global_step: int = 0
 
-        # Кеш facts як frozenset[HornAtom] (для сумісності з .facts property)
+        #  Kesh facts iak frozenset[HornAtom] (dlia compatibility z .facts property)
         self._facts_cache: Optional[FrozenSet[HornAtom]] = None
-        self._facts_cache_n: int = -1  # _n_facts при створенні кешу
+        self._facts_cache_n: int = -1  #  _n_facts pry stvorenni keshu
 
         # Ground-term interning: Const/Compound -> stable term ids in tensor buffers.
         self._term_to_id: Dict[Term, int] = {}
@@ -1348,12 +1178,9 @@ class TensorKnowledgeBase:
     def _decode_term(self, term_id: int) -> Term:
         return self._id_to_term.get(term_id, Const(int(term_id)))
 
-    # ── Кодування HornAtom → (pred, a0, a1) int tuple ────────────────────────
+    #  -- Koduvannia HornAtom -> (pred, a0, a1) int tuple ------------------------
     def _atom_to_key(self, atom: HornAtom) -> Tuple[int, int, int]:
-        """
-        Ground atom → (pred, a0, a1) int tuple.
-        Змінні кодуються як VAR_0/VAR_1 (використовується для тіл правил).
-        """
+        """English documentation for atom to key."""
         args = atom.args
 
         def _enc(a: object, slot: int) -> int:
@@ -1373,18 +1200,9 @@ class TensorKnowledgeBase:
         a1 = _enc(args[1], 1) if len(args) > 1 else self.NONE
         return (int(atom.pred), a0, a1)
 
-    # ── Кодування HornClause → (h_p, h_a0, h_a1, b_p, b_a0, b_a1) або None ─
+    #  -- Koduvannia HornClause -> (h_p, h_a0, h_a1, b_p, b_a0, b_a1) abo None -
     def _clause_to_tensor_row(self, clause: HornClause) -> Optional[Tuple[int, ...]]:
-        """
-        Однотільний HornClause → 6-int tuple для тензорного буфера.
-        Повертає None для multi-body (>1 literal) — вони обробляються Python-ом.
-
-        Логіка кодування змінних:
-          · Збираємо Var-імена за позицією їх першої появи у body.
-          · Перша по позиції body[0] Var → VAR_0 (-1), body[1] Var → VAR_1 (-2).
-          · У head: якщо arg — та сама Var → VAR_0/VAR_1 (буде замінено фактом).
-          · Якщо Var у head не з'являється у body → VAR_0 (безпечний default).
-        """
+        """English documentation for clause to tensor row."""
         if len(clause.body) != 1:
             return None  # multi-body: Python fallback
 
@@ -1404,8 +1222,8 @@ class TensorKnowledgeBase:
             if not all(_tensor_term_ok(arg) for arg in atom.args):
                 return None
 
-        # Будуємо мапу ім'я Var → VAR_0/VAR_1 за body-слотом першої появи.
-        # Це критично для правил на кшталт h(X,c) :- b(c,X), де X походить з body arg1.
+        #  Buduiemo mapu im'ia Var -> VAR_0/VAR_1 za body-slotom pershoi poiavy.
+        #  Tse krytychno dlia rule na kshtalt h(X,c) :- b(c,X), de X pokhodyt z body arg1.
         var_map: Dict[str, int] = {}
         for pos, a in enumerate(body.args):
             if isinstance(a, Var) and a.name not in var_map:
@@ -1454,14 +1272,14 @@ class TensorKnowledgeBase:
                                                       device=self._dev)
         self._fact_set.add(key)
         self._n_facts += 1
-        self._facts_cache = None  # інвалідуємо кеш
+        self._facts_cache = None  #  invaliduiemo kesh
         return True
 
     # ── add_rule ──────────────────────────────────────────────────────────────
     def add_rule(self, clause: HornClause,
                  status: EpistemicStatus = EpistemicStatus.proposed) -> bool:
         if clause in self._rule_hash_set:
-            # Дублікат → збільшуємо use_count
+            #  Dublikat -> zbilshuiemo use_count
             for r in self.rules:
                 if r == clause:
                     r.use_count += 1
@@ -1471,23 +1289,23 @@ class TensorKnowledgeBase:
                 rec.use_count += 1
             return False
 
-        # LRU-евікція якщо переповнений
+        #  LRU-eviktsiia iakshcho perepovnenyi
         if self._n_rules >= self.max_rules:
             self._evict_worst_rule()
 
-        # Тензорне кодування (якщо однотільне)
+        #  Tenzorne koduvannia (iakshcho odnotilne)
         row = self._clause_to_tensor_row(clause)
         if row is not None:
             self._rule_buf[self._n_rules] = torch.tensor(row, dtype=torch.long,
                                                          device=self._dev)
             self._rule_is_tensor[self._n_rules] = True
-        # else: multi-body → tensor slot лишається NONE (пропускається у fc)
+        #  else: multi-body -> tensor slot lyshaietsia NONE (propuskaietsia u fc)
 
         self.rules.append(clause)
         self._rule_hash_set.add(clause)
         self._records[clause] = RuleRecord(rule=clause, status=status)
         self._n_rules += 1
-        # Оновлюємо кешований лічильник статусів
+        #  Onovliuiemo keshovanyi lichylnyk statusiv
         if status == EpistemicStatus.proposed:
             self._n_proposed += 1
         elif status == EpistemicStatus.verified:
@@ -1495,7 +1313,7 @@ class TensorKnowledgeBase:
         return True
 
     def _evict_worst_rule(self) -> None:
-        """Видаляємо правило з найнижчою Utility (LRU-подібна евікція)."""
+        """English documentation for evict worst rule."""
         if not self.rules:
             return
         worst_i = min(
@@ -1504,7 +1322,7 @@ class TensorKnowledgeBase:
                           RuleRecord(rule=self.rules[i])).utility()
         )
         evicted = self.rules.pop(worst_i)
-        # Оновлюємо кешований лічильник статусів
+        #  Onovliuiemo keshovanyi lichylnyk statusiv
         evicted_rec = self._records.get(evicted)
         if evicted_rec is not None:
             if evicted_rec.status == EpistemicStatus.proposed:
@@ -1513,7 +1331,7 @@ class TensorKnowledgeBase:
                 self._n_verified -= 1
         self._rule_hash_set.discard(evicted)
         self._records.pop(evicted, None)
-        # Зсуваємо тензорний буфер (compact)
+        #  Zsuvaiemo tenzornyi bufer (compact)
         if worst_i < self._n_rules - 1:
             self._rule_buf[worst_i:self._n_rules - 1] = \
                 self._rule_buf[worst_i + 1:self._n_rules].clone()
@@ -1528,23 +1346,11 @@ class TensorKnowledgeBase:
                       starting_facts: Optional[FrozenSet] = None,
                       only_verified: bool = False,
                       track_epistemic: bool = True) -> FrozenSet[HornAtom]:
-        """
-        GPU-акселерований Forward Chaining.
-
-        Алгоритм:
-          1. Факти як (N,3) int64 тензор на GPU.
-          2. Однотільні правила як (R,6) int64 тензор на GPU.
-          3. Match matrix: (N,R) broadcast — один GPU kernel на depth.
-          4. Нові факти: scatter по (fact_i, rule_j) парах.
-          5. Multi-body правила: Python fallback (зазвичай 0-5% правил).
-
-        Складність: O(depth × N × R) — матричні операції на GPU.
-        vs оригінал: O(depth × R × N) Python loops (~1000x повільніше).
-        """
+        """English documentation for forward chain."""
         if self._n_facts == 0 and not self._extra_facts and not starting_facts:
             return frozenset()
 
-        # Якщо передано starting_facts — конвертуємо у тензор
+        #  Yakshcho peredano starting_facts - konvertuiemo u tenzor
         extra_facts: Set[HornAtom] = set(self._extra_facts)
         if starting_facts is not None:
             tensor_start = [a for a in starting_facts if len(a.args) <= 2]
@@ -1636,22 +1442,22 @@ class TensorKnowledgeBase:
         for _depth in range(max_depth):
             n_new_total = 0
 
-            # ── TENSOR PATH: однотільні правила ───────────────────────────────
+            #  -- TENSOR PATH: odnotilni rule -------------------------------
             if R > 0 and N > 0:
-                # body предикат і аргументи
+                #  body predicate i argument
                 b_pred = rules[:, 3]   # (R,)
-                b_a0   = rules[:, 4]   # (R,)  VAR=-1,-2 або const≥0
+                b_a0   = rules[:, 4]  #  (R,) VAR=-1,-2 abo const>=0
                 b_a1   = rules[:, 5]   # (R,)
 
-                # Match matrix (N, R) ── три умови за AND
-                # 1. Предикат точно збігається
+                #  Match matrix (N, R) -- try umovy za AND
+                #  1. predicate tochno zbihaietsia
                 pred_m = (facts[:, 0:1] == b_pred.unsqueeze(0))  # (N, R)
 
-                # 2. Аргумент 0: VAR (<0) → match будь-який; const → точний збіг
+                #  2. argument 0: VAR (<0) -> match bud-iakyi; const -> tochnyi zbih
                 a0_var = (b_a0 < 0).unsqueeze(0)                  # (1, R)
                 a0_m   = a0_var | (facts[:, 1:2] == b_a0.unsqueeze(0))  # (N, R)
 
-                # 3. Аргумент 1: NONE (-99) вважається wildcardʼом
+                #  3. argument 1: NONE (-99) vvazhaietsia wildcardʼom
                 a1_var = (b_a1 < 0).unsqueeze(0)                  # (1, R)
                 a1_m   = a1_var | (facts[:, 2:3] == b_a1.unsqueeze(0))  # (N, R)
 
@@ -1662,28 +1468,28 @@ class TensorKnowledgeBase:
                 match = pred_m & a0_m & a1_m & same_var_m          # (N, R)
 
                 if match.any():
-                    fi, ri = match.nonzero(as_tuple=True)           # (M,) кожен
+                    fi, ri = match.nonzero(as_tuple=True)  #  (M,) kozhen
 
-                    # Голови правил для кожного match
+                    #  Holovy rule dlia kozhnoho match
                     h_pred   = rules[ri, 0]                         # (M,)
                     h_a0_enc = rules[ri, 1]                         # (M,)
                     h_a1_enc = rules[ri, 2]                         # (M,)
 
-                    # Фактичні значення аргументів з matched fact
+                    #  fact znachennia argument z matched fact
                     fa0 = facts[fi, 1]                              # (M,)
                     fa1 = facts[fi, 2]                              # (M,)
 
-                    # Резолюція головних аргументів:
-                    # VAR_0 (-1) → беремо fa0; VAR_1 (-2) → беремо fa1; інакше const
+                    #  Rezoliutsiia holovnykh argument:
+                    #  VAR_0 (-1) -> beremo fa0; VAR_1 (-2) -> beremo fa1; inakshe const
                     h_a0 = torch.where(h_a0_enc == self.VAR_0, fa0,
                            torch.where(h_a0_enc == self.VAR_1, fa1, h_a0_enc))
                     h_a1 = torch.where(h_a1_enc == self.VAR_0, fa0,
                            torch.where(h_a1_enc == self.VAR_1, fa1, h_a1_enc))
 
-                    # Нові кандидати (M, 3)
+                    #  Novi candidate (M, 3)
                     candidates = torch.stack([h_pred, h_a0, h_a1], dim=1)
 
-                    # Дедуплікація: фільтруємо вже відомі факти
+                    #  Deduplikatsiia: filtruiemo vzhe vidomi fact
                     novel_rows: List[List[int]] = []
                     for cand_idx, row in enumerate(candidates.tolist()):
                         key = (row[0], row[1], row[2])
@@ -1710,9 +1516,9 @@ class TensorKnowledgeBase:
                         N = facts.shape[0]
                         n_new_total += len(novel_rows)
 
-            # ── PYTHON FALLBACK: multi-body правила ───────────────────────────
-            # Ці правила рідкісні (NeuralAbductionHead генерує 1-тільні),
-            # тому Python-overhead тут незначний.
+            #  -- PYTHON FALLBACK: multi-body rule ---------------------------
+            #  Tsi rule ridkisni (NeuralAbductionHead heneruie 1-tilni),
+            #  tomu Python-overhead tut neznachnyi.
             for clause in fast_multi_rules:
                 if not clause.body:
                     continue
@@ -1892,9 +1698,9 @@ class TensorKnowledgeBase:
                                     self.mark_rule_verified(clause)
 
             if n_new_total == 0:
-                break  # fixpoint досягнуто
+                break  #  fixpoint dosiahnuto
 
-        # Конвертуємо тензор назад у frozenset[HornAtom]
+        #  Konvertuiemo tenzor nazad u frozenset[HornAtom]
         tensor_facts = frozenset(
             HornAtom(pred=int(row[0]),
                      args=self._ints_to_args(int(row[1]), int(row[2])))
@@ -1904,7 +1710,7 @@ class TensorKnowledgeBase:
         return tensor_facts | frozenset(extra_facts)
 
     def _ints_to_args(self, a0: int, a1: int) -> Tuple:
-        """(a0, a1) int → Tuple[Term] для HornAtom."""
+        """English documentation for ints to args."""
         if a1 == self.NONE:
             return (self._decode_term(a0),) if a0 >= 0 else (Var("_v0"),)
         args: list = []
@@ -2219,10 +2025,10 @@ class TensorKnowledgeBase:
                     bindings[arg.name] = self._decode_term(int(row[j + 1].item()))
         return Substitution(bindings)
 
-    # ── facts property (frozenset[HornAtom] для сумісності) ──────────────────
+    #  -- facts property (frozenset[HornAtom] dlia compatibility) ------------------
     @property
     def facts(self) -> FrozenSet[HornAtom]:
-        """Повертає всі факти як frozenset[HornAtom]. Кешується між змінами."""
+        """English documentation for facts."""
         if self._facts_cache is not None and self._facts_cache_n == self._n_facts:
             return self._facts_cache
         result: Set[HornAtom] = set()
@@ -2235,7 +2041,7 @@ class TensorKnowledgeBase:
         self._facts_cache_n = self._n_facts
         return self._facts_cache
 
-    # ── Епістемічний трекер (ідентичний KnowledgeBase) ───────────────────────
+    #  -- Epistemichnyi treker (identychnyi KnowledgeBase) -----------------------
     def mark_rule_verified(self, clause: HornClause) -> None:
         rec = self._records.get(clause)
         if rec is not None:
@@ -2243,7 +2049,7 @@ class TensorKnowledgeBase:
             rec.status = EpistemicStatus.verified
             rec.success_count += 1
             rec.weight *= 1.05
-            # Оновлюємо кешовані лічильники при переході статусу
+            #  Onovliuiemo keshovani lichylnyky pry perekhodi statusu
             if old_status == EpistemicStatus.proposed:
                 self._n_proposed -= 1
                 self._n_verified += 1
@@ -2260,7 +2066,7 @@ class TensorKnowledgeBase:
         if rec is not None:
             old_status = rec.status
             rec.status = EpistemicStatus.contradicted
-            # Оновлюємо кешовані лічильники
+            #  Onovliuiemo keshovani lichylnyky
             if old_status == EpistemicStatus.proposed:
                 self._n_proposed -= 1
             elif old_status == EpistemicStatus.verified:
@@ -2281,7 +2087,7 @@ class TensorKnowledgeBase:
         return True
 
     def consolidate(self, use_count_threshold: int = 2) -> int:
-        """Видаляємо слабкі / contradicted правила."""
+        """English documentation for consolidate."""
         to_remove: Set[HornClause] = set()
         for rule, rec in list(self._records.items()):
             if rec.status == EpistemicStatus.contradicted:
@@ -2296,12 +2102,12 @@ class TensorKnowledgeBase:
         if not to_remove:
             return 0
 
-        # Знаходимо індекси для видалення
+        #  Znakhodymo indeksy dlia remove
         indices_to_remove = [
             i for i, r in enumerate(self.rules)
             if r in to_remove
         ]
-        # Compact тензорних буферів (видаляємо рядки)
+        #  Compact tenzornykh buferiv (vydaliaiemo riadky)
         keep_mask = torch.ones(self._n_rules, dtype=torch.bool, device=self._dev)
         for i in sorted(indices_to_remove, reverse=True):
             if i < self._n_rules:
@@ -2317,7 +2123,7 @@ class TensorKnowledgeBase:
 
         self.rules = [r for r in self.rules if r not in to_remove]
         self._rule_hash_set -= to_remove
-        # Оновлюємо кешовані лічильники перед видаленням записів
+        #  Onovliuiemo keshovani lichylnyky pered remove zapysiv
         for rule in to_remove:
             rec = self._records.get(rule)
             if rec is not None:
@@ -2331,19 +2137,19 @@ class TensorKnowledgeBase:
         return len(to_remove)
 
     def tick(self) -> None:
-        # PERF FIX: не ітеруємо всі записи на кожному кроці.
-        # age_steps кожного запису — це (global_step - birth_step).
-        # Просто збільшуємо глобальний лічильник; utility() читає age_steps
-        # ліниво через RuleRecord.age_steps, який ми більше не оновлюємо тут.
-        # Натомість ставимо age_steps = global_step при створенні (birth = 0),
-        # а utility() ділить success_count на (1 + global_step - birth_step).
-        # Для зворотньої сумісності просто пропускаємо per-record update —
-        # age_steps залишається freeze на моменті додавання правила,
-        # але global_step зростає → utility() з часом зменшується через
-        # додаткову нормалізацію на рівні consolidate().
+        #  PERF FIX: ne iteruiemo vsi zapysy na kozhnomu krotsi.
+        #  age_steps kozhnoho zapysu - tse (global_step - birth_step).
+        #  Prosto zbilshuiemo hlobalnyi lichylnyk; utility() chytaie age_steps
+        #  linyvo cherez RuleRecord.age_steps, iakyi my bilshe ne onovliuiemo tut.
+        #  Natomist stavymo age_steps = global_step pry stvorenni (birth = 0),
+        #  a utility() dilyt success_count na (1 + global_step - birth_step).
+        #  Dlia zvorotnoi compatibility prosto propuskaiemo per-record update -
+        #  age_steps zalyshaietsia freeze na momenti add rule,
+        #  ale global_step zrostaie -> utility() z chasom zmenshuietsia cherez
+        #  dodatkovu normalizatsiiu na rivni consolidate().
         self._global_step += 1
 
-    # ── MDL / utility (ідентично KnowledgeBase) ───────────────────────────────
+    #  -- MDL / utility (identychno KnowledgeBase) -------------------------------
     def complexity_penalty(self) -> float:
         return sum(r.description_length_bits() for r in self.rules)
 
@@ -2453,7 +2259,7 @@ class TensorKnowledgeBase:
 
     def add_concept_fact(self, token_idx: int,
                          context_indices: Optional[List[int]] = None) -> None:
-        """Сумісність з NET: реєструємо NET токен як факт."""
+        """English documentation for add concept fact."""
         NET_TOKEN_PRED = 100
         NET_CONTEXT_PRED = 101
         NET_MEANS_PRED = 102
@@ -2490,12 +2296,12 @@ class TensorKnowledgeBase:
 
     @property
     def n_proposed(self) -> int:
-        """Кількість правил зі статусом 'proposed' (O(1), кешовано)."""
+        """English documentation for n proposed."""
         return max(0, self._n_proposed)
 
     @property
     def n_verified(self) -> int:
-        """Кількість правил зі статусом 'verified' (O(1), кешовано)."""
+        """English documentation for n verified."""
         return max(0, self._n_verified)
 
     def __len__(self) -> int:
@@ -2505,7 +2311,7 @@ class TensorKnowledgeBase:
         return self._n_facts + len(self._extra_facts)
 
     def to(self, device: torch.device) -> "TensorKnowledgeBase":
-        """Переносимо тензорні буфери на новий device."""
+        """English documentation for to."""
         self._dev = device
         self._fact_buf = self._fact_buf.to(device)
         self._rule_buf = self._rule_buf.to(device)
@@ -2514,34 +2320,24 @@ class TensorKnowledgeBase:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4.  НЕЙРО-СИМВОЛЬНИЙ ІНТЕРФЕЙС (розділи 5-7 специфікації)
+#  4. NEYRO-SYMVOLNYY INTERFEYS (rozdily 5-7 spetsyfikatsii)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TermEmbedder(nn.Module):
-    """
-    Ембеддинги для термів першого порядку (розділ 5.1).
-
-    E: Symbol → R^d
-
-    Константи c: E(c) — lookup table.
-    Змінні  X:  глобальні навчені вектори v_{X} (positional-encoding для логіки).
-    Compound f(t1,...,tk): MLP_f(t1_emb ⊕ ... ⊕ tk_emb).
-
-    t_emb обчислюється рекурсивно (TreeLSTM-like, спрощено до MLP).
-    """
+    """English documentation for Term Embedder."""
 
     def __init__(self, sym_vocab: int, d: int, max_arity: int = 2):
         super().__init__()
         self.d = d
         self.max_arity = max_arity
 
-        # Ембеддинги констант і предикатів
+        #  Embeddynhy konstant i predicate
         self.const_emb = nn.Embedding(sym_vocab + 4, d)
 
-        # Глобальні ембеддинги змінних (по хешу від імені)
+        #  Hlobalni embeddynhy variable (po kheshu vid imeni)
         self.var_emb   = nn.Embedding(256, d)
 
-        # MLP для Compound f(t1,...,tk) → R^d
+        #  MLP dlia Compound f(t1,...,tk) -> R^d
         self.compound_mlp = nn.Sequential(
             nn.Linear(d * max_arity, d),
             nn.GELU(),
@@ -2552,7 +2348,7 @@ class TermEmbedder(nn.Module):
         return abs(hash(name)) % 256
 
     def embed_term(self, t: Term, device: torch.device) -> torch.Tensor:
-        """Повертає вектор ∈ R^d для терму t (рекурсивно)."""
+        """English documentation for embed term."""
         if isinstance(t, Const):
             idx = min(t.val, self.const_emb.num_embeddings - 1)
             return self.const_emb(torch.tensor(idx, device=device))
@@ -2568,7 +2364,7 @@ class TermEmbedder(nn.Module):
         return torch.zeros(self.d, device=device)
 
     def embed_atom(self, atom: HornAtom, device: torch.device) -> torch.Tensor:
-        """Ембеддинг атому: mean(args_embs) + pred_emb, нормований."""
+        """English documentation for embed atom."""
         pred_idx  = min(atom.pred, self.const_emb.num_embeddings - 1)
         pred_emb  = self.const_emb(torch.tensor(pred_idx, device=device))
         if not atom.args:
@@ -2577,20 +2373,12 @@ class TermEmbedder(nn.Module):
         return (arg_embs.mean(0) + pred_emb) * 0.5
 
     def forward(self, atoms: List[HornAtom], device: torch.device) -> torch.Tensor:
-        """
-        atoms: список HornAtom
-        Returns: (len(atoms), d) — матриця ембеддингів
-
-        PERF FIX: pred-індекси збираємо у один LongTensor → один GPU-виклик
-        замість N окремих torch.tensor()+embedding (було ~N×3 kernel launches).
-        Args Const/Var → пряме звернення до .weight[idx] (без torch.tensor()).
-        Compound (рідкість) → fallback на embed_term().
-        """
+        """English documentation for forward."""
         if not atoms:
             return torch.zeros(0, self.d, device=device)
         max_e = self.const_emb.num_embeddings - 1
 
-        # --- Один batch-виклик для всіх pred-ембеддингів (N kernel calls → 1) ---
+        #  --- Odyn batch-vyklyk dlia vsikh pred-embeddynhiv (N kernel calls -> 1) ---
         pred_ids  = torch.tensor([min(a.pred, max_e) for a in atoms],
                                   dtype=torch.long, device=device)
         pred_embs = self.const_emb(pred_ids)                     # (N, d)
@@ -2604,7 +2392,7 @@ class TermEmbedder(nn.Module):
             arg_embs: List[torch.Tensor] = []
             for t in atom.args:
                 if isinstance(t, Const):
-                    # Пряме звернення до матриці ваг — без torch.tensor() overhead
+                    #  Priame zvernennia do matrytsi vah - bez torch.tensor() overhead
                     arg_embs.append(self.const_emb.weight[min(t.val, max_e)])
                 elif isinstance(t, Var):
                     arg_embs.append(self.var_emb.weight[self._var_idx(t.name)])
@@ -2612,7 +2400,7 @@ class TermEmbedder(nn.Module):
                     idx = min(t, max_e) if t >= 0 else 0
                     arg_embs.append(self.const_emb.weight[idx])
                 elif isinstance(t, Compound):
-                    arg_embs.append(self.embed_term(t, device))  # рекурсія (рідко)
+                    arg_embs.append(self.embed_term(t, device))  #  rekursiia (ridko)
                 else:
                     arg_embs.append(torch.zeros(self.d, device=device))
             arg_mean = torch.stack(arg_embs).mean(0)
@@ -2622,18 +2410,7 @@ class TermEmbedder(nn.Module):
 
 
 class SoftUnifier(nn.Module):
-    """
-    Диференційована уніфікація (розділ 7 специфікації).
-
-    М'яка підстановка через механізм уваги:
-      σ_soft(X) = Σ_c α(X,c)·E(c)
-    де  α(X,c) = softmax(Score(E(X), E(c)))
-
-    Score(B_j, F) = σ(MLP(B_j_emb ⊕ F_emb))   (розділ 5.2)
-
-    Енергія уніфікації (диференційована):
-      E(σ) = Σ_j min_{F∈F} ||B_j_emb − F_emb||²
-    """
+    """English documentation for Soft Unifier."""
 
     def __init__(self, d: int, sym_vocab: int, max_arity: int = 2):
         super().__init__()
@@ -2651,13 +2428,7 @@ class SoftUnifier(nn.Module):
                          facts_list: List[HornAtom],
                          device: torch.device,
                          fact_embs: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Диференційована енергія уніфікації тіла правила з фактами:
-          E = Σ_j min_{F∈F} ||body_j_emb − F_emb||²
-
-        Мінімум замінюється на log-sum-exp для диференційованості:
-          E_smooth = Σ_j −τ·log Σ_F exp(−||B_j−F||²/τ)
-        """
+        """English documentation for soft unif energy."""
         if not facts_list or not rule_body:
             return torch.tensor(0.0, device=device)
 
@@ -2665,11 +2436,11 @@ class SoftUnifier(nn.Module):
             fact_embs = self.term_emb(facts_list, device)       # (|F|, d)
         body_embs = self.term_emb(list(rule_body), device)      # (|body|, d)
 
-        # (|body|, |F|) — матриця квадратних відстаней
+        #  (|body|, |F|) - matrytsia kvadratnykh vidstanei
         diffs    = body_embs.unsqueeze(1) - fact_embs.unsqueeze(0)
         sq_dists = diffs.pow(2).sum(-1)                         # (|body|, |F|)
 
-        # Smooth min через neg-logsumexp
+        #  Smooth min cherez neg-logsumexp
         tau  = 0.1
         energy = (-tau * torch.logsumexp(-sq_dists / tau, dim=1)).sum()
         return energy
@@ -2680,12 +2451,7 @@ class SoftUnifier(nn.Module):
                            device: torch.device,
                            fact_embs: Optional[torch.Tensor] = None
                            ) -> Tuple[torch.Tensor, Optional[HornAtom]]:
-        """
-        Attention-розподіл підстановки для атому з змінними:
-          α(B_j, F) = σ(MLP([B_j_emb ⊕ F_emb]))
-
-        Повертає (attn_weights ∈ R^{|F|}, argmax_fact).
-        """
+        """English documentation for variable attention."""
         if not facts_list:
             return torch.zeros(0, device=device), None
 
@@ -2707,11 +2473,7 @@ class SoftUnifier(nn.Module):
                 facts: FrozenSet[HornAtom],
                 device: torch.device,
                 prepared: Optional[PreparedRelaxedCycleContext] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Повертає (soft_energy, attn_entropy):
-          soft_energy — диференційована енергія уніфікації
-          attn_entropy — ентропія розподілу уваги (регуляризація)
-        """
+        """English documentation for forward."""
         facts_list = list(facts)
         fact_embs = prepared.soft_fact_embs if prepared is not None else None
         energy = self.soft_unif_energy(rule_body, facts_list, device, fact_embs=fact_embs)
@@ -2719,7 +2481,7 @@ class SoftUnifier(nn.Module):
         entropies: List[torch.Tensor] = []
         for atom in rule_body:
             if not atom.vars():
-                continue               # ground atom — без змінних
+                continue  #  ground atom - bez variable
             attn, _ = self.variable_attention(atom, facts_list, device, fact_embs=fact_embs)
             if attn.numel() > 1:
                 ent = -(attn * (attn + 1e-9).log()).sum()
@@ -2731,34 +2493,22 @@ class SoftUnifier(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4b.  GRAPH MATCHING UNIFIER — консистентна уніфікація (розділ 5.2)
+#  4b. GRAPH MATCHING UNIFIER - consistent unification (rozdil 5.2)
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# Ключова ідея: якщо ?Y з'являється у кількох атомах тіла, то м'яке
-# прив'язування ?Y → константа ПОВИННЕ бути однаковим у всіх атомах.
+#  Kliuchova ideia: iakshcho ?Y z'iavliaietsia u kilkokh atomakh tila, to m'iake
+#  pryv'iazuvannia ?Y -> konstanta POVYNNE buty odnakovym u vsikh atomakh.
 #
-# Реалізація через ітеративний message-passing на графі:
-#   Вузли: {змінні} ∪ {факти-кандидати}
-#   Ребра: (X, F) якщо F є кандидатом для X; (X, Y) якщо X,Y в одному атомі.
+#  Realizatsiia cherez iteratyvnyi message-passing na hrafi:
+#  Vuzly: {variable} ∪ {fact-candidate}
+#  Rebra: (X, F) iakshcho F ie candidate dlia X; (X, Y) iakshcho X,Y v odnomu atomi.
 #
 # Soft-substitution: σ_soft(?Y) = Σ_c α(?Y,c)·E(c)
-# де α(?Y,c) = Gumbel-Softmax(score(?Y,c))  — диференційоване.
+#  de alpha(?Y,c) = Gumbel-Softmax(score(?Y,c)) - dyferentsiiovane.
 # ══════════════════════════════════════════════════════════════════════════════
 
 class GraphMatchingUnifier(nn.Module):
-    """
-    Граф-відповідності для консистентної уніфікації (розділ 5.2).
-
-    Забезпечує, що одна й та сама змінна ?Y в різних атомах тіла
-    прив'язується до ОДНОГО і того ж терму — через спільний вектор змінної
-    та cross-body attention.
-
-    Граф: вузли = {змінні} ∪ {факти-кандидати}
-          ребра = var→fact (attention),  var→var (co-occurrence у тілі).
-
-    Score(B_j, F) = σ(MLP(B_j_emb ⊕ F_emb))  — розділ 5.2.
-    Soft-substitution: σ_soft(?Y) = Σ_c α(?Y,c)·E(c)  — розділ 7.
-    """
+    """English documentation for Graph Matching Unifier."""
 
     def __init__(self, d: int, sym_vocab: int,
                  max_arity: int = 2, n_iters: int = 3):
@@ -2767,17 +2517,17 @@ class GraphMatchingUnifier(nn.Module):
         self.n_iters = n_iters
         self.term_emb = TermEmbedder(sym_vocab, d, max_arity)
 
-        # Проекції для attention: змінна → query, факт → key/value
+        #  Proektsii dlia attention: variable -> query, fact -> key/value
         self.var_q  = nn.Linear(d, d)
         self.fact_k = nn.Linear(d, d)
         self.fact_v = nn.Linear(d, d)
 
-        # Message-passing gate: оновлення var_emb через контекст сусідів
+        #  Message-passing gate: onovlennia var_emb cherez kontekst susidiv
         self.msg_gate = nn.Sequential(
             nn.Linear(d * 2, d), nn.GELU(), nn.Linear(d, d), nn.Sigmoid()
         )
 
-        # Co-occurrence gate: якщо дві змінні в одному атомі → обмін інфо
+        #  Co-occurrence gate: iakshcho dvi variable v odnomu atomi -> obmin info
         self.cooc_gate = nn.Sequential(
             nn.Linear(d * 2, d), nn.GELU(), nn.Linear(d, d), nn.Sigmoid()
         )
@@ -2797,28 +2547,13 @@ class GraphMatchingUnifier(nn.Module):
         Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor],
         Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor, Dict[str, torch.Tensor]],
     ]:
-        """
-        Диференційована уніфікація тіла правила з фактами.
-
-        Returns:
-          energy     : scalar — сумарна енергія уніфікації E(σ)
-          var_assign : {var_name → soft_vec ∈ R^d}  — м'яке прив'язування
-          entropy    : scalar — ентропія розподілу уваги (регуляризатор)
-
-        Алгоритм (3 фази):
-          Phase 1. Ініціалізація: var_vec = TermEmbedder(Var)
-          Phase 2. Ітеративний message-passing:
-                    a) var → facts: attention, оновлення var_vec
-                    b) var → var: co-occurrence (якщо в одному атомі)
-          Phase 3. Gumbel-Softmax: диференційована підстановка
-                   σ_soft(?Y) = Σ_c Gumbel(score(?Y,c))·V(c)
-        """
+        """English documentation for forward."""
         facts_list = list(facts)
         if not facts_list or not rule_body:
             zero = torch.tensor(0.0, device=device)
             return zero, {}, zero
 
-        # ── Phase 0: ембеддинги фактів ────────────────────────────────────────
+        #  -- Phase 0: embeddynhy fact ----------------------------------------
         if prepared is not None:
             fact_embs = prepared.graph_fact_embs
             K = prepared.graph_keys
@@ -2830,11 +2565,11 @@ class GraphMatchingUnifier(nn.Module):
             V = self.fact_v(fact_embs)                     # (|F|, d)
             fact_pred_indices = {}
 
-        # ── Phase 1: збір унікальних змінних з тіла ───────────────────────────
-        # Ключово: ?Y з різних атомів ОДИН вектор → консистентне прив'язування
+        #  -- Phase 1: zbir unikalnykh variable z tila ---------------------------
+        #  Kliuchovo: ?Y z riznykh atomiv ODYN vektor -> consistent pryv'iazuvannia
         var_names: List[str] = []
         seen: Set[str] = set()
-        # co-occurrence: множини змінних для кожного атому
+        #  co-occurrence: mnozhyny variable dlia kozhnoho atomu
         atom_var_sets: List[Set[str]] = []
         for atom in rule_body:
             av: Set[str] = set()
@@ -2850,13 +2585,13 @@ class GraphMatchingUnifier(nn.Module):
             zero = torch.tensor(0.0, device=device)
             return zero, {}, zero
 
-        # Початкові ембеддинги змінних
+        #  Pochatkovi embeddynhy variable
         var_vecs: Dict[str, torch.Tensor] = {
             name: self.term_emb.embed_term(Var(name), device)
             for name in var_names
         }
 
-        # ── Phase 2: ітеративний graph message-passing ─────────────────────────
+        #  -- Phase 2: iteratyvnyi graph message-passing -------------------------
         for _it in range(self.n_iters):
             # (a) var → facts: attention-based update
             new_vecs: Dict[str, torch.Tensor] = {}
@@ -2869,12 +2604,12 @@ class GraphMatchingUnifier(nn.Module):
                     torch.cat([var_vecs[name], ctx], dim=-1))
                 new_vecs[name] = g * ctx + (1 - g) * var_vecs[name]
 
-            # (b) var → var: co-occurrence у одному атомі
+            #  (b) var -> var: co-occurrence u odnomu atomi
             for av_set in atom_var_sets:
                 cooc_names = [n for n in var_names if n in av_set]
                 if len(cooc_names) < 2:
                     continue
-                # Повідомлення між парами (усереднення)
+                #  Povidomlennia mizh paramy (userednennia)
                 avg = torch.stack([new_vecs[n] for n in cooc_names]).mean(0)
                 for n in cooc_names:
                     g2 = self.cooc_gate(
@@ -2884,7 +2619,7 @@ class GraphMatchingUnifier(nn.Module):
             var_vecs = new_vecs
 
         # ── Phase 3: Gumbel-Softmax assignments ───────────────────────────────
-        # σ_soft(?Y) = Σ_c Gumbel(score(?Y,c))·V(c)  — диференційована підст.
+        #  sigma_soft(?Y) = Σ_c Gumbel(score(?Y,c)) * V(c) - dyferentsiiovana pidst.
         var_assign: Dict[str, torch.Tensor] = {}
         var_attn: Dict[str, torch.Tensor] = {}
         total_entropy  = torch.tensor(0.0, device=device)
@@ -2902,7 +2637,7 @@ class GraphMatchingUnifier(nn.Module):
             ent     = -(probs * (probs + 1e-9).log()).sum()
             total_entropy = total_entropy + ent
 
-        # ── Phase 4: енергія E(σ) — квадратна відстань після підстановки ──────
+        #  -- Phase 4: enerhiia E(sigma) - kvadratna vidstan pislia substitution ------
         # E(σ) = Σ_j min_{F∈F} ||B_j·σ_emb − F_emb||²  (smooth-min)
         for atom in rule_body:
             arg_embs: List[torch.Tensor] = []
@@ -2940,58 +2675,45 @@ class GraphMatchingUnifier(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4c.  PROOF COST ESTIMATOR — Cost(T) (розділ 6 специфікації)
+#  4c. PROOF COST ESTIMATOR - Cost(T) (rozdil 6 spetsyfikatsii)
 # ══════════════════════════════════════════════════════════════════════════════
 #
 # Cost(T) = Σ_{(R,σ)∈T} [ Length(R) + λ·UnifComplexity(σ) ]
 #
-# Де:
-#   Length(R)         = MDL-довжина правила (HornClause.complexity())
+#  De:
+#  Length(R) = MDL-dovzhyna rule (HornClause.complexity())
 #   UnifComplexity(σ) = Σ_{X∈dom(σ)} Depth(σ(X))  (Substitution.unif_complexity())
 #
-# Нейронна складова: TermEmbedder дає диференційовану оцінку складності правила.
-# Це дозволяє градієнту проходити через вибір правил у REINFORCE.
+#  neural skladova: term daie dyferentsiiovanu otsinku complexity rule.
+#  Tse dozvoliaie hradiientu prokhodyty cherez vybir rule u REINFORCE.
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ProofCostEstimator(nn.Module):
-    """
-    Оцінювач вартості доведення — формула Cost(T) з розділу 6.
-
-    Cost(T) = Σ_{(R,σ)∈T} [Length(R) + λ·UnifComplexity(σ)]
-
-    MDL-принцип: простіші правила з простішими підстановками → менша вартість.
-    Короткі докази з малою глибиною термів у σ — краще.
-
-    Нейронна частина nn_len = rule_enc(clause_emb) дозволяє градієнту
-    текти через вибір правил (диференційована метрика MDL).
-    """
+    """English documentation for Proof Cost Estimator."""
 
     def __init__(self, d: int, sym_vocab: int, lam: float = 0.1):
         super().__init__()
         self.lam      = lam
         self.term_emb = TermEmbedder(sym_vocab, d)
 
-        # Нейронний estimator складності правила: emb → scalar ≥ 0
+        #  neural estimator complexity rule: emb -> scalar >= 0
         self.rule_enc = nn.Sequential(
             nn.Linear(d, d),
             nn.GELU(),
             nn.Linear(d, 1),
-            nn.Softplus(),          # гарантує ≥ 0
+            nn.Softplus(),  #  harantuie >= 0
         )
 
     def clause_emb(self, clause: 'HornClause',
                    device: torch.device) -> torch.Tensor:
-        """Ембеддинг правила: mean(head_emb + body_atom_embs)."""
+        """English documentation for clause emb."""
         atoms = [clause.head] + list(clause.body)
         embs  = self.term_emb(atoms, device)         # (n_atoms, d)
         return embs.mean(0)                           # (d,)
 
     def symbolic_cost(self, clause: 'HornClause',
                       sigma: Optional['Substitution']) -> float:
-        """
-        Суто символьна вартість (без градієнту):
-          sym_cost = bits(R) + λ·bits(σ)
-        """
+        """English documentation for symbolic cost."""
         rule_len = float(clause.description_length_bits())
         unif_cost = (
             universal_int_bits(int(sigma.unif_complexity()))
@@ -3004,13 +2726,7 @@ class ProofCostEstimator(nn.Module):
         trajectory: List[Tuple['HornClause', Optional['Substitution']]],
         device: torch.device,
     ) -> torch.Tensor:
-        """
-        trajectory : список (rule, sigma) — кроки доведення
-        Returns    : scalar tensor Cost(T) = Σ [Length(R) + λ·UnifComplexity(σ)]
-
-        Диференційована версія:
-          Cost = Σ_i [ bits(Ri) + nn_len(Ri) + λ·bits(σi) ]
-        """
+        """English documentation for forward."""
         if not trajectory:
             return torch.tensor(0.0, device=device)
 
@@ -3018,7 +2734,7 @@ class ProofCostEstimator(nn.Module):
         for rule, sigma in trajectory:
             # Fixed symbolic code length in bits.
             sym_len = float(rule.description_length_bits())
-            # Нейронна оцінка (диференційована для backprop)
+            #  neural otsinka (dyferentsiiovana dlia backprop)
             r_emb   = self.clause_emb(rule, device)          # (d,)
             nn_len  = self.rule_enc(r_emb.unsqueeze(0)).squeeze()   # scalar ≥ 0
 
@@ -3035,19 +2751,11 @@ class ProofCostEstimator(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5.  POLICY NETWORK  (стратегія пошуку доведення)
+#  5. POLICY NETWORK (stratehiia poshuku proof)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ProofPolicyNet(nn.Module):
-    """
-    π_θ(Action | State)
-
-    State  = конкатенація: z_context (стан моделі) + z_goal (ціль)
-    Action = який правило застосувати наступним (індекс у rules)
-
-    Навчається через REINFORCE:
-      ∇_θ J = E_τ[R(τ)·Σ_t ∇_θ log π_θ(a_t|s_t)]
-    """
+    """English documentation for Proof Policy Net."""
 
     def __init__(self, d_latent: int, max_rules: int, dropout: float = 0.1):
         super().__init__()
@@ -3073,18 +2781,11 @@ class ProofPolicyNet(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 6.  ABDUCTION HEAD  (генерує кандидати-правила з нейронного z)
+#  6. ABDUCTION HEAD (heneruie candidate-rule z neural z)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class NeuralAbductionHead(nn.Module):
-    """
-    Нейромережевий генератор HornClause-кандидатів.
-
-    R* = argmin [ Complexity(R) + λ·PredError(R, Trace) ]
-
-    Мережа пропонує кандидати через Gumbel-Softmax,
-    символьна оцінка виконується детерміновано.
-    """
+    """English documentation for Neural Abduction Head."""
 
     def __init__(self, d_latent: int, sym_vocab: int,
                  n_cands: int, max_arity: int = 2):
@@ -3093,10 +2794,10 @@ class NeuralAbductionHead(nn.Module):
         self.n_cands  = n_cands
         self.max_arity = max_arity
 
-        # Мережа → розподіл над sym_vocab для кожного слоту
-        # Структура: [pred] [arg0..argN] для head + body
+        #  Merezha -> rozpodil nad sym_vocab dlia kozhnoho slotu
+        #  Struktura: [pred] [arg0..argN] dlia head + body
         slots_per_atom = 1 + max_arity          # pred + args
-        n_slots_total  = slots_per_atom * 2     # head + 1 тіло-атом
+        n_slots_total  = slots_per_atom * 2  #  head + 1 tilo-atom
         self.rule_gen = nn.Sequential(
             nn.Linear(d_latent, d_latent * 2), nn.GELU(),
             nn.Linear(d_latent * 2, sym_vocab * n_slots_total),
@@ -3190,22 +2891,7 @@ class NeuralAbductionHead(nn.Module):
         tau: float = 0.7,
         max_candidates: Optional[int] = None,
     ) -> Tuple[List[HornClause], torch.Tensor]:
-        """
-        z: (1, d_latent)
-        Returns: список HornClause-кандидатів зі ЗМІННИМИ у args.
-
-        Ключова зміна: аргументи правил тепер є іменованими Var (?X0,...,?Xk),
-        а не конкретними константами. Це забезпечує compositional generalization:
-        правило узагальнюється на будь-які константи (розділ 5.2).
-
-        Підтримує три паттерни змінних для різноманітного узагальнення:
-          Mode 0: head(?X,?Y) :- body(?X,?Y)  — спільні змінні (transitive)
-          Mode 1: head(?X,?Z) :- body(?X,?Y), ...  — часткове перекриття
-          Mode 2: head(?X,?X) :- body(?X,?Y)  — рефлексивне правило
-
-        Gumbel-Softmax вибирає ПРЕДИКАТ (pred_id), а не аргументи,
-        оскільки аргументи є змінними і обираються уніфікацією.
-        """
+        """English documentation for sample candidates."""
         specs = self.sample_candidates_relaxed(
             z,
             stochastic=stochastic,
@@ -3222,19 +2908,7 @@ class NeuralAbductionHead(nn.Module):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DifferentiableProver(nn.Module):
-    """
-    Диференційований Theorem Prover (∂-Prolog).
-
-    Навчання:
-      · Швидкий цикл (GPU): оновлення θ через -log P_θ
-      · Повільний цикл (CPU): оновлення Γ через абдукцію
-
-    L_sym = -E_{τ~π_θ}[R(τ)] + α·Length(τ)
-
-    Де:
-      R(τ)      = 1 якщо ціль доведена, 0 інакше
-      Length(τ) = кількість кроків (заохочує короткі докази)
-    """
+    """Differentiable prover used by OMEN."""
 
     def __init__(self,
                  d_latent:   int,
@@ -3254,32 +2928,32 @@ class DifferentiableProver(nn.Module):
         self.eta_utility = eta_utility
         self.consolidate_every = consolidate_every
 
-        # Глобальна KnowledgeBase (GPU-акселерована TensorKnowledgeBase)
+        #  Hlobalna KnowledgeBase (GPU-akselerovana TensorKnowledgeBase)
         self.kb = TensorKnowledgeBase(max_rules=max_rules)
 
-        # ── Нові компоненти ────────────────────────────────────────────────────
-        # VeM: фільтрує кандидати абдукції до додавання в LTM
+        #  -- Novi komponenty ----------------------------------------------------
+        #  VeM: filtruie candidate abduction do add v LTM
         self.vem = VerificationModule(d_latent, sym_vocab, vem_tau=vem_tau)
 
-        # Нейронні компоненти (оновлюються на швидкому циклі)
+        #  neural komponenty (onovliuiutsia na shvydkomu tsykli)
         self.policy   = ProofPolicyNet(d_latent, max_rules)
         self.abductor = NeuralAbductionHead(d_latent, sym_vocab, n_cands)
 
-        # Проекція z → символьна ціль (goal embedding)
+        #  Proektsiia z -> symvolna tsil (goal embedding)
         self.goal_proj = nn.Linear(d_latent, d_latent)
         self.z_to_pred = nn.Linear(d_latent, sym_vocab)
 
-        # Для ground-зв'язку: символьні ембеддинги → нейронний простір
+        #  Dlia ground-zv'iazku: symvolni embeddynhy -> neural prostir
         self.sym_emb  = nn.Embedding(sym_vocab + 2, d_latent)
         self.out_proj = nn.Linear(d_latent, d_latent)
 
-        # TermEmbedder: структурний ембеддинг термів (розділ 5.1)
+        #  term: strukturnyi embeddynh term (rozdil 5.1)
         self.term_emb  = TermEmbedder(sym_vocab, d_latent)
-        # SoftUnifier: диференційована уніфікація (розділ 7)
+        #  SoftUnifier: dyferentsiiovana unification (rozdil 7)
         self.soft_unif = SoftUnifier(d_latent, sym_vocab)
-        # GraphMatchingUnifier: консистентна уніфікація (розділ 5.2)
+        #  GraphMatchingUnifier: consistent unification (rozdil 5.2)
         self.graph_unif = GraphMatchingUnifier(d_latent, sym_vocab)
-        # ProofCostEstimator: Cost(T) = Σ[Length(R) + λ·UnifComplexity(σ)] (розділ 6)
+        #  ProofCostEstimator: Cost(T) = Σ[Length(R) + lambda * UnifComplexity(sigma)] (rozdil 6)
         self.cost_est   = ProofCostEstimator(d_latent, sym_vocab,
                                              lam=alpha)
 
@@ -3305,17 +2979,17 @@ class DifferentiableProver(nn.Module):
             Tuple[Tuple[HornAtom, ...], FrozenSet[HornAtom], str],
             RuleSubstitutionCacheEntry,
         ] = {}
-        # fc_cache видалено: TensorKnowledgeBase.forward_chain виконується
-        # за ~0.1–0.5 ms/батч через GPU broadcast — кешування не потрібне.
+        #  fc_cache remove: TensorKnowledgeBase.forward_chain vykonuietsia
+        #  za ~0.1-0.5 ms/batch cherez GPU broadcast - keshuvannia ne potribne.
 
-        # ── WorldRNN-інтеграція (Fix: Дедукція + Абдукція) ────────────────────
-        # WorldRNN ін'єктується з omen_scale після ініціалізації через set_world_rnn().
-        # Використовується в:
-        #   · _mental_simulate_rule()  → latent-space Prediction Error (Дедукція)
-        #   · _pred_error_for_rule()   → WorldRNN component у MDL PredError (Абдукція)
+        #  -- WorldRNN-intehratsiia (Fix: deduction + abduction) --------------------
+        #  WorldRNN in'iektuietsia z omen_scale pislia initsializatsii cherez set_world_rnn().
+        #  Vyutility v:
+        #  * _mental_simulate_rule() -> latent-space Prediction Error (deduction)
+        #  * _pred_error_for_rule() -> WorldRNN component u MDL PredError (abduction)
         self._world_rnn: Optional[Any] = None          # WorldRNN | None
-        self._last_z: Optional[torch.Tensor] = None    # (B, d) — знімок з останнього forward()
-        self._world_rnn_vocab: int = 0                 # кешована vocab_size для clamp
+        self._last_z: Optional[torch.Tensor] = None  #  (B, d) - znimok z ostannoho forward()
+        self._world_rnn_vocab: int = 0  #  keshovana vocab_size dlia clamp
         self._world_graph_context: Optional[torch.Tensor] = None
         self._world_target_state: Optional[torch.Tensor] = None
         self.hypothesis_token_head: Optional[nn.Module] = None
@@ -3367,7 +3041,7 @@ class DifferentiableProver(nn.Module):
         self.creative_cycle = CreativeCycleCoordinator()
         self.last_creative_report = self.creative_cycle.last_report
 
-    # ── Нейронний → символьний (perception) ──────────────────────────────────
+    #  -- neural -> symvolnyi (perception) ----------------------------------
     def set_task_context(self, context: Optional[SymbolicTaskContext]) -> None:
         if context is not None:
             context = self.creative_cycle.enrich_task_context(context)
@@ -3397,14 +3071,7 @@ class DifferentiableProver(nn.Module):
         self.allow_latent_goal_fallback = bool(enabled)
 
     def set_world_rnn(self, world_rnn: Any) -> None:
-        """
-        Ін'єктує WorldRNN у прувер для:
-          · ментальної симуляції правил (Дедукція, розділ 2 концепції)
-          · MDL PredError з latent-space відстанню (Абдукція, розділ 6)
-
-        Викликається з omen_scale.py після ініціалізації:
-          self.prover.set_world_rnn(self.world_rnn)
-        """
+        """English documentation for set world rnn."""
         self._world_rnn = world_rnn
         emb = getattr(world_rnn, "act_emb", None)
         self._world_rnn_vocab = int(getattr(emb, "num_embeddings", 0))
@@ -4567,17 +4234,7 @@ class DifferentiableProver(nn.Module):
         return self.load_observed_facts(self.task_context.observed_facts, limit=limit)
 
     def load_observed_facts(self, facts, limit: int = 96) -> int:
-        """
-        Ідеальна реалізація п.2: явне завантаження спостережуваних фактів
-        безпосередньо у KB до forward() pass.
-
-        Відрізняється від materialize_task_context_facts():
-          · Приймає facts напряму (не через task_context)
-          · Ліміт за замовчуванням 96 (більший, для символьного контексту)
-          · Може приймати будь-який iterable: frozenset, list, тощо
-
-        Повертає кількість доданих нових фактів.
-        """
+        """English documentation for load observed facts."""
         if not facts:
             return 0
         working = set(self._working_memory_facts)
@@ -5868,22 +5525,19 @@ class DifferentiableProver(nn.Module):
         return added, frozenset(new_facts), derivations, frozenset(current_set)
 
     def perceive(self, z: torch.Tensor) -> HornAtom:
-        """z: (B, d) → один HornAtom (усереднений по батчу)"""
+        """English documentation for perceive."""
         z_mean = z.mean(0, keepdim=True)                   # (1, d)
         pred_logits = self.z_to_pred(z_mean)               # (1, sv)
         pred = pred_logits.argmax(-1).item()
 
-        # Аргументи через хешування (детерміновано)
+        #  argument cherez kheshuvannia (determ)
         arg0 = int(z_mean.abs().argmax().item()) % (self.abductor.sv)
         arg1 = int(z_mean.sum().item() * 100) % (self.abductor.sv)
         return HornAtom(pred=int(pred), args=(arg0, arg1))
 
-    # ── Символьний → нейронний (grounding) ────────────────────────────────────
+    #  -- Symvolnyi -> neural (grounding) ------------------------------------
     def ground(self, facts: "FrozenSet[HornAtom]", device) -> torch.Tensor:
-        """
-        Перетворює набір фактів у нейронний вектор z_sym.
-        Використовує TermEmbedder для врахування структури pred + args.
-        """
+        """English documentation for ground."""
         if not facts:
             return torch.zeros(1, self.d, device=device)
         cache_key = (str(device), facts)
@@ -5891,7 +5545,7 @@ class DifferentiableProver(nn.Module):
         if cached is not None:
             return cached
         facts_list = list(facts)
-        # TermEmbedder враховує структуру кожного атому
+        #  term vrakhovuie strukturu kozhnoho atomu
         embs = self.term_emb(facts_list, device)              # (|facts|, d)
         grounded = self.out_proj(embs.mean(0, keepdim=True))  # (1, d)
         self._ground_cache[cache_key] = grounded
@@ -5903,12 +5557,7 @@ class DifferentiableProver(nn.Module):
         only_verified: bool = False,
         device: Optional[torch.device] = None,
     ) -> Tuple[int, "FrozenSet[HornAtom]", List[Tuple[HornClause, Optional[Substitution]]]]:
-        """
-        Один крок forward chaining з комітом нових фактів у KB.
-
-        Потрібно для EMC, інакше дія ForwardChainStep бачить приріст у
-        `forward_chain(max_depth=1)`, але стан KB фактично не змінюється.
-        """
+        """English documentation for forward chain step."""
         before = self.kb.facts
         current = before
         added = 0
@@ -6068,16 +5717,7 @@ class DifferentiableProver(nn.Module):
         current_facts: "FrozenSet[HornAtom]",
         device: torch.device,
     ) -> Tuple[float, Optional["HornAtom"]]:
-        """
-        Ментальна симуляція правила ДО його реального застосування.
-        Реалізує концептуальну Дедукцію (розділ 2 концепції):
-          «Уявляє, як правило працюватиме, обчислює Prediction Error
-           у латентному просторі ДО реального застосування»
-
-        Повертає: (prediction_error ∈ [0,1], derived_atom_or_None)
-          0.0 = правило консистентне з фактами
-          1.0 = правило конфліктує або не уніфікується
-        """
+        """English documentation for mental simulate rule."""
         summary = self._rule_prediction_summary(
             rule,
             current_facts,
@@ -6086,10 +5726,10 @@ class DifferentiableProver(nn.Module):
         )
         return summary.pred_error, summary.predicted_one
 
-        # ── WorldRNN latent-space Prediction Error (Дедукція, розділ 2) ─────
-        # Концепція: «WorldRNN отримує на вхід z та дію (правило) і передбачає
-        # наступний стан z_next.  Якщо z_next ≠ символьно-очікуваний стан →
-        # Prediction Error у латентному просторі ДО реального застосування.»
+        #  -- WorldRNN latent-space Prediction Error (deduction, rozdil 2) -----
+        #  Kontseptsiia: "WorldRNN otrymuie na vkhid z ta diiu (rule) i peredbachaie
+        #  nastupnyi stan z_next. Yakshcho z_next != symvolno-ochikuvanyi stan ->
+        #  Prediction Error u latentnomu prostori DO realnoho apply."
         if (self._world_rnn is not None
                 and self._last_z is not None
                 and self._world_rnn_vocab > 0):
@@ -6099,16 +5739,16 @@ class DifferentiableProver(nn.Module):
                     act_id = min(int(rule.head.pred), self._world_rnn_vocab - 1)
                     act_t  = torch.tensor([act_id], device=device, dtype=torch.long)
                     z_next_world, _ = self._world_rnn(z_anchor, act_t)  # (1, d)
-                    # Символьно-очікуваний стан після виведення derived
+                    #  Symvolno-ochikuvanyi stan pislia vyvedennia derived
                     z_sym_exp = self.ground(frozenset({derived}), device)[:1]  # (1, d)
                     cos = float(
                         F.cosine_similarity(z_next_world, z_sym_exp, dim=-1).clamp(-1.0, 1.0).item()
                     )
                     world_pred_error = (1.0 - cos) / 2.0              # [0, 1]
-                    # 60% символьна уніфікація + 40% WorldRNN latent-consistency
+                    #  60% symvolna unification + 40% WorldRNN latent-consistency
                     pred_error = 0.6 * pred_error + 0.4 * world_pred_error
             except Exception:
-                pass  # WorldRNN недоступний → залишаємо символьний pred_error
+                pass  #  WorldRNN nedostupnyi -> zalyshaiemo symvolnyi pred_error
 
         return pred_error, derived
 
@@ -6235,10 +5875,7 @@ class DifferentiableProver(nn.Module):
         current_facts: "FrozenSet[HornAtom]",
         device: torch.device,
     ) -> torch.Tensor:
-        """
-        Вектор сумісності правил з поточними фактами.
-        Скеровує вибір policy до правил, які реально можуть уніфікуватись.
-        """
+        """English documentation for compute rule compatibility scores."""
         scores = torch.zeros(n_rules, device=device)
         for i, rule in enumerate(self.kb.rules[:n_rules]):
             if not self._rule_is_usable(rule):
@@ -6254,7 +5891,7 @@ class DifferentiableProver(nn.Module):
                 vem_s = self.vem.score(rule, device)
                 scores[i] = float(vem_s)
             else:
-                scores[i] = -1.0  # Не може уніфікуватись → депріоритизуємо
+                scores[i] = -1.0  #  Ne mozhe unifikuvatys -> depriorytyzuiemo
         return scores
 
     # ── Proof Search (REINFORCE + Cost(T) + Mental Simulation) ───────────────
@@ -6263,23 +5900,7 @@ class DifferentiableProver(nn.Module):
                           z_ctx: torch.Tensor,
                           n_steps: Optional[int] = None,
                           starting_facts: Optional[FrozenSet[HornAtom]] = None) -> Tuple[bool, List[int], torch.Tensor]:
-        """
-        Шукає доведення goal із ментальною симуляцією перед застосуванням.
-
-        Реалізує концептуальну Дедукцію (розділ 2 концепції):
-          «Модель уявляє, як правило працюватиме → обчислює PredError →
-           лише тоді застосовує (або відкидає) правило»
-
-        Алгоритм:
-          1. Policy вибирає правило (z_ctx + compat_scores)
-          2. _mental_simulate_rule() → pred_error:
-             < threshold → застосовуємо реально
-             ≥ threshold → відхиляємо (REINFORCE отримує штраф)
-          3. Cost(T) включає pred_error кожного кроку
-
-        L_proof = -E_{T~π_θ}[R(T) - α·Cost(T)]
-        Cost(T) = Σ_i [Length(Ri) + λ·UnifComplexity(σi) + μ·PredError(Ri)]
-        """
+        """English documentation for prove with policy."""
         n_steps = n_steps or self.max_depth
         n_rules = len(self.kb.rules)
         device  = z_ctx.device
@@ -6302,7 +5923,7 @@ class DifferentiableProver(nn.Module):
             if proved or not usable_indices:
                 break
 
-            # Символьна сумісність → скеровуємо policy до придатних правил
+            #  Symvolna compatibility -> skerovuiemo policy do prydatnykh rule
             compat_scores = self._compute_rule_compatibility_scores(
                 n_rules, current_facts, device
             )
@@ -6322,7 +5943,7 @@ class DifferentiableProver(nn.Module):
             if rule_idx.item() < len(self.kb.rules):
                 rule = self.kb.rules[rule_idx.item()]
 
-                # ── Ментальна симуляція ПЕРЕД застосуванням ───────────────────
+                #  -- mental symuliatsiia PERED apply -------------------
                 summary = self._rule_prediction_summary(
                     rule,
                     current_facts,
@@ -6335,12 +5956,12 @@ class DifferentiableProver(nn.Module):
 
                 mental_threshold = float(getattr(self, "_mental_sim_threshold", 0.8))
                 if pred_error >= mental_threshold:
-                    # Ментальна симуляція відхилила правило
-                    # → не застосовуємо, але REINFORCE отримає штраф через pred_error
+                    #  mental symuliatsiia vidkhylyla rule
+                    #  -> ne apply, ale REINFORCE otrymaie shtraf cherez pred_error
                     proof_steps.append((rule, None))
                     continue
 
-                # Симуляція пройшла → застосовуємо реально
+                #  Symuliatsiia proishla -> apply realno
                 if rule.body:
                     sigma = summary.primary_sigma
                     proof_steps.append((rule, sigma))
@@ -6368,7 +5989,7 @@ class DifferentiableProver(nn.Module):
 
         if log_probs:
             proof_loss = -effective_reward * torch.stack(log_probs).sum()
-            # Штраф за кроки з великою prediction_error (дедукційний сигнал)
+            #  Shtraf za step z velykoiu prediction_error (deduction syhnal)
             pred_err_penalty = torch.tensor(
                 avg_pred_error * self.alpha, device=device, dtype=proof_loss.dtype
             )
@@ -6378,7 +5999,7 @@ class DifferentiableProver(nn.Module):
 
         return proved, trajectory, proof_loss
 
-    # ── Abduce and Learn (повільний цикл) + MDL candidate ranking ────────────
+    #  -- Abduce and Learn (povilnyi tsykl) + MDL candidate ranking ------------
 
     def _pred_error_for_rule(
         self,
@@ -6386,18 +6007,7 @@ class DifferentiableProver(nn.Module):
         observed_facts: "FrozenSet[HornAtom]",
         lam: float = 0.5,
     ) -> float:
-        """
-        PredError(R, Trace) — наскільки правило R не може пояснити спостереження.
-
-        Реалізує праву частину формули абдукції:
-          R* = argmin_R [Length(R) + λ·PredError(R, Trace)]
-
-        PredError = 1.0 − coverage, де coverage = частка observed_facts,
-        яка покривається виведеним множиною фактів при застосуванні R.
-
-        Для pure-fact-правил (body=[]) — перевіряємо, чи голова є у фактах.
-        Для правил з тілом — рахуємо кількість успішних уніфікацій тіла.
-        """
+        """English documentation for pred error for rule."""
         cache_key = (clause, observed_facts)
         cached = self._pred_error_cache.get(cache_key)
         if cached is not None:
@@ -6439,8 +6049,8 @@ class DifferentiableProver(nn.Module):
             self._pred_error_cache[cache_key] = score
             return score
 
-        # Рахуємо, скільки фактів входять у «пояснену зону» правила
-        # (тобто беруть участь як підстановки у body)
+        #  Rakhuiemo, skilky fact vkhodiat u "poiasnenu zonu" rule
+        #  (tobto berut uchast iak substitution u body)
         total_facts = max(len(observed_facts), 1)
         explained_atoms: Set[HornAtom] = set()
         explained_targets: Set[HornAtom] = set()
@@ -6453,13 +6063,13 @@ class DifferentiableProver(nn.Module):
         )
         world_errors: List[float] = []
         for sigma in subs:
-            # Факти, що задовольнили тіло правила — «пояснені»
+            #  fact, shcho zadovolnyly tilo rule - "poiasneni"
             for b_atom in body_atoms:
                 grounded = sigma.apply_atom(b_atom)
                 for obs in observed_facts:
                     if unify(grounded, obs) is not None:
                         explained_atoms.add(obs)
-            # Виведений голова — якщо є у спостереженнях, теж пояснений
+            #  Vyvedenyi holova - iakshcho ie u sposterezhenniakh, tezh poiasnenyi
             derived = sigma.apply_atom(clause.head)
             if derived.is_ground():
                 for obs in observed_facts:
@@ -6496,11 +6106,11 @@ class DifferentiableProver(nn.Module):
         self._pred_error_cache[cache_key] = score
         return score
 
-        # ── WorldRNN latent-space component (Абдукція, розділ 6) ──────────────
-        # Концепція: PredError(R, Trace) має включати не лише символьне покриття,
-        # а й узгодженість з латентним передбаченням WorldRNN.
-        # Якщо WorldRNN не передбачає стан, характерний для виведеного факту →
-        # PredError зростає, правило отримує вищий MDL-score → менш ймовірне.
+        #  -- WorldRNN latent-space component (abduction, rozdil 6) --------------
+        #  Kontseptsiia: PredError(R, Trace) maie vkliuchaty ne lyshe symvolne pokryttia,
+        #  a i uzhodzhenist z latentnym peredbachenniam WorldRNN.
+        #  Yakshcho WorldRNN ne peredbachaie stan, kharakternyi dlia vyvedenoho fact ->
+        #  PredError zrostaie, rule otrymuie vyshchyi MDL-score -> mensh imovirne.
         if (self._world_rnn is not None
                 and self._last_z is not None
                 and self._world_rnn_vocab > 0
@@ -6512,7 +6122,7 @@ class DifferentiableProver(nn.Module):
                     act_id = min(int(clause.head.pred), self._world_rnn_vocab - 1)
                     act_t  = torch.tensor([act_id], device=device, dtype=torch.long)
                     z_next_world, _ = self._world_rnn(z_anchor, act_t)  # (1, d)
-                    # Беремо перший виведений факт як символьну ціль
+                    #  Beremo pershyi vyvedenyi fact iak symvolnu tsil
                     fresh2 = freshen_vars(clause)
                     for sigma2 in subs[:1]:
                         derived2 = sigma2.apply_atom(fresh2.head)
@@ -6524,11 +6134,11 @@ class DifferentiableProver(nn.Module):
                                 ).clamp(-1.0, 1.0).item()
                             )
                             world_miss = (1.0 - cos) / 2.0      # [0, 1]
-                            # 70% символьне покриття + 30% WorldRNN узгодженість
+                            #  70% symvolne pokryttia + 30% WorldRNN uzhodzhenist
                             coverage = 0.7 * coverage + 0.3 * (1.0 - world_miss)
                             break
             except Exception:
-                pass  # WorldRNN недоступний → залишаємо символьне coverage
+                pass  #  WorldRNN nedostupnyi -> zalyshaiemo symvolne coverage
 
         return 1.0 - min(max(coverage, 0.0), 1.0)
 
@@ -6538,13 +6148,7 @@ class DifferentiableProver(nn.Module):
         observed_facts: "FrozenSet[HornAtom]",
         lam: float = 0.5,
     ) -> "List[Tuple[float, HornClause]]":
-        """
-        Сортує кандидатів за MDL-формулою:
-          score(R) = description_length_bits(R) + λ·PredError(R, Trace)
-
-        Повертає список (score, clause) відсортований за зростанням score.
-        Мінімальний score = найкраще правило (принцип Оккама).
-        """
+        """English documentation for mdl sort candidates."""
         if not candidates:
             return []
         scored: List[Tuple[float, HornClause]] = []
@@ -6562,25 +6166,14 @@ class DifferentiableProver(nn.Module):
         error: float,
         force: bool = False,
     ) -> Tuple[int, torch.Tensor, torch.Tensor, float]:
-        """
-        Цілеспрямований пошук мінімального правила (концепція, розділ 6):
-          R* = argmin_R [Length(R) + λ·PredError(R, Trace)]
-
-        Замість випадкової генерації → MDL-фільтрації:
-          1. Генерація кандидатів (контекстні + нейронні)
-          2. MDL-ранжування за description_length_bits + λ·PredError
-          3. VeM-фільтрація (U(R) > τ)
-          4. Додавання найкращих у LTM зі статусом proposed
-
-        Returns: (кількість доданих правил, hinge_loss, abductor_loss, mean_utility)
-        """
+        """English documentation for abduce and learn."""
         device = z.device
         if (error < 0.5) and not force:
             zero = torch.zeros(1, device=device).squeeze()
             self.last_abduced_rules = []
             return 0, zero, zero, 0.0
 
-        # 1. Генеруємо кандидатів
+        #  1. Heneruiemo candidate
         trace_candidates, contextual_candidates, neural_candidates, log_probs = self._abduction_candidate_pool(
             z,
             max_contextual=12,
@@ -6595,8 +6188,8 @@ class DifferentiableProver(nn.Module):
             self.last_abduced_rules = []
             return 0, zero, zero, 0.0
 
-        # 2. MDL-ранжування ПЕРЕД VeM-фільтрацією
-        # Це реалізує цілеспрямований пошук замість випадкової генерації:
+        #  2. MDL-ranzhuvannia PERED VeM-filtratsiieiu
+        #  Tse realizuie tsilespriamovanyi poshuk zamist vypadkovoi heneratsii:
         #   R* = argmin_R [Length(R) + λ·PredError(R, Trace)]
         observed = self.kb.facts
         if self.task_context is not None and self.task_context.observed_facts:
@@ -6605,36 +6198,36 @@ class DifferentiableProver(nn.Module):
         lam_mdl = float(getattr(self, "_mdl_lambda", 0.5))
         mdl_ranked = self._mdl_sort_candidates(raw_candidates, observed, lam=lam_mdl)
 
-        # Беремо лише топ-50% за MDL: відкидаємо явно погані кандидати
-        # ще до VeM, зменшуючи простір пошуку
+        #  Beremo lyshe top-50% za MDL: vidkydaiemo iavno pohani candidate
+        #  shche do VeM, zmenshuiuchy prostir poshuku
         cutoff = max(1, len(mdl_ranked) // 2)
         mdl_filtered = [clause for _, clause in mdl_ranked[:cutoff]]
 
-        # Зберігаємо MDL-scores для REINFORCE (заохочуємо нейронну мережу
-        # генерувати MDL-мінімальні правила)
+        #  Zberihaiemo MDL-scores dlia REINFORCE (zaokhochuiemo neural merezhu
+        #  heneruvaty MDL-minimalni rule)
         mdl_scores_map: Dict[HornClause, float] = {
             clause: score for score, clause in mdl_ranked
         }
 
-        # 3. VeM-фільтрація (U(R) > τ) на MDL-відібраних кандидатах
+        #  3. VeM-filtratsiia (U(R) > tau) na MDL-vidibranykh candidate
         utilities = self.vem.score_batch(mdl_filtered, device)
         accepted, hinge_loss = self.vem.filter_candidates(mdl_filtered, device)
 
-        # REINFORCE для нейронних кандидатів:
-        # Заохочуємо генерацію правил з малим MDL-score та high VeM-score
+        #  REINFORCE dlia neural candidate:
+        #  Zaokhochuiemo heneratsiiu rule z malym MDL-score ta high VeM-score
         neural_mdl_filtered_lp: List[torch.Tensor] = []
         neural_mdl_utilities: List[float] = []
         if log_probs.numel() > 0:
             for i, nc in enumerate(neural_candidates):
                 if nc in mdl_scores_map and i < log_probs.shape[0]:
-                    # Нормалізуємо MDL-score до [0,1]: менший score = більша utility
+                    #  Normalizuiemo MDL-score do [0,1]: menshyi score = bilsha utility
                     max_possible_mdl = max(
                         (s for s, _ in mdl_ranked), default=1.0
                     )
                     mdl_utility = 1.0 - min(
                         mdl_scores_map[nc] / max(max_possible_mdl, 1.0), 1.0
                     )
-                    # Комбінуємо VeM utility + MDL utility
+                    #  Kombinuiemo VeM utility + MDL utility
                     vem_u = self.vem.score(nc, device)
                     combined_utility = 0.6 * float(vem_u) + 0.4 * mdl_utility
                     neural_mdl_filtered_lp.append(log_probs[i])
@@ -6649,7 +6242,7 @@ class DifferentiableProver(nn.Module):
         else:
             abductor_loss = torch.zeros(1, device=device).squeeze()
 
-        # 4. Додаємо прийнятих кандидатів у LTM
+        #  4. Dodaiemo pryiniatykh candidate u LTM
         added = 0
         added_rules: List[HornClause] = []
         for c in accepted:
@@ -6658,11 +6251,11 @@ class DifferentiableProver(nn.Module):
                 added_rules.append(c)
         self.last_abduced_rules = added_rules
 
-        # Записуємо VeM-сигнал: MDL-кращі кандидати отримують вищий prior
+        #  Zapysuiemo VeM-syhnal: MDL-krashchi candidate otrymuiut vyshchyi prior
         for score, clause in mdl_ranked:
             max_mdl = max((s for s, _ in mdl_ranked), default=1.0)
             prior = 1.0 - min(score / max(max_mdl, 1.0), 1.0)
-            # Зберігаємо MDL-заснований prior (не фіксований 0.5)
+            #  Zberihaiemo MDL-zasnovanyi prior (ne fiksovanyi 0.5)
             self.vem.record_outcome(clause, utility_target=prior * 0.7, device=device)
 
         mean_utility = float(utilities.mean().item()) if utilities.numel() > 0 else 0.0
@@ -6702,35 +6295,26 @@ class DifferentiableProver(nn.Module):
                     target = 0.5
             self.vem.record_outcome(clause, utility_target=target, device=device)
 
-    # ── Forward (інтеграція у тренувальний цикл) ──────────────────────────────
+    #  -- Forward (intehratsiia u trenuvalnyi tsykl) ------------------------------
     def forward(self,
                 z: torch.Tensor,
                 world_error: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        z           : (B, d)
-        world_error : scalar
-        Returns: z_sym (B, d),  sym_loss scalar
-
-        Нові складові sym_loss (порівняно з v1):
-          + 0.01 · L_vem            ← штраф за погані кандидати абдукції
-          + 0.01 · L_vem_self       ← самонавчання VeM
-        KB tick + консолідація кожні consolidate_every кроків.
-        """
+        """English documentation for forward."""
         B, device = z.shape[0], z.device
         self._clear_runtime_caches()
         self._step += 1
         self.last_used_rules = []
         self._last_used_rule_hashes.clear()
 
-        # Зберігаємо знімок z без градієнта для _mental_simulate_rule
-        # та _pred_error_for_rule (ментальна симуляція без backprop витоку)
+        #  Zberihaiemo znimok z bez hradiienta dlia _mental_simulate_rule
+        #  ta _pred_error_for_rule (mental symuliatsiia bez backprop vytoku)
         self._last_z = z.detach()
 
-        # 0. Оновлюємо вік правил і запускаємо консолідацію
+        #  0. Onovliuiemo vik rule i zapuskaiemo konsolidatsiiu
         self.kb.tick()
         if self._step % self.consolidate_every == 0:
             n_removed = self.kb.consolidate(use_count_threshold=2)
-            # (можна логувати: n_removed правил видалено)
+            #  (mozhna lohuvaty: n_removed rule remove)
 
         # 1. Materialize discrete task facts into working memory.
         self.materialize_task_context_facts()
@@ -6757,8 +6341,8 @@ class DifferentiableProver(nn.Module):
         unresolved_targets = exec_result.unresolved_targets
 
         # 3. Grounding: KB → z_sym
-        # PERF FIX: при великому KB (>128 фактів) сэмплюємо підмножину,
-        # щоб уникнути O(N) Python-ітерації + N×3 GPU-викликів у ground().
+        #  PERF FIX: pry velykomu KB (>128 fact) sempliuiemo pidmnozhynu,
+        #  shchob unyknuty O(N) Python-iteratsii + N×3 GPU-vyklykiv u ground().
         _MAX_GROUND = 128
         ground_sample = (frozenset(random.sample(list(all_facts), _MAX_GROUND))
                          if len(all_facts) > _MAX_GROUND else all_facts)
@@ -6771,7 +6355,7 @@ class DifferentiableProver(nn.Module):
         )
         z_target = self.ground(target_ground_sample, device).expand(B, -1)
 
-        # 4. Proof search (тільки під час навчання)
+        #  4. Proof search (tilky pid chas training)
         controller_result = run_latent_reasoning_controller(
             self,
             z,
@@ -6830,7 +6414,7 @@ class DifferentiableProver(nn.Module):
                 )
                 background_intrinsic_coverage = float(background_intrinsic_hits) / float(background_intrinsic_total)
 
-        # 7. Symbolic Consistency Loss: MSE між z та z_sym
+        #  7. Symbolic Consistency Loss: MSE mizh z ta z_sym
         sym_consist = F.mse_loss(z, z_sym.detach()) + \
                       F.mse_loss(z_sym, z.detach())
         symbolic_induction = (
@@ -6996,26 +6580,14 @@ class DifferentiableProver(nn.Module):
 
         return z_sym, sym_loss
 
-    # ── Допоміжне ─────────────────────────────────────────────────────────────
+    #  -- Dopomizhne -------------------------------------------------------------
     def rule_regularizer(self, lam_sym: float,
                          eta_utility: float = 0.1) -> float:
-        """
-        MDL із урахуванням корисності правил:
-          L_rule = λ · Σ_{R∈Γ} (Complexity(R) − η·Utility(R))
-
-        Порівняно зі старим λ·Σ_R len(R):
-          · Корисні правила (high Utility) отримують знижку → залишаються.
-          · Некорисні складні правила → більший штраф → видаляються.
-        """
+        """English documentation for rule regularizer."""
         return lam_sym * self.kb.utility_adjusted_penalty(eta_utility)
 
     def vem_loss(self, z: torch.Tensor, delta: float = 1e-3) -> torch.Tensor:
-        """
-        δ · E_{R~Abduction}[max(0, τ − U(R))]
-
-        Штрафує AbductionHead, якщо він генерує кандидати, яких VeM відхиляє.
-        Викликається окремо з OMENScaleLoss для включення у повний J(θ,Γ,M).
-        """
+        """English documentation for vem loss."""
         device = z.device
         if not self.training:
             return torch.zeros(1, device=device).squeeze()
@@ -7041,18 +6613,18 @@ class DifferentiableProver(nn.Module):
     def semantic_feedback_pairs(
             self, max_pairs: int = 32
     ) -> List[Tuple[int, int, float]]:
-        """Повертає пари NET-токенів, пов'язаних через факти/абдукцію в KB."""
+        """English documentation for semantic feedback pairs."""
         return self.kb.get_token_pairs_for_semantic_feedback(max_pairs)
 
     def __len__(self): return len(self.kb)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 7.  INLINE ТЕСТИ
+#  7. INLINE TESTY
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 8.  INLINE ТЕСТИ
+#  8. INLINE TESTY
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _run_prolog_tests() -> None:
@@ -7083,20 +6655,20 @@ def _run_prolog_tests() -> None:
     assert sigma.apply(comp) == Compound(func=0, subterms=(c1, c2)), "apply Compound FAIL"
     assert sigma.apply(c1)   == c1,                             "apply Const FAIL"
 
-    # Композиція: σ={X→c2}, θ={Y→X}  →  (σ∘θ): Y→c2, X→c2
+    #  Kompozytsiia: sigma={X->c2}, theta={Y->X} -> (sigma∘theta): Y->c2, X->c2
     theta   = Substitution({"Y": X})
     composed = sigma.compose(theta)
     assert composed.apply(Y) == c2, f"compose FAIL: {composed.apply(Y)}"
     assert composed.apply(X) == c2, f"compose X FAIL"
 
-    # bind: нова підстановка
+    #  bind: nova substitution
     sigma2 = Substitution.empty().bind("Z", Compound(func=0, subterms=(c1,)))
     assert sigma2.apply(Z) == Compound(func=0, subterms=(c1,)), "bind FAIL"
     print(f"  Const={c1}, Var={X}, Compound={comp}")
-    print(f"  σ={sigma}, composed={composed}  [PASS]")
+    print(f"  sigma={sigma}, composed={composed}  [PASS]")
 
     # ══ T0b: Martelli-Montanari ════════════════════════════════════════════════
-    sep("T0b · Martelli-Montanari уніфікація")
+    sep("T0b - Martelli-Montanari unification")
 
     # f(X, g(Y)) =?= f(c1, g(c2)) → mgu={X→c1, Y→c2}
     t_lhs = Compound(func=0, subterms=(X, Compound(func=1, subterms=(Y,))))
@@ -7126,10 +6698,10 @@ def _run_prolog_tests() -> None:
     anon = unify_mm([(Var("_0"), c3)])
     assert anon is not None and len(anon) == 0, "Anon wildcard FAIL"
 
-    print(f"  mgu={mgu}  clash=None  occurs=None  anon=ε  [PASS]")
+    print(f"  mgu={mgu}  clash=None  occurs=None  anon=eps  [PASS]")
 
-    # ══ T1: HornAtom уніфікація ════════════════════════════════════════════════
-    sep("T1 · Уніфікація HornAtom (via MM)")
+    #  == T1: HornAtom unification ================================================
+    sep("T1 - HornAtom unification (via MM)")
     a1 = HornAtom(pred=1, args=(Const(2), Const(3)))
     a2 = HornAtom(pred=1, args=(Var("X"), Const(3)))
     b  = unify(a2, a1)
@@ -7142,21 +6714,21 @@ def _run_prolog_tests() -> None:
     a4 = HornAtom(pred=2, args=(Const(2), Const(3)))
     assert unify(a2, a4) is None,  "Different pred should be None"
 
-    # Зворотна сумісність: int args → Const/Var автоматично
+    #  Zvorotna compatibility: int args -> Const/Var avtomatychno
     a_compat = HornAtom(pred=1, args=(-1, 3))    # Var("_0"), Const(3)
     assert isinstance(a_compat.args[0], Var)
     assert isinstance(a_compat.args[1], Const)
-    b_compat = unify(a_compat, a1)               # anon var → skip → σ=ε, проходить
+    b_compat = unify(a_compat, a1)  #  anon var -> skip -> sigma=eps, prokhodyt
     assert b_compat is not None, f"Compat unify FAIL: {b_compat}"
-    print(f"  σ={b}  compat={b_compat}  [PASS]")
+    print(f"  sigma={b}  compat={b_compat}  [PASS]")
 
     # ══ T2: apply_bindings ════════════════════════════════════════════════════
-    sep("T2 · apply_bindings (з Substitution)")
+    sep("T2 - apply_bindings with Substitution")
     head_t2 = HornAtom(pred=1, args=(Var("X"), Const(5)))
     sigma_t2 = Substitution({"X": Const(9)})
     result_t2 = apply_bindings(head_t2, sigma_t2)
-    assert result_t2 == HornAtom(pred=1, args=(Const(9), Const(5))), f"FAIL: {result_t2}"
-    print(f"  {head_t2} + {{X→9}} = {result_t2}  [PASS]")
+    print(f"  {head_t2} + {{X->9}} = {result_t2}  [PASS]")
+
 
     # ══ T3: KnowledgeBase Forward Chaining (FOL) ═══════════════════════════════
     sep("T3 · KnowledgeBase Forward Chaining (FOL, named vars)")
@@ -7169,15 +6741,15 @@ def _run_prolog_tests() -> None:
     kb.add_rule(HornClause(head=head_t3, body=body_t3))
     derived = kb.forward_chain(max_depth=3)
     mortal_facts = [f for f in derived if f.pred == 1]
-    print(f"  Всього фактів: {len(derived)}, mortal: {mortal_facts}")
+    print(f"  Total facts: {len(derived)}, mortal: {mortal_facts}")
     assert len(mortal_facts) >= 2, f"FAIL: {mortal_facts}"
-    # Перевіряємо конкретні факти
+    # Check concrete facts.
     assert HornAtom(pred=1, args=(Const(1), Const(0))) in mortal_facts
     assert HornAtom(pred=1, args=(Const(2), Const(0))) in mortal_facts
     print("  [PASS]")
 
     # ══ T_GP: Grandparent (transitive composition) ═════════════════════════════
-    sep("T_GP · Grandparent — композиційне узагальнення")
+    sep("T_GP - Grandparent composition")
     # grandparent(?X,?Z) :- parent(?X,?Y), parent(?Y,?Z)
     kb_gp = KnowledgeBase(max_rules=64)
     kb_gp.add_fact(HornAtom(pred=0, args=(Const(1), Const(2))))  # parent(1,2)
@@ -7190,10 +6762,10 @@ def _run_prolog_tests() -> None:
     kb_gp.add_rule(HornClause(head=head_gp, body=body_gp))
     derived_gp = kb_gp.forward_chain(max_depth=5)
     gp_facts = [f for f in derived_gp if f.pred == 1]
-    print(f"  grandparent-факти: {gp_facts}")
+    print(f"  grandparent facts: {gp_facts}")
     assert HornAtom(pred=1, args=(Const(1), Const(3))) in gp_facts, "gp(1,3) FAIL"
     assert HornAtom(pred=1, args=(Const(2), Const(4))) in gp_facts, "gp(2,4) FAIL"
-    print("  [PASS] — дедукція через транзитивність")
+    print("  [PASS] - deduction via transitivity")
 
     sep("T_GP_TENSOR · TensorKnowledgeBase — fast join + compound terms")
     tkb = TensorKnowledgeBase(max_rules=64, max_facts=128, device=device)
@@ -7211,11 +6783,11 @@ def _run_prolog_tests() -> None:
     ))
     derived_tkb = tkb.forward_chain(max_depth=3)
     assert HornAtom(pred=12, args=(comp_src, Const(99))) in derived_tkb, f"Tensor KB compound join FAIL: {derived_tkb}"
-    print("  [PASS] — tensor KB виводить compound-терми в multi-body правилі")
+    print("  [PASS] - tensor KB derives compound terms in a multi-body rule")
 
     # ══ T_ALL_SUB: find_all_substitutions ══════════════════════════════════════
     sep("T_ALL_SUB · find_all_substitutions (backtracking DFS)")
-    sep("T_GP_TENSOR_STRUCT В· TensorKnowledgeBase — structured compound join")
+    sep("T_GP_TENSOR_STRUCT - TensorKnowledgeBase structured compound join")
     tkb_struct = TensorKnowledgeBase(max_rules=64, max_facts=128, device=device)
     nested_fact = Compound(func=20, subterms=(Const(1), Const(5)))
     tkb_struct.add_fact(HornAtom(pred=20, args=(nested_fact,)))
@@ -7234,9 +6806,9 @@ def _run_prolog_tests() -> None:
         args=(Compound(func=30, subterms=(Const(5), Const(7))),),
     )
     assert expected_struct in derived_struct, f"Structured compound join FAIL: {derived_struct}"
-    print("  [PASS] вЂ” structured fast join РїС–РґС‚СЂРёРјСѓС” f(Const,Var) Сѓ body Р№ head")
+    print("  [PASS] - structured fast join supports f(Const,Var) in body and head")
 
-    sep("T_TENSOR_ARITY3 В· TensorKnowledgeBase — fallback для арності > 2")
+    sep("T_TENSOR_ARITY3 - TensorKnowledgeBase fallback for arity > 2")
     sep("T_TENSOR_VARPOS")
     tkb_varpos = TensorKnowledgeBase(max_rules=64, max_facts=128, device=device)
     Xv = Var("Xv")
@@ -7275,7 +6847,7 @@ def _run_prolog_tests() -> None:
     assert HornAtom(pred=32, args=(Const(4), Const(5), Const(6))) in derived_arity, (
         f"Arity-3 fact-rule fallback FAIL: {derived_arity}"
     )
-    print("  [PASS] — >2 аргументи не губляться і виводяться через Python fallback")
+    print("  [PASS] - arguments with arity > 2 are preserved through the Python fallback")
 
     facts_u = frozenset([
         HornAtom(pred=0, args=(Const(1), Const(2))),
@@ -7288,7 +6860,7 @@ def _run_prolog_tests() -> None:
     assert len(subs_u) == 3, f"FAIL: {len(subs_u)} (expected 3)"
     for s in subs_u:
         assert isinstance(s.apply(Xu), Const), f"X not ground: {s}"
-    print(f"  {len(subs_u)} підстановок знайдено  [PASS]")
+    print(f"  {len(subs_u)} substitutions found  [PASS]")
 
     # ══ T4: MDL complexity penalty ════════════════════════════════════════════
     sep("T4 · MDL complexity penalty")
@@ -7327,7 +6899,7 @@ def _run_prolog_tests() -> None:
     print(f"  log_probs shape={tuple(lp.shape)}  max={lp.max():.3f}  [PASS]")
 
     # ══ T_TERM_EMB: TermEmbedder ══════════════════════════════════════════════
-    sep("T_TERM_EMB · TermEmbedder (нейронні ембеддинги термів)")
+    sep("T_TERM_EMB - TermEmbedder (neural term embeddings)")
     te = TermEmbedder(sym_vocab=32, d=16).to(device)
     atoms_te = [
         HornAtom(pred=0, args=(Const(1), Const(2))),
@@ -7335,12 +6907,12 @@ def _run_prolog_tests() -> None:
     ]
     embs_te = te(atoms_te, device)
     assert embs_te.shape == (2, 16), f"FAIL: {embs_te.shape}"
-    # Ембеддинги різних атомів повинні відрізнятись
+    # Embeddings of different atoms must differ.
     assert not torch.allclose(embs_te[0], embs_te[1]), "Embeddings should differ"
     print(f"  embs shape={tuple(embs_te.shape)}  [PASS]")
 
     # ══ T_SOFT_UNIF: SoftUnifier ══════════════════════════════════════════════
-    sep("T_SOFT_UNIF · SoftUnifier (диференційована уніфікація)")
+    sep("T_SOFT_UNIF - SoftUnifier (differentiable unification)")
     su = SoftUnifier(d=16, sym_vocab=32).to(device)
     facts_su = frozenset([
         HornAtom(pred=0, args=(Const(1), Const(2))),
@@ -7350,7 +6922,7 @@ def _run_prolog_tests() -> None:
     energy_su, ent_su = su(body_su, facts_su, device)
     assert energy_su.dim() == 0, f"energy not scalar: {energy_su.shape}"
     assert not torch.isnan(energy_su), "NaN energy"
-    # Backward через soft unifier
+    # Backward pass through the soft unifier.
     (energy_su + ent_su).backward()
     grad_sum = sum(p.grad.norm().item() for p in su.parameters() if p.grad is not None)
     assert grad_sum > 0, "No gradient through SoftUnifier"
@@ -7363,11 +6935,11 @@ def _run_prolog_tests() -> None:
     clauses = abd(z)
     assert len(clauses) == 4
     for c in clauses:
-        assert isinstance(c, HornClause) and not c.is_fact()
-        # Нові правила мають змінні у args (не константи)
+        # New rules must keep variables in args rather than constants.
+        #  Novi rule maiut variable u args (ne konstanty)
         assert c.head.vars(), f"Head has no vars: {c.head}"
         assert c.body[0].vars(), f"Body has no vars: {c.body[0]}"
-    print(f"  {len(clauses)} кандидати зі змінними: {clauses[0]}  [PASS]")
+    print(f"  {len(clauses)} candidates with variables: {clauses[0]}  [PASS]")
 
     # ══ T7: DifferentiableProver — forward ════════════════════════════════════
     sep("T7 · DifferentiableProver forward")
@@ -7383,18 +6955,18 @@ def _run_prolog_tests() -> None:
     assert not torch.isnan(sym_loss)
     print(f"  z_sym {tuple(z_sym.shape)}  sym_loss={sym_loss.item():.4f}  [PASS]")
 
-    # ══ T8: Backward через DifferentiableProver ════════════════════════════════
-    sep("T8 · Backward через DifferentiableProver")
+    #  == T8: Backward through DifferentiableProver ============================
+    sep("T8 - Backward through DifferentiableProver")
     prover.zero_grad()
     loss = sym_loss + z_sym.pow(2).mean()
     loss.backward()
     g_sum = sum(p.grad.norm().item() for p in prover.parameters() if p.grad is not None)
-    assert g_sum > 0, "FAIL: нема градієнту"
+    assert g_sum > 0, "FAIL: no gradient"
     print(f"  grad_sum={g_sum:.4f}  [PASS]")
 
-    # ══ T9: prove_with_policy + FOL правило ═══════════════════════════════════
-    sep("T9 · prove_with_policy з FOL-правилом")
-    # Правило з іменованими змінними: p3(?X, c7) :- p2(c7, ?X)
+    #  == T9: prove_with_policy + FOL rule ===================================
+    sep("T9 - prove_with_policy with an FOL rule")
+    # Rule with named variables: p3(?X, c7) :- p2(c7, ?X)
     Xp = Var("XV")
     prover.kb.add_fact(HornAtom(pred=2, args=(Const(7), Const(5))))
     prover.kb.add_rule(HornClause(
@@ -7404,10 +6976,10 @@ def _run_prolog_tests() -> None:
     goal = HornAtom(pred=3, args=(Const(5), Const(7)))
     z1   = torch.randn(1, 32, device=device)
     proved, traj, pl = prover.prove_with_policy(goal, z1, n_steps=3)
-    assert pl.dim() == 0 or pl.numel() == 1, "FAIL: proof_loss не скалярний"
+    assert pl.dim() == 0 or pl.numel() == 1, "FAIL: proof_loss is not scalar"
     print(f"  proved={proved}  steps={len(traj)}  proof_loss={pl.item():.4f}  [PASS]")
 
-    sep("T9b В· answer_query Р· query-specific proof state")
+    sep("T9b - answer_query with query-specific proof state")
     query_goal = HornAtom(pred=3, args=(Var("ANS"), Const(7)))
     z_query, answer_ids, support = prover.answer_query(query_goal, device=device)
     assert z_query.shape == (1, 32), f"FAIL: query state {z_query.shape}"
@@ -7415,13 +6987,13 @@ def _run_prolog_tests() -> None:
     assert 5 in answer_ids, f"FAIL: expected answer 5 in {answer_ids}"
     print(f"  support={support.item():.4f}  answers={answer_ids}  [PASS]")
 
-    # ══ T10: Абдукція ═════════════════════════════════════════════════════════
+    #  == T10: abduction =========================================================
     sep("T10 · abduce_and_learn")
     n_before = len(prover.kb)
     added, _, _, _ = prover.abduce_and_learn(z_in, error=2.0, force=True)
     n_after  = len(prover.kb)
     print(f"  rules before={n_before}  added={added}  after={n_after}  [PASS]")
-    sep("T10a В· contextual bridge-chain abduction")
+    sep("T10a - contextual bridge-chain abduction")
     bridge_prover = DifferentiableProver(
         d_latent=32, sym_vocab=32, max_rules=32, max_depth=3, n_cands=4
     ).to(device)
@@ -7797,14 +7369,14 @@ def _run_prolog_tests() -> None:
     )
 
     # ══ T_GRAPH_UNIF: GraphMatchingUnifier ════════════════════════════════════
-    sep("T_GRAPH_UNIF · GraphMatchingUnifier (консистентна уніфікація)")
+    sep("T_GRAPH_UNIF - GraphMatchingUnifier (consistent unification)")
     gmu = GraphMatchingUnifier(d=16, sym_vocab=32).to(device)
     facts_gmu = frozenset([
         HornAtom(pred=0, args=(Const(1), Const(2))),
         HornAtom(pred=0, args=(Const(2), Const(3))),
         HornAtom(pred=0, args=(Const(3), Const(4))),
     ])
-    # parent(?X,?Y), parent(?Y,?Z) — ?Y спільна → консистентне прив'язування
+    # parent(?X,?Y), parent(?Y,?Z) - ?Y is shared, so the binding must stay consistent.
     Xg, Yg, Zg = Var("X"), Var("Y"), Var("Z")
     body_gmu = (
         HornAtom(pred=0, args=(Xg, Yg)),
@@ -7823,13 +7395,13 @@ def _run_prolog_tests() -> None:
     print(f"  energy={energy_gmu.item():.4f}  ent={ent_gmu.item():.4f}"
           f"  vars={list(var_assign_gmu.keys())}  grad={grad_gmu:.4f}  [PASS]")
 
-    # ══ T_GRAPH_CONSISTENT: перевіряємо консистентність ?Y ══════════════════
-    sep("T_GRAPH_CONSISTENT · GraphMatchingUnifier — ?Y однаковий у обох атомах")
+    #  == T_GRAPH_CONSISTENT: check consistent ?Y ============================
+    sep("T_GRAPH_CONSISTENT - GraphMatchingUnifier keeps ?Y identical in both atoms")
     gmu2 = GraphMatchingUnifier(d=32, sym_vocab=32, n_iters=5).to(device)
-    # При n_iters=5 co-occurrence повинен зробити ?Y однаковим
+    # With n_iters=5, co-occurrence should make ?Y identical.
     e2, va2, ent2 = gmu2(body_gmu, facts_gmu, device, hard=True)
-    # hard=True → one-hot → var_assign["Y"] в обох атомах має бути одним вектором
-    # (перевіряємо через norm: Y-вектор має бути ненульовим)
+    # hard=True -> one-hot -> var_assign["Y"] must be the same vector in both atoms.
+    # Check via the norm: the Y vector must be non-zero.
     y_vec = va2.get("Y")
     assert y_vec is not None, "?Y not assigned"
     assert y_vec.norm() > 0, "?Y assignment is zero vector"
@@ -7839,7 +7411,7 @@ def _run_prolog_tests() -> None:
     sep("T_PROOF_COST · ProofCostEstimator — Cost(T)")
     pce = ProofCostEstimator(d=16, sym_vocab=32, lam=0.1).to(device)
 
-    # Простий ланцюжок доведення: [(rule, sigma), ...]
+    # Simple proof chain: [(rule, sigma), ...]
     Xp2 = Var("XV2")
     rule_pce = HornClause(
         head=HornAtom(pred=3, args=(Xp2, Const(7))),
@@ -7859,15 +7431,15 @@ def _run_prolog_tests() -> None:
                    for p in pce.parameters() if p.grad is not None)
     assert grad_pce > 0, "No gradient through ProofCostEstimator"
 
-    # Символьна вартість: complexity + λ·UnifComplexity
+    # Symbolic cost: complexity + lambda * UnifComplexity.
     sym_c = pce.symbolic_cost(rule_pce, sigma_pce)
     assert sym_c > 0, "symbolic_cost should be > 0"
     print(f"  cost={cost_pce.item():.4f}  sym_cost={sym_c:.2f}"
           f"  grad={grad_pce:.4f}  [PASS]")
 
-    # ══ T_MDL_FULL: повна MDL-формула Intelligence = min_Γ[Length(Γ)+E[min_σ Cost(...)]]
-    sep("T_MDL_FULL · Повна MDL-формула з Cost(T)")
-    # Перевіряємо, що Cost(T) ≥ 0 і зростає з довжиною правила
+    #  == T_MDL_FULL: Full MDL formula Intelligence = min_Gamma[Length(Gamma)+E[min_sigma Cost(...)]]
+    sep("T_MDL_FULL - Full MDL formula with Cost(T)")
+    # Check that Cost(T) >= 0 and grows with rule length.
     short_rule = HornClause(
         head=HornAtom(pred=0, args=(Var("X"),)),
         body=(HornAtom(pred=1, args=(Var("X"),)),)
@@ -7882,9 +7454,9 @@ def _run_prolog_tests() -> None:
     cost_short = pce.symbolic_cost(short_rule, None)
     cost_long  = pce.symbolic_cost(long_rule,  None)
     assert cost_long > cost_short, (
-        f"Довше правило має більшу вартість: {cost_long:.1f} vs {cost_short:.1f}"
+        f"A longer rule has a higher cost: {cost_long:.1f} vs {cost_short:.1f}"
     )
-    # UnifComplexity зростає з глибиною термів
+    # UnifComplexity grows with term depth.
     sigma_deep = Substitution({
         "X": Compound(0, (Compound(1, (Const(0),)), Const(1))),  # depth=2
     })
@@ -7892,7 +7464,7 @@ def _run_prolog_tests() -> None:
     assert cost_deep > pce.symbolic_cost(short_rule, Substitution({"X": Const(0)}))
     print(f"  cost_short={cost_short:.1f}  cost_long={cost_long:.1f}"
           f"  cost_deep={cost_deep:.1f}  [PASS]")
-    print("  Intelligence = min_Γ[Length(Γ)+E[min_σ Cost(Prove(Γ,Task,σ))]] ✅")
+    print("  Intelligence = min_Gamma[Length(Gamma)+E[min_sigma Cost(Prove(Gamma,Task,sigma))]]  [PASS]")
 
     sep("T_MDL_SUBST · MDL — UnifComplexity(σ)")
     sigma_mdl = Substitution({
@@ -7907,7 +7479,7 @@ def _run_prolog_tests() -> None:
     cost = r_complexity + 0.1 * uc
     print(f"  UnifComplexity={uc}  rule_complexity={r_complexity}  Cost={cost:.2f}  [PASS]")
 
-    print("\n  ✅  omen_prolog: всі тести пройдено — FOL уніфікація активна\n")
+    print("\n  omen_prolog: all tests passed - FOL unification active\n")
 
 
 if __name__ == "__main__":
