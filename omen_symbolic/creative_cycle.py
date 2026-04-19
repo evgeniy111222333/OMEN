@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 import math
 import pickle
@@ -58,6 +59,20 @@ class CreativeCycleCoordinator:
         oee_bundle_beam_width: int = 4,
         oee_max_bundle_rules: int = 3,
         oee_bundle_seed_k: int = 12,
+        train_fast_cwe_max_rule_mods: int = 1,
+        train_fast_cwe_max_candidates: int = 2,
+        train_fast_cwe_max_transforms_per_rule: int = 1,
+        train_fast_oee_max_candidates: int = 2,
+        train_fast_oee_max_targets: int = 2,
+        train_fast_oee_max_paradox_facts: int = 2,
+        train_fast_oee_max_hypotheses: int = 4,
+        train_fast_oee_max_scored_hypotheses: int = 32,
+        train_fast_oee_max_open_body_literals: int = 1,
+        train_fast_oee_max_open_patterns: int = 2,
+        train_fast_oee_max_open_head_patterns: int = 2,
+        train_fast_oee_bundle_beam_width: int = 2,
+        train_fast_oee_max_bundle_rules: int = 2,
+        train_fast_oee_bundle_seed_k: int = 4,
         # ICE params
         ice_state_history: int = 128,
         ice_goal_threshold: float = 0.35,
@@ -65,6 +80,26 @@ class CreativeCycleCoordinator:
         self.enabled = bool(enabled)
         self.cycle_every = max(int(cycle_every), 1)
         self.max_selected_rules = max(int(max_selected_rules), 1)
+        self.train_fast_cwe_max_rule_mods = max(int(train_fast_cwe_max_rule_mods), 1)
+        self.train_fast_cwe_max_candidates = max(int(train_fast_cwe_max_candidates), 1)
+        self.train_fast_cwe_max_transforms_per_rule = max(int(train_fast_cwe_max_transforms_per_rule), 1)
+        self.train_fast_oee_max_candidates = max(int(train_fast_oee_max_candidates), 1)
+        self.train_fast_oee_max_targets = max(int(train_fast_oee_max_targets), 1)
+        self.train_fast_oee_max_paradox_facts = max(int(train_fast_oee_max_paradox_facts), 0)
+        self.train_fast_oee_max_hypotheses = max(int(train_fast_oee_max_hypotheses), 1)
+        self.train_fast_oee_max_scored_hypotheses = max(
+            int(train_fast_oee_max_scored_hypotheses),
+            self.train_fast_oee_max_hypotheses,
+        )
+        self.train_fast_oee_max_open_body_literals = max(int(train_fast_oee_max_open_body_literals), 1)
+        self.train_fast_oee_max_open_patterns = max(int(train_fast_oee_max_open_patterns), 1)
+        self.train_fast_oee_max_open_head_patterns = max(int(train_fast_oee_max_open_head_patterns), 1)
+        self.train_fast_oee_bundle_beam_width = max(int(train_fast_oee_bundle_beam_width), 2)
+        self.train_fast_oee_max_bundle_rules = max(int(train_fast_oee_max_bundle_rules), 2)
+        self.train_fast_oee_bundle_seed_k = max(
+            int(train_fast_oee_bundle_seed_k),
+            self.train_fast_oee_bundle_beam_width,
+        )
         self.analogy_engine = AnalogyMetaphorEngine(
             embedding_dim=analogy_dim,
             tau_analogy=tau_analogy,
@@ -102,6 +137,7 @@ class CreativeCycleCoordinator:
             forward_chain_depth=oee_forward_chain_depth,
             max_interaction_preds=oee_max_interaction_preds,
             max_hypotheses=oee_max_hypotheses,
+            max_scored_hypotheses=max(max(oee_max_hypotheses * 8, 64), oee_max_hypotheses),
             oee_bundle_beam_width=oee_bundle_beam_width,
             oee_max_bundle_rules=oee_max_bundle_rules,
             oee_bundle_seed_k=oee_bundle_seed_k,
@@ -112,6 +148,8 @@ class CreativeCycleCoordinator:
         )
         self.last_report = CreativeCycleReport()
         self.rule_origins: Dict[int, str] = {}
+        self._runtime_derived_facts_cache: Optional[Dict[Tuple[int, Tuple[int, ...]], Any]] = None
+        self._runtime_task_gap_cache: Optional[Dict[Tuple[int, Tuple[int, ...], Tuple[int, ...]], float]] = None
 
     @staticmethod
     def _cpu_report(report: CreativeCycleReport) -> CreativeCycleReport:
@@ -185,6 +223,18 @@ class CreativeCycleCoordinator:
     def scheduled_intrinsic_goals(self) -> Tuple[Any, ...]:
         return tuple(goal.goal for goal in self.intrinsic_engine.scheduled_goals() if goal.goal is not None)
 
+    def _clear_runtime_caches(self) -> None:
+        self._runtime_derived_facts_cache = None
+        self._runtime_task_gap_cache = None
+
+    @staticmethod
+    def _runtime_rule_key(extra_rules: Sequence[Any]) -> Tuple[int, ...]:
+        return tuple(sorted(hash(rule) for rule in extra_rules))
+
+    @staticmethod
+    def _runtime_target_key(target_facts: Sequence[Any]) -> Tuple[int, ...]:
+        return tuple(sorted(hash(target) for target in target_facts))
+
     @staticmethod
     def _dedupe_facts(facts: Sequence[Any]) -> List[Any]:
         unique: List[Any] = []
@@ -230,6 +280,88 @@ class CreativeCycleCoordinator:
             if intrinsic_hash not in seen:
                 support.append(intrinsic_goal)
         return tuple(support)
+
+    @staticmethod
+    def _limit_unique_facts(facts: Sequence[Any], limit: int) -> Tuple[Any, ...]:
+        if limit <= 0:
+            return tuple()
+        unique: List[Any] = []
+        seen: set[int] = set()
+        for fact in facts:
+            fact_hash = hash(fact)
+            if fact_hash in seen:
+                continue
+            seen.add(fact_hash)
+            unique.append(fact)
+            if len(unique) >= limit:
+                break
+        return tuple(unique)
+
+    @contextmanager
+    def _train_fast_symbolic_budget(self):
+        sampler = self.ontology_engine._sampler
+        saved = (
+            self.counterfactual_engine.max_rule_mods,
+            self.counterfactual_engine.max_candidates,
+            self.counterfactual_engine.max_transforms_per_rule,
+            sampler.max_hypotheses,
+            sampler.max_scored_hypotheses,
+            sampler.max_open_body_literals,
+            sampler.max_open_patterns,
+            sampler.max_open_head_patterns,
+            sampler.bundle_beam_width,
+            sampler.max_bundle_rules,
+            sampler.bundle_seed_k,
+        )
+        self.counterfactual_engine.max_rule_mods = self.train_fast_cwe_max_rule_mods
+        self.counterfactual_engine.max_candidates = self.train_fast_cwe_max_candidates
+        self.counterfactual_engine.max_transforms_per_rule = self.train_fast_cwe_max_transforms_per_rule
+        sampler.max_hypotheses = min(sampler.max_hypotheses, self.train_fast_oee_max_hypotheses)
+        sampler.max_scored_hypotheses = min(
+            sampler.max_scored_hypotheses,
+            self.train_fast_oee_max_scored_hypotheses,
+        )
+        sampler.max_open_body_literals = min(
+            sampler.max_open_body_literals,
+            self.train_fast_oee_max_open_body_literals,
+        )
+        sampler.max_open_patterns = min(
+            sampler.max_open_patterns,
+            self.train_fast_oee_max_open_patterns,
+        )
+        sampler.max_open_head_patterns = min(
+            sampler.max_open_head_patterns,
+            self.train_fast_oee_max_open_head_patterns,
+        )
+        sampler.bundle_beam_width = min(
+            sampler.bundle_beam_width,
+            self.train_fast_oee_bundle_beam_width,
+        )
+        sampler.max_bundle_rules = min(
+            sampler.max_bundle_rules,
+            self.train_fast_oee_max_bundle_rules,
+        )
+        sampler.bundle_seed_k = min(
+            sampler.bundle_seed_k,
+            self.train_fast_oee_bundle_seed_k,
+        )
+        sampler.bundle_seed_k = max(sampler.bundle_seed_k, sampler.bundle_beam_width)
+        try:
+            yield
+        finally:
+            (
+                self.counterfactual_engine.max_rule_mods,
+                self.counterfactual_engine.max_candidates,
+                self.counterfactual_engine.max_transforms_per_rule,
+                sampler.max_hypotheses,
+                sampler.max_scored_hypotheses,
+                sampler.max_open_body_literals,
+                sampler.max_open_patterns,
+                sampler.max_open_head_patterns,
+                sampler.bundle_beam_width,
+                sampler.max_bundle_rules,
+                sampler.bundle_seed_k,
+            ) = saved
 
     @staticmethod
     def _report_summary(report: Optional[CreativeCycleReport]) -> Dict[str, float]:
@@ -410,13 +542,20 @@ class CreativeCycleCoordinator:
         mdl_after += sum(self._fact_description_bits(fact) for fact in unresolved_after)
         return float(mdl_before - mdl_after)
 
-    def _task_gap(
+    def _derived_facts(
         self,
         prover: Any,
         current_facts: Sequence[Any],
-        target_facts: Sequence[Any],
         extra_rules: Sequence[Any] = (),
-    ) -> float:
+    ):
+        cache = self._runtime_derived_facts_cache
+        rule_count = int(getattr(prover.kb, "_n_rules", len(getattr(prover.kb, "rules", ()))))
+        cache_key = (rule_count, self._runtime_rule_key(extra_rules))
+        if cache is not None:
+            cached = cache.get(cache_key)
+            if cached is not None:
+                return cached
+        current_fact_set = frozenset(current_facts)
         try:
             if extra_rules:
                 sandbox = self.counterfactual_engine._clone_kb(prover.kb)
@@ -424,22 +563,51 @@ class CreativeCycleCoordinator:
                     sandbox.add_rule(rule)
                 derived = sandbox.forward_chain(
                     max(int(getattr(prover, "max_depth", 1)), 1),
-                    starting_facts=frozenset(current_facts),
+                    starting_facts=current_fact_set,
                     only_verified=False,
+                    track_epistemic=False,
                 )
             else:
                 derived = prover.kb.forward_chain(
                     max(int(getattr(prover, "max_depth", 1)), 1),
-                    starting_facts=frozenset(current_facts),
+                    starting_facts=current_fact_set,
                     only_verified=False,
+                    track_epistemic=False,
                 )
         except Exception:
-            derived = frozenset(current_facts)
+            derived = current_fact_set
+        derived_facts = frozenset(derived)
+        if cache is not None:
+            cache[cache_key] = derived_facts
+        return derived_facts
+
+    def _task_gap(
+        self,
+        prover: Any,
+        current_facts: Sequence[Any],
+        target_facts: Sequence[Any],
+        extra_rules: Sequence[Any] = (),
+    ) -> float:
         targets = list(target_facts)
         if not targets:
             return float(getattr(getattr(prover, "task_context", None), "metadata", {}).get("gap_norm", 0.0))
+        cache = self._runtime_task_gap_cache
+        rule_count = int(getattr(prover.kb, "_n_rules", len(getattr(prover.kb, "rules", ()))))
+        cache_key = (
+            rule_count,
+            self._runtime_rule_key(extra_rules),
+            self._runtime_target_key(targets),
+        )
+        if cache is not None:
+            cached = cache.get(cache_key)
+            if cached is not None:
+                return float(cached)
+        derived = self._derived_facts(prover, current_facts, extra_rules=extra_rules)
         unresolved = sum(1 for target in targets if not self._goal_supported(target, derived))
-        return float(unresolved / max(len(targets), 1))
+        gap = float(unresolved / max(len(targets), 1))
+        if cache is not None:
+            cache[cache_key] = gap
+        return gap
 
     def _world_counterfactual_surprise(
         self,
@@ -624,8 +792,7 @@ class CreativeCycleCoordinator:
     ) -> List[RuleCandidate]:
         if not seed_candidates:
             return []
-
-        baseline_gap = self._task_gap(prover, current_facts, unresolved_targets)
+        compression_cache: Dict[Tuple[int, Tuple[int, ...]], float] = {}
 
         def _fact_bits(fact: Any) -> float:
             return float(4 + 2 * len(tuple(getattr(fact, "args", ()))))
@@ -633,22 +800,17 @@ class CreativeCycleCoordinator:
         def _compression_delta(rule: Any, target_subset: Sequence[Any]) -> float:
             if not target_subset:
                 return 0.0
+            cache_key = (hash(rule), self._runtime_target_key(target_subset))
+            cached = compression_cache.get(cache_key)
+            if cached is not None:
+                return float(cached)
             after = self._task_gap(prover, current_facts, target_subset, extra_rules=[rule])
             before = self._task_gap(prover, current_facts, target_subset)
             unresolved_before = [
                 target for target in target_subset
                 if not self._goal_supported(target, current_facts)
             ]
-            try:
-                sandbox = self.counterfactual_engine._clone_kb(prover.kb)
-                sandbox.add_rule(rule)
-                derived_after = sandbox.forward_chain(
-                    max(int(getattr(prover, "max_depth", 1)), 1),
-                    starting_facts=frozenset(current_facts),
-                    only_verified=False,
-                )
-            except Exception:
-                derived_after = frozenset(current_facts)
+            derived_after = self._derived_facts(prover, current_facts, extra_rules=[rule])
             unresolved_after = [
                 target for target in target_subset
                 if not self._goal_supported(target, derived_after)
@@ -658,8 +820,11 @@ class CreativeCycleCoordinator:
                 _fact_bits(fact) for fact in unresolved_after
             )
             if before <= after and mdl_before <= mdl_after:
+                compression_cache[cache_key] = 0.0
                 return 0.0
-            return float(mdl_before - mdl_after)
+            gain = float(mdl_before - mdl_after)
+            compression_cache[cache_key] = gain
+            return gain
 
         selected: Dict[int, RuleCandidate] = {}
         situations = list(unresolved_targets) if unresolved_targets else [None]
@@ -703,19 +868,25 @@ class CreativeCycleCoordinator:
         current_facts: Sequence[Any],
         target_facts: Sequence[Any],
         device: torch.device,
+        *,
+        fast_mode: bool = False,
     ) -> CreativeCycleReport:
         report = CreativeCycleReport()
+        self._clear_runtime_caches()
         if not self.enabled or prover._step % self.cycle_every != 0:
             self.intrinsic_engine.update_state(z)
             queued_goals = self.intrinsic_engine.scheduled_goals()
             report.metrics = {
                 "cycle_active": 0.0,
+                "train_fast_budgeted": 1.0 if fast_mode else 0.0,
                 "intrinsic_goal_queue_size": float(len(queued_goals)),
                 "intrinsic_background_goals": float(max(len(queued_goals) - 1, 0)),
             }
             self.last_report = report
             return report
 
+        self._runtime_derived_facts_cache = {}
+        self._runtime_task_gap_cache = {}
         rules = list(getattr(prover.kb, "rules", ()))
         report.abduction_candidates = self._recent_abduction_candidates(prover)
         analogy_state = self.analogy_engine.fit(rules)
@@ -738,13 +909,14 @@ class CreativeCycleCoordinator:
         conflict_fn = getattr(prover, "_atoms_conflict", None)
         if conflict_fn is None:
             conflict_fn = lambda left, right: False
-        counterfactual = self.counterfactual_engine.explore(
-            prover.kb,
-            current_facts,
-            prover.max_depth,
-            conflict_fn=conflict_fn,
-            world_surprise_fn=self._world_counterfactual_surprise(prover, current_facts),
-        )
+        with (self._train_fast_symbolic_budget() if fast_mode else nullcontext()):
+            counterfactual = self.counterfactual_engine.explore(
+                prover.kb,
+                current_facts,
+                prover.max_depth,
+                conflict_fn=conflict_fn,
+                world_surprise_fn=self._world_counterfactual_surprise(prover, current_facts),
+            )
         report.counterfactual_candidates = list(counterfactual.candidates)
         report.counterfactual_novel_facts = tuple(counterfactual.novel_facts)
         report.counterfactual_contradictions = tuple(counterfactual.contradictions)
@@ -764,18 +936,27 @@ class CreativeCycleCoordinator:
                 paradox_facts.append(right)
 
         goal = prover.current_goal(z) if hasattr(prover, "current_goal") else None
-        report.ontology_candidates = self.ontology_engine.generate_candidates(
-            current_facts=current_facts,
-            goal=goal,
-            gap_norm=gap_norm,
-            contradiction_count=len(counterfactual.contradictions),
-            paradox_facts=paradox_facts,
-            target_facts=target_facts,
-            state_z=z,
-            predicate_embeddings=report.predicate_embeddings,
-            kb=prover.kb,
-            existing_rules=rules,
-        )
+        oee_target_facts: Sequence[Any] = target_facts
+        oee_paradox_facts: Sequence[Any] = paradox_facts
+        oee_max_candidates = 4
+        if fast_mode:
+            oee_target_facts = self._limit_unique_facts(target_facts, self.train_fast_oee_max_targets)
+            oee_paradox_facts = self._limit_unique_facts(paradox_facts, self.train_fast_oee_max_paradox_facts)
+            oee_max_candidates = self.train_fast_oee_max_candidates
+        with (self._train_fast_symbolic_budget() if fast_mode else nullcontext()):
+            report.ontology_candidates = self.ontology_engine.generate_candidates(
+                current_facts=current_facts,
+                goal=goal,
+                gap_norm=gap_norm,
+                contradiction_count=len(counterfactual.contradictions),
+                max_candidates=oee_max_candidates,
+                paradox_facts=oee_paradox_facts,
+                target_facts=oee_target_facts,
+                state_z=z,
+                predicate_embeddings=report.predicate_embeddings,
+                kb=prover.kb,
+                existing_rules=rules,
+            )
 
         seed_candidates: List[RuleCandidate] = (
             list(report.abduction_candidates)
@@ -786,14 +967,7 @@ class CreativeCycleCoordinator:
             + list(report.counterfactual_candidates)
             + list(report.ontology_candidates)
         )
-        try:
-            baseline_facts = prover.kb.forward_chain(
-                max(int(getattr(prover, "max_depth", 1)), 1),
-                starting_facts=frozenset(current_facts),
-                only_verified=False,
-            )
-        except Exception:
-            baseline_facts = frozenset(current_facts)
+        baseline_facts = self._derived_facts(prover, current_facts)
         self.intrinsic_engine.resolve_supported_goals(tuple(baseline_facts))
         unresolved_targets = [
             target
@@ -847,14 +1021,7 @@ class CreativeCycleCoordinator:
         report.selected_rules = accepted_selected
         post_facts = baseline_facts
         if accepted_selected:
-            try:
-                post_facts = prover.kb.forward_chain(
-                    max(int(getattr(prover, "max_depth", 1)), 1),
-                    starting_facts=frozenset(current_facts),
-                    only_verified=False,
-                )
-            except Exception:
-                post_facts = frozenset(current_facts)
+            post_facts = self._derived_facts(prover, current_facts)
         supported_before = self._supported_targets(target_facts, baseline_facts)
         supported_after = self._supported_targets(target_facts, post_facts)
         gained_targets = self._dedupe_facts(
@@ -928,6 +1095,7 @@ class CreativeCycleCoordinator:
         )
         report.metrics = {
             "cycle_active": 1.0,
+            "train_fast_budgeted": 1.0 if fast_mode else 0.0,
             "abduction_candidates": float(len(report.abduction_candidates)),
             "analogy_candidates": float(len(report.analogy_candidates)),
             "metaphor_candidates": float(len(report.metaphor_candidates)),
@@ -1001,4 +1169,5 @@ class CreativeCycleCoordinator:
         }
         self.intrinsic_engine.update_state(z)
         self.last_report = report
+        self._clear_runtime_caches()
         return report

@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import torch
 
@@ -18,13 +19,14 @@ from omen_prolog import (
     HornClause,
     KnowledgeBase,
     SymbolicTaskContext,
+    TensorKnowledgeBase,
     Var,
     _atoms_conflict,
 )
 from omen_symbolic.aesthetic_engine import AestheticEvolutionEngine
 from omen_symbolic.analogy_engine import AnalogyMetaphorEngine
-from omen_symbolic.counterfactual_engine import CounterfactualWorldEngine
-from omen_symbolic.creative_types import CreativeCycleReport, IntrinsicGoal, RuleCandidate
+from omen_symbolic.counterfactual_engine import COMPLEMENT_OFFSET, CounterfactualWorldEngine
+from omen_symbolic.creative_types import CounterfactualResult, CreativeCycleReport, IntrinsicGoal, RuleCandidate
 from omen_symbolic.intrinsic_engine import IntrinsicCuriosityEngine
 from omen_symbolic.ontology_engine import OntologyExpansionEngine, RuleHypothesisSampler
 from omen_symbolic.rule_graph import build_predicate_graph_view
@@ -166,6 +168,127 @@ class CreativeSymbolicEnginesTest(unittest.TestCase):
         self.assertEqual(result.metadata.get("exact_search", 0.0), 1.0)
         self.assertGreaterEqual(result.metadata.get("evaluated_subsets", 0.0), 1.0)
 
+    def test_cwe_tensor_kb_matches_classic_kb(self) -> None:
+        def _populate(kb):
+            kb.add_fact(atom(20, Const(1), Const(2)))
+            kb.add_fact(atom(21, Const(2), Const(3)))
+            kb.add_rule(rule(atom(30, Var("X"), Var("Y")), atom(20, Var("X"), Var("Y"))))
+            kb.add_rule(rule(atom(31, Var("X"), Var("Y")), atom(21, Var("X"), Var("Y"))))
+            return kb
+
+        classic = _populate(KnowledgeBase(max_rules=16))
+        tensor = _populate(TensorKnowledgeBase(max_rules=16, max_facts=64, device=torch.device("cpu")))
+
+        def _joint_only_world_surprise(modified_rules, novel_facts, sandbox):
+            return 100.0 if len(modified_rules) == 2 else 0.0
+
+        classic_result = CounterfactualWorldEngine(
+            max_rule_mods=2,
+            max_candidates=4,
+            surprise_lambda=1.0,
+            max_transforms_per_rule=1,
+        ).explore(
+            classic,
+            list(classic.facts),
+            max_depth=2,
+            conflict_fn=lambda left, right: False,
+            world_surprise_fn=_joint_only_world_surprise,
+        )
+        tensor_result = CounterfactualWorldEngine(
+            max_rule_mods=2,
+            max_candidates=4,
+            surprise_lambda=1.0,
+            max_transforms_per_rule=1,
+        ).explore(
+            tensor,
+            list(tensor.facts),
+            max_depth=2,
+            conflict_fn=lambda left, right: False,
+            world_surprise_fn=_joint_only_world_surprise,
+        )
+
+        self.assertEqual([repr(rule) for rule in classic_result.modified_rules], [repr(rule) for rule in tensor_result.modified_rules])
+        self.assertEqual(
+            float(classic_result.metadata.get("evaluated_subsets", 0.0)),
+            float(tensor_result.metadata.get("evaluated_subsets", 0.0)),
+        )
+        self.assertAlmostEqual(float(classic_result.surprise), float(tensor_result.surprise), places=6)
+
+    def test_cwe_measure_surprise_matches_naive_complement_scan(self) -> None:
+        def _populate(kb):
+            x = Var("X")
+            base = frozenset(
+                {
+                    atom(1, Const(1)),
+                    atom(2, Const(2)),
+                    atom(3, Const(3)),
+                    atom(10, Const(1)),
+                    atom(COMPLEMENT_OFFSET + 30, Const(2)),
+                }
+            )
+            for fact in base:
+                kb.add_fact(fact)
+            kb.add_rule(rule(atom(COMPLEMENT_OFFSET + 10, x), atom(1, x)))
+            kb.add_rule(rule(atom(30, x), atom(2, x)))
+            kb.add_rule(rule(atom(COMPLEMENT_OFFSET + 40, x), atom(3, x)))
+            kb.add_rule(rule(atom(40, x), atom(3, x)))
+            return kb, base
+
+        def _naive_conflict(left, right):
+            left_pred = int(getattr(left, "pred", -1))
+            right_pred = int(getattr(right, "pred", -1))
+            left_args = tuple(getattr(left, "args", ()))
+            right_args = tuple(getattr(right, "args", ()))
+            if left_pred >= COMPLEMENT_OFFSET and right_pred == left_pred - COMPLEMENT_OFFSET:
+                return left_args == right_args
+            if right_pred >= COMPLEMENT_OFFSET and left_pred == right_pred - COMPLEMENT_OFFSET:
+                return left_args == right_args
+            return False
+
+        def _naive_measure(kb, baseline, starting_facts):
+            derived = kb.forward_chain(
+                2,
+                starting_facts=starting_facts,
+                only_verified=False,
+                track_epistemic=False,
+            )
+            novel = tuple(sorted(derived - baseline, key=hash))
+            contradictions = {}
+            derived_list = list(derived)
+            for idx, fact in enumerate(derived_list):
+                for known in derived_list[idx + 1 :]:
+                    if not _naive_conflict(fact, known):
+                        continue
+                    contradictions[tuple(sorted((hash(fact), hash(known))))] = (fact, known)
+                for known in baseline:
+                    if not _naive_conflict(fact, known):
+                        continue
+                    contradictions[tuple(sorted((hash(fact), hash(known))))] = (fact, known)
+            return novel, list(contradictions.values())
+
+        def _pair_keys(pairs):
+            return {tuple(sorted((repr(left), repr(right)))) for left, right in pairs}
+
+        kb_factories = [
+            lambda: KnowledgeBase(max_rules=16),
+            lambda: TensorKnowledgeBase(max_rules=16, max_facts=64, device=torch.device("cpu")),
+        ]
+        for make_kb in kb_factories:
+            kb, baseline = _populate(make_kb())
+            starting_facts = baseline
+            expected_novel, expected_contradictions = _naive_measure(kb, baseline, starting_facts)
+            novel_count, novel, contradictions = CounterfactualWorldEngine._measure_surprise(
+                kb,
+                baseline,
+                starting_facts,
+                2,
+                conflict_fn=lambda left, right: False,
+            )
+            self.assertEqual(float(novel_count), float(len(expected_novel)))
+            self.assertEqual({repr(fact) for fact in novel}, {repr(fact) for fact in expected_novel})
+            self.assertEqual(_pair_keys(contradictions), _pair_keys(expected_contradictions))
+            self.assertEqual(len(contradictions), 3)
+
     def test_oee_invents_predicate_candidates(self) -> None:
         engine = OntologyExpansionEngine(gap_threshold=0.2, contradiction_threshold=1)
         current_facts = [atom(50, Const(1), Const(2))]
@@ -300,6 +423,290 @@ class CreativeSymbolicEnginesTest(unittest.TestCase):
         self.assertTrue(any(hyp.bundle_size >= 3 for hyp in hypotheses))
         self.assertGreaterEqual(sampler._last_beam_best_size, 3)
         self.assertGreater(sampler._last_beam_states, 0)
+
+    def test_oee_depth2_consistency_fast_path_matches_direct_scoring(self) -> None:
+        kb = KnowledgeBase(max_rules=16)
+        kb.add_fact(atom(10, Const(1), Const(2)))
+        kb.add_fact(atom(11, Const(2), Const(3)))
+        sampler = RuleHypothesisSampler(max_hypotheses=16, forward_chain_depth=2)
+        starting_facts = frozenset([atom(10, Const(1), Const(2)), atom(11, Const(2), Const(3))])
+        baseline = kb.forward_chain(2, starting_facts=starting_facts, only_verified=False)
+        first_step = kb.forward_chain(1, starting_facts=starting_facts, only_verified=False)
+        target = atom(70, Const(2), Const(3))
+        rules = [
+            rule(atom(900010, Var("Y")), atom(10, Var("X"), Var("Y"))),
+            rule(atom(70, Var("X"), Var("Z")), atom(900010, Var("X")), atom(11, Var("X"), Var("Z"))),
+        ]
+
+        direct = sampler._consistency_score_direct(
+            kb,
+            rules,
+            baseline,
+            starting_facts,
+            target_facts=[target],
+        )
+        fast = sampler._consistency_score_depth2_decomposed(
+            kb,
+            rules,
+            baseline,
+            starting_facts,
+            first_step_facts=first_step,
+            target_facts=[target],
+        )
+
+        self.assertAlmostEqual(direct[0], fast[0], places=6)
+        self.assertAlmostEqual(direct[1], fast[1], places=6)
+        self.assertAlmostEqual(direct[2], fast[2], places=6)
+
+    def test_oee_depth2_consistency_fast_path_matches_direct_scoring_on_tensor_kb(self) -> None:
+        kb = TensorKnowledgeBase(max_rules=16, max_facts=64, device=torch.device("cpu"))
+        kb.add_fact(atom(10, Const(1), Const(2)))
+        kb.add_fact(atom(11, Const(2), Const(3)))
+        sampler = RuleHypothesisSampler(max_hypotheses=16, forward_chain_depth=2)
+        starting_facts = frozenset([atom(10, Const(1), Const(2)), atom(11, Const(2), Const(3))])
+        baseline = kb.forward_chain(2, starting_facts=starting_facts, only_verified=False)
+        first_step = kb.forward_chain(1, starting_facts=starting_facts, only_verified=False)
+        target = atom(70, Const(2), Const(3))
+        rules = [
+            rule(atom(900010, Var("Y")), atom(10, Var("X"), Var("Y"))),
+            rule(atom(70, Var("X"), Var("Z")), atom(900010, Var("X")), atom(11, Var("X"), Var("Z"))),
+        ]
+
+        direct = sampler._consistency_score_direct(
+            kb,
+            rules,
+            baseline,
+            starting_facts,
+            target_facts=[target],
+        )
+        fast = sampler._consistency_score_depth2_decomposed(
+            kb,
+            rules,
+            baseline,
+            starting_facts,
+            first_step_facts=first_step,
+            target_facts=[target],
+        )
+
+        self.assertAlmostEqual(direct[0], fast[0], places=6)
+        self.assertAlmostEqual(direct[1], fast[1], places=6)
+        self.assertAlmostEqual(direct[2], fast[2], places=6)
+
+    def test_oee_depth2_consistency_cached_singletons_match_direct_scoring(self) -> None:
+        kb = TensorKnowledgeBase(max_rules=16, max_facts=64, device=torch.device("cpu"))
+        kb.add_fact(atom(10, Const(1), Const(2)))
+        kb.add_fact(atom(11, Const(2), Const(3)))
+        sampler = RuleHypothesisSampler(max_hypotheses=16, forward_chain_depth=2)
+        starting_facts = frozenset([atom(10, Const(1), Const(2)), atom(11, Const(2), Const(3))])
+        baseline = kb.forward_chain(
+            2,
+            starting_facts=starting_facts,
+            only_verified=False,
+            track_epistemic=False,
+        )
+        first_step = kb.forward_chain(
+            1,
+            starting_facts=starting_facts,
+            only_verified=False,
+            track_epistemic=False,
+        )
+        rules = [
+            rule(atom(900011, Var("Y")), atom(10, Var("X"), Var("Y"))),
+            rule(atom(70, Var("X"), Var("Z")), atom(900011, Var("X")), atom(11, Var("X"), Var("Z"))),
+        ]
+        target = atom(70, Const(2), Const(3))
+
+        direct = sampler._consistency_score_direct(
+            kb,
+            rules,
+            baseline,
+            starting_facts,
+            target_facts=[target],
+        )
+
+        singleton_cache = {}
+        for single_rule in rules:
+            tiny = sampler._build_empty_sandbox(kb, max_rules=32)
+            tiny.add_rule(single_rule)
+            singleton_cache[hash(single_rule)] = frozenset(
+                tiny.forward_chain(
+                    1,
+                    starting_facts=starting_facts,
+                    only_verified=False,
+                    track_epistemic=False,
+                ) - starting_facts
+            )
+
+        sampler._consistency_fast_context = {
+            "kb_id": id(kb),
+            "starting_facts": starting_facts,
+            "baseline": baseline,
+            "first_step_facts": first_step,
+            "singleton_first_step_delta_by_rule": singleton_cache,
+        }
+        cached = sampler._consistency_score(
+            kb,
+            rules,
+            baseline,
+            starting_facts,
+            target_facts=[target],
+        )
+
+        self.assertAlmostEqual(direct[0], cached[0], places=6)
+        self.assertAlmostEqual(direct[1], cached[1], places=6)
+        self.assertAlmostEqual(direct[2], cached[2], places=6)
+
+    def test_oee_depth2_zero_delta_fast_path_matches_direct_scoring(self) -> None:
+        kb = TensorKnowledgeBase(max_rules=16, max_facts=64, device=torch.device("cpu"))
+        kb.add_fact(atom(10, Const(1), Const(2)))
+        kb.add_rule(rule(atom(11, Var("X"), Var("Y")), atom(10, Var("X"), Var("Y"))))
+        sampler = RuleHypothesisSampler(max_hypotheses=16, forward_chain_depth=2)
+        starting_facts = frozenset([atom(10, Const(1), Const(2))])
+        baseline = kb.forward_chain(
+            2,
+            starting_facts=starting_facts,
+            only_verified=False,
+            track_epistemic=False,
+        )
+        first_step = kb.forward_chain(
+            1,
+            starting_facts=starting_facts,
+            only_verified=False,
+            track_epistemic=False,
+        )
+        new_rule = rule(atom(70, Var("X"), Var("Y")), atom(11, Var("X"), Var("Y")))
+        target = atom(70, Const(1), Const(2))
+
+        direct = sampler._consistency_score_direct(
+            kb,
+            [new_rule],
+            baseline,
+            starting_facts,
+            target_facts=[target],
+        )
+
+        sampler._consistency_fast_context = {
+            "kb_id": id(kb),
+            "starting_facts": starting_facts,
+            "baseline": baseline,
+            "first_step_facts": first_step,
+            "singleton_first_step_delta_by_rule": {
+                hash(new_rule): frozenset(),
+            },
+        }
+        fast = sampler._consistency_score(
+            kb,
+            [new_rule],
+            baseline,
+            starting_facts,
+            target_facts=[target],
+        )
+
+        self.assertAlmostEqual(direct[0], fast[0], places=6)
+        self.assertAlmostEqual(direct[1], fast[1], places=6)
+        self.assertAlmostEqual(direct[2], fast[2], places=6)
+
+    def test_forward_chain_track_epistemic_false_preserves_rule_state(self) -> None:
+        factories = (
+            lambda: KnowledgeBase(max_rules=8),
+            lambda: TensorKnowledgeBase(max_rules=8, max_facts=32, device=torch.device("cpu")),
+        )
+
+        for build_kb in factories:
+            tracked_kb = build_kb()
+            untracked_kb = build_kb()
+            for kb in (tracked_kb, untracked_kb):
+                kb.add_fact(atom(10, Const(1), Const(2)))
+            tracked_bridge = rule(atom(11, Var("X"), Var("Y")), atom(10, Var("X"), Var("Y")))
+            untracked_bridge = rule(atom(11, Var("X"), Var("Y")), atom(10, Var("X"), Var("Y")))
+            tracked_kb.add_rule(tracked_bridge, status=EpistemicStatus.proposed)
+            untracked_kb.add_rule(untracked_bridge, status=EpistemicStatus.proposed)
+            before_rule = (int(untracked_bridge.use_count), float(untracked_bridge.weight))
+            before_record = untracked_kb._records[hash(untracked_bridge)]
+            before_state = (
+                before_record.status,
+                int(before_record.use_count),
+                int(before_record.success_count),
+                int(before_record.age_steps),
+                float(before_record.weight),
+            )
+
+            tracked = tracked_kb.forward_chain(
+                1,
+                starting_facts=frozenset(tracked_kb.facts),
+                only_verified=False,
+            )
+            untracked = untracked_kb.forward_chain(
+                1,
+                starting_facts=frozenset(untracked_kb.facts),
+                only_verified=False,
+                track_epistemic=False,
+            )
+
+            self.assertEqual(tracked, untracked)
+            after_record = untracked_kb._records[hash(untracked_bridge)]
+            after_state = (
+                after_record.status,
+                int(after_record.use_count),
+                int(after_record.success_count),
+                int(after_record.age_steps),
+                float(after_record.weight),
+            )
+            self.assertEqual(
+                before_rule,
+                (int(untracked_bridge.use_count), float(untracked_bridge.weight)),
+            )
+            self.assertEqual(before_state, after_state)
+
+    def test_oee_sampling_does_not_mutate_live_kb_rule_state(self) -> None:
+        factories = (
+            lambda: KnowledgeBase(max_rules=16),
+            lambda: TensorKnowledgeBase(max_rules=16, max_facts=64, device=torch.device("cpu")),
+        )
+
+        for build_kb in factories:
+            kb = build_kb()
+            facts = [
+                atom(10, Const(1), Const(2)),
+                atom(11, Const(2), Const(3)),
+            ]
+            for fact in facts:
+                kb.add_fact(fact)
+            bridge = rule(atom(12, Var("X"), Var("Y")), atom(10, Var("X"), Var("Y")))
+            kb.add_rule(bridge, status=EpistemicStatus.proposed)
+            before_rule = (int(bridge.use_count), float(bridge.weight))
+            before_record = kb._records[hash(bridge)]
+            before_state = (
+                before_record.status,
+                int(before_record.use_count),
+                int(before_record.success_count),
+                int(before_record.age_steps),
+                float(before_record.weight),
+            )
+
+            sampler = RuleHypothesisSampler(max_hypotheses=16, forward_chain_depth=2)
+            hypotheses = sampler.sample(
+                pred_id=900011,
+                arity=2,
+                interaction_preds=[10, 11],
+                interaction_scores=[0.9, 0.8],
+                current_facts=facts,
+                kb=kb,
+                goal=atom(70, Var("A"), Var("B")),
+                target_facts=[atom(71, Var("A"), Var("B"))],
+            )
+
+            self.assertTrue(hypotheses)
+            after_record = kb._records[hash(bridge)]
+            after_state = (
+                after_record.status,
+                int(after_record.use_count),
+                int(after_record.success_count),
+                int(after_record.age_steps),
+                float(after_record.weight),
+            )
+            self.assertEqual(before_rule, (int(bridge.use_count), float(bridge.weight)))
+            self.assertEqual(before_state, after_state)
 
     def test_ice_formulates_goal(self) -> None:
         x, y, z = Var("X"), Var("Y"), Var("Z")
@@ -646,6 +1053,188 @@ class CreativeSymbolicEnginesTest(unittest.TestCase):
         self.assertIn("creative_compression_gain", prover.last_forward_info)
         self.assertIn("background_intrinsic_goals", prover.last_forward_info)
         self.assertGreaterEqual(prover.last_forward_info["background_intrinsic_goals"], 1.0)
+
+    def test_creative_cycle_fast_mode_applies_symbolic_budgets(self) -> None:
+        device = torch.device("cpu")
+        prover = DifferentiableProver(
+            d_latent=8,
+            sym_vocab=32,
+            max_rules=32,
+            max_depth=2,
+            n_cands=2,
+        ).to(device)
+        prover.eval()
+        prover.configure_creative_cycle(
+            enabled=True,
+            cycle_every=1,
+            analogy_contrastive_steps=0,
+            aee_generations=1,
+            aee_population=4,
+            train_fast_cwe_max_rule_mods=1,
+            train_fast_cwe_max_candidates=2,
+            train_fast_cwe_max_transforms_per_rule=1,
+            train_fast_oee_max_candidates=2,
+            train_fast_oee_max_targets=2,
+            train_fast_oee_max_paradox_facts=2,
+            train_fast_oee_max_hypotheses=3,
+            train_fast_oee_max_scored_hypotheses=7,
+            train_fast_oee_max_open_body_literals=1,
+            train_fast_oee_max_open_patterns=2,
+            train_fast_oee_max_open_head_patterns=2,
+            train_fast_oee_bundle_beam_width=2,
+            train_fast_oee_max_bundle_rules=2,
+            train_fast_oee_bundle_seed_k=4,
+        )
+        coordinator = prover.creative_cycle
+        original_cwe = (
+            coordinator.counterfactual_engine.max_rule_mods,
+            coordinator.counterfactual_engine.max_candidates,
+            coordinator.counterfactual_engine.max_transforms_per_rule,
+        )
+        original_oee = (
+            coordinator.ontology_engine._sampler.max_hypotheses,
+            coordinator.ontology_engine._sampler.max_scored_hypotheses,
+            coordinator.ontology_engine._sampler.max_open_body_literals,
+            coordinator.ontology_engine._sampler.max_open_patterns,
+            coordinator.ontology_engine._sampler.max_open_head_patterns,
+            coordinator.ontology_engine._sampler.bundle_beam_width,
+            coordinator.ontology_engine._sampler.max_bundle_rules,
+            coordinator.ontology_engine._sampler.bundle_seed_k,
+        )
+
+        x, y = Var("X"), Var("Y")
+        prover.kb.add_rule(rule(atom(10, x), atom(20, x, y)), status=EpistemicStatus.verified)
+        current_facts = [atom(20, Const(1), Const(2))]
+        target_facts = [
+            atom(30, Const(1)),
+            atom(31, Const(2)),
+            atom(32, Const(3)),
+        ]
+        z = torch.randn(1, 8, device=device)
+        captured: dict[str, object] = {}
+        paradox_novel = tuple(atom(700 + idx, Const(idx)) for idx in range(3))
+        contradictions = tuple(
+            (atom(800 + idx, Const(idx)), atom(COMPLEMENT_OFFSET + 800 + idx, Const(idx)))
+            for idx in range(3)
+        )
+
+        def _fake_explore(*args, **kwargs):
+            del args, kwargs
+            captured["cwe"] = (
+                coordinator.counterfactual_engine.max_rule_mods,
+                coordinator.counterfactual_engine.max_candidates,
+                coordinator.counterfactual_engine.max_transforms_per_rule,
+            )
+            return CounterfactualResult(
+                candidates=tuple(),
+                novel_facts=paradox_novel,
+                contradictions=contradictions,
+                modified_rules=tuple(),
+                surprise=1.0,
+                metadata={},
+            )
+
+        def _fake_generate_candidates(*args, **kwargs):
+            del args
+            captured["oee"] = {
+                "max_candidates": kwargs["max_candidates"],
+                "target_facts": tuple(kwargs.get("target_facts") or ()),
+                "paradox_facts": tuple(kwargs.get("paradox_facts") or ()),
+                "max_hypotheses": coordinator.ontology_engine._sampler.max_hypotheses,
+                "max_scored_hypotheses": coordinator.ontology_engine._sampler.max_scored_hypotheses,
+                "max_open_body_literals": coordinator.ontology_engine._sampler.max_open_body_literals,
+                "max_open_patterns": coordinator.ontology_engine._sampler.max_open_patterns,
+                "max_open_head_patterns": coordinator.ontology_engine._sampler.max_open_head_patterns,
+                "bundle_beam_width": coordinator.ontology_engine._sampler.bundle_beam_width,
+                "max_bundle_rules": coordinator.ontology_engine._sampler.max_bundle_rules,
+                "bundle_seed_k": coordinator.ontology_engine._sampler.bundle_seed_k,
+            }
+            return []
+
+        with mock.patch.object(coordinator.counterfactual_engine, "explore", side_effect=_fake_explore), \
+             mock.patch.object(coordinator.ontology_engine, "generate_candidates", side_effect=_fake_generate_candidates), \
+             mock.patch.object(coordinator, "_evolve_for_situations", return_value=[]), \
+             mock.patch.object(
+                 coordinator.intrinsic_engine,
+                 "formulate_goal",
+                 return_value=IntrinsicGoal(
+                     goal=atom(999, Const(1)),
+                     value=0.1,
+                     kind="explore_structure",
+                     provenance="test",
+                 ),
+             ):
+            report = coordinator.run(
+                prover,
+                z,
+                current_facts,
+                target_facts,
+                device,
+                fast_mode=True,
+            )
+
+        self.assertEqual(captured["cwe"], (1, 2, 1))
+        self.assertEqual(captured["oee"]["max_candidates"], 2)
+        self.assertLessEqual(len(captured["oee"]["target_facts"]), 2)
+        self.assertLessEqual(len(captured["oee"]["paradox_facts"]), 2)
+        self.assertEqual(captured["oee"]["max_hypotheses"], 3)
+        self.assertEqual(captured["oee"]["max_scored_hypotheses"], 7)
+        self.assertEqual(captured["oee"]["max_open_body_literals"], 1)
+        self.assertEqual(captured["oee"]["max_open_patterns"], 2)
+        self.assertEqual(captured["oee"]["max_open_head_patterns"], 2)
+        self.assertEqual(captured["oee"]["bundle_beam_width"], 2)
+        self.assertEqual(captured["oee"]["max_bundle_rules"], 2)
+        self.assertEqual(captured["oee"]["bundle_seed_k"], 4)
+        self.assertEqual(
+            (
+                coordinator.counterfactual_engine.max_rule_mods,
+                coordinator.counterfactual_engine.max_candidates,
+                coordinator.counterfactual_engine.max_transforms_per_rule,
+            ),
+            original_cwe,
+        )
+        self.assertEqual(
+            (
+                coordinator.ontology_engine._sampler.max_hypotheses,
+                coordinator.ontology_engine._sampler.max_scored_hypotheses,
+                coordinator.ontology_engine._sampler.max_open_body_literals,
+                coordinator.ontology_engine._sampler.max_open_patterns,
+                coordinator.ontology_engine._sampler.max_open_head_patterns,
+                coordinator.ontology_engine._sampler.bundle_beam_width,
+                coordinator.ontology_engine._sampler.max_bundle_rules,
+                coordinator.ontology_engine._sampler.bundle_seed_k,
+            ),
+            original_oee,
+        )
+        self.assertEqual(report.metrics["train_fast_budgeted"], 1.0)
+
+    def test_creative_cycle_task_gap_reuses_runtime_forward_chain_results(self) -> None:
+        prover = DifferentiableProver(
+            d_latent=8,
+            sym_vocab=32,
+            max_rules=16,
+            max_depth=2,
+            n_cands=2,
+        )
+        prover.eval()
+        coordinator = prover.creative_cycle
+        target = atom(30, Const(1))
+        current_facts = [atom(20, Const(1))]
+
+        coordinator._runtime_derived_facts_cache = {}
+        coordinator._runtime_task_gap_cache = {}
+        with mock.patch.object(
+            prover.kb,
+            "forward_chain",
+            wraps=prover.kb.forward_chain,
+        ) as forward_chain:
+            gap_first = coordinator._task_gap(prover, current_facts, [target])
+            gap_second = coordinator._task_gap(prover, current_facts, [target])
+
+        self.assertEqual(gap_first, gap_second)
+        self.assertEqual(forward_chain.call_count, 1)
+
+        coordinator._clear_runtime_caches()
 
     def test_goal_less_context_can_be_enriched_by_intrinsic_goal(self) -> None:
         prover = DifferentiableProver(

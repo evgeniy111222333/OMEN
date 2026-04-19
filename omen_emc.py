@@ -751,6 +751,7 @@ class EfficientMetaController(nn.Module):
                     gap_feedback: Optional[
                         Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, Dict[str, float]]]
                     ] = None,
+                    fast_mode: bool = False,
                     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
                                torch.Tensor, 'TrajectoryStats']:
         """
@@ -799,6 +800,17 @@ class EfficientMetaController(nn.Module):
         # В EMC-режимі prover.forward() НЕ викликається, тому _last_z був би stale/None.
         # WorldRNN latent-space компонента Дедукції та Абдукції потребує актуального z.
         prover._last_z = z.detach()
+        maintenance_every = max(
+            int(getattr(self.cfg, "emc_train_fast_maintenance_every", 1)),
+            1,
+        )
+        maintenance_due = (
+            not self.training
+            or not fast_mode
+            or maintenance_every <= 1
+            or prover._step <= 1
+            or ((prover._step - 1) % maintenance_every == 0)
+        )
 
         # ── 1. Perception: z → fact → KB ──────────────────────────────────────
         prover.materialize_task_context_facts()
@@ -1142,14 +1154,52 @@ class EfficientMetaController(nn.Module):
             if getattr(prover, "task_context", None) is not None else frozenset()
         )
         effective_targets = target_facts or frozenset({goal})
-        cycle_stats: Dict[str, float] = {}
+        cycle_stats: Dict[str, float] = {
+            "active": 0.0,
+            "executed": 0.0,
+            "cadenced_skip": 0.0,
+        }
         cycle_recent_rules = []
-        if self.training and getattr(prover, "continuous_cycle_enabled", False):
+        cycle_enabled = self.training and getattr(prover, "continuous_cycle_enabled", False)
+        cycle_kwargs: Dict[str, int] = {}
+        if fast_mode:
+            cycle_kwargs = {
+                "max_trace_candidates": int(
+                    getattr(
+                        self.cfg,
+                        "emc_train_fast_cycle_trace_candidates",
+                        getattr(prover, "continuous_cycle_max_trace_candidates", 0),
+                    )
+                ),
+                "max_contextual": int(
+                    getattr(
+                        self.cfg,
+                        "emc_train_fast_cycle_contextual",
+                        getattr(prover, "continuous_cycle_max_contextual", 0),
+                    )
+                ),
+                "max_neural": int(
+                    getattr(
+                        self.cfg,
+                        "emc_train_fast_cycle_neural",
+                        getattr(prover, "continuous_cycle_max_neural", 0),
+                    )
+                ),
+                "max_repairs": int(
+                    getattr(
+                        self.cfg,
+                        "emc_train_fast_cycle_max_repairs",
+                        getattr(prover, "continuous_cycle_max_repairs", 0),
+                    )
+                ),
+            }
+        if cycle_enabled and maintenance_due:
             cycle = prover.continuous_hypothesis_cycle(
                 z_cur,
                 working_facts,
                 effective_targets,
                 device,
+                **cycle_kwargs,
             )
             abductor_aux = abductor_aux + cycle["loss_tensor"]
             abduced_rules += float(cycle.get("added_rules", 0))
@@ -1157,9 +1207,14 @@ class EfficientMetaController(nn.Module):
                 induction_stats,
                 cycle.get("induction_stats", {}),
             )
-            cycle_stats = cycle.get("stats", {})
+            cycle_stats.update(cycle.get("stats", {}))
+            cycle_stats["active"] = 1.0
+            cycle_stats["executed"] = 1.0
             cycle_recent_rules = list(cycle.get("accepted_rules", []))
             r_int_cumulative += float(cycle.get("mean_utility", 0.0))
+        elif cycle_enabled:
+            cycle_stats["active"] = 1.0
+            cycle_stats["cadenced_skip"] = 1.0
         target_hits = len(all_facts & target_facts)
         target_total = len(target_facts)
         target_coverage = (
@@ -1172,12 +1227,17 @@ class EfficientMetaController(nn.Module):
             getattr(prover, "task_context", None) is not None
             and prover.task_context.trigger_abduction
         )
-        should_abduce = (
+        reactive_abduction_pending = (
             self.training
             and (
                 trigger_abduction
                 or mismatch_error > 0.0
             )
+        )
+        should_abduce = reactive_abduction_pending and (maintenance_due or trigger_abduction)
+        reactive_abduction_executed = 0.0
+        reactive_abduction_cadenced_skip = (
+            1.0 if reactive_abduction_pending and not should_abduce else 0.0
         )
         if should_abduce:
             n_added_abd, reactive_vem_hinge, reactive_abductor_aux, mean_utility = prover.abduce_and_learn(
@@ -1185,6 +1245,7 @@ class EfficientMetaController(nn.Module):
                 max(float(err_val), float(mismatch_error)),
                 force=trigger_abduction or mismatch_error > 0.0,
             )
+            reactive_abduction_executed = 1.0
             vem_hinge = vem_hinge + reactive_vem_hinge
             abductor_aux = abductor_aux + reactive_abductor_aux
             abduced_rules += float(n_added_abd)
@@ -1203,6 +1264,7 @@ class EfficientMetaController(nn.Module):
             working_facts,
             effective_targets,
             device,
+            fast_mode=fast_mode,
         )
         r_int_cumulative += float(creative_report.metrics.get("selected_mean_utility", 0.0))
         target_ground = effective_targets
@@ -1319,6 +1381,10 @@ class EfficientMetaController(nn.Module):
             "unresolved_targets": float(max(target_total - target_hits, 0)),
             "abduced_rules": abduced_rules,
             "abduction_utility": r_int_cumulative,
+            "emc_symbolic_maintenance_due": 1.0 if maintenance_due else 0.0,
+            "emc_symbolic_maintenance_interval": float(maintenance_every),
+            "emc_reactive_abduction_executed": reactive_abduction_executed,
+            "emc_reactive_abduction_cadenced_skip": reactive_abduction_cadenced_skip,
             "induction_checked": induction_stats["checked"],
               "induction_verified": induction_stats["verified"],
               "induction_contradicted": induction_stats["contradicted"],
@@ -1326,6 +1392,10 @@ class EfficientMetaController(nn.Module):
               "induction_repaired": induction_stats.get("repaired", 0.0),
               "induction_matches": induction_stats["matched_predictions"],
               "induction_score": induction_stats["mean_score"],
+              "cycle_active": float(cycle_stats.get("active", 0.0)),
+              "cycle_executed": float(cycle_stats.get("executed", 0.0)),
+              "cycle_cadenced_skip": float(cycle_stats.get("cadenced_skip", 0.0)),
+              "cycle_candidate_budget": float(cycle_stats.get("candidate_budget", 0.0)),
               "cycle_checked": float(cycle_stats.get("checked", 0.0)),
               "cycle_accepted": float(cycle_stats.get("accepted", 0.0)),
               "cycle_added": float(cycle_stats.get("added", 0.0)),

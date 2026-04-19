@@ -130,6 +130,20 @@ class OMENScaleConfig:
     oee_forward_chain_depth: int = 2
     oee_max_interaction_preds: int = 3
     oee_max_hypotheses: int = 8
+    creative_train_fast_cwe_max_rule_mods: int = 1
+    creative_train_fast_cwe_max_candidates: int = 2
+    creative_train_fast_cwe_max_transforms_per_rule: int = 1
+    creative_train_fast_oee_max_candidates: int = 2
+    creative_train_fast_oee_max_targets: int = 2
+    creative_train_fast_oee_max_paradox_facts: int = 2
+    creative_train_fast_oee_max_hypotheses: int = 4
+    creative_train_fast_oee_max_scored_hypotheses: int = 32
+    creative_train_fast_oee_max_open_body_literals: int = 1
+    creative_train_fast_oee_max_open_patterns: int = 2
+    creative_train_fast_oee_max_open_head_patterns: int = 2
+    creative_train_fast_oee_bundle_beam_width: int = 2
+    creative_train_fast_oee_max_bundle_rules: int = 2
+    creative_train_fast_oee_bundle_seed_k: int = 4
     ice_state_history: int = 128
     ice_goal_threshold: float = 0.35
     ce_reinforce_enabled: bool = True
@@ -290,6 +304,11 @@ class OMENScaleConfig:
     #   При λ→0: чистий TD(0); при λ→1: Monte-Carlo. Компроміс bias/variance.
     emc_use_gae:       bool  = True    # True → GAE замість Монте-Карло returns
     emc_gae_lambda:    float = 0.95    # λ у GAE (0=TD, 1=MC)
+    emc_train_fast_maintenance_every: int = 4  # cadence for heavy symbolic maintenance in train_fast
+    emc_train_fast_cycle_trace_candidates: int = 2
+    emc_train_fast_cycle_contextual: int = 2
+    emc_train_fast_cycle_neural: int = 2
+    emc_train_fast_cycle_max_repairs: int = 1
 
     # MDL(proof) компонент:
     #   U_stop(s) -= λ_mdl · MDL(proof)

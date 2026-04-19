@@ -104,6 +104,7 @@ class _MockProver:
             provenance="latent",
             trigger_abduction=False,
         )
+        self.last_creative_fast_mode = False
 
     def materialize_task_context_facts(self) -> None:
         return None
@@ -123,8 +124,17 @@ class _MockProver:
         del max_depth, starting_facts, only_verified, device
         return frozenset()
 
-    def run_creative_cycle(self, z_cur: torch.Tensor, working_facts, targets, device: torch.device):
+    def run_creative_cycle(
+        self,
+        z_cur: torch.Tensor,
+        working_facts,
+        targets,
+        device: torch.device,
+        *,
+        fast_mode: bool = False,
+    ):
         del z_cur, working_facts, targets, device
+        self.last_creative_fast_mode = bool(fast_mode)
         return SimpleNamespace(metrics={})
 
     def _goal_supported(self, goal, all_facts) -> bool:
@@ -399,6 +409,170 @@ class EMCGapProtocolTest(unittest.TestCase):
         self.assertEqual(traj.recall_effective_steps, 1.0)
         self.assertGreater(float(prover.last_forward_info.get("emc_recall_gap_delta", 0.0)), 0.0)
         self.assertEqual(float(prover.last_forward_info.get("emc_recall_effective_ratio", 0.0)), 1.0)
+
+    def test_train_fast_cadences_background_symbolic_maintenance(self) -> None:
+        cfg = _emc_gap_config()
+        cfg.emc_train_fast_maintenance_every = 4
+        model = OMENScale(cfg)
+        model.emc.train()
+        prover = _MockProver(cfg.d_latent)
+        prover.continuous_cycle_enabled = True
+        prover._step = 1
+        z = torch.ones(1, cfg.d_latent, dtype=torch.float32)
+        memory = _MockMemory(torch.zeros_like(z))
+        cycle_result = {
+            "loss_tensor": torch.tensor(0.0),
+            "added_rules": 0,
+            "induction_stats": {},
+            "stats": {},
+            "accepted_rules": [],
+            "mean_utility": 0.0,
+        }
+        abduction_result = (
+            0,
+            torch.tensor(0.0),
+            torch.tensor(0.0),
+            0.0,
+        )
+
+        with mock.patch.object(model.emc.actor, "forward", side_effect=_scripted_actor([ACTION_STOP])), \
+             mock.patch.object(model.emc.critic, "forward", return_value=torch.zeros(1, dtype=torch.float32)), \
+             mock.patch.object(model.emc.stopping_utility, "forward", return_value=torch.zeros(1, dtype=torch.float32)), \
+             mock.patch.object(model.emc.stopping_utility, "bellman_should_stop", return_value=False), \
+             mock.patch.object(model.emc.voc, "should_continue", return_value=True), \
+             mock.patch.object(prover, "continuous_hypothesis_cycle", return_value=cycle_result, create=True) as cycle_mock, \
+             mock.patch.object(prover, "abduce_and_learn", return_value=abduction_result, create=True) as abduce_mock:
+            model.emc.run_episode(
+                z,
+                torch.tensor([1.0], dtype=torch.float32),
+                None,
+                prover,
+                memory,
+                torch.tensor(0.0, dtype=torch.float32),
+                device=z.device,
+                fast_mode=True,
+            )
+
+        cycle_mock.assert_not_called()
+        abduce_mock.assert_not_called()
+        self.assertEqual(float(prover.last_forward_info.get("emc_symbolic_maintenance_due", 1.0)), 0.0)
+        self.assertEqual(float(prover.last_forward_info.get("cycle_cadenced_skip", 0.0)), 1.0)
+        self.assertEqual(float(prover.last_forward_info.get("emc_reactive_abduction_cadenced_skip", 0.0)), 1.0)
+        self.assertTrue(prover.last_creative_fast_mode)
+
+    def test_train_fast_allows_triggered_abduction_even_when_cadenced(self) -> None:
+        cfg = _emc_gap_config()
+        cfg.emc_train_fast_maintenance_every = 4
+        model = OMENScale(cfg)
+        model.emc.train()
+        prover = _MockProver(cfg.d_latent)
+        prover.continuous_cycle_enabled = True
+        prover._step = 1
+        prover.task_context = SimpleNamespace(
+            target_facts=frozenset(),
+            provenance="latent",
+            trigger_abduction=True,
+        )
+        z = torch.ones(1, cfg.d_latent, dtype=torch.float32)
+        memory = _MockMemory(torch.zeros_like(z))
+        cycle_result = {
+            "loss_tensor": torch.tensor(0.0),
+            "added_rules": 0,
+            "induction_stats": {},
+            "stats": {},
+            "accepted_rules": [],
+            "mean_utility": 0.0,
+        }
+        abduction_result = (
+            0,
+            torch.tensor(0.0),
+            torch.tensor(0.0),
+            0.0,
+        )
+
+        with mock.patch.object(model.emc.actor, "forward", side_effect=_scripted_actor([ACTION_STOP])), \
+             mock.patch.object(model.emc.critic, "forward", return_value=torch.zeros(1, dtype=torch.float32)), \
+             mock.patch.object(model.emc.stopping_utility, "forward", return_value=torch.zeros(1, dtype=torch.float32)), \
+             mock.patch.object(model.emc.stopping_utility, "bellman_should_stop", return_value=False), \
+             mock.patch.object(model.emc.voc, "should_continue", return_value=True), \
+             mock.patch.object(prover, "continuous_hypothesis_cycle", return_value=cycle_result, create=True) as cycle_mock, \
+             mock.patch.object(prover, "abduce_and_learn", return_value=abduction_result, create=True) as abduce_mock:
+            model.emc.run_episode(
+                z,
+                torch.tensor([1.0], dtype=torch.float32),
+                None,
+                prover,
+                memory,
+                torch.tensor(0.0, dtype=torch.float32),
+                device=z.device,
+                fast_mode=True,
+            )
+
+        cycle_mock.assert_not_called()
+        abduce_mock.assert_called_once()
+        self.assertEqual(float(prover.last_forward_info.get("emc_symbolic_maintenance_due", 1.0)), 0.0)
+        self.assertEqual(float(prover.last_forward_info.get("emc_reactive_abduction_executed", 0.0)), 1.0)
+        self.assertEqual(float(prover.last_forward_info.get("emc_reactive_abduction_cadenced_skip", 1.0)), 0.0)
+        self.assertTrue(prover.last_creative_fast_mode)
+
+    def test_train_fast_runs_symbolic_maintenance_on_due_step(self) -> None:
+        cfg = _emc_gap_config()
+        cfg.emc_train_fast_maintenance_every = 4
+        cfg.emc_train_fast_cycle_trace_candidates = 1
+        cfg.emc_train_fast_cycle_contextual = 2
+        cfg.emc_train_fast_cycle_neural = 3
+        cfg.emc_train_fast_cycle_max_repairs = 1
+        model = OMENScale(cfg)
+        model.emc.train()
+        prover = _MockProver(cfg.d_latent)
+        prover.continuous_cycle_enabled = True
+        prover._step = 0
+        z = torch.ones(1, cfg.d_latent, dtype=torch.float32)
+        memory = _MockMemory(torch.zeros_like(z))
+        cycle_result = {
+            "loss_tensor": torch.tensor(0.0),
+            "added_rules": 0,
+            "induction_stats": {},
+            "stats": {},
+            "accepted_rules": [],
+            "mean_utility": 0.0,
+        }
+        abduction_result = (
+            0,
+            torch.tensor(0.0),
+            torch.tensor(0.0),
+            0.0,
+        )
+
+        with mock.patch.object(model.emc.actor, "forward", side_effect=_scripted_actor([ACTION_STOP])), \
+             mock.patch.object(model.emc.critic, "forward", return_value=torch.zeros(1, dtype=torch.float32)), \
+             mock.patch.object(model.emc.stopping_utility, "forward", return_value=torch.zeros(1, dtype=torch.float32)), \
+             mock.patch.object(model.emc.stopping_utility, "bellman_should_stop", return_value=False), \
+             mock.patch.object(model.emc.voc, "should_continue", return_value=True), \
+             mock.patch.object(prover, "continuous_hypothesis_cycle", return_value=cycle_result, create=True) as cycle_mock, \
+             mock.patch.object(prover, "abduce_and_learn", return_value=abduction_result, create=True) as abduce_mock:
+            model.emc.run_episode(
+                z,
+                torch.tensor([1.0], dtype=torch.float32),
+                None,
+                prover,
+                memory,
+                torch.tensor(0.0, dtype=torch.float32),
+                device=z.device,
+                fast_mode=True,
+            )
+
+        cycle_mock.assert_called_once()
+        abduce_mock.assert_called_once()
+        cycle_kwargs = cycle_mock.call_args.kwargs
+        self.assertEqual(cycle_kwargs.get("max_trace_candidates"), 1)
+        self.assertEqual(cycle_kwargs.get("max_contextual"), 2)
+        self.assertEqual(cycle_kwargs.get("max_neural"), 3)
+        self.assertEqual(cycle_kwargs.get("max_repairs"), 1)
+        self.assertEqual(float(prover.last_forward_info.get("emc_symbolic_maintenance_due", 0.0)), 1.0)
+        self.assertEqual(float(prover.last_forward_info.get("cycle_executed", 0.0)), 1.0)
+        self.assertEqual(float(prover.last_forward_info.get("emc_reactive_abduction_executed", 0.0)), 1.0)
+        self.assertTrue(prover.last_creative_fast_mode)
 
     def test_eval_episode_uses_gap_feedback_for_recall(self) -> None:
         cfg = _emc_gap_config()

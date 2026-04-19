@@ -1874,6 +1874,56 @@ class OMENScale(nn.Module):
             oee_forward_chain_depth=getattr(cfg, "oee_forward_chain_depth", 2),
             oee_max_interaction_preds=getattr(cfg, "oee_max_interaction_preds", 3),
             oee_max_hypotheses=getattr(cfg, "oee_max_hypotheses", 8),
+            train_fast_cwe_max_rule_mods=getattr(cfg, "creative_train_fast_cwe_max_rule_mods", 1),
+            train_fast_cwe_max_candidates=getattr(cfg, "creative_train_fast_cwe_max_candidates", 2),
+            train_fast_cwe_max_transforms_per_rule=getattr(
+                cfg,
+                "creative_train_fast_cwe_max_transforms_per_rule",
+                1,
+            ),
+            train_fast_oee_max_candidates=getattr(cfg, "creative_train_fast_oee_max_candidates", 2),
+            train_fast_oee_max_targets=getattr(cfg, "creative_train_fast_oee_max_targets", 2),
+            train_fast_oee_max_paradox_facts=getattr(
+                cfg,
+                "creative_train_fast_oee_max_paradox_facts",
+                2,
+            ),
+            train_fast_oee_max_hypotheses=getattr(cfg, "creative_train_fast_oee_max_hypotheses", 4),
+            train_fast_oee_max_scored_hypotheses=getattr(
+                cfg,
+                "creative_train_fast_oee_max_scored_hypotheses",
+                32,
+            ),
+            train_fast_oee_max_open_body_literals=getattr(
+                cfg,
+                "creative_train_fast_oee_max_open_body_literals",
+                1,
+            ),
+            train_fast_oee_max_open_patterns=getattr(
+                cfg,
+                "creative_train_fast_oee_max_open_patterns",
+                2,
+            ),
+            train_fast_oee_max_open_head_patterns=getattr(
+                cfg,
+                "creative_train_fast_oee_max_open_head_patterns",
+                2,
+            ),
+            train_fast_oee_bundle_beam_width=getattr(
+                cfg,
+                "creative_train_fast_oee_bundle_beam_width",
+                2,
+            ),
+            train_fast_oee_max_bundle_rules=getattr(
+                cfg,
+                "creative_train_fast_oee_max_bundle_rules",
+                2,
+            ),
+            train_fast_oee_bundle_seed_k=getattr(
+                cfg,
+                "creative_train_fast_oee_bundle_seed_k",
+                4,
+            ),
             ice_state_history=getattr(cfg, "ice_state_history", 128),
             ice_goal_threshold=getattr(cfg, "ice_goal_threshold", 0.35),
         )
@@ -4733,6 +4783,7 @@ class OMENScale(nn.Module):
                 world_err, device=z_enr.device,
                 gap_features=gap_stats,
                 gap_feedback=self._make_emc_gap_feedback(z_sim),
+                fast_mode=fast_metrics,
             )
             # Якщо EMC виконав RecallMCore → використовуємо збагачений v_mem
             if v_mem_emc.norm() > 1e-6:

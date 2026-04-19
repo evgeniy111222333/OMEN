@@ -148,6 +148,26 @@ class BenchmarkProtocolTest(unittest.TestCase):
         self.assertEqual(report["time_budget_sec"], 0.01)
         self.assertGreaterEqual(report["wall_time_sec"], 0.0)
 
+    def test_time_budget_marks_single_overrun_batch(self) -> None:
+        cfg = _benchmark_test_config()
+        dataset = make_synthetic_dataset(cfg, n=12)
+        with mock.patch(
+            "benchmarks.benchmark_omen_scale_eval._budget_expired",
+            side_effect=[False, True],
+        ):
+            report = run_benchmark(
+                cfg,
+                dataset,
+                batches=1,
+                batch_size=1,
+                seed=9,
+                time_budget_sec=0.0,
+            )
+        self.assertEqual(report["n_batches"], 1)
+        self.assertEqual(report["requested_batches"], 1)
+        self.assertTrue(report["timed_out"])
+        self.assertEqual(report["stop_reason"], "time_budget_exhausted")
+
     def test_progress_report_path_emits_partial_json(self) -> None:
         cfg = _benchmark_test_config()
         dataset = make_synthetic_dataset(cfg, n=12)

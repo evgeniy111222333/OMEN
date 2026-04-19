@@ -1095,7 +1095,8 @@ class KnowledgeBase:
     # ── Forward Chaining ───────────────────────────────────────────────────────
     def forward_chain(self, max_depth: int = 5,
                       starting_facts: "Optional[FrozenSet]" = None,
-                      only_verified: bool = False) -> "FrozenSet[HornAtom]":
+                      only_verified: bool = False,
+                      track_epistemic: bool = True) -> "FrozenSet[HornAtom]":
         """
         Застосовує правила до fixpoint або max_depth ітерацій.
         Повертає всі виведені + існуючі факти.
@@ -1118,14 +1119,16 @@ class KnowledgeBase:
                     if not derived.is_ground():
                         continue
                     if any(_atoms_conflict(derived, known) for known in current):
-                        self.mark_rule_contradicted(clause)
+                        if track_epistemic:
+                            self.mark_rule_contradicted(clause)
                         continue
                     if derived not in current:
                         new_facts.add(derived)
-                        clause.use_count += 1
-                        clause.weight    *= 1.01
-                        # Оновлюємо епістемічний статус
-                        self.mark_rule_verified(clause)
+                        if track_epistemic:
+                            clause.use_count += 1
+                            clause.weight    *= 1.01
+                            # Оновлюємо епістемічний статус
+                            self.mark_rule_verified(clause)
             if not new_facts:
                 break
             current = current | frozenset(new_facts)
@@ -1482,7 +1485,8 @@ class TensorKnowledgeBase:
     # ── forward_chain (GPU tensor) ────────────────────────────────────────────
     def forward_chain(self, max_depth: int = 4,
                       starting_facts: Optional[FrozenSet] = None,
-                      only_verified: bool = False) -> FrozenSet[HornAtom]:
+                      only_verified: bool = False,
+                      track_epistemic: bool = True) -> FrozenSet[HornAtom]:
         """
         GPU-акселерований Forward Chaining.
 
@@ -1650,8 +1654,9 @@ class TensorKnowledgeBase:
                             _atoms_conflict(candidate_atom, known) for known in self.facts
                         )
                         if has_conflict:
-                            rule_idx = int(tensor_rule_indices[ri[cand_idx]].item())
-                            self.mark_rule_contradicted(self.rules[rule_idx])
+                            if track_epistemic:
+                                rule_idx = int(tensor_rule_indices[ri[cand_idx]].item())
+                                self.mark_rule_contradicted(self.rules[rule_idx])
                             continue
                         if key not in fact_set and row[0] >= 0:
                             fact_set.add(key)
@@ -1715,7 +1720,8 @@ class TensorKnowledgeBase:
                     )
                     key = (int(row[0].item()), int(row[1].item()), int(row[2].item()))
                     if any(_atoms_conflict(derived, known) for known in self.facts):
-                        self.mark_rule_contradicted(clause)
+                        if track_epistemic:
+                            self.mark_rule_contradicted(clause)
                         continue
                     if key in fact_set:
                         continue
@@ -1723,9 +1729,10 @@ class TensorKnowledgeBase:
                     facts = torch.cat([facts, row.unsqueeze(0)], dim=0)
                     N += 1
                     n_new_total += 1
-                    clause.use_count += 1
-                    clause.weight *= 1.01
-                    self.mark_rule_verified(clause)
+                    if track_epistemic:
+                        clause.use_count += 1
+                        clause.weight *= 1.01
+                        self.mark_rule_verified(clause)
 
             for clause in structured_multi_rules:
                 if not clause.body:
@@ -1761,7 +1768,8 @@ class TensorKnowledgeBase:
                         continue
                     dk = self._atom_to_key(derived)
                     if any(_atoms_conflict(derived, known) for known in self.facts):
-                        self.mark_rule_contradicted(clause)
+                        if track_epistemic:
+                            self.mark_rule_contradicted(clause)
                         continue
                     if dk not in fact_set and dk[0] >= 0:
                         fact_set.add(dk)
@@ -1769,9 +1777,10 @@ class TensorKnowledgeBase:
                         facts = torch.cat([facts, new_row], dim=0)
                         N += 1
                         n_new_total += 1
-                        clause.use_count += 1
-                        clause.weight *= 1.01
-                        self.mark_rule_verified(clause)
+                        if track_epistemic:
+                            clause.use_count += 1
+                            clause.weight *= 1.01
+                            self.mark_rule_verified(clause)
 
             if python_fallback_rules:
                 current_frozenset = frozenset(
@@ -1786,16 +1795,18 @@ class TensorKnowledgeBase:
                         if not fresh.head.is_ground():
                             continue
                         if any(_atoms_conflict(fresh.head, known) for known in current_frozenset):
-                            self.mark_rule_contradicted(clause)
+                            if track_epistemic:
+                                self.mark_rule_contradicted(clause)
                             continue
                         if len(fresh.head.args) > 2:
                             if fresh.head not in extra_facts:
                                 extra_facts.add(fresh.head)
                                 current_frozenset = current_frozenset | {fresh.head}
                                 n_new_total += 1
-                                clause.use_count += 1
-                                clause.weight *= 1.01
-                                self.mark_rule_verified(clause)
+                                if track_epistemic:
+                                    clause.use_count += 1
+                                    clause.weight *= 1.01
+                                    self.mark_rule_verified(clause)
                             continue
                         dk = self._atom_to_key(fresh.head)
                         if dk not in fact_set and dk[0] >= 0:
@@ -1804,24 +1815,27 @@ class TensorKnowledgeBase:
                             facts = torch.cat([facts, new_row], dim=0)
                             N += 1
                             n_new_total += 1
-                            clause.use_count += 1
-                            clause.weight *= 1.01
-                            self.mark_rule_verified(clause)
+                            if track_epistemic:
+                                clause.use_count += 1
+                                clause.weight *= 1.01
+                                self.mark_rule_verified(clause)
                         continue
                     for sigma in find_all_substitutions(fresh.body, current_frozenset):
                         derived = sigma.apply_atom(fresh.head)
                         if derived.is_ground():
                             if any(_atoms_conflict(derived, known) for known in current_frozenset):
-                                self.mark_rule_contradicted(clause)
+                                if track_epistemic:
+                                    self.mark_rule_contradicted(clause)
                                 continue
                             if len(derived.args) > 2:
                                 if derived not in extra_facts:
                                     extra_facts.add(derived)
                                     current_frozenset = current_frozenset | {derived}
                                     n_new_total += 1
-                                    clause.use_count += 1
-                                    clause.weight *= 1.01
-                                    self.mark_rule_verified(clause)
+                                    if track_epistemic:
+                                        clause.use_count += 1
+                                        clause.weight *= 1.01
+                                        self.mark_rule_verified(clause)
                                 continue
                             dk = self._atom_to_key(derived)
                             if dk not in fact_set and dk[0] >= 0:
@@ -1831,9 +1845,10 @@ class TensorKnowledgeBase:
                                 facts = torch.cat([facts, new_row], dim=0)
                                 N += 1
                                 n_new_total += 1
-                                clause.use_count += 1
-                                clause.weight *= 1.01
-                                self.mark_rule_verified(clause)
+                                if track_epistemic:
+                                    clause.use_count += 1
+                                    clause.weight *= 1.01
+                                    self.mark_rule_verified(clause)
 
             if n_new_total == 0:
                 break  # fixpoint досягнуто
@@ -3414,6 +3429,20 @@ class DifferentiableProver(nn.Module):
         oee_bundle_beam_width: int = 4,
         oee_max_bundle_rules: int = 3,
         oee_bundle_seed_k: int = 12,
+        train_fast_cwe_max_rule_mods: int = 1,
+        train_fast_cwe_max_candidates: int = 2,
+        train_fast_cwe_max_transforms_per_rule: int = 1,
+        train_fast_oee_max_candidates: int = 2,
+        train_fast_oee_max_targets: int = 2,
+        train_fast_oee_max_paradox_facts: int = 2,
+        train_fast_oee_max_hypotheses: int = 4,
+        train_fast_oee_max_scored_hypotheses: int = 32,
+        train_fast_oee_max_open_body_literals: int = 1,
+        train_fast_oee_max_open_patterns: int = 2,
+        train_fast_oee_max_open_head_patterns: int = 2,
+        train_fast_oee_bundle_beam_width: int = 2,
+        train_fast_oee_max_bundle_rules: int = 2,
+        train_fast_oee_bundle_seed_k: int = 4,
         ice_state_history: int = 128,
         ice_goal_threshold: float = 0.35,
     ) -> None:
@@ -3453,6 +3482,20 @@ class DifferentiableProver(nn.Module):
             oee_bundle_beam_width=oee_bundle_beam_width,
             oee_max_bundle_rules=oee_max_bundle_rules,
             oee_bundle_seed_k=oee_bundle_seed_k,
+            train_fast_cwe_max_rule_mods=train_fast_cwe_max_rule_mods,
+            train_fast_cwe_max_candidates=train_fast_cwe_max_candidates,
+            train_fast_cwe_max_transforms_per_rule=train_fast_cwe_max_transforms_per_rule,
+            train_fast_oee_max_candidates=train_fast_oee_max_candidates,
+            train_fast_oee_max_targets=train_fast_oee_max_targets,
+            train_fast_oee_max_paradox_facts=train_fast_oee_max_paradox_facts,
+            train_fast_oee_max_hypotheses=train_fast_oee_max_hypotheses,
+            train_fast_oee_max_scored_hypotheses=train_fast_oee_max_scored_hypotheses,
+            train_fast_oee_max_open_body_literals=train_fast_oee_max_open_body_literals,
+            train_fast_oee_max_open_patterns=train_fast_oee_max_open_patterns,
+            train_fast_oee_max_open_head_patterns=train_fast_oee_max_open_head_patterns,
+            train_fast_oee_bundle_beam_width=train_fast_oee_bundle_beam_width,
+            train_fast_oee_max_bundle_rules=train_fast_oee_max_bundle_rules,
+            train_fast_oee_bundle_seed_k=train_fast_oee_bundle_seed_k,
             ice_state_history=ice_state_history,
             ice_goal_threshold=ice_goal_threshold,
         )
@@ -3464,6 +3507,8 @@ class DifferentiableProver(nn.Module):
         current_facts: FrozenSet[HornAtom],
         target_facts: FrozenSet[HornAtom],
         device: torch.device,
+        *,
+        fast_mode: bool = False,
     ) -> Any:
         self.last_creative_report = self.creative_cycle.run(
             self,
@@ -3471,6 +3516,7 @@ class DifferentiableProver(nn.Module):
             current_facts,
             target_facts,
             device,
+            fast_mode=fast_mode,
         )
         return self.last_creative_report
 
@@ -5100,10 +5146,35 @@ class DifferentiableProver(nn.Module):
         current_facts: FrozenSet[HornAtom],
         target_facts: FrozenSet[HornAtom],
         device: torch.device,
+        *,
+        max_trace_candidates: Optional[int] = None,
+        max_contextual: Optional[int] = None,
+        max_neural: Optional[int] = None,
+        max_repairs: Optional[int] = None,
     ) -> Dict[str, Any]:
         zero = torch.zeros(1, device=device).squeeze()
         empty_stats = dict(empty_induction_stats())
         empty_stats.setdefault("repaired", 0.0)
+        max_trace_candidates = (
+            self.continuous_cycle_max_trace_candidates
+            if max_trace_candidates is None
+            else max(int(max_trace_candidates), 0)
+        )
+        max_contextual = (
+            self.continuous_cycle_max_contextual
+            if max_contextual is None
+            else max(int(max_contextual), 0)
+        )
+        max_neural = (
+            self.continuous_cycle_max_neural
+            if max_neural is None
+            else max(int(max_neural), 0)
+        )
+        max_repairs = (
+            self.continuous_cycle_max_repairs
+            if max_repairs is None
+            else max(int(max_repairs), 0)
+        )
         cycle_active = bool(self.continuous_cycle_enabled and (self.training or self.continuous_cycle_eval_enabled))
         eval_active = bool(cycle_active and not self.training)
         learning_active = bool(cycle_active and (self.training or self.continuous_cycle_eval_learning_enabled))
@@ -5156,27 +5227,27 @@ class DifferentiableProver(nn.Module):
         trace_bundle = self._task_execution_trace()
         trace_candidates = (
             self._trace_abduction_candidates(
-                max_candidates=self.continuous_cycle_max_trace_candidates,
+                max_candidates=max_trace_candidates,
                 max_body_atoms=3,
             )
-            if self.continuous_cycle_max_trace_candidates > 0
+            if max_trace_candidates > 0
             else []
         )
         contextual_candidates = (
             self._contextual_abduction_candidates(
-                max_candidates=self.continuous_cycle_max_contextual,
+                max_candidates=max_contextual,
                 max_body_atoms=3,
             )
-            if self.continuous_cycle_max_contextual > 0
+            if max_contextual > 0
             else []
         )
         neural_specs: List[RelaxedHornClauseSpec] = []
-        if self.continuous_cycle_max_neural > 0:
+        if max_neural > 0:
             neural_specs = self.abductor.sample_candidates_relaxed(
                 z[:1],
                 stochastic=self.training,
                 tau=max(self.continuous_cycle_candidate_tau, 1e-3),
-                max_candidates=self.continuous_cycle_max_neural,
+                max_candidates=max_neural,
             )
         result["stats"]["trace_candidates"] = float(len(trace_candidates))
         result["stats"]["contextual_candidates"] = float(len(contextual_candidates))
@@ -5213,14 +5284,14 @@ class DifferentiableProver(nn.Module):
         ranked_candidates.sort(key=lambda item: item[0])
         budget = max(
             1,
-            self.continuous_cycle_max_trace_candidates
-            + self.continuous_cycle_max_contextual
-            + self.continuous_cycle_max_neural,
+            max_trace_candidates
+            + max_contextual
+            + max_neural,
         )
         result["stats"]["candidate_budget"] = float(budget)
         pending: List[Tuple[float, HornClause, Optional[torch.Tensor], str, Optional[RelaxedHornClauseSpec]]] = ranked_candidates[:budget]
         seen_candidate_hashes = {hash(clause) for _, clause, _, _, _ in pending}
-        repair_budget = self.continuous_cycle_max_repairs
+        repair_budget = max_repairs
 
         query_atom = self._current_query_atom()
         query_emb = (
@@ -5259,7 +5330,7 @@ class DifferentiableProver(nn.Module):
         matched_predictions = 0
         checked = 0
 
-        while pending and checked < (budget + self.continuous_cycle_max_repairs):
+        while pending and checked < (budget + max_repairs):
             _mdl_score, clause, log_prob, _source, relaxed_spec = pending.pop(0)
             checked += 1
             summary = self._rule_prediction_summary(

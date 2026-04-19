@@ -232,6 +232,7 @@ class RuleHypothesisSampler:
         consistency_lambda: float = 0.1,
         max_interaction_preds: int = 3,
         max_hypotheses: int = 8,
+        max_scored_hypotheses: int = 64,
         forward_chain_depth: int = 2,
         max_open_body_literals: int = 2,
         max_open_patterns: int = 4,
@@ -243,16 +244,23 @@ class RuleHypothesisSampler:
         self.consistency_lambda = float(max(consistency_lambda, 1e-6))
         self.max_interaction_preds = max(int(max_interaction_preds), 1)
         self.max_hypotheses = max(int(max_hypotheses), 1)
+        self.max_scored_hypotheses = max(
+            int(max_scored_hypotheses),
+            self.max_hypotheses,
+        )
         self.forward_chain_depth = max(int(forward_chain_depth), 1)
         self.max_open_body_literals = max(int(max_open_body_literals), 1)
-        self.max_open_patterns = max(int(max_open_patterns), 4)
-        self.max_open_head_patterns = max(int(max_open_head_patterns), 4)
+        self.max_open_patterns = max(int(max_open_patterns), 1)
+        self.max_open_head_patterns = max(int(max_open_head_patterns), 1)
         self.bundle_beam_width = max(int(bundle_beam_width), 2)
         self.max_bundle_rules = max(int(max_bundle_rules), 2)
         self.bundle_seed_k = max(int(bundle_seed_k), self.bundle_beam_width)
         self._last_beam_states: int = 0
         self._last_beam_best_size: int = 1
         self._last_beam_best_score: float = 0.0
+        self._last_consistency_cache_hits: int = 0
+        self._last_consistency_cache_misses: int = 0
+        self._consistency_fast_context: Optional[Dict[str, Any]] = None
 
     @staticmethod
     def _make_vars(n: int) -> Tuple[Any, ...]:
@@ -277,15 +285,116 @@ class RuleHypothesisSampler:
         return HornAtom(pred=int(pred), args=args)
 
     def _build_sandbox(self, kb: Any) -> Any:
-        try:
-            sb = type(kb)(max_rules=max(int(getattr(kb, "max_rules", 512)), 32))
-        except TypeError:
-            sb = type(kb)(max_rules=max(int(getattr(kb, "max_rules", 512)), 32), device=None)
-        for fact in getattr(kb, "facts", frozenset()):
-            sb.add_fact(fact)
-        for rule in getattr(kb, "rules", ()):
-            sb.add_rule(rule)
+        sb = self._build_empty_sandbox(kb, max_rules=max(int(getattr(kb, "max_rules", 512)), 32))
+        self._copy_kb_into_sandbox(kb, sb, preserve_status=False)
         return sb
+
+    def _build_fact_sandbox(self, kb: Any, *, max_rules: int) -> Any:
+        sb = self._build_empty_sandbox(kb, max_rules=max_rules)
+        self._copy_kb_into_sandbox(kb, sb, preserve_status=False, include_rules=False)
+        return sb
+
+    def _build_empty_sandbox(self, kb: Any, *, max_rules: int) -> Any:
+        max_facts = max(int(getattr(kb, "_max_facts", 32)), 32)
+        device = getattr(kb, "_dev", getattr(kb, "device", None))
+        # Temporary symbolic evaluators launch many tiny FC passes; CPU avoids GPU micro-kernel overhead here.
+        if hasattr(kb, "_max_facts") and hasattr(kb, "_dev"):
+            device = torch.device("cpu")
+        constructor_variants = (
+            {"max_rules": max_rules, "max_facts": max_facts, "device": device},
+            {"max_rules": max_rules, "max_facts": max_facts},
+            {"max_rules": max_rules, "device": device},
+            {"max_rules": max_rules},
+        )
+        last_error: Optional[Exception] = None
+        for kwargs in constructor_variants:
+            try:
+                return type(kb)(**kwargs)
+            except TypeError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise TypeError(f"Unable to instantiate sandbox for {type(kb).__name__}")
+
+    @staticmethod
+    def _copy_kb_into_sandbox(
+        kb: Any,
+        sandbox: Any,
+        *,
+        preserve_status: bool,
+        include_rules: bool = True,
+    ) -> None:
+        from omen_prolog import EpistemicStatus, RuleRecord
+
+        if (
+            hasattr(kb, "_fact_buf")
+            and hasattr(kb, "_rule_buf")
+            and hasattr(sandbox, "_fact_buf")
+            and hasattr(sandbox, "_rule_buf")
+        ):
+            n_facts = int(getattr(kb, "_n_facts", 0))
+            if n_facts > 0:
+                sandbox._fact_buf[:n_facts] = kb._fact_buf[:n_facts].to(device=sandbox._dev)
+            sandbox._n_facts = n_facts
+            sandbox._fact_set = set(getattr(kb, "_fact_set", set()))
+            sandbox._extra_facts = set(getattr(kb, "_extra_facts", set()))
+            sandbox._term_to_id = dict(getattr(kb, "_term_to_id", {}))
+            sandbox._id_to_term = dict(getattr(kb, "_id_to_term", {}))
+            sandbox._next_term_id = int(getattr(kb, "_next_term_id", 1))
+            sandbox._facts_cache = None
+            sandbox._facts_cache_n = -1
+
+            rules = list(getattr(kb, "rules", ())) if include_rules else []
+            n_rules = int(getattr(kb, "_n_rules", len(getattr(kb, "rules", ())))) if include_rules else 0
+            if n_rules > 0:
+                sandbox._rule_buf[:n_rules] = kb._rule_buf[:n_rules].to(device=sandbox._dev)
+                sandbox._rule_is_tensor[:n_rules] = kb._rule_is_tensor[:n_rules].to(device=sandbox._dev)
+            sandbox._n_rules = n_rules
+            sandbox.rules = list(rules)
+            sandbox._rule_hash_set = set(getattr(kb, "_rule_hash_set", set())) if include_rules else set()
+            sandbox._global_step = int(getattr(kb, "_global_step", 0))
+            status_by_hash = {
+                key: getattr(record, "status", EpistemicStatus.proposed)
+                for key, record in getattr(kb, "_records", {}).items()
+            }
+            if preserve_status:
+                sandbox._records = {
+                    hash(rule): RuleRecord(rule=rule, status=status_by_hash.get(hash(rule), EpistemicStatus.proposed))
+                    for rule in sandbox.rules
+                }
+            else:
+                sandbox._records = {
+                    hash(rule): RuleRecord(rule=rule, status=EpistemicStatus.proposed)
+                    for rule in sandbox.rules
+                }
+            sandbox._n_proposed = sum(
+                1 for record in sandbox._records.values() if record.status == EpistemicStatus.proposed
+            )
+            sandbox._n_verified = sum(
+                1 for record in sandbox._records.values() if record.status == EpistemicStatus.verified
+            )
+            return
+
+        facts = frozenset(getattr(kb, "facts", frozenset()))
+        rules = list(getattr(kb, "rules", ())) if include_rules else []
+        sandbox.facts = facts
+        sandbox.rules = list(rules)
+        sandbox._rule_set = set(getattr(kb, "_rule_set", {hash(rule) for rule in rules})) if include_rules else set()
+        sandbox._global_step = int(getattr(kb, "_global_step", 0))
+        status_by_hash = {
+            key: getattr(record, "status", EpistemicStatus.proposed)
+            for key, record in getattr(kb, "_records", {}).items()
+        }
+        if preserve_status:
+            sandbox._records = {
+                hash(rule): RuleRecord(rule=rule, status=status_by_hash.get(hash(rule), EpistemicStatus.proposed))
+                for rule in rules
+            }
+        else:
+            sandbox._records = {
+                hash(rule): RuleRecord(rule=rule, status=EpistemicStatus.proposed)
+                for rule in rules
+            }
 
     @staticmethod
     def _is_safe_rule(rule: Any) -> bool:
@@ -315,7 +424,43 @@ class RuleHypothesisSampler:
             return 0.0
         return float(sum(1.0 for target in targets if cls._supports_target(target, facts)))
 
-    def _consistency_score(
+    @staticmethod
+    def _target_facts_cache_key(target_facts: Optional[Sequence[Any]]) -> Tuple[int, ...]:
+        return tuple(sorted(hash(target) for target in (target_facts or ())))
+
+    @classmethod
+    def _baseline_coverage_cached(
+        cls,
+        baseline: FrozenSet[Any],
+        target_facts: Optional[Sequence[Any]],
+        context: Optional[Dict[str, Any]],
+    ) -> float:
+        targets = tuple(target_facts or ())
+        if not targets:
+            return 0.0
+        target_key = cls._target_facts_cache_key(targets)
+        if context is None:
+            return cls._coverage_score(baseline, targets)
+        cache = context.setdefault("baseline_coverage_by_targets", {})
+        cached = cache.get(target_key)
+        if cached is not None:
+            return float(cached)
+        baseline_coverage = cls._coverage_score(baseline, targets)
+        cache[target_key] = float(baseline_coverage)
+        return float(baseline_coverage)
+
+    @classmethod
+    def _consistency_cache_key(
+        cls,
+        new_rules: Sequence[Any],
+        target_facts: Optional[Sequence[Any]],
+    ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+        return (
+            tuple(sorted(hash(rule) for rule in new_rules)),
+            cls._target_facts_cache_key(target_facts),
+        )
+
+    def _consistency_score_direct(
         self,
         kb: Any,
         new_rules: Sequence[Any],
@@ -335,10 +480,15 @@ class RuleHypothesisSampler:
                 self.forward_chain_depth,
                 starting_facts=starting_facts,
                 only_verified=False,
+                track_epistemic=False,
             )
             novelty_gain = float(len(derived - baseline))
             targets = tuple(target_facts or ())
-            baseline_coverage = self._coverage_score(baseline, targets)
+            baseline_coverage = self._baseline_coverage_cached(
+                baseline,
+                targets,
+                self._consistency_fast_context,
+            )
             derived_coverage = self._coverage_score(derived, targets)
             coverage_gain = float(derived_coverage - baseline_coverage)
             if targets:
@@ -348,6 +498,149 @@ class RuleHypothesisSampler:
             return float(consistency), coverage_gain, novelty_gain
         except Exception:
             return 0.0, 0.0, 0.0
+
+    def _consistency_score_depth2_decomposed(
+        self,
+        kb: Any,
+        new_rules: Sequence[Any],
+        baseline: FrozenSet[Any],
+        starting_facts: FrozenSet[Any],
+        *,
+        first_step_facts: FrozenSet[Any],
+        target_facts: Optional[Sequence[Any]] = None,
+    ) -> Tuple[float, float, float]:
+        context = self._consistency_fast_context or {}
+        singleton_delta_cache = context.get("singleton_first_step_delta_by_rule")
+        delta_union: FrozenSet[Any]
+        if isinstance(singleton_delta_cache, dict):
+            delta_facts = set()
+            for rule in new_rules:
+                rule_hash = hash(rule)
+                cached_delta = singleton_delta_cache.get(rule_hash)
+                if cached_delta is None:
+                    tiny = self._build_empty_sandbox(
+                        kb,
+                        max_rules=max(max(int(getattr(kb, "max_rules", 512)), 32), 1),
+                    )
+                    tiny.add_rule(rule)
+                    cached_delta = frozenset(
+                        tiny.forward_chain(
+                            1,
+                            starting_facts=starting_facts,
+                            only_verified=False,
+                            track_epistemic=False,
+                        ) - starting_facts
+                    )
+                    singleton_delta_cache[rule_hash] = cached_delta
+                delta_facts.update(cached_delta)
+            delta_union = frozenset(delta_facts)
+        else:
+            tiny = self._build_empty_sandbox(
+                kb,
+                max_rules=max(max(int(getattr(kb, "max_rules", 512)), 32), len(tuple(new_rules))),
+            )
+            for rule in new_rules:
+                tiny.add_rule(rule)
+            delta_union = frozenset(
+                tiny.forward_chain(
+                    1,
+                    starting_facts=starting_facts,
+                    only_verified=False,
+                    track_epistemic=False,
+                ) - starting_facts
+            )
+        round_one_facts = frozenset(first_step_facts | delta_union)
+
+        if not delta_union:
+            sb = self._build_fact_sandbox(
+                kb,
+                max_rules=max(max(int(getattr(kb, "max_rules", 512)), 32), len(tuple(new_rules))),
+            )
+            for rule in new_rules:
+                sb.add_rule(rule)
+            derived = frozenset(
+                baseline
+                | sb.forward_chain(
+                    1,
+                    starting_facts=first_step_facts,
+                    only_verified=False,
+                    track_epistemic=False,
+                )
+            )
+        else:
+            sb = self._build_sandbox(kb)
+            for rule in new_rules:
+                sb.add_rule(rule)
+            derived = sb.forward_chain(
+                1,
+                starting_facts=round_one_facts,
+                only_verified=False,
+                track_epistemic=False,
+            )
+        novelty_gain = float(len(derived - baseline))
+        targets = tuple(target_facts or ())
+        baseline_coverage = self._baseline_coverage_cached(
+            baseline,
+            targets,
+            context,
+        )
+        derived_coverage = self._coverage_score(derived, targets)
+        coverage_gain = float(derived_coverage - baseline_coverage)
+        if targets:
+            consistency = 3.0 * coverage_gain + 0.10 * novelty_gain
+        else:
+            consistency = novelty_gain
+        return float(consistency), coverage_gain, novelty_gain
+
+    def _consistency_score(
+        self,
+        kb: Any,
+        new_rules: Sequence[Any],
+        baseline: FrozenSet[Any],
+        starting_facts: FrozenSet[Any],
+        target_facts: Optional[Sequence[Any]] = None,
+    ) -> Tuple[float, float, float]:
+        context = self._consistency_fast_context
+        cache_key = self._consistency_cache_key(new_rules, target_facts)
+        if context is not None:
+            cache = context.setdefault("consistency_by_rule_set", {})
+            cached = cache.get(cache_key)
+            if cached is not None:
+                self._last_consistency_cache_hits += 1
+                return cached
+        self._last_consistency_cache_misses += 1
+        if (
+            self.forward_chain_depth == 2
+            and context is not None
+            and context.get("kb_id") == id(kb)
+            and context.get("starting_facts") is starting_facts
+            and context.get("baseline") is baseline
+            and context.get("first_step_facts") is not None
+        ):
+            try:
+                result = self._consistency_score_depth2_decomposed(
+                    kb,
+                    new_rules,
+                    baseline,
+                    starting_facts,
+                    first_step_facts=context["first_step_facts"],
+                    target_facts=target_facts,
+                )
+                if context is not None:
+                    cache[cache_key] = result
+                return result
+            except Exception:
+                pass
+        result = self._consistency_score_direct(
+            kb,
+            new_rules,
+            baseline,
+            starting_facts,
+            target_facts=target_facts,
+        )
+        if context is not None:
+            cache[cache_key] = result
+        return result
 
     def _add_hypothesis(
         self,
@@ -361,6 +654,8 @@ class RuleHypothesisSampler:
         starting_facts: FrozenSet[Any],
         target_facts: Optional[Sequence[Any]] = None,
     ) -> None:
+        if len(hypotheses) >= self.max_scored_hypotheses:
+            return
         if not self._is_safe_rule(rule):
             return
         h = hash(rule)
@@ -606,9 +901,15 @@ class RuleHypothesisSampler:
         def _is_alias(template: str) -> bool:
             return template in alias_templates or template.startswith("open_alias_")
 
-        core = [hyp for hyp in hypotheses if _is_core(hyp.template)]
-        bridges = [hyp for hyp in hypotheses if _is_bridge(hyp.template)]
-        aliases = [hyp for hyp in hypotheses if _is_alias(hyp.template)]
+        ranked = sorted(
+            hypotheses,
+            key=lambda hyp: (hyp.score, hyp.coverage_gain, hyp.novelty_gain),
+            reverse=True,
+        )
+        ranked = ranked[: min(len(ranked), self.bundle_seed_k)]
+        core = [hyp for hyp in ranked if _is_core(hyp.template)]
+        bridges = [hyp for hyp in ranked if _is_bridge(hyp.template)]
+        aliases = [hyp for hyp in ranked if _is_alias(hyp.template)]
         seen_bundles: set[Tuple[int, ...]] = set()
 
         def _update_bundle(hypothesis: _RuleHypothesis, score: float, templates: Tuple[str, ...], size: int) -> None:
@@ -781,14 +1082,38 @@ class RuleHypothesisSampler:
             return []
 
         starting_facts = frozenset(current_facts)
+        self._last_consistency_cache_hits = 0
+        self._last_consistency_cache_misses = 0
+        self._consistency_fast_context = None
         try:
             baseline: FrozenSet[Any] = kb.forward_chain(
                 self.forward_chain_depth,
                 starting_facts=starting_facts,
                 only_verified=False,
+                track_epistemic=False,
             )
         except Exception:
             baseline = frozenset()
+        else:
+            if self.forward_chain_depth == 2:
+                try:
+                    first_step_facts = kb.forward_chain(
+                        1,
+                        starting_facts=starting_facts,
+                        only_verified=False,
+                        track_epistemic=False,
+                    )
+                    self._consistency_fast_context = {
+                        "kb_id": id(kb),
+                        "starting_facts": starting_facts,
+                        "baseline": baseline,
+                        "first_step_facts": first_step_facts,
+                        "singleton_first_step_delta_by_rule": {},
+                        "consistency_by_rule_set": {},
+                        "baseline_coverage_by_targets": {},
+                    }
+                except Exception:
+                    self._consistency_fast_context = None
 
         max_fact_arity = max((len(tuple(getattr(fact, "args", ()))) for fact in current_facts), default=0)
         goal_arity = len(tuple(getattr(goal, "args", ()))) if goal is not None else 0
@@ -1178,6 +1503,7 @@ class OntologyExpansionEngine:
         forward_chain_depth: int = 2,
         max_interaction_preds: int = 3,
         max_hypotheses: int = 8,
+        max_scored_hypotheses: int = 64,
         oee_bundle_beam_width: int = 4,
         oee_max_bundle_rules: int = 3,
         oee_bundle_seed_k: int = 12,
@@ -1206,6 +1532,7 @@ class OntologyExpansionEngine:
             consistency_lambda=consistency_lambda,
             max_interaction_preds=max_interaction_preds,
             max_hypotheses=max_hypotheses,
+            max_scored_hypotheses=max_scored_hypotheses,
             forward_chain_depth=forward_chain_depth,
             bundle_beam_width=oee_bundle_beam_width,
             max_bundle_rules=oee_max_bundle_rules,
@@ -1935,9 +2262,12 @@ class OntologyExpansionEngine:
             "oee_bundle_beam_width": float(self._sampler.bundle_beam_width),
             "oee_max_bundle_rules": float(self._sampler.max_bundle_rules),
             "oee_bundle_seed_k": float(self._sampler.bundle_seed_k),
+            "oee_max_scored_hypotheses": float(self._sampler.max_scored_hypotheses),
             "oee_beam_states": float(self._sampler._last_beam_states),
             "oee_beam_best_bundle_size": float(self._sampler._last_beam_best_size),
             "oee_beam_best_bundle_score": float(self._sampler._last_beam_best_score),
+            "oee_consistency_cache_hits": float(self._sampler._last_consistency_cache_hits),
+            "oee_consistency_cache_misses": float(self._sampler._last_consistency_cache_misses),
         }
 
     # ─── Публічні властивості ─────────────────────────────────────────────────

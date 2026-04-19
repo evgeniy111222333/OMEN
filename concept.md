@@ -666,6 +666,171 @@ Execution traces дають:
 
 Саме це переводить symbolic learning із режиму "логіка поверх тексту" у режим "логіка поверх виконуваного світу".
 
+### 15.4 Канонічний program substrate
+
+Для програмних задач OMEN не повинен мислити у термінах ізольованих "світів мов".
+
+Канонічний program substrate має бути єдиним і складатися з:
+
+- канонічного `Program IR`;
+- program facts, придатних для symbolic reasoning;
+- execution traces;
+- пов'язаного graph/state-представлення;
+- program-grounded target facts для anchoring.
+
+Source code окремої мови є вхідним носієм, але не фінальною онтологією системи.
+
+Канонічна мета полягає не в тому, щоб "знати Python", "знати Rust" або "знати Java" як окремі ментальні всесвіти, а в тому, щоб мати спільну program semantics, у яку різні мови проєктуються з різною повнотою.
+
+### 15.5 `Canonical Program IR`
+
+`Canonical Program IR` є мовно-агностичним проміжним представленням, яке стоїть між language-specific frontend і symbolic/world state.
+
+Його призначення:
+
+- уніфікувати семантику різних мов;
+- бути substrate для symbolic facts;
+- давати основу для program anchoring;
+- дозволяти reasoning не по синтаксису, а по стабільних програмних сутностях;
+- служити містком між source-level структурою, execution trace і compiled evidence.
+
+Мінімальні канонічні класи сутностей, які `Program IR` повинен уміти виразити:
+
+- module / package / namespace;
+- import / export / dependency edge;
+- type / record / class / enum / interface / trait;
+- function / method / closure / lambda;
+- parameter / local binding / captured binding;
+- block / scope / control region;
+- expression / statement / literal / operator;
+- callsite / dispatch / return;
+- allocation / mutation / alias-like relation / ownership-like constraint;
+- branch / loop / match / exception / async boundary;
+- data-flow edge / def-use edge / control-flow edge;
+- effect facts;
+- error facts;
+- contracts, якщо вони доступні;
+- program target facts для synthesis, repair або verification.
+
+Канонічні program facts мають будуватися поверх цього IR, а не поверх довільних названих AST-вузлів окремої мови.
+
+### 15.6 Ієрархія підтримки мов
+
+Довгостроково підтримка мов у продукті повинна бути tiered, а не плоскою.
+
+`Tier A` — high-fidelity anchor languages.
+
+Це обмежений набір мов, для яких підтримуються:
+
+- найкращий frontend;
+- найбагатший semantic lifting;
+- найповніше program anchoring;
+- найкращий execution-trace mapping;
+- найглибша symbolic/world інтеграція.
+
+Рекомендований профіль для `Tier A`:
+
+- `Python`
+- `JavaScript/TypeScript`
+- `Java`
+- `Rust`
+- `C/C++` або `Go`
+
+Ці мови не є "привілейованими світами". Вони є якірними адаптерами, через які система вчиться стабільній програмній семантиці на максимально різних парадигмах.
+
+`Tier B` — broad source-language support.
+
+Для цих мов система повинна вміти:
+
+- будувати AST або інше frontend-представлення;
+- мапити його в `Canonical Program IR`;
+- витягувати базові program facts;
+- прив'язувати execution traces, якщо вони доступні.
+
+`Tier B` не вимагає такої ж глибини ручної семантичної розписки, як `Tier A`, але не повинен зводитися до "сирого тексту".
+
+`Tier C` — low-level fallback support.
+
+Сюди входять випадки, коли є:
+
+- лише bytecode;
+- лише `LLVM IR`;
+- лише `WASM`;
+- лише `JVM` / `CLR` bytecode;
+- лише машинний код;
+- частково зруйноване або неповне source-представлення.
+
+`Tier C` є fallback-режимом добування evidence, а не канонічною формою програмного мислення продукту.
+
+### 15.7 Роль source, AST, IR і trace
+
+Канонічний маршрут для програмної інформації:
+
+`source language -> language frontend -> Canonical Program IR -> symbolic facts / world graph / execution trace integration`
+
+Ролі рівнів:
+
+- source text потрібен як людський surface і носій високорівневого задуму;
+- AST є language-specific frontend-структурою;
+- `Canonical Program IR` є основним міжмовним substrate;
+- execution trace є grounding-джерелом фактичної поведінки;
+- symbolic facts є reasoning-facing формою знання про програму.
+
+Отже, AST сам по собі не є кінцевою метою. Він є frontend-етапом на шляху до `Canonical Program IR` і trace-grounded symbolic representation.
+
+### 15.8 Роль bytecode, `LLVM IR`, `WASM` і машинного коду
+
+Compiled representations є важливими, але їхній статус повинен бути чітко обмежений.
+
+Вони потрібні для:
+
+- fallback-аналізу, коли source відсутній або неповний;
+- добування CFG, data-flow, call graph, effect structure;
+- верифікації того, що високорівневе представлення узгоджується з реальною поведінкою;
+- platform-specific evidence;
+- compiler-normalized погляду на програму;
+- трасування виконання і post-compilation diagnostics.
+
+Але compiled representations не повинні ставати primary semantic substrate продукту.
+
+Причини:
+
+- raw machine code втрачає значну частину високорівневого змісту;
+- машинний код залежить від компілятора, ABI, optimization level і target platform;
+- одна і та сама програма може мати дуже різні машинні форми;
+- code generation, repair, explanation і symbolic anchoring значно краще спираються на source/IR semantics, ніж на raw opcodes.
+
+Тому:
+
+- `LLVM IR`, `WASM`, `JVM` bytecode і подібні форми є evidence-rich support layer;
+- raw machine code є крайнім fallback;
+- reasoning поверх сирого machine code може існувати, але повинен мати нижчий semantic priority і нижчу довіру, ніж reasoning поверх source + IR + trace.
+
+### 15.9 Явно правильна довгострокова стратегія
+
+Канонічно правильною стратегією для продукту вважається така:
+
+- невеликий набір anchor languages детально пропрацьовується на semantic рівні;
+- всі інші мови зводяться не до "просто тексту", а до `Canonical Program IR`;
+- compiled forms використовуються як допоміжне evidence-покриття;
+- execution trace залишається головним grounding-механізмом;
+- symbolic layer reason-ить по канонічних program facts, а не по випадкових синтаксичних тегах конкретної мови.
+
+Явно неправильною стратегією вважається така:
+
+- "повністю описати кілька мов, а всі інші назавжди залишити на сирому низькому рівні";
+- будувати довгостроковий product semantics навколо raw machine code;
+- підміняти `Canonical Program IR` набором несумісних language-specific онтологій;
+- вважати AST конкретної мови фінальним reasoning substrate.
+
+Критерій зрілості підтримки нової мови:
+
+- існує frontend;
+- існує мапінг у `Canonical Program IR`;
+- існує program-fact lifting;
+- існує trace integration, якщо вона доступна;
+- існує program anchoring без порушення канонічної міжмовної семантики.
+
 ## 16. `DifferentiableProver` і continuous symbolic cycle
 
 ### 16.1 Роль прувера
@@ -716,6 +881,8 @@ Execution traces дають:
 ### 16.4 Program anchoring
 
 Для задач програмного або trace-driven типу OMEN будує `program_state` з `program_target_facts`.
+
+`program_target_facts` канонічно повинні походити не лише з language-specific AST, а з `Canonical Program IR`, execution trace та, за потреби, compiled evidence.
 
 Це дає:
 
@@ -1035,7 +1202,7 @@ M-Core повертає memory state `v_mem`.
 - memory facts;
 - NET facts;
 - saliency support;
-- AST / program facts, якщо вони доступні.
+- AST-derived facts, `Canonical Program IR` facts, execution-trace facts і bytecode/IR-derived facts, якщо вони доступні.
 
 ### Крок 14. Prover world priming
 

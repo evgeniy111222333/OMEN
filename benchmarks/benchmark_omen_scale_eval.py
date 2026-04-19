@@ -237,12 +237,28 @@ def _write_json_report(path: str | Path, payload: Mapping[str, object]) -> None:
     report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _coerce_metric_value(value: object) -> float | None:
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    if torch.is_tensor(value) and value.numel() == 1:
+        try:
+            return float(value.detach().item())
+        except (TypeError, ValueError, RuntimeError):
+            return None
+    return None
+
+
 def _collect_metrics(out: Dict[str, object], metric_keys: Iterable[str]) -> Dict[str, float]:
-    return {
-        key: float(out[key])
-        for key in metric_keys
-        if key in out and isinstance(out[key], (int, float))
-    }
+    collected: Dict[str, float] = {}
+    for key in metric_keys:
+        if key not in out:
+            continue
+        scalar = _coerce_metric_value(out[key])
+        if scalar is not None:
+            collected[key] = scalar
+    return collected
 
 
 def _evaluate_model(
@@ -278,6 +294,9 @@ def _evaluate_model(
             out = model(src, tgt)
             timings_ms.append((time.perf_counter() - t0) * 1000.0)
             metric_rows.append(_collect_metrics(out, metric_keys))
+            timed_out_after_batch = _budget_expired(deadline)
+            if timed_out_after_batch:
+                stop_reason = "time_budget_exhausted"
             if progress_callback is not None:
                 progress_callback(
                     {
@@ -287,11 +306,13 @@ def _evaluate_model(
                         "metric_keys": list(metric_keys),
                         "n_batches": len(metric_rows),
                         "requested_batches": requested_batches,
-                        "timed_out": False,
-                        "stop_reason": "running",
+                        "timed_out": timed_out_after_batch,
+                        "stop_reason": "time_budget_exhausted" if timed_out_after_batch else "running",
                         "device": str(device),
                     }
                 )
+            if timed_out_after_batch:
+                break
 
     return {
         "summary": aggregate(metric_rows),
@@ -545,6 +566,9 @@ def _adapt_model(
         optimizer.step()
         model.memory.maybe_flush()
         history.append(_collect_metrics(out, ("total", "ce_bits", "world_nll", "sym_target_coverage")))
+        if _budget_expired(deadline):
+            stop_reason = "time_budget_exhausted"
+            break
     model.eval()
     return {
         "history": history,

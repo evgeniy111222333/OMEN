@@ -32,6 +32,8 @@ from dataclasses import dataclass
 from itertools import combinations
 from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Optional, Sequence, Tuple
 
+import torch
+
 from omen_symbolic.creative_types import CounterfactualResult, RuleCandidate
 
 # Предикат-complement для реалізації ¬A ← B
@@ -74,6 +76,25 @@ def _is_complement_conflict(left: Any, right: Any) -> bool:
     if right_pred >= COMPLEMENT_OFFSET and left_pred == right_pred - COMPLEMENT_OFFSET:
         return left_args == right_args
     return False
+
+
+def _fact_signature(fact: Any) -> Tuple[int, Tuple[Any, ...]]:
+    return int(getattr(fact, "pred", -1)), tuple(getattr(fact, "args", ()))
+
+
+def _complement_signature(
+    pred: int,
+    args: Tuple[Any, ...],
+) -> Optional[Tuple[int, Tuple[Any, ...]]]:
+    if pred < 0:
+        return None
+    if pred >= COMPLEMENT_OFFSET:
+        return pred - COMPLEMENT_OFFSET, args
+    return pred + COMPLEMENT_OFFSET, args
+
+
+def _build_fact_index(facts: Sequence[Any]) -> Dict[Tuple[int, Tuple[Any, ...]], Any]:
+    return {_fact_signature(fact): fact for fact in facts}
 
 
 # ─── Повний набір операторів Invert ──────────────────────────────────────────
@@ -186,20 +207,112 @@ class CounterfactualWorldEngine:
     # ─── Клонування KB у sandbox ─────────────────────────────────────────────
 
     @staticmethod
+    def _temporary_sandbox_device(kb: Any) -> Optional[torch.device]:
+        # Temporary counterfactual evaluators are tiny; CPU avoids repeated GPU micro-kernel overhead.
+        if hasattr(kb, "_max_facts") and hasattr(kb, "_dev"):
+            return torch.device("cpu")
+        return getattr(kb, "_dev", getattr(kb, "device", None))
+
+    @classmethod
+    def _make_empty_sandbox(cls, kb: Any) -> Any:
+        max_rules = max(int(getattr(kb, "max_rules", 1024)), 32)
+        max_facts = max(int(getattr(kb, "_max_facts", 32)), 32)
+        device = cls._temporary_sandbox_device(kb)
+        constructor_variants = (
+            {"max_rules": max_rules, "max_facts": max_facts, "device": device},
+            {"max_rules": max_rules, "max_facts": max_facts},
+            {"max_rules": max_rules, "device": device},
+            {"max_rules": max_rules},
+        )
+        last_error: Optional[Exception] = None
+        for kwargs in constructor_variants:
+            try:
+                return type(kb)(**kwargs)
+            except TypeError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise TypeError(f"Unable to instantiate sandbox for {type(kb).__name__}")
+
+    @staticmethod
+    def _copy_kb_into_sandbox(kb: Any, sandbox: Any, *, preserve_status: bool) -> None:
+        from omen_prolog import EpistemicStatus, RuleRecord
+
+        if (
+            hasattr(kb, "_fact_buf")
+            and hasattr(kb, "_rule_buf")
+            and hasattr(sandbox, "_fact_buf")
+            and hasattr(sandbox, "_rule_buf")
+        ):
+            n_facts = int(getattr(kb, "_n_facts", 0))
+            if n_facts > 0:
+                sandbox._fact_buf[:n_facts] = kb._fact_buf[:n_facts].to(device=sandbox._dev)
+            sandbox._n_facts = n_facts
+            sandbox._fact_set = set(getattr(kb, "_fact_set", set()))
+            sandbox._extra_facts = set(getattr(kb, "_extra_facts", set()))
+            sandbox._term_to_id = dict(getattr(kb, "_term_to_id", {}))
+            sandbox._id_to_term = dict(getattr(kb, "_id_to_term", {}))
+            sandbox._next_term_id = int(getattr(kb, "_next_term_id", 1))
+            sandbox._facts_cache = None
+            sandbox._facts_cache_n = -1
+
+            rules = list(getattr(kb, "rules", ()))
+            n_rules = int(getattr(kb, "_n_rules", len(rules)))
+            if n_rules > 0:
+                sandbox._rule_buf[:n_rules] = kb._rule_buf[:n_rules].to(device=sandbox._dev)
+                sandbox._rule_is_tensor[:n_rules] = kb._rule_is_tensor[:n_rules].to(device=sandbox._dev)
+            sandbox._n_rules = n_rules
+            sandbox.rules = list(rules)
+            sandbox._rule_hash_set = set(getattr(kb, "_rule_hash_set", set()))
+            sandbox._global_step = int(getattr(kb, "_global_step", 0))
+            status_by_hash = {
+                key: getattr(record, "status", EpistemicStatus.proposed)
+                for key, record in getattr(kb, "_records", {}).items()
+            }
+            if preserve_status:
+                sandbox._records = {
+                    hash(rule): RuleRecord(rule=rule, status=status_by_hash.get(hash(rule), EpistemicStatus.proposed))
+                    for rule in sandbox.rules
+                }
+            else:
+                sandbox._records = {
+                    hash(rule): RuleRecord(rule=rule, status=EpistemicStatus.proposed)
+                    for rule in sandbox.rules
+                }
+            sandbox._n_proposed = sum(
+                1 for record in sandbox._records.values() if record.status == EpistemicStatus.proposed
+            )
+            sandbox._n_verified = sum(
+                1 for record in sandbox._records.values() if record.status == EpistemicStatus.verified
+            )
+            return
+
+        facts = frozenset(getattr(kb, "facts", frozenset()))
+        rules = list(getattr(kb, "rules", ()))
+        sandbox.facts = facts
+        sandbox.rules = list(rules)
+        sandbox._rule_set = set(getattr(kb, "_rule_set", {hash(rule) for rule in rules}))
+        sandbox._global_step = int(getattr(kb, "_global_step", 0))
+        status_by_hash = {
+            key: getattr(record, "status", EpistemicStatus.proposed)
+            for key, record in getattr(kb, "_records", {}).items()
+        }
+        if preserve_status:
+            sandbox._records = {
+                hash(rule): RuleRecord(rule=rule, status=status_by_hash.get(hash(rule), EpistemicStatus.proposed))
+                for rule in rules
+            }
+        else:
+            sandbox._records = {
+                hash(rule): RuleRecord(rule=rule, status=EpistemicStatus.proposed)
+                for rule in rules
+            }
+
+    @staticmethod
     def _clone_kb(kb: Any) -> Any:
         """Повністю клонує KB: факти + правила зі статусами."""
-        try:
-            clone = type(kb)(max_rules=max(int(getattr(kb, "max_rules", 1024)), 32))
-        except TypeError:
-            clone = type(kb)(max_rules=max(int(getattr(kb, "max_rules", 1024)), 32), device=None)
-        for fact in getattr(kb, "facts", frozenset()):
-            clone.add_fact(fact)
-        for rule in getattr(kb, "rules", ()):
-            status = getattr(getattr(kb, "_records", {}).get(hash(rule), None), "status", None)
-            if status is None:
-                clone.add_rule(rule)
-            else:
-                clone.add_rule(rule, status=status)
+        clone = CounterfactualWorldEngine._make_empty_sandbox(kb)
+        CounterfactualWorldEngine._copy_kb_into_sandbox(kb, clone, preserve_status=True)
         return clone
 
     # ─── Побудова sandbox KB з Γ_mod ─────────────────────────────────────────
@@ -211,24 +324,45 @@ class CounterfactualWorldEngine:
         Видаляє оригінали і додає трансформовані правила.
         """
         # Клонуємо базову KB
-        try:
-            sandbox = type(kb)(max_rules=max(int(getattr(kb, "max_rules", 1024)), 32))
-        except TypeError:
-            sandbox = type(kb)(max_rules=max(int(getattr(kb, "max_rules", 1024)), 32), device=None)
-        for fact in getattr(kb, "facts", frozenset()):
-            sandbox.add_fact(fact)
+        sandbox = CounterfactualWorldEngine._make_empty_sandbox(kb)
+        CounterfactualWorldEngine._copy_kb_into_sandbox(kb, sandbox, preserve_status=True)
 
         # Множина оригіналів, що виключаються (Γ \ Γ_mod)
         excluded: FrozenSet[int] = frozenset(hash(t.original) for t in gamma_mod)
 
-        for rule in getattr(kb, "rules", ()):
-            if hash(rule) in excluded:
-                continue
-            status = getattr(getattr(kb, "_records", {}).get(hash(rule), None), "status", None)
-            if status is None:
-                sandbox.add_rule(rule)
-            else:
-                sandbox.add_rule(rule, status=status)
+        if excluded:
+            kept_rules = [rule for rule in sandbox.rules if hash(rule) not in excluded]
+            sandbox.rules = kept_rules
+            if hasattr(sandbox, "_rule_hash_set"):
+                sandbox._rule_hash_set = {hash(rule) for rule in kept_rules}
+            if hasattr(sandbox, "_rule_set"):
+                sandbox._rule_set = {hash(rule) for rule in kept_rules}
+            sandbox._records = {
+                hash(rule): sandbox._records[hash(rule)]
+                for rule in kept_rules
+                if hash(rule) in sandbox._records
+            }
+            if hasattr(sandbox, "_rule_buf") and hasattr(sandbox, "_rule_is_tensor"):
+                kept_indices = [
+                    idx for idx, rule in enumerate(getattr(kb, "rules", ()))
+                    if hash(rule) not in excluded
+                ]
+                n_kept = len(kept_indices)
+                if n_kept > 0:
+                    idx_t = torch.tensor(kept_indices, dtype=torch.long, device=sandbox._dev)
+                    sandbox._rule_buf[:n_kept] = sandbox._rule_buf[idx_t].clone()
+                    sandbox._rule_is_tensor[:n_kept] = sandbox._rule_is_tensor[idx_t].clone()
+                sandbox._rule_buf[n_kept:sandbox._n_rules] = sandbox.NONE
+                sandbox._rule_is_tensor[n_kept:sandbox._n_rules] = False
+                sandbox._n_rules = n_kept
+            if hasattr(sandbox, "_n_proposed"):
+                sandbox._n_proposed = sum(
+                    1 for record in sandbox._records.values() if record.status.value == "proposed"
+                )
+            if hasattr(sandbox, "_n_verified"):
+                sandbox._n_verified = sum(
+                    1 for record in sandbox._records.values() if record.status.value == "verified"
+                )
 
         # Додаємо Invert(Γ_mod)
         for t in gamma_mod:
@@ -245,6 +379,9 @@ class CounterfactualWorldEngine:
         starting_facts: FrozenSet[Any],
         max_depth: int,
         conflict_fn: Callable[[Any, Any], bool],
+        *,
+        baseline_list: Optional[Tuple[Any, ...]] = None,
+        baseline_index: Optional[Dict[Tuple[int, Tuple[Any, ...]], Any]] = None,
     ) -> Tuple[float, Tuple[Any, ...], List[Tuple[Any, Any]]]:
         """
         Повертає (surprise_score, novel_facts, contradictions).
@@ -254,22 +391,27 @@ class CounterfactualWorldEngine:
             max(int(max_depth), 1),
             starting_facts=starting_facts,
             only_verified=False,
+            track_epistemic=False,
         )
         novel = tuple(sorted(derived - baseline, key=hash))
+        derived_list = list(derived)
+        derived_index = _build_fact_index(derived_list)
+        baseline_list = tuple(baseline) if baseline_list is None else baseline_list
+        baseline_index = _build_fact_index(baseline_list) if baseline_index is None else baseline_index
 
         # Complement-суперечності: p(X) та ¬p(X) як усередині sandbox,
         # так і відносно базового виводу Γ.
         complement_pairs: Dict[Tuple[int, int], Tuple[Any, Any]] = {}
-        derived_list = list(derived)
-        for idx, fact in enumerate(derived_list):
-            for known in derived_list[idx + 1 :]:
-                if not _is_complement_conflict(fact, known):
-                    continue
+        for (pred, args), fact in derived_index.items():
+            complement_key = _complement_signature(pred, args)
+            if complement_key is None:
+                continue
+            known = derived_index.get(complement_key)
+            if known is not None:
                 key = tuple(sorted((hash(fact), hash(known))))
                 complement_pairs[key] = (fact, known)
-            for known in baseline:
-                if not _is_complement_conflict(fact, known):
-                    continue
+            known = baseline_index.get(complement_key)
+            if known is not None:
                 key = tuple(sorted((hash(fact), hash(known))))
                 complement_pairs[key] = (fact, known)
         complement_contradictions = list(complement_pairs.values())
@@ -277,7 +419,7 @@ class CounterfactualWorldEngine:
         # Класичні суперечності через conflict_fn
         classic_contradictions: List[Tuple[Any, Any]] = []
         for fact in novel:
-            for known in baseline:
+            for known in baseline_list:
                 if conflict_fn(fact, known):
                     classic_contradictions.append((fact, known))
 
@@ -361,6 +503,8 @@ class CounterfactualWorldEngine:
         kb: Any,
         gamma_mod: Sequence[_Transform],
         baseline: FrozenSet[Any],
+        baseline_list: Tuple[Any, ...],
+        baseline_index: Dict[Tuple[int, Tuple[Any, ...]], Any],
         starting_facts: FrozenSet[Any],
         max_depth: int,
         conflict_fn: Callable[[Any, Any], bool],
@@ -368,7 +512,13 @@ class CounterfactualWorldEngine:
     ) -> Tuple[float, Tuple[Any, ...], List[Tuple[Any, Any]], float]:
         sandbox = self._build_sandbox(kb, gamma_mod)
         novel_count, novel, contras = self._measure_surprise(
-            sandbox, baseline, starting_facts, max_depth, conflict_fn
+            sandbox,
+            baseline,
+            starting_facts,
+            max_depth,
+            conflict_fn,
+            baseline_list=baseline_list,
+            baseline_index=baseline_index,
         )
         world_surprise = 0.0
         if world_surprise_fn is not None:
@@ -411,6 +561,8 @@ class CounterfactualWorldEngine:
         best_contradictions: List[Tuple[Any, Any]] = []
         best_world_surprise: float = 0.0
         evaluated_subsets = 0
+        baseline_list = tuple(baseline)
+        baseline_index = _build_fact_index(baseline_list)
 
         for subset_size in range(1, min(self.max_rule_mods, len(candidate_pool)) + 1):
             for subset in combinations(candidate_pool, subset_size):
@@ -421,6 +573,8 @@ class CounterfactualWorldEngine:
                     kb,
                     subset,
                     baseline,
+                    baseline_list,
+                    baseline_index,
                     starting_facts,
                     max_depth,
                     conflict_fn,
@@ -512,6 +666,7 @@ class CounterfactualWorldEngine:
             max(int(max_depth), 1),
             starting_facts=starting_facts,
             only_verified=False,
+            track_epistemic=False,
         )
 
         # Пул атомів для _op_add_body_literal
