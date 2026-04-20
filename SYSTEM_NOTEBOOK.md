@@ -19,6 +19,7 @@ Do not use this file as the main sink for new durable findings unless the user e
 
 - [Operating Rules](#operating-rules)
 - [Memory Inspection Recipes](#memory-inspection-recipes)
+- [Persistence Model](#persistence-model)
 - [Memory Categories](#memory-categories)
 - [Memory Naming Rules](#memory-naming-rules)
 - [When To Write To Memory](#when-to-write-to-memory)
@@ -53,6 +54,15 @@ Do not use this file as the main sink for new durable findings unless the user e
   - `RefactorMap:`
   - `ModuleUnderstanding:`
   - `OpenQuestion:`
+
+## Persistence Model
+
+- `memory` persists durable data across sessions only when the chat has the same `memory` MCP mounted against the same backend.
+- `codegraph` persists its index through the local graph database, but a chat still needs a working `codegraph` MCP mount to use it.
+- `filesystem` persists because files live on disk.
+- `github` persists because remote state lives on GitHub.
+- `context7` is a documentation lookup tool, not a repository memory store.
+- `sequential-thinking` is an in-session reasoning tool, not a persistent memory store.
 
 ## Memory Categories
 

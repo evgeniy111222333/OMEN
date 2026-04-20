@@ -9,6 +9,21 @@ class GroundingSpan:
     start: int
     end: int
     text: str = ""
+    byte_start: Optional[int] = None
+    byte_end: Optional[int] = None
+    source_id: str = ""
+    document_id: str = ""
+    episode_id: str = ""
+
+    @property
+    def char_length(self) -> int:
+        return max(0, int(self.end) - int(self.start))
+
+    @property
+    def byte_length(self) -> int:
+        if self.byte_start is not None and self.byte_end is not None:
+            return max(0, int(self.byte_end) - int(self.byte_start))
+        return len(str(self.text).encode("utf-8"))
 
 
 @dataclass(frozen=True)
@@ -45,6 +60,11 @@ class GroundingDocumentSummary:
     structural_unit_count: int = 0
     semantic_authority: float = 0.0
     multilingual: float = 0.0
+    source_id: str = ""
+    document_id: str = ""
+    episode_id: str = ""
+    char_coverage: float = 0.0
+    byte_coverage: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -149,6 +169,9 @@ class GroundedTextSegment:
 class GroundedTextDocument:
     language: str
     source_text: str
+    source_id: str = ""
+    document_id: str = ""
+    episode_id: str = ""
     routing: Optional[GroundingSourceProfile] = None
     structural_units: Tuple[GroundedStructuralUnit, ...] = field(default_factory=tuple)
     segments: Tuple[GroundedTextSegment, ...] = field(default_factory=tuple)

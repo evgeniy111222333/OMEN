@@ -150,6 +150,8 @@ class GroundingScenePipelineTest(unittest.TestCase):
         assert result.document.routing is not None
         self.assertEqual(result.document.routing.modality, "structured_text")
         self.assertEqual(result.document.routing.subtype, "config_text")
+        self.assertGreater(float(result.document.metadata.get("grounding_document_state_authority", 0.0)), 0.0)
+        self.assertGreater(float(result.document.metadata.get("grounding_document_semantic_authority", 0.0)), 0.0)
         self.assertEqual(result.scene.metadata.get("scene_structural_primary_active", 0.0), 1.0)
         self.assertEqual(result.scene.metadata.get("scene_fallback_backbone_active", 1.0), 0.0)
         self.assertGreaterEqual(result.document.metadata.get("grounding_key_value_units", 0.0), 3.0)
@@ -179,6 +181,9 @@ class GroundingScenePipelineTest(unittest.TestCase):
         assert result.document.routing is not None
         self.assertEqual(result.document.routing.modality, "structured_text")
         self.assertEqual(result.document.routing.subtype, "json_records")
+        self.assertGreater(float(result.document.metadata.get("grounding_document_state_authority", 0.0)), 0.0)
+        self.assertGreater(float(result.document.metadata.get("grounding_document_goal_authority", 0.0)), 0.0)
+        self.assertGreater(float(result.document.metadata.get("grounding_document_semantic_authority", 0.0)), 0.0)
         self.assertEqual(result.scene.metadata.get("scene_structural_primary_active", 0.0), 1.0)
         self.assertEqual(result.scene.metadata.get("scene_fallback_backbone_active", 1.0), 0.0)
         self.assertGreaterEqual(len(result.scene.states), 3)
@@ -204,6 +209,8 @@ class GroundingScenePipelineTest(unittest.TestCase):
 
         result = ground_text_to_symbolic(text, language="text", max_segments=8)
 
+        self.assertGreater(float(result.document.metadata.get("grounding_document_state_authority", 0.0)), 0.0)
+        self.assertGreater(float(result.document.metadata.get("grounding_document_semantic_authority", 0.0)), 0.0)
         self.assertEqual(result.scene.metadata.get("scene_structural_primary_active", 0.0), 1.0)
         self.assertEqual(result.scene.metadata.get("scene_structural_primary_hybrid_active", 0.0), 1.0)
         self.assertEqual(result.scene.metadata.get("scene_fallback_backbone_active", 0.0), 1.0)
@@ -246,6 +253,11 @@ class GroundingScenePipelineTest(unittest.TestCase):
         assert result.document.routing is not None
         self.assertEqual(result.document.routing.modality, "natural_text")
         self.assertEqual(result.document.routing.subtype, "dialogue_text")
+        self.assertGreater(float(result.document.metadata.get("grounding_goal_hints", 0.0)), 0.0)
+        self.assertGreater(float(result.document.metadata.get("grounding_relation_hints", 0.0)), 0.0)
+        self.assertGreater(float(result.document.metadata.get("grounding_document_goal_authority", 0.0)), 0.0)
+        self.assertGreater(float(result.document.metadata.get("grounding_document_relation_authority", 0.0)), 0.0)
+        self.assertGreater(float(result.document.metadata.get("grounding_document_semantic_authority", 0.0)), 0.0)
         self.assertEqual(result.scene.metadata.get("scene_structural_primary_active", 0.0), 1.0)
         self.assertEqual(result.scene.metadata.get("scene_fallback_backbone_active", 1.0), 0.0)
         self.assertGreaterEqual(result.scene.metadata.get("scene_structural_primary_segments", 0.0), 2.0)
@@ -265,6 +277,29 @@ class GroundingScenePipelineTest(unittest.TestCase):
         )
         self.assertTrue(any(event.evidence_refs for event in result.scene.events))
         self.assertTrue(any(goal.evidence_refs for goal in result.scene.goals))
+
+    def test_pipeline_routes_instruction_sequences_into_structural_primary_scene(self) -> None:
+        text = (
+            "step 1 open panel\n"
+            "step 2 enable backup pump\n"
+            "if pressure drops then trigger alarm\n"
+            "goal stable cooling"
+        )
+
+        result = ground_text_to_symbolic(text, language="text", max_segments=8)
+
+        self.assertEqual(result.document.routing.subtype, "instructional_text")
+        self.assertGreater(float(result.document.metadata.get("grounding_goal_hints", 0.0)), 0.0)
+        self.assertGreater(float(result.document.metadata.get("grounding_relation_hints", 0.0)), 0.0)
+        self.assertGreater(float(result.document.metadata.get("grounding_document_goal_authority", 0.0)), 0.0)
+        self.assertGreater(float(result.document.metadata.get("grounding_document_relation_authority", 0.0)), 0.0)
+        self.assertGreater(float(result.document.metadata.get("grounding_document_semantic_authority", 0.0)), 0.0)
+        self.assertEqual(result.scene.metadata.get("scene_structural_primary_active", 0.0), 1.0)
+        self.assertEqual(result.scene.metadata.get("scene_fallback_backbone_active", 1.0), 0.0)
+        self.assertGreaterEqual(len(result.scene.goals), 1)
+        self.assertGreaterEqual(len(result.scene.events), 1)
+        self.assertGreaterEqual(result.compiled.metadata.get("compiled_goal_claims", 0.0), 1.0)
+        self.assertGreaterEqual(result.compiled.metadata.get("compiled_relation_claims", 0.0), 1.0)
 
     def test_pipeline_uses_injected_backbone_scene_graph(self) -> None:
         result = ground_text_to_symbolic("unstructured placeholder text", language="text", backbone=_FixedBackbone())

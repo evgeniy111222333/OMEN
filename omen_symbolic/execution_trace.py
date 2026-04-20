@@ -154,6 +154,11 @@ def _build_grounding_runtime_artifacts(
         structural_unit_count=len(tuple(getattr(document, "structural_units", ()) or ())),
         semantic_authority=float(getattr(document, "metadata", {}).get("grounding_document_semantic_authority", 0.0)),
         multilingual=float(getattr(document, "metadata", {}).get("grounding_multilingual", 0.0)),
+        source_id=str(getattr(document, "source_id", "") or ""),
+        document_id=str(getattr(document, "document_id", "") or ""),
+        episode_id=str(getattr(document, "episode_id", "") or ""),
+        char_coverage=float(getattr(document, "metadata", {}).get("grounding_span_char_coverage", 0.0)),
+        byte_coverage=float(getattr(document, "metadata", {}).get("grounding_span_byte_coverage", 0.0)),
     )
     grounding_facts, grounding_targets, grounding_symbolic_stats = compile_scene_symbolic_atoms(pipeline.scene)
     grounding_context_facts, grounding_context_symbolic_stats = compile_scene_context_symbolic_atoms(
@@ -218,6 +223,11 @@ def _build_grounding_runtime_artifacts(
             "grounding_schema_version_v1": 1.0,
             "grounding_contract_document_segments": float(document_summary.segment_count),
             "grounding_contract_document_structural_units": float(document_summary.structural_unit_count),
+            "grounding_contract_document_char_coverage": float(document_summary.char_coverage),
+            "grounding_contract_document_byte_coverage": float(document_summary.byte_coverage),
+            "grounding_contract_identity_present": float(
+                all((document_summary.source_id, document_summary.document_id, document_summary.episode_id))
+            ),
             "grounding_mode": "semantic_scene_compiler",
             "grounding_orchestrator_active": 1.0,
         },

@@ -42,8 +42,64 @@ Use tools according to the shape of the task:
 - `SYSTEM_NOTEBOOK.md` for the repository-local operating manual, memory taxonomy, retrieval recipes, and templates
 - `github` for remote repository state, PRs, issues, CI, review threads, branch metadata, and remote code search
 - `context7` for third-party library/framework/package documentation and version-sensitive external API behavior
+- `sequential-thinking` for in-session multi-step reasoning, decomposition, and hypothesis checking
 
 Never substitute one tool class for another when a more authoritative tool is available.
+
+## Persistence Model
+
+Do not confuse tool availability with persistence.
+
+Persistence by tool:
+- `memory` persists durable data across sessions only when the session has the same `memory` MCP mounted against the same backend
+- `codegraph` persists its index through the local graph database, but each chat session still needs a working `codegraph` MCP mount
+- `filesystem` persists because files live on disk
+- `github` persists because remote state lives on GitHub
+- `context7` is not a persistent memory store for this repository; it is a live documentation lookup tool
+- `sequential-thinking` is not a persistent memory store; it is an in-session reasoning tool only
+
+If another chat session does not see expected memory or codegraph data, distinguish between:
+- the underlying data exists
+- the MCP tool is mounted in that chat
+- the MCP server started successfully
+- the assistant actually queried the tool
+
+Do not assume that a missing answer in another chat means the data was not persisted.
+
+## Runtime CLI Diagnostics
+
+This machine may have both:
+- Codex Desktop
+- Codex via the VS Code extension
+
+They can be open at the same time.
+
+Do not assume that a failure in one runtime means MCP is misconfigured globally.
+
+When diagnosing local MCP configuration from PowerShell:
+- do not rely only on bare `codex`
+- first identify which `codex.exe` PowerShell resolves
+- if bare `codex` fails, try the known runtime-specific binaries directly
+
+Known local diagnostic candidates:
+- Desktop binary: `C:\Program Files\WindowsApps\OpenAI.Codex_26.415.4716.0_x64__2p2nqsd0c76g0\app\resources\codex.exe`
+- VS Code extension binary: `C:\Users\HP\.vscode\extensions\openai.chatgpt-26.415.20818-win32-x64\bin\windows-x86_64\codex.exe`
+
+Important local behavior observed in this environment:
+- the Desktop `codex.exe` may fail from PowerShell with `Access is denied`
+- the VS Code extension `codex.exe` may still work correctly for `mcp list` and `mcp get`
+
+Diagnostic rule:
+- if bare `codex` fails, try both runtime-specific binaries before concluding that MCP configuration is broken
+- if the Desktop binary fails with `Access is denied`, retry with the VS Code extension binary
+- if one runtime sees MCP config and the other does not, say that explicitly rather than reporting a generic MCP failure
+- if CLI probing is still ambiguous, inspect the shared config at `C:\Users\HP\.codex\config.toml`
+
+Do not confuse:
+- a broken CLI executable path
+- a broken MCP mount in the current chat
+- a broken MCP server
+- missing persisted data
 
 ## Memory Guidance
 
@@ -169,6 +225,52 @@ Memory workflow:
 - treat memory as a durable hint layer, then verify against the repo when accuracy matters
 - after learning a durable fact, write it back succinctly
 - if memory conflicts with the repo, trust the repo and update memory later
+
+## Sequential Thinking Guidance
+
+Use `sequential-thinking` for:
+- multi-step reasoning
+- decomposition of ambiguous tasks
+- hypothesis generation and checking
+- plan refinement when the first approach looks weak
+- difficult debugging where several alternative causes must be tested
+
+Do not use `sequential-thinking` as a memory system.
+
+Rules for `sequential-thinking`:
+- treat it as temporary in-session reasoning support
+- if it produces a durable conclusion, write that conclusion to `memory`
+- do not assume a later chat can see previous sequential-thinking traces
+- use it to improve reasoning quality, not to store long-term project knowledge
+
+Sequential-thinking workflow:
+- use it when the task has competing hypotheses, unclear scope, or a high risk of shallow reasoning
+- keep the thought chain goal-directed toward a concrete answer, code change, diagnosis, or decision
+- stop using it once the uncertainty is resolved enough to act
+- after the reasoning converges, summarize the durable conclusion in normal tool work rather than leaving it trapped inside the thought chain
+- if the result matters beyond the session, write the conclusion to `memory`
+
+Sequential-thinking plus repo tools:
+- use `codegraph`, `filesystem`, `github`, `context7`, and `memory` as evidence sources
+- use `sequential-thinking` only to structure and test reasoning over that evidence
+- do not substitute a long thought chain for reading the repo or querying authoritative tools
+
+Sequential-thinking anti-patterns:
+- do not use it for trivial direct answers
+- do not use it as a running notebook
+- do not assume the chain itself is recoverable in another chat
+- do not let it expand indefinitely when the next useful step is a real repository or MCP query
+
+## Memory Availability Checks
+
+If a chat expects durable memory but appears to see nothing useful, do not assume the memory backend is empty.
+
+Check in this order:
+- verify that the `memory` MCP is actually mounted in the current chat
+- use `read_graph` to inspect whether the backend already contains entities
+- use `search_nodes` with targeted repo terms such as `OMEN Repository`, `Tooling:CodeGraphContext`, `GroundingFlow:`, `RefactorMap:`, or a specific module name
+- if useful entities exist, use `open_nodes` before concluding that memory is unavailable
+- only after those checks should the assistant say that memory appears unavailable or empty in the current session
 
 ## GitHub Guidance
 

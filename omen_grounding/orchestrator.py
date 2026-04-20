@@ -54,44 +54,50 @@ def _parser_agreement_score(pipeline: TextGroundingPipelineResult) -> Dict[str, 
     document_segments = tuple(getattr(pipeline.document, "segments", ()) or ())
     compiled_segments = tuple(getattr(pipeline.compiled, "segments", ()) or ())
     by_idx = {int(segment.index): segment for segment in compiled_segments}
-    semantic_authority = float(
-        getattr(pipeline.document, "metadata", {}).get("grounding_document_semantic_authority", 1.0)
-    )
-    semantic_document = semantic_authority > 0.0
+    document_meta = getattr(pipeline.document, "metadata", {}) or {}
+    semantic_authority = float(document_meta.get("grounding_document_semantic_authority", 1.0))
+    state_authority = _clip01(document_meta.get("grounding_document_state_authority", semantic_authority))
+    relation_authority = _clip01(document_meta.get("grounding_document_relation_authority", semantic_authority))
+    goal_authority = _clip01(document_meta.get("grounding_document_goal_authority", semantic_authority))
+
+    def _weighted_channel_agreement(document_count: int, compiled_count: int, authority: float) -> float:
+        base = 1.0 - (
+            abs(int(document_count) - int(compiled_count))
+            / max(int(document_count), int(compiled_count), 1)
+        )
+        return _clip01((1.0 - float(authority)) + (float(authority) * float(base)))
+
     relation_scores = []
     state_scores = []
     goal_scores = []
     for document_segment in document_segments:
         compiled_segment = by_idx.get(int(document_segment.index))
         if compiled_segment is None:
-            relation_scores.append(0.0)
-            state_scores.append(0.0)
-            goal_scores.append(0.0)
+            relation_scores.append(_weighted_channel_agreement(len(document_segment.relations), 0, relation_authority))
+            state_scores.append(_weighted_channel_agreement(len(document_segment.states), 0, state_authority))
+            goal_scores.append(_weighted_channel_agreement(len(document_segment.goals), 0, goal_authority))
             continue
-        if semantic_document or len(document_segment.relations) > 0:
-            relation_scores.append(
-                1.0 - (
-                    abs(len(document_segment.relations) - len(compiled_segment.relations))
-                    / max(len(document_segment.relations), len(compiled_segment.relations), 1)
-                )
-            )
-        else:
-            relation_scores.append(1.0)
-        state_scores.append(
-            1.0 - (
-                abs(len(document_segment.states) - len(compiled_segment.states))
-                / max(len(document_segment.states), len(compiled_segment.states), 1)
+        relation_scores.append(
+            _weighted_channel_agreement(
+                len(document_segment.relations),
+                len(compiled_segment.relations),
+                relation_authority,
             )
         )
-        if semantic_document or len(document_segment.goals) > 0:
-            goal_scores.append(
-                1.0 - (
-                    abs(len(document_segment.goals) - len(compiled_segment.goals))
-                    / max(len(document_segment.goals), len(compiled_segment.goals), 1)
-                )
+        state_scores.append(
+            _weighted_channel_agreement(
+                len(document_segment.states),
+                len(compiled_segment.states),
+                state_authority,
             )
-        else:
-            goal_scores.append(1.0)
+        )
+        goal_scores.append(
+            _weighted_channel_agreement(
+                len(document_segment.goals),
+                len(compiled_segment.goals),
+                goal_authority,
+            )
+        )
     relation_agreement = sum(relation_scores) / max(len(relation_scores), 1)
     state_agreement = sum(state_scores) / max(len(state_scores), 1)
     goal_agreement = sum(goal_scores) / max(len(goal_scores), 1)
@@ -114,24 +120,53 @@ def _span_traceability_score(pipeline: TextGroundingPipelineResult) -> Dict[str,
         if getattr(segment, "span", None) is not None
     }
     span_segment_coverage = float(len(segment_spans)) / max(float(len(document_segments)), 1.0)
+    byte_segment_spans = {
+        idx: span
+        for idx, span in segment_spans.items()
+        if getattr(span, "byte_start", None) is not None and getattr(span, "byte_end", None) is not None
+    }
+    byte_segment_coverage = float(len(byte_segment_spans)) / max(float(len(document_segments)), 1.0)
     traced_hypotheses = sum(
         1 for hypothesis in pipeline.compiled.hypotheses
         if getattr(hypothesis, "source_span", None) is not None
+    )
+    byte_traced_hypotheses = sum(
+        1
+        for hypothesis in pipeline.compiled.hypotheses
+        if getattr(hypothesis, "source_span", None) is not None
+        and getattr(hypothesis.source_span, "byte_start", None) is not None
+        and getattr(hypothesis.source_span, "byte_end", None) is not None
     )
     traced_world_state = sum(
         1 for record in pipeline.world_state.records
         if getattr(record, "source_span", None) is not None
     )
+    byte_traced_world_state = sum(
+        1
+        for record in pipeline.world_state.records
+        if getattr(record, "source_span", None) is not None
+        and getattr(record.source_span, "byte_start", None) is not None
+        and getattr(record.source_span, "byte_end", None) is not None
+    )
     hypothesis_coverage = float(traced_hypotheses) / max(float(len(pipeline.compiled.hypotheses)), 1.0)
+    byte_hypothesis_coverage = float(byte_traced_hypotheses) / max(float(len(pipeline.compiled.hypotheses)), 1.0)
     world_state_coverage = float(traced_world_state) / max(float(len(pipeline.world_state.records)), 1.0)
+    byte_world_state_coverage = float(byte_traced_world_state) / max(float(len(pipeline.world_state.records)), 1.0)
     traceability = _clip01(
         (0.45 * span_segment_coverage) + (0.30 * hypothesis_coverage) + (0.25 * world_state_coverage)
+    )
+    byte_traceability = _clip01(
+        (0.45 * byte_segment_coverage) + (0.30 * byte_hypothesis_coverage) + (0.25 * byte_world_state_coverage)
     )
     return {
         "grounding_span_segment_coverage": float(span_segment_coverage),
         "grounding_span_hypothesis_coverage": float(hypothesis_coverage),
         "grounding_span_world_state_coverage": float(world_state_coverage),
         "grounding_span_traceability": float(traceability),
+        "grounding_byte_span_segment_coverage": float(byte_segment_coverage),
+        "grounding_byte_span_hypothesis_coverage": float(byte_hypothesis_coverage),
+        "grounding_byte_span_world_state_coverage": float(byte_world_state_coverage),
+        "grounding_byte_span_traceability": float(byte_traceability),
     }
 
 

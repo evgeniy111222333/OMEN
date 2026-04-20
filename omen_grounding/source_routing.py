@@ -528,6 +528,9 @@ def build_parser_candidates(profile: GroundingSourceProfile) -> Tuple[GroundingP
     elif subtype == "dialogue_text":
         candidates.append(GroundingParserCandidate("speaker_turn_parser", max(0.58, confidence), role="primary"))
         candidates.append(GroundingParserCandidate("utterance_clause_segmenter", max(0.46, confidence * 0.8), role="support"))
+    elif subtype == "instructional_text":
+        candidates.append(GroundingParserCandidate("instruction_step_parser", max(0.58, confidence), role="primary"))
+        candidates.append(GroundingParserCandidate("clause_segmenter", max(0.46, confidence * 0.8), role="support"))
     elif subtype == "scientific_text":
         candidates.append(GroundingParserCandidate("citation_span_parser", max(0.55, confidence), role="primary"))
         candidates.append(GroundingParserCandidate("section_role_parser", max(0.48, confidence * 0.82), role="support"))

@@ -91,6 +91,9 @@ def _benchmark_pipeline(case: GroundingBenchmarkCase, *, iterations: int, max_se
         "compiled_event_frames": float(result.compiled.metadata.get("compiled_event_frames", 0.0)),
         "world_state_records": float(result.world_state.metadata.get("grounding_world_state_records", 0.0)),
         "verification_records": float(result.verification.metadata.get("verification_records", 0.0)),
+        "char_cov": float(result.document.metadata.get("grounding_span_char_coverage", 0.0)),
+        "byte_cov": float(result.document.metadata.get("grounding_span_byte_coverage", 0.0)),
+        "sem_auth": float(result.document.metadata.get("grounding_document_semantic_authority", 0.0)),
     }
 
 
@@ -108,6 +111,8 @@ def _benchmark_trace(case: GroundingBenchmarkCase, *, iterations: int) -> Dict[s
         "trace_grounding_facts": float(bundle.metadata.get("grounding_facts", 0.0)),
         "trace_interlingua_relations": float(bundle.metadata.get("interlingua_relations", 0.0)),
         "trace_validation_records": float(bundle.metadata.get("verifier_stack_records", 0.0)),
+        "trace_byte_span": float(bundle.metadata.get("grounding_byte_span_traceability", 0.0)),
+        "parser_ag": float(bundle.metadata.get("grounding_parser_agreement", 0.0)),
     }
 
 
@@ -124,6 +129,11 @@ def main() -> None:
         "pipe_p95".rjust(10),
         "trace_mean".rjust(12),
         "trace_p95".rjust(10),
+        "char_cov".rjust(10),
+        "byte_cov".rjust(10),
+        "sem_auth".rjust(10),
+        "par_ag".rjust(10),
+        "byte_tr".rjust(10),
         "events".rjust(8),
         "coref".rjust(8),
         "hyp".rjust(8),
@@ -138,6 +148,11 @@ def main() -> None:
             f"{pipeline_stats['pipeline_p95_ms']:.2f}".rjust(10),
             f"{trace_stats['trace_mean_ms']:.2f}".rjust(12),
             f"{trace_stats['trace_p95_ms']:.2f}".rjust(10),
+            f"{pipeline_stats['char_cov']:.2f}".rjust(10),
+            f"{pipeline_stats['byte_cov']:.2f}".rjust(10),
+            f"{pipeline_stats['sem_auth']:.2f}".rjust(10),
+            f"{trace_stats['parser_ag']:.2f}".rjust(10),
+            f"{trace_stats['trace_byte_span']:.2f}".rjust(10),
             f"{pipeline_stats['scene_events']:.0f}".rjust(8),
             f"{pipeline_stats['scene_coreference_links']:.0f}".rjust(8),
             f"{pipeline_stats['compiled_hypotheses']:.0f}".rjust(8),

@@ -4405,6 +4405,21 @@ class OMENScale(nn.Module):
                     "grounding_contract_document_multilingual": float(
                         getattr(document_summary, "multilingual", 0.0)
                     ),
+                    "grounding_contract_document_char_coverage": float(
+                        getattr(document_summary, "char_coverage", 0.0)
+                    ),
+                    "grounding_contract_document_byte_coverage": float(
+                        getattr(document_summary, "byte_coverage", 0.0)
+                    ),
+                    "grounding_contract_identity_present": float(
+                        all(
+                            (
+                                str(getattr(document_summary, "source_id", "") or ""),
+                                str(getattr(document_summary, "document_id", "") or ""),
+                                str(getattr(document_summary, "episode_id", "") or ""),
+                            )
+                        )
+                    ),
                 }
             )
         return features
