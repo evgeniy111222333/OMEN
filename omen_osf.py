@@ -201,6 +201,7 @@ class OSFSynthesizer(nn.Module):
         symbolic_goal=None,
         symbolic_facts=None,
         prover=None,
+        planner_state=None,
     ) -> PlanSequence:
         orig_depth = self.planner.max_depth
         try:
@@ -213,6 +214,7 @@ class OSFSynthesizer(nn.Module):
                 symbolic_goal=symbolic_goal,
                 symbolic_facts=symbolic_facts,
                 prover=prover,
+                planner_state=planner_state,
             )
         finally:
             self.planner.max_depth = orig_depth
@@ -266,6 +268,7 @@ class OSFSynthesizer(nn.Module):
         symbolic_goal=None,
         symbolic_facts=None,
         prover=None,
+        planner_state=None,
         best_verify=None,
     ) -> Tuple[PlanSequence, object, int]:
         best_plan = current_plan
@@ -291,6 +294,7 @@ class OSFSynthesizer(nn.Module):
                 symbolic_goal=symbolic_goal,
                 symbolic_facts=symbolic_facts,
                 prover=prover,
+                planner_state=planner_state,
             )
             candidate_verify = self.symbolic_verifier(candidate_plan, batch_size=batch_size, device=device)
             tried += 1
@@ -319,6 +323,7 @@ class OSFSynthesizer(nn.Module):
         prover=None,
         symbolic_goal=None,
         symbolic_facts=None,
+        planner_state=None,
         fast_mode: bool = False,
     ) -> Tuple[torch.Tensor, Dict]:
         """
@@ -382,6 +387,7 @@ class OSFSynthesizer(nn.Module):
             symbolic_goal=symbolic_goal,
             symbolic_facts=symbolic_facts,
             prover=prover,
+            planner_state=planner_state,
         )
 
         # ── Simulation + symbolic verification ──────────────────────────────
@@ -421,6 +427,7 @@ class OSFSynthesizer(nn.Module):
                 symbolic_goal=symbolic_goal,
                 symbolic_facts=symbolic_facts,
                 prover=prover,
+                planner_state=planner_state,
                 best_verify=verify_result,
             )
             if symbolic_repairs > 0:
@@ -474,6 +481,7 @@ class OSFSynthesizer(nn.Module):
                         symbolic_goal=symbolic_goal,
                         symbolic_facts=symbolic_facts,
                         prover=prover,
+                        planner_state=planner_state,
                     )
                     candidate_verify = self.symbolic_verifier(
                         candidate_plan, batch_size=B, device=device
@@ -493,6 +501,7 @@ class OSFSynthesizer(nn.Module):
                             symbolic_goal=symbolic_goal,
                             symbolic_facts=symbolic_facts,
                             prover=prover,
+                            planner_state=planner_state,
                             best_verify=candidate_verify,
                         )
                         if repair_tries > 0:
@@ -610,6 +619,15 @@ class OSFSynthesizer(nn.Module):
 
         # Clamp for stability.
         j_osf = j_osf.clamp(-10.0, 10.0) if torch.is_tensor(j_osf) else j_osf
+        bridge_steps = sum(1 for operator in plan.operators if getattr(operator, "source", "") == "grounding_bridge")
+        symbolic_rule_steps = sum(
+            1 for operator in plan.operators if getattr(operator, "source", "") == "symbolic_rule"
+        )
+        bridge_operator_library = float(len(getattr(planner_state, "operators", ()) or ())) if planner_state is not None else 0.0
+        bridge_resource_library = float(len(getattr(planner_state, "resources", ()) or ())) if planner_state is not None else 0.0
+        bridge_alternative_worlds = float(
+            len(getattr(planner_state, "alternative_worlds", ()) or ())
+        ) if planner_state is not None else 0.0
 
         # ── Statistics ───────────────────────────────────────────────────────
         osf_out: Dict = {
@@ -639,6 +657,11 @@ class OSFSynthesizer(nn.Module):
             "osf_plan_rl":     plan_rl_loss.item() if self.training else 0.0,
             "osf_plan_loss":   plan.plan_loss.item(),
             "osf_fast_forced": 1.0 if fast_execution_forced else 0.0,
+            "osf_bridge_operator_steps": float(bridge_steps),
+            "osf_symbolic_rule_steps": float(symbolic_rule_steps),
+            "osf_bridge_operator_library": bridge_operator_library,
+            "osf_bridge_resource_library": bridge_resource_library,
+            "osf_bridge_alternative_worlds": bridge_alternative_worlds,
         }
 
         if cfg_used.use_meta and hasattr(self, "meta_ctrl"):

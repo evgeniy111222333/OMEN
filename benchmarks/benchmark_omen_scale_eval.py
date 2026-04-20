@@ -102,6 +102,31 @@ DEFAULT_METRIC_KEYS = [
     "sym_ast_lang_javascript",
     "sym_ast_lang_rust",
     "sym_ast_lang_other",
+    "sym_source_domain_code",
+    "sym_source_domain_observation",
+    "sym_source_domain_structured",
+    "sym_source_domain_other",
+    "sym_source_confidence",
+    "sym_source_modality_code",
+    "sym_source_modality_natural_text",
+    "sym_source_modality_structured_text",
+    "sym_source_modality_mixed",
+    "sym_source_modality_unknown",
+    "sym_source_profile_code",
+    "sym_source_profile_natural_text",
+    "sym_source_profile_structured_text",
+    "sym_source_profile_mixed",
+    "sym_source_profile_unknown",
+    "sym_source_verification_ast_program",
+    "sym_source_verification_natural_claim",
+    "sym_source_verification_scientific_claim",
+    "sym_source_verification_structured_state",
+    "sym_source_verification_log_trace",
+    "sym_source_verification_config_schema",
+    "sym_source_verification_table_consistency",
+    "sym_source_verification_dialogue_state",
+    "sym_source_verification_mixed_hybrid",
+    "sym_source_verification_fallback",
     "n_rules",
 ]
 
@@ -171,6 +196,118 @@ def make_observation_structured(seq_len: int, n: int = 96) -> List[torch.Tensor]
         '{"step":1,"tank":"full","valve":"closed"}\n{"step":2,"valve":"open","flow":"high"}\n{"goal":"pressure","value":"stable"}',
         "state: user=guest, access=limited\nnext: user=admin, access=full\ngoal access=audited",
         "1) sensor=temp_high, fan=off\n2) fan=on, temp=drop\n3) target status=stable",
+    ]
+    return _encode_text_examples((templates[idx % len(templates)] for idx in range(max(int(n), 1))), seq_len)
+
+
+def make_scientific_text(seq_len: int, n: int = 96) -> List[torch.Tensor]:
+    templates = [
+        (
+            "Abstract: We evaluate a retrieval model on a benchmark dataset. "
+            "Methods: two experiments were run. Results: p < 0.05 and the baseline improved. "
+            "Conclusion: the method generalizes."
+        ),
+        (
+            "Introduction: this study investigates memory-guided reasoning. "
+            "Methods: participants completed three trials. Results showed statistically significant gains. "
+            "References [1] [2]."
+        ),
+        (
+            "Background: prior work reports lower accuracy. "
+            "Experiment: we compare a symbolic baseline and a neural baseline. "
+            "Discussion: error decreased and the hypothesis was supported."
+        ),
+    ]
+    return _encode_text_examples((templates[idx % len(templates)] for idx in range(max(int(n), 1))), seq_len)
+
+
+def make_log_text(seq_len: int, n: int = 96) -> List[torch.Tensor]:
+    templates = [
+        (
+            "2026-04-19 10:15:22 INFO start pipeline\n"
+            "2026-04-19 10:15:23 WARN cache miss on key user:17\n"
+            "2026-04-19 10:15:24 ERROR traceback: invalid state transition"
+        ),
+        (
+            "INFO worker=alpha step=load status=ok\n"
+            "DEBUG worker=alpha step=parse latency_ms=12\n"
+            "ERROR worker=alpha step=commit exception=TimeoutError"
+        ),
+    ]
+    return _encode_text_examples((templates[idx % len(templates)] for idx in range(max(int(n), 1))), seq_len)
+
+
+def make_config_text(seq_len: int, n: int = 96) -> List[torch.Tensor]:
+    templates = [
+        (
+            "[service]\n"
+            "host = localhost\n"
+            "port = 8080\n"
+            "mode = production\n"
+            "timeout = 30"
+        ),
+        (
+            "database.url=postgres://db/app\n"
+            "database.pool=16\n"
+            "feature.cache=true\n"
+            "feature.audit=false"
+        ),
+    ]
+    return _encode_text_examples((templates[idx % len(templates)] for idx in range(max(int(n), 1))), seq_len)
+
+
+def make_table_text(seq_len: int, n: int = 96) -> List[torch.Tensor]:
+    templates = [
+        (
+            "metric|baseline|omen\n"
+            "accuracy|0.71|0.84\n"
+            "latency_ms|15|12\n"
+            "memory_mb|220|210"
+        ),
+        (
+            "name,split,score\n"
+            "alpha,dev,0.82\n"
+            "beta,test,0.79\n"
+            "gamma,holdout,0.81"
+        ),
+    ]
+    return _encode_text_examples((templates[idx % len(templates)] for idx in range(max(int(n), 1))), seq_len)
+
+
+def make_dialogue_text(seq_len: int, n: int = 96) -> List[torch.Tensor]:
+    templates = [
+        (
+            "User: the server is slow.\n"
+            "Assistant: check the database latency first.\n"
+            "User: it spikes after deploy.\n"
+            "Assistant: then inspect the new migration."
+        ),
+        (
+            "Q: why did the job fail?\n"
+            "A: the worker lost access to the artifact store.\n"
+            "Q: what should we verify next?\n"
+            "A: rotate credentials and rerun the job."
+        ),
+    ]
+    return _encode_text_examples((templates[idx % len(templates)] for idx in range(max(int(n), 1))), seq_len)
+
+
+def make_mixed_text(seq_len: int, n: int = 96) -> List[torch.Tensor]:
+    templates = [
+        (
+            "def add(a, b):\n"
+            "    # Step 1: validate inputs\n"
+            "    if a is None or b is None:\n"
+            "        raise ValueError('missing operand')\n"
+            "    return a + b\n"
+        ),
+        (
+            "function serve(req) {\n"
+            "  // status: degraded\n"
+            "  const cfg = { retries: 3, mode: 'safe' };\n"
+            "  return cfg.mode;\n"
+            "}\n"
+        ),
     ]
     return _encode_text_examples((templates[idx % len(templates)] for idx in range(max(int(n), 1))), seq_len)
 
@@ -539,6 +676,12 @@ def build_transfer_tasks(
         "multilingual": make_multilingual_code(synthetic_samples, cfg.seq_len),
         "observation_text": make_observation_text(cfg.seq_len, synthetic_samples),
         "observation_structured": make_observation_structured(cfg.seq_len, synthetic_samples),
+        "scientific_text": make_scientific_text(cfg.seq_len, synthetic_samples),
+        "log_text": make_log_text(cfg.seq_len, synthetic_samples),
+        "config_text": make_config_text(cfg.seq_len, synthetic_samples),
+        "table_text": make_table_text(cfg.seq_len, synthetic_samples),
+        "dialogue_text": make_dialogue_text(cfg.seq_len, synthetic_samples),
+        "mixed_text": make_mixed_text(cfg.seq_len, synthetic_samples),
     }
     for name, path in (real_corpora or {}).items():
         tasks[str(name)] = load_text_corpus(
@@ -751,6 +894,24 @@ def run_transfer_suite(
         "sym_ast_lang_javascript",
         "sym_ast_lang_rust",
         "sym_ast_lang_other",
+        "sym_source_modality_code",
+        "sym_source_modality_natural_text",
+        "sym_source_modality_structured_text",
+        "sym_source_modality_mixed",
+        "sym_source_modality_unknown",
+        "sym_source_verification_ast_program",
+        "sym_source_verification_natural_claim",
+        "sym_source_verification_scientific_claim",
+        "sym_source_verification_structured_state",
+        "sym_source_verification_log_trace",
+        "sym_source_verification_config_schema",
+        "sym_source_verification_table_consistency",
+        "sym_source_verification_dialogue_state",
+        "sym_source_verification_mixed_hybrid",
+        "sym_source_profile_code",
+        "sym_source_profile_natural_text",
+        "sym_source_profile_structured_text",
+        "sym_source_profile_mixed",
     )
     for name, summary in task_summaries.items():
         if name == source_task:

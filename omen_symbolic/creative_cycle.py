@@ -866,6 +866,9 @@ class CreativeCycleCoordinator:
     ) -> CreativeCycleReport:
         report = CreativeCycleReport()
         self._clear_runtime_caches()
+        contradiction_scope = tuple(
+            getattr(getattr(prover, "task_context", None), "contradiction_scope_facts", lambda: frozenset())()
+        )
         if not self.enabled or prover._step % self.cycle_every != 0:
             self.intrinsic_engine.update_state(z)
             queued_goals = self.intrinsic_engine.scheduled_goals()
@@ -874,6 +877,7 @@ class CreativeCycleCoordinator:
                 "train_fast_budgeted": 1.0 if fast_mode else 0.0,
                 "intrinsic_goal_queue_size": float(len(queued_goals)),
                 "intrinsic_background_goals": float(max(len(queued_goals) - 1, 0)),
+                "contradiction_scope_facts": float(len(contradiction_scope)),
             }
             self.last_report = report
             return report
@@ -927,6 +931,9 @@ class CreativeCycleCoordinator:
                 paradox_facts.append(left)
             if right not in paradox_facts:
                 paradox_facts.append(right)
+        for fact in contradiction_scope:
+            if fact not in paradox_facts:
+                paradox_facts.append(fact)
 
         goal = prover.current_goal(z) if hasattr(prover, "current_goal") else None
         oee_target_facts: Sequence[Any] = target_facts
@@ -1089,6 +1096,7 @@ class CreativeCycleCoordinator:
         report.metrics = {
             "cycle_active": 1.0,
             "train_fast_budgeted": 1.0 if fast_mode else 0.0,
+            "contradiction_scope_facts": float(len(contradiction_scope)),
             "abduction_candidates": float(len(report.abduction_candidates)),
             "analogy_candidates": float(len(report.analogy_candidates)),
             "metaphor_candidates": float(len(report.metaphor_candidates)),

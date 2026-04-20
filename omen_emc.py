@@ -48,6 +48,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 
+from omen_grounding.emc_signals import grounding_emc_features
 from omen_symbolic.controller import merge_induction_stats
 
 
@@ -95,6 +96,13 @@ class TrajectoryStats:
     memory_residuals:  list  = field(default_factory=list)
     memory_alignments: list  = field(default_factory=list)
     memory_pressures:  list  = field(default_factory=list)
+    grounding_uncertainties: list = field(default_factory=list)
+    grounding_supports: list = field(default_factory=list)
+    grounding_ambiguities: list = field(default_factory=list)
+    grounding_recall_pressures: list = field(default_factory=list)
+    grounding_verification_pressures: list = field(default_factory=list)
+    grounding_abduction_pressures: list = field(default_factory=list)
+    grounding_control_pressures: list = field(default_factory=list)
     gap_deltas:        list  = field(default_factory=list)
     recall_gap_deltas: list  = field(default_factory=list)
     recall_gap_reliefs:list  = field(default_factory=list)
@@ -249,8 +257,8 @@ class EMCStateEncoder(nn.Module):
                  use_action_hist: bool = True):
         super().__init__()
         self.use_action_hist = use_action_hist
-        # z + goal + WM summary + 10 scalar features + action histogram.
-        d_in = d_latent * 3 + 10 + (N_ACTIONS if use_action_hist else 0)
+        # z + goal + WM summary + 16 scalar control features + action histogram.
+        d_in = d_latent * 3 + 16 + (N_ACTIONS if use_action_hist else 0)
         self.z_proj = nn.Linear(d_latent, d_latent, bias=False)
         self.goal_proj = nn.Linear(d_latent, d_latent, bias=False)
         self.wm_proj = nn.Linear(d_latent, d_latent, bias=False)
@@ -271,6 +279,12 @@ class EMCStateEncoder(nn.Module):
                 gap_relief:  Optional[torch.Tensor] = None,
                 gap_residual: Optional[torch.Tensor] = None,
                 gap_alignment: Optional[torch.Tensor] = None,
+                grounding_uncertainty: Optional[torch.Tensor] = None,
+                grounding_support: Optional[torch.Tensor] = None,
+                grounding_ambiguity: Optional[torch.Tensor] = None,
+                grounding_recall: Optional[torch.Tensor] = None,
+                grounding_verify: Optional[torch.Tensor] = None,
+                grounding_abduction: Optional[torch.Tensor] = None,
                 goal_embed:  Optional[torch.Tensor] = None,
                 wm_embed:    Optional[torch.Tensor] = None,
                 trigger_flag: Optional[torch.Tensor] = None,
@@ -308,12 +322,42 @@ class EMCStateEncoder(nn.Module):
             _as_col(relief_gap),
             _as_col(residual_gap),
             _as_col(alignment),
+            _as_col(
+                grounding_uncertainty
+                if grounding_uncertainty is not None
+                else torch.zeros((), device=z.device, dtype=z.dtype)
+            ),
+            _as_col(
+                grounding_support
+                if grounding_support is not None
+                else torch.zeros((), device=z.device, dtype=z.dtype)
+            ),
+            _as_col(
+                grounding_ambiguity
+                if grounding_ambiguity is not None
+                else torch.zeros((), device=z.device, dtype=z.dtype)
+            ),
+            _as_col(
+                grounding_recall
+                if grounding_recall is not None
+                else torch.zeros((), device=z.device, dtype=z.dtype)
+            ),
+            _as_col(
+                grounding_verify
+                if grounding_verify is not None
+                else torch.zeros((), device=z.device, dtype=z.dtype)
+            ),
+            _as_col(
+                grounding_abduction
+                if grounding_abduction is not None
+                else torch.zeros((), device=z.device, dtype=z.dtype)
+            ),
             _as_col(depth_norm),
             _as_col(nfacts_norm),
             _as_col(nrules_norm),
             _as_col(trigger_flag if trigger_flag is not None else torch.zeros((), device=z.device, dtype=z.dtype)),
             _as_col(hot_ratio if hot_ratio is not None else torch.zeros((), device=z.device, dtype=z.dtype)),
-        ], dim=-1)                                              # (B, 10)
+        ], dim=-1)                                              # (B, 16)
 
         if self.use_action_hist:
             if action_hist is not None:
@@ -440,8 +484,13 @@ class EfficientMetaController(nn.Module):
         self.lambda_gap   = getattr(cfg, 'emc_lambda_gap',     0.05)   # GapNorm penalty
         self.lambda_memory_residual = getattr(cfg, 'emc_lambda_memory_residual', 0.02)
         self.lambda_memory_misalignment = getattr(cfg, 'emc_lambda_memory_misalignment', 0.02)
+        self.lambda_grounding_uncertainty = getattr(cfg, 'emc_lambda_grounding_uncertainty', 0.02)
+        self.lambda_grounding_ambiguity = getattr(cfg, 'emc_lambda_grounding_ambiguity', 0.01)
+        self.lambda_grounding_verification = getattr(cfg, 'emc_lambda_grounding_verification', 0.02)
         self.lambda_mdl   = getattr(cfg, 'emc_lambda_mdl',     0.01)   # MDL(proof) penalty
         self.eta_int      = getattr(cfg, 'emc_eta_int',        0.10)   # bonus for newly useful facts
+        self.grounding_recall_bonus = getattr(cfg, 'emc_grounding_recall_bonus', 0.05)
+        self.grounding_abduction_bonus = getattr(cfg, 'emc_grounding_abduction_bonus', 0.03)
         self.c_recall     = getattr(cfg, 'emc_c_recall',       0.01)
         self.c_fc         = getattr(cfg, 'emc_c_fc',           0.05)
         self.c_abduce     = getattr(cfg, 'emc_c_abduce',       0.10)
@@ -564,6 +613,12 @@ class EfficientMetaController(nn.Module):
         relief_gap_val = max(min(gap_info["gap_memory_relief"] / 5.0, 1.0), -1.0)
         residual_gap_val = max(min(gap_info["gap_memory_residual"], 5.0), 0.0) / 5.0
         alignment_val = max(min(gap_info["gap_memory_alignment"], 1.0), -1.0)
+        grounding_uncertainty = max(min(gap_info.get("grounding_uncertainty", 0.0), 1.0), 0.0)
+        grounding_support = max(min(gap_info.get("grounding_support", 0.0), 1.0), 0.0)
+        grounding_ambiguity = max(min(gap_info.get("grounding_ambiguity", 0.0), 1.0), 0.0)
+        grounding_recall = max(min(gap_info.get("grounding_recall_readiness", 0.0), 1.0), 0.0)
+        grounding_verify = max(min(gap_info.get("grounding_verification_pressure", 0.0), 1.0), 0.0)
+        grounding_abduction = max(min(gap_info.get("grounding_abduction_pressure", 0.0), 1.0), 0.0)
 
         def _s(v) -> torch.Tensor:
             return torch.tensor(v, device=dev, dtype=dtype)
@@ -590,6 +645,12 @@ class EfficientMetaController(nn.Module):
             gap_relief=_s(relief_gap_val),
             gap_residual=_s(residual_gap_val),
             gap_alignment=_s(alignment_val),
+            grounding_uncertainty=_s(grounding_uncertainty),
+            grounding_support=_s(grounding_support),
+            grounding_ambiguity=_s(grounding_ambiguity),
+            grounding_recall=_s(grounding_recall),
+            grounding_verify=_s(grounding_verify),
+            grounding_abduction=_s(grounding_abduction),
             goal_embed=goal_embed,
             wm_embed=wm_embed,
             trigger_flag=_s(trigger_flag),
@@ -644,7 +705,40 @@ class EfficientMetaController(nn.Module):
             "gap_memory_relief": relief_gap,
             "gap_memory_residual": residual_gap,
             "gap_memory_alignment": alignment,
+            **{
+                key: float(value)
+                for key, value in features.items()
+                if str(key).startswith("grounding_")
+                and not isinstance(value, bool)
+                and isinstance(value, (int, float))
+            },
         }
+
+    @staticmethod
+    def _grounding_override_features(
+        gap_features: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, float]:
+        overrides: Dict[str, float] = {}
+        for key, value in (gap_features or {}).items():
+            if not str(key).startswith("grounding_"):
+                continue
+            try:
+                overrides[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
+        return overrides
+
+    def _merge_task_grounding_features(
+        self,
+        prover,
+        gap_features: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, float]:
+        task_context = getattr(prover, "task_context", None)
+        metadata = getattr(task_context, "metadata", None)
+        merged = dict(gap_features or {})
+        merged.update(grounding_emc_features(metadata))
+        merged.update(self._grounding_override_features(gap_features))
+        return merged
 
     def _apply_recall_gap_feedback(
         self,
@@ -740,6 +834,41 @@ class EfficientMetaController(nn.Module):
             + self.lambda_memory_misalignment * misalignment
         )
 
+    def _grounding_control_penalty(
+        self,
+        gap_features: Optional[Dict[str, float]] = None,
+    ) -> float:
+        features = gap_features or {}
+        uncertainty = max(min(float(features.get("grounding_uncertainty", 0.0)), 1.0), 0.0)
+        ambiguity = max(min(float(features.get("grounding_ambiguity", 0.0)), 1.0), 0.0)
+        verification = max(
+            min(float(features.get("grounding_verification_pressure", 0.0)), 1.0),
+            0.0,
+        )
+        return (
+            self.lambda_grounding_uncertainty * uncertainty
+            + self.lambda_grounding_ambiguity * ambiguity
+            + self.lambda_grounding_verification * verification
+        )
+
+    def _grounding_action_bonus(
+        self,
+        action: int,
+        gap_features: Optional[Dict[str, float]] = None,
+    ) -> float:
+        features = gap_features or {}
+        if action == ACTION_RECALL:
+            return self.grounding_recall_bonus * max(
+                min(float(features.get("grounding_recall_readiness", 0.0)), 1.0),
+                0.0,
+            )
+        if action == ACTION_ABDUCE:
+            return self.grounding_abduction_bonus * max(
+                min(float(features.get("grounding_abduction_pressure", 0.0)), 1.0),
+                0.0,
+            )
+        return 0.0
+
     # Main loop
 
     def run_episode(self,
@@ -825,7 +954,10 @@ class EfficientMetaController(nn.Module):
         z_cur        = z.clone()
         v_mem_out    = torch.zeros_like(z)
         gap_norm_cur = gap_norm.clone()   # updated after every action
-        current_gap_features = self._coerce_gap_features(gap_norm_cur, gap_features)
+        current_gap_features = self._merge_task_grounding_features(
+            prover,
+            self._coerce_gap_features(gap_norm_cur, gap_features),
+        )
 
         # VoC criterion reset for new episode
         self.voc.reset()
@@ -872,7 +1004,30 @@ class EfficientMetaController(nn.Module):
             traj.memory_residuals.append(float(current_gap_features["gap_memory_residual"]))
             traj.memory_alignments.append(float(current_gap_features["gap_memory_alignment"]))
             memory_pressure = self._memory_control_penalty(current_gap_features)
+            grounding_pressure = self._grounding_control_penalty(current_gap_features)
+            total_control_pressure = memory_pressure + grounding_pressure
             traj.memory_pressures.append(memory_pressure)
+            traj.grounding_uncertainties.append(
+                float(current_gap_features.get("grounding_uncertainty", 0.0))
+            )
+            traj.grounding_supports.append(
+                float(current_gap_features.get("grounding_support", 0.0))
+            )
+            traj.grounding_ambiguities.append(
+                float(current_gap_features.get("grounding_ambiguity", 0.0))
+            )
+            traj.grounding_recall_pressures.append(
+                float(current_gap_features.get("grounding_recall_readiness", 0.0))
+            )
+            traj.grounding_verification_pressures.append(
+                float(current_gap_features.get("grounding_verification_pressure", 0.0))
+            )
+            traj.grounding_abduction_pressures.append(
+                float(current_gap_features.get("grounding_abduction_pressure", 0.0))
+            )
+            traj.grounding_control_pressures.append(
+                float(current_gap_features.get("grounding_control_pressure", 0.0))
+            )
 
             # ── Critic: V(s) ─────────────────────────────────────────────────
             val = self.critic(state_vec).mean()   # scalar
@@ -885,7 +1040,7 @@ class EfficientMetaController(nn.Module):
                 state_vec, r_int_cumulative, gap_norm_cur,
                 mdl_cost=mdl_cost_cur,
                 t_elapsed=step,
-                memory_penalty=memory_pressure)                                # ← λ_time·T_elapsed
+                memory_penalty=total_control_pressure)                                # ← λ_time·T_elapsed
             u_stop_scalar = u_stop.mean().item()
             u_stop_list.append(u_stop_scalar)
 
@@ -954,13 +1109,17 @@ class EfficientMetaController(nn.Module):
                     v_mem_step.norm(dim=-1).mean().item() / (z.shape[-1] ** 0.5 + 1e-6)
                     + gap_delta
                 )
+                r_int += self._grounding_action_bonus(ACTION_RECALL, current_gap_features)
                 traj.recall_gap_deltas.append(gap_delta)
                 traj.recall_gap_reliefs.append(float(recall_gap.get("gap_memory_relief", gap_delta)))
                 traj.recall_effective_steps += float(recall_gap.get("gap_effective", 0.0))
-                current_gap_features = self._coerce_gap_features(
-                    gap_norm_cur,
-                    recall_gap,
-                    prior_features=current_gap_features,
+                current_gap_features = self._merge_task_grounding_features(
+                    prover,
+                    self._coerce_gap_features(
+                        gap_norm_cur,
+                        recall_gap,
+                        prior_features=current_gap_features,
+                    ),
                 )
 
             elif a == ACTION_FC:
@@ -1003,10 +1162,13 @@ class EfficientMetaController(nn.Module):
                         gap_norm_cur = (gap_norm_cur * 0.95).clamp(0.0, 5.0)
                         gap_delta = gap_before - float(gap_norm_cur.mean().item())
                         after_stats = {}
-                    current_gap_features = self._coerce_gap_features(
-                        gap_norm_cur,
-                        after_stats,
-                        prior_features=current_gap_features,
+                    current_gap_features = self._merge_task_grounding_features(
+                        prover,
+                        self._coerce_gap_features(
+                            gap_norm_cur,
+                            after_stats,
+                            prior_features=current_gap_features,
+                        ),
                     )
                     r_int += gap_delta
 
@@ -1057,12 +1219,16 @@ class EfficientMetaController(nn.Module):
                         gap_norm_cur = (gap_norm_cur * 0.85).clamp(0.0, 5.0)
                         gap_delta = gap_before - float(gap_norm_cur.mean().item())
                         after_stats = {}
-                    current_gap_features = self._coerce_gap_features(
-                        gap_norm_cur,
-                        after_stats,
-                        prior_features=current_gap_features,
+                    current_gap_features = self._merge_task_grounding_features(
+                        prover,
+                        self._coerce_gap_features(
+                            gap_norm_cur,
+                            after_stats,
+                            prior_features=current_gap_features,
+                        ),
                     )
                     r_int += gap_delta
+                r_int += self._grounding_action_bonus(ACTION_ABDUCE, current_gap_features)
 
             elif a == ACTION_INTRINSIC:
                 focused_goal = getattr(prover, "focus_intrinsic_goal", lambda: None)()
@@ -1070,6 +1236,13 @@ class EfficientMetaController(nn.Module):
                     goal = prover.current_goal(z_cur)
                     goal_embed = self._goal_embed(prover, goal, B, device)
                     r_int = max(float(getattr(prover, "current_intrinsic_value", lambda: 0.0)()), 0.0)
+                    current_gap_features = self._merge_task_grounding_features(
+                        prover,
+                        self._coerce_gap_features(
+                            gap_norm_cur,
+                            prior_features=current_gap_features,
+                        ),
+                    )
 
             r_int_cumulative += r_int
             traj.action_costs.append(cost_a)
@@ -1084,7 +1257,7 @@ class EfficientMetaController(nn.Module):
             instant = (self.eta_int * r_int
                        - cost_a
                        - self.lambda_gap * min(gn_val, 5.0)
-                       - memory_pressure
+                       - total_control_pressure
                        - self.lambda_time
                        - self.lambda_mdl * float(cost_a))   # MDL(proof) penalty per step
             rewards_list.append(instant)
@@ -1364,6 +1537,7 @@ class EfficientMetaController(nn.Module):
                 z_cur, gap_norm_cur,
                 len(traj.actions),
                 len(working_facts), len(prover.kb),
+                gap_features=current_gap_features,
                 goal_embed=goal_embed,
                 wm_embed=self._wm_embed(prover, device, B, facts=working_facts),
                 trigger_flag=self._rule_trigger_flag(prover, facts=working_facts),
@@ -1484,6 +1658,37 @@ class EfficientMetaController(nn.Module):
                 float(sum(traj.memory_pressures) / len(traj.memory_pressures))
                 if traj.memory_pressures else 0.0
             ),
+            "emc_state_grounding_uncertainty": (
+                float(sum(traj.grounding_uncertainties) / len(traj.grounding_uncertainties))
+                if traj.grounding_uncertainties else 0.0
+            ),
+            "emc_state_grounding_support": (
+                float(sum(traj.grounding_supports) / len(traj.grounding_supports))
+                if traj.grounding_supports else 0.0
+            ),
+            "emc_state_grounding_ambiguity": (
+                float(sum(traj.grounding_ambiguities) / len(traj.grounding_ambiguities))
+                if traj.grounding_ambiguities else 0.0
+            ),
+            "emc_state_grounding_recall_readiness": (
+                float(sum(traj.grounding_recall_pressures) / len(traj.grounding_recall_pressures))
+                if traj.grounding_recall_pressures else 0.0
+            ),
+            "emc_state_grounding_verification_pressure": (
+                float(
+                    sum(traj.grounding_verification_pressures)
+                    / len(traj.grounding_verification_pressures)
+                )
+                if traj.grounding_verification_pressures else 0.0
+            ),
+            "emc_state_grounding_abduction_pressure": (
+                float(sum(traj.grounding_abduction_pressures) / len(traj.grounding_abduction_pressures))
+                if traj.grounding_abduction_pressures else 0.0
+            ),
+            "emc_state_grounding_control_pressure": (
+                float(sum(traj.grounding_control_pressures) / len(traj.grounding_control_pressures))
+                if traj.grounding_control_pressures else 0.0
+            ),
             "emc_gap_events": float(len(traj.gap_deltas)),
             "emc_recall_steps": float(len(traj.recall_gap_deltas)),
             "emc_recall_gap_delta": (
@@ -1553,7 +1758,10 @@ class EfficientMetaController(nn.Module):
         z_cur        = z.clone()
         v_mem_out    = torch.zeros_like(z)
         gap_norm_cur = gap_norm.clone()
-        current_gap_features = self._coerce_gap_features(gap_norm_cur, gap_features)
+        current_gap_features = self._merge_task_grounding_features(
+            prover,
+            self._coerce_gap_features(gap_norm_cur, gap_features),
+        )
         self.voc.reset()
 
         action_counts: List[int] = [0] * N_ACTIONS
@@ -1574,6 +1782,13 @@ class EfficientMetaController(nn.Module):
         memory_residuals: List[float] = []
         memory_alignments: List[float] = []
         memory_pressures: List[float] = []
+        grounding_uncertainties: List[float] = []
+        grounding_supports: List[float] = []
+        grounding_ambiguities: List[float] = []
+        grounding_recall_pressures: List[float] = []
+        grounding_verification_pressures: List[float] = []
+        grounding_abduction_pressures: List[float] = []
+        grounding_control_pressures: List[float] = []
         recall_gap_deltas: List[float] = []
         recall_gap_reliefs: List[float] = []
         recall_effective_steps = 0.0
@@ -1601,7 +1816,24 @@ class EfficientMetaController(nn.Module):
             memory_residuals.append(float(current_gap_features["gap_memory_residual"]))
             memory_alignments.append(float(current_gap_features["gap_memory_alignment"]))
             memory_pressure = self._memory_control_penalty(current_gap_features)
+            grounding_pressure = self._grounding_control_penalty(current_gap_features)
+            total_control_pressure = memory_pressure + grounding_pressure
             memory_pressures.append(memory_pressure)
+            grounding_uncertainties.append(float(current_gap_features.get("grounding_uncertainty", 0.0)))
+            grounding_supports.append(float(current_gap_features.get("grounding_support", 0.0)))
+            grounding_ambiguities.append(float(current_gap_features.get("grounding_ambiguity", 0.0)))
+            grounding_recall_pressures.append(
+                float(current_gap_features.get("grounding_recall_readiness", 0.0))
+            )
+            grounding_verification_pressures.append(
+                float(current_gap_features.get("grounding_verification_pressure", 0.0))
+            )
+            grounding_abduction_pressures.append(
+                float(current_gap_features.get("grounding_abduction_pressure", 0.0))
+            )
+            grounding_control_pressures.append(
+                float(current_gap_features.get("grounding_control_pressure", 0.0))
+            )
 
             val    = self.critic(state_vec).mean()
             mdl_cost_cur = self.lambda_mdl * proof_mdl_cur
@@ -1609,7 +1841,7 @@ class EfficientMetaController(nn.Module):
                 state_vec, r_int_cumulative, gap_norm_cur,
                 mdl_cost=mdl_cost_cur,
                 t_elapsed=step,
-                memory_penalty=memory_pressure)
+                memory_penalty=total_control_pressure)
 
             # Bellman + VoC stop check
             bellman_stop = self.stopping_utility.bellman_should_stop(
@@ -1648,14 +1880,18 @@ class EfficientMetaController(nn.Module):
                 z_cur      = (z_before + v_mem_step).clamp(-20.0, 20.0)
                 v_mem_out  = v_mem_step
                 r_int      = v_mem_step.norm(dim=-1).mean().item() / (z.shape[-1] ** 0.5 + 1e-6)
+                r_int += self._grounding_action_bonus(ACTION_RECALL, current_gap_features)
                 gap_deltas.append(float(recall_gap.get("gap_delta", 0.0)))
                 recall_gap_deltas.append(float(recall_gap.get("gap_delta", 0.0)))
                 recall_gap_reliefs.append(float(recall_gap.get("gap_memory_relief", 0.0)))
                 recall_effective_steps += float(recall_gap.get("gap_effective", 0.0))
-                current_gap_features = self._coerce_gap_features(
-                    gap_norm_cur,
-                    recall_gap,
-                    prior_features=current_gap_features,
+                current_gap_features = self._merge_task_grounding_features(
+                    prover,
+                    self._coerce_gap_features(
+                        gap_norm_cur,
+                        recall_gap,
+                        prior_features=current_gap_features,
+                    ),
                 )
 
             elif a == ACTION_FC:
@@ -1694,10 +1930,13 @@ class EfficientMetaController(nn.Module):
                         gap_norm_cur = (gap_norm_cur * 0.95).clamp(0.0, 5.0)
                         gap_deltas.append(gap_before - float(gap_norm_cur.mean().item()))
                         after_stats = {}
-                    current_gap_features = self._coerce_gap_features(
-                        gap_norm_cur,
-                        after_stats,
-                        prior_features=current_gap_features,
+                    current_gap_features = self._merge_task_grounding_features(
+                        prover,
+                        self._coerce_gap_features(
+                            gap_norm_cur,
+                            after_stats,
+                            prior_features=current_gap_features,
+                        ),
                     )
 
             elif a == ACTION_ABDUCE:
@@ -1752,11 +1991,15 @@ class EfficientMetaController(nn.Module):
                         gap_norm_cur = (gap_norm_cur * 0.85).clamp(0.0, 5.0)
                         gap_deltas.append(gap_before - float(gap_norm_cur.mean().item()))
                         after_stats = {}
-                    current_gap_features = self._coerce_gap_features(
-                        gap_norm_cur,
-                        after_stats,
-                        prior_features=current_gap_features,
+                    current_gap_features = self._merge_task_grounding_features(
+                        prover,
+                        self._coerce_gap_features(
+                            gap_norm_cur,
+                            after_stats,
+                            prior_features=current_gap_features,
+                        ),
                     )
+                r_int += self._grounding_action_bonus(ACTION_ABDUCE, current_gap_features)
 
             elif a == ACTION_INTRINSIC:
                 focused_goal = getattr(prover, "focus_intrinsic_goal", lambda: None)()
@@ -1764,6 +2007,13 @@ class EfficientMetaController(nn.Module):
                     goal = prover.current_goal(z_cur)
                     goal_embed = self._goal_embed(prover, goal, B, device)
                     r_int = max(float(getattr(prover, "current_intrinsic_value", lambda: 0.0)()), 0.0)
+                    current_gap_features = self._merge_task_grounding_features(
+                        prover,
+                        self._coerce_gap_features(
+                            gap_norm_cur,
+                            prior_features=current_gap_features,
+                        ),
+                    )
 
             r_int_cumulative += r_int
 
@@ -1910,6 +2160,34 @@ class EfficientMetaController(nn.Module):
             "emc_state_memory_pressure": (
                 float(sum(memory_pressures) / len(memory_pressures))
                 if memory_pressures else 0.0
+            ),
+            "emc_state_grounding_uncertainty": (
+                float(sum(grounding_uncertainties) / len(grounding_uncertainties))
+                if grounding_uncertainties else 0.0
+            ),
+            "emc_state_grounding_support": (
+                float(sum(grounding_supports) / len(grounding_supports))
+                if grounding_supports else 0.0
+            ),
+            "emc_state_grounding_ambiguity": (
+                float(sum(grounding_ambiguities) / len(grounding_ambiguities))
+                if grounding_ambiguities else 0.0
+            ),
+            "emc_state_grounding_recall_readiness": (
+                float(sum(grounding_recall_pressures) / len(grounding_recall_pressures))
+                if grounding_recall_pressures else 0.0
+            ),
+            "emc_state_grounding_verification_pressure": (
+                float(sum(grounding_verification_pressures) / len(grounding_verification_pressures))
+                if grounding_verification_pressures else 0.0
+            ),
+            "emc_state_grounding_abduction_pressure": (
+                float(sum(grounding_abduction_pressures) / len(grounding_abduction_pressures))
+                if grounding_abduction_pressures else 0.0
+            ),
+            "emc_state_grounding_control_pressure": (
+                float(sum(grounding_control_pressures) / len(grounding_control_pressures))
+                if grounding_control_pressures else 0.0
             ),
             "emc_gap_events": float(len(gap_deltas)),
             "emc_recall_steps": float(len(recall_gap_deltas)),

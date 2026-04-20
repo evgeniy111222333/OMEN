@@ -60,6 +60,9 @@ class OMENScaleConfig:
     mem_decay:        float = 0.995
     mem_symbolic_recall_topk: int = 8
     mem_symbolic_min_sim: float = 0.20
+    mem_grounding_recall_topk: int = 6
+    mem_grounding_min_sim: float = 0.15
+    mem_grounding_seed_limit: int = 16
 
     # ─── ∂-Prolog (Symbolic) ──────────────────────────────────────────────────
     sym_vocab:        int   = 128     # symbolic vocabulary size
@@ -290,7 +293,12 @@ class OMENScaleConfig:
     emc_lambda_gap:    float = 0.05    # GapNorm penalty (ignorance)
     emc_lambda_memory_residual: float = 0.02   # memory-residual penalty in meta-control
     emc_lambda_memory_misalignment: float = 0.02  # memory-misalignment penalty in meta-control
+    emc_lambda_grounding_uncertainty: float = 0.02  # grounding-uncertainty pressure in meta-control
+    emc_lambda_grounding_ambiguity: float = 0.01  # modality/typing ambiguity pressure in meta-control
+    emc_lambda_grounding_verification: float = 0.02  # weak-support pressure in meta-control
     emc_eta_int:       float = 0.10    # bonus for new facts/rules (R_int)
+    emc_grounding_recall_bonus: float = 0.05  # bounded prior for recall under grounding uncertainty
+    emc_grounding_abduction_bonus: float = 0.03  # bounded prior for abduction under weak support
     emc_c_recall:      float = 0.01    # RecallMCore action cost
     emc_c_fc:          float = 0.05    # ForwardChainStep action cost
     emc_c_abduce:      float = 0.10    # Abduce action cost

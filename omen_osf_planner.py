@@ -25,11 +25,13 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass, field
-from typing import Dict, FrozenSet, List, Optional, Set, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from omen_grounding import compile_planner_bridge_operator_specs, planner_state_seed_facts
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -61,6 +63,9 @@ class PlanOperator:
     add_effects:   Tuple[PlanFact, ...]
     del_effects:   Tuple[PlanFact, ...]
     embedding:     Optional[torch.Tensor] = None   # (d_plan,)
+    source:        str = "planner_default"
+    status:        str = "active"
+    priority:      float = 0.0
 
     def applicable(self, wm: Set[PlanFact]) -> bool:
         return all(p in wm for p in self.preconditions)
@@ -361,6 +366,9 @@ class SymbolicPlanner(nn.Module):
                 add_effects=add_all,
                 del_effects=del_all,
                 embedding=op_emb,
+                source="planner_default",
+                status="active",
+                priority=0.0,
             ))
         return lib
 
@@ -393,9 +401,52 @@ class SymbolicPlanner(nn.Module):
                 add_effects=tuple(dict.fromkeys(add)),
                 del_effects=tuple(),
                 embedding=emb,
+                source="symbolic_rule",
+                status="active",
+                priority=0.12,
             ))
             if len(lib) >= self.n_operators:
                 break
+        return lib
+
+    def _planner_state_seed(
+        self,
+        planner_state: Any,
+    ) -> Set[PlanFact]:
+        return {
+            PlanFact(int(pred), int(arg))
+            for pred, arg in planner_state_seed_facts(planner_state)
+        }
+
+    def _planner_state_operator_library(
+        self,
+        planner_state: Any,
+        goal_id: int,
+        device: torch.device,
+    ) -> List[PlanOperator]:
+        specs = compile_planner_bridge_operator_specs(
+            planner_state,
+            goal_id=goal_id,
+            limit=max(4, self.n_operators // 2),
+        )
+        lib: List[PlanOperator] = []
+        for idx, spec in enumerate(specs):
+            emb = self.op_embeddings(
+                torch.tensor([idx % max(self.n_operators, 1)], device=device, dtype=torch.long)
+            ).squeeze(0)
+            lib.append(
+                PlanOperator(
+                    op_id=idx % max(self.n_operators, 1),
+                    op_type=str(spec.predicate or "bridge"),
+                    preconditions=tuple(PlanFact(int(pred), int(arg)) for pred, arg in spec.preconditions),
+                    add_effects=tuple(PlanFact(int(pred), int(arg)) for pred, arg in spec.add_effects),
+                    del_effects=tuple(PlanFact(int(pred), int(arg)) for pred, arg in spec.del_effects),
+                    embedding=emb,
+                    source=str(spec.source or "grounding_bridge"),
+                    status=str(spec.status or "hypothetical"),
+                    priority=float(spec.priority),
+                )
+            )
         return lib
 
     @staticmethod
@@ -465,6 +516,7 @@ class SymbolicPlanner(nn.Module):
         symbolic_goal=None,
         symbolic_facts: Optional[FrozenSet] = None,
         prover=None,
+        planner_state: Any = None,
     ) -> PlanSequence:
         """
         intent_state.z_intent: (B, d_intent)
@@ -478,6 +530,7 @@ class SymbolicPlanner(nn.Module):
             symbolic_goal=symbolic_goal,
             symbolic_facts=symbolic_facts,
             prover=prover,
+            planner_state=planner_state,
         )
 
     def _forward_beam(
@@ -486,6 +539,7 @@ class SymbolicPlanner(nn.Module):
         symbolic_goal=None,
         symbolic_facts: Optional[FrozenSet] = None,
         prover=None,
+        planner_state: Any = None,
     ) -> PlanSequence:
         """
         Real search-based planner on top of Working Memory.
@@ -500,11 +554,31 @@ class SymbolicPlanner(nn.Module):
         goal_id, default_goal_facts = self._goal_facts(intent_state)
         goal_facts = symbolic_goal_facts or default_goal_facts
         goal_id = sym_goal_id if sym_goal_id is not None else goal_id
+        bridge_ops = self._planner_state_operator_library(planner_state, goal_id, device)
         symbolic_ops = self._symbolic_operator_library(prover, symbolic_facts, device)
         default_ops = self._operator_library(z_intent, goal_id, device)
-        operator_lib = symbolic_ops + default_ops[:max(self.n_operators - len(symbolic_ops), 0)]
+        bridge_quota = min(len(bridge_ops), max(2, self.n_operators // 3))
+        symbolic_quota = min(len(symbolic_ops), max(2, self.n_operators // 3))
+        default_quota = max(self.n_operators - bridge_quota - symbolic_quota, 0)
+        operator_lib = (
+            bridge_ops[:bridge_quota]
+            + symbolic_ops[:symbolic_quota]
+            + default_ops[:default_quota]
+        )
+        if len(operator_lib) < self.n_operators:
+            remaining = (
+                bridge_ops[bridge_quota:]
+                + symbolic_ops[symbolic_quota:]
+                + default_ops[default_quota:]
+            )
+            operator_lib = operator_lib + remaining[: max(self.n_operators - len(operator_lib), 0)]
         start_fact = PlanFact(300, goal_id)
-        start_wm = symbolic_wm or {start_fact}
+        start_wm = set(symbolic_wm)
+        start_wm.update(self._planner_state_seed(planner_state))
+        if not start_wm:
+            start_wm = {start_fact}
+        else:
+            start_wm.add(start_fact)
 
         beam = [{
             "wm": start_wm,
@@ -555,6 +629,7 @@ class SymbolicPlanner(nn.Module):
                     heuristic = (
                         2.5 * new_progress
                         + 0.2 * value_score
+                        + float(getattr(op, "priority", 0.0))
                         - next_depth_penalty
                     )
                     expanded.append({

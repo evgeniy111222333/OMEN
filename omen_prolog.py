@@ -447,8 +447,16 @@ class SymbolicTaskContext:
     observed_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
     observed_now_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
     memory_derived_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
+    memory_grounding_records: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_hypotheses: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_verification_records: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_world_state_records: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_world_state_active_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
+    grounding_world_state_hypothetical_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
+    grounding_world_state_contradicted_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
     saliency_derived_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
     net_derived_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
+    grounding_derived_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
     world_context_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
     abduced_support_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
     goal: Optional[HornAtom] = None
@@ -471,8 +479,16 @@ class SymbolicTaskContext:
         self.observed_facts = _freeze_atoms(self.observed_facts)
         self.observed_now_facts = _freeze_atoms(self.observed_now_facts)
         self.memory_derived_facts = _freeze_atoms(self.memory_derived_facts)
+        self.memory_grounding_records = tuple(self.memory_grounding_records or ())
+        self.grounding_hypotheses = tuple(self.grounding_hypotheses or ())
+        self.grounding_verification_records = tuple(self.grounding_verification_records or ())
+        self.grounding_world_state_records = tuple(self.grounding_world_state_records or ())
+        self.grounding_world_state_active_facts = _freeze_atoms(self.grounding_world_state_active_facts)
+        self.grounding_world_state_hypothetical_facts = _freeze_atoms(self.grounding_world_state_hypothetical_facts)
+        self.grounding_world_state_contradicted_facts = _freeze_atoms(self.grounding_world_state_contradicted_facts)
         self.saliency_derived_facts = _freeze_atoms(self.saliency_derived_facts)
         self.net_derived_facts = _freeze_atoms(self.net_derived_facts)
+        self.grounding_derived_facts = _freeze_atoms(self.grounding_derived_facts)
         self.world_context_facts = _freeze_atoms(self.world_context_facts)
         self.abduced_support_facts = _freeze_atoms(self.abduced_support_facts)
         self.target_facts = _freeze_atoms(self.target_facts)
@@ -488,6 +504,7 @@ class SymbolicTaskContext:
         merged.update(self.memory_derived_facts)
         merged.update(self.saliency_derived_facts)
         merged.update(self.net_derived_facts)
+        merged.update(self.grounding_world_state_active_facts)
         merged.update(self.world_context_facts)
         merged.update(self.abduced_support_facts)
         self.observed_facts = frozenset(merged)
@@ -496,19 +513,46 @@ class SymbolicTaskContext:
     def recalled_facts(self) -> FrozenSet[HornAtom]:
         return self.memory_derived_facts
 
+    def reasoning_facts(self) -> FrozenSet[HornAtom]:
+        merged = set(self.observed_facts)
+        merged.update(self.grounding_world_state_active_facts)
+        return frozenset(merged)
+
+    def planner_facts(self) -> FrozenSet[HornAtom]:
+        merged = set(self.reasoning_facts())
+        merged.update(self.grounding_world_state_hypothetical_facts)
+        return frozenset(merged)
+
+    def contradiction_scope_facts(self) -> FrozenSet[HornAtom]:
+        return self.grounding_world_state_contradicted_facts
+
     def source_fact_records(
         self,
         *,
         include_goal: bool = False,
         include_targets: bool = False,
-    ) -> Tuple[Tuple[str, HornAtom], ...]:
-        records: List[Tuple[str, HornAtom]] = []
-        seen: Set[HornAtom] = set()
+    ) -> Tuple[Tuple[str, Any], ...]:
+        records: List[Tuple[str, Any]] = []
+        seen: Set[Any] = set()
+        for record in sorted(self.grounding_world_state_records, key=repr):
+            status = str(getattr(record, "world_status", "hypothetical") or "hypothetical").strip().lower()
+            label = f"grounding_world_state_{status}"
+            if record in seen:
+                continue
+            seen.add(record)
+            records.append((label, record))
         source_groups = (
             ("observed_now", self.observed_now_facts),
             ("memory", self.memory_derived_facts),
+            ("grounding_world_state_active_fact", self.grounding_world_state_active_facts),
+            ("grounding_world_state_hypothetical_fact", self.grounding_world_state_hypothetical_facts),
+            ("grounding_world_state_contradicted_fact", self.grounding_world_state_contradicted_facts),
+            ("grounding_hypothesis", self.grounding_hypotheses),
+            ("grounding_verification", self.grounding_verification_records),
+            ("memory_grounding", self.memory_grounding_records),
             ("saliency", self.saliency_derived_facts),
             ("net", self.net_derived_facts),
+            ("grounding", self.grounding_derived_facts),
             ("world_context", self.world_context_facts),
             ("abduced", self.abduced_support_facts),
         )
@@ -534,8 +578,25 @@ class SymbolicTaskContext:
         return {
             "observed_now_facts": float(len(self.observed_now_facts)),
             "memory_derived_facts": float(len(self.memory_derived_facts)),
+            "memory_grounding_records": float(len(self.memory_grounding_records)),
+            "grounding_hypotheses": float(len(self.grounding_hypotheses)),
+            "grounding_verification_records": float(len(self.grounding_verification_records)),
+            "grounding_world_state_records": float(len(self.grounding_world_state_records)),
+            "grounding_world_state_active_records": float(
+                sum(1 for record in self.grounding_world_state_records if getattr(record, "world_status", "") == "active")
+            ),
+            "grounding_world_state_hypothetical_records": float(
+                sum(1 for record in self.grounding_world_state_records if getattr(record, "world_status", "") == "hypothetical")
+            ),
+            "grounding_world_state_contradicted_records": float(
+                sum(1 for record in self.grounding_world_state_records if getattr(record, "world_status", "") == "contradicted")
+            ),
+            "grounding_world_state_active_facts": float(len(self.grounding_world_state_active_facts)),
+            "grounding_world_state_hypothetical_facts": float(len(self.grounding_world_state_hypothetical_facts)),
+            "grounding_world_state_contradicted_facts": float(len(self.grounding_world_state_contradicted_facts)),
             "saliency_derived_facts": float(len(self.saliency_derived_facts)),
             "net_derived_facts": float(len(self.net_derived_facts)),
+            "grounding_derived_facts": float(len(self.grounding_derived_facts)),
             "world_context_facts": float(len(self.world_context_facts)),
             "abduced_support_facts": float(len(self.abduced_support_facts)),
             "target_facts": float(len(self.target_facts)),
@@ -3885,7 +3946,23 @@ class DifferentiableProver(nn.Module):
     def _task_observed_facts(self) -> FrozenSet[HornAtom]:
         if self.task_context is None:
             return frozenset()
-        return self.task_context.observed_facts
+        return self.task_context.reasoning_facts()
+
+    def _task_planner_facts(self) -> FrozenSet[HornAtom]:
+        if self.task_context is None:
+            return frozenset()
+        planner_fn = getattr(self.task_context, "planner_facts", None)
+        if callable(planner_fn):
+            return planner_fn()
+        return self._task_observed_facts()
+
+    def _task_contradiction_scope_facts(self) -> FrozenSet[HornAtom]:
+        if self.task_context is None:
+            return frozenset()
+        contradiction_fn = getattr(self.task_context, "contradiction_scope_facts", None)
+        if callable(contradiction_fn):
+            return contradiction_fn()
+        return frozenset()
 
     def _task_target_facts(self) -> FrozenSet[HornAtom]:
         if self.task_context is None:
@@ -4228,10 +4305,16 @@ class DifferentiableProver(nn.Module):
         working.update(self._working_memory_facts)
         return frozenset(working)
 
+    def current_planner_facts(self) -> FrozenSet[HornAtom]:
+        working: Set[HornAtom] = set(self.kb.facts)
+        working.update(self._task_planner_facts())
+        working.update(self._working_memory_facts)
+        return frozenset(working)
+
     def materialize_task_context_facts(self, limit: int = 32) -> int:
-        if self.task_context is None or not self.task_context.observed_facts:
+        if self.task_context is None or not self.task_context.reasoning_facts():
             return 0
-        return self.load_observed_facts(self.task_context.observed_facts, limit=limit)
+        return self.load_observed_facts(self.task_context.reasoning_facts(), limit=limit)
 
     def load_observed_facts(self, facts, limit: int = 96) -> int:
         """English documentation for load observed facts."""
@@ -6380,9 +6463,10 @@ class DifferentiableProver(nn.Module):
         induction_stats: Dict[str, float] = controller_result.induction_stats or empty_induction_stats()
         cycle_stats: Dict[str, float] = controller_result.cycle_stats or {}
         creative_targets = target_facts or frozenset({goal})
+        creative_facts = self.current_planner_facts()
         creative_report = self.run_creative_cycle(
             z,
-            working_facts,
+            creative_facts,
             creative_targets,
             device,
         )

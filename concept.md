@@ -1,5 +1,7 @@
 # OMEN Canonical Product Concept and Technical Specification
 
+NEXT GROUNDING CONCEPT IN - GROUNDING_MASTERPLAN.md
+
 ## 1. Document Status
 
 This document is the canonical product concept for OMEN in the current repository.
@@ -235,6 +237,166 @@ Canonical world state includes:
 `grounded_state` is a derived readout for decoding and downstream heads. It is
 not an alternative primary meaning of `z`.
 
+### 7.4 Canonical Source Typing and Verification Routing
+
+OMEN must not treat verification as if a single hard `code / text / other`
+split were conceptually sufficient.
+
+At the carrier level, code, prose, logs, tables, scientific papers, configs,
+and mixed notebook-like inputs are all UTF-8 byte streams.
+
+At the verification level, they are not interchangeable.
+
+The canonical architecture therefore uses a unified byte-first substrate
+together with a hierarchical, soft source-typing profile that routes evidence
+into different verification paths.
+
+#### 7.4.1 L0: Unified Carrier
+
+The L0 carrier is always raw UTF-8 bytes.
+
+All higher typing is derived rather than assumed.
+
+This preserves the canonical byte-first contract while allowing verification to
+be specialized later.
+
+#### 7.4.2 L1: Canonical Modality Classes
+
+The first stable typing layer is L1 modality.
+
+Canonical L1 classes are:
+
+- `code`
+- `natural_text`
+- `structured_text`
+- `mixed`
+- `unknown`
+
+These are not mutually exclusive in the scoring phase.
+
+The runtime should estimate a soft distribution over them and expose:
+
+- the winning L1 class
+- confidence
+- the full L1 soft profile
+
+`mixed` is first-class and must not be collapsed into `other`.
+
+`unknown` is a real state of uncertainty, not a garbage bucket for everything
+that does not fit an ad hoc heuristic.
+
+#### 7.4.3 L2: Canonical Verification-Relevant Subtypes
+
+L2 subtypes refine verification behavior.
+
+Canonical L2 examples include:
+
+- for `code`: `program_source`
+- for `natural_text`: `scientific_text`, `instructional_text`,
+  `dialogue_text`, `legal_text`, `medical_text`, `narrative_text`,
+  `claim_text`, `generic_text`
+- for `structured_text`: `json_records`, `key_value_records`, `log_text`,
+  `config_text`, `table_text`
+- for `mixed`: `mixed_code_text`, `mixed_code_structured`
+
+This list is open to extension, but the architecture must preserve the
+principle that verification-relevant distinctions are explicit rather than
+hidden inside a single undifferentiated text label.
+
+#### 7.4.4 L3: Fine-Grained Language / Schema / Domain Hints
+
+L3 captures narrower facts such as:
+
+- programming language (`python`, `javascript`, `rust`, ...)
+- record format (`json`, `yaml`, `csv`, ...)
+- interaction or document domain
+- parser agreement or schema agreement
+
+L3 is not the primary ontology, but it should sharpen verification path
+selection and parser choice.
+
+#### 7.4.5 Canonical Routing Principle
+
+OMEN should use one universal typed-router, not multiple unrelated ad hoc
+classifiers.
+
+However, that router must not emit only one hard label.
+
+It should emit a structured routing decision containing at least:
+
+- coarse domain compatibility for legacy behavior
+- L1 modality
+- L2 subtype
+- verification path
+- confidence
+- soft modality profile
+- supporting evidence scores
+
+The current coarse domain layer may remain as a backward-compatible projection,
+but it is not the full canonical typing model.
+
+#### 7.4.6 Verification Paths
+
+The verifier must be selected from the source-typing profile rather than from a
+single generic text path.
+
+Canonical verification paths include:
+
+- AST / program verification for executable code
+- execution-trace-guided verification for trace-like structured inputs
+- structured-state verification for JSON-like or record-like state updates
+- config / schema verification for configuration-like inputs
+- table consistency verification for tabular text
+- natural-language claim verification for ordinary prose and observation text
+- scientific claim verification for scientific and technical exposition
+- dialogue state verification for dialogue-like text
+- mixed hybrid verification for mixed code-plus-prose or code-plus-structure
+  inputs
+- fallback verification for uncertain or weakly typed inputs
+
+Different paths may run jointly when the source is mixed or uncertain.
+
+#### 7.4.7 Multi-Window Aggregation
+
+Typing must not depend only on one local byte window.
+
+Canonical routing should support aggregation across multiple local windows,
+because many real corpora contain:
+
+- function bodies without headers
+- mid-document slices
+- prose embedded inside code docstrings
+- code embedded inside prose
+- tables or logs without obvious headers in every chunk
+
+The system should therefore combine:
+
+- local chunk evidence
+- neighboring chunk evidence
+- parser agreement
+- execution-trace evidence
+- document-level or stream-level priors when available
+
+#### 7.4.8 Design Constraint
+
+The canonical design is neither:
+
+- a primitive hard `code / text / other` split
+
+nor:
+
+- a fully untyped "let the model figure it out implicitly" regime
+
+The canonical design is:
+
+- one universal byte-first substrate
+- one universal typed-router
+- soft hierarchical typing
+- explicit verification-path selection
+- uncertainty-aware fallback behavior
+
+This is the required long-term direction for OMEN perception and verification.
+
 ## 8. World Graph
 
 The world graph is the grounding substrate for the modelled world.
@@ -346,6 +508,8 @@ An implementation counts as canonically aligned only if it:
 
 - uses byte-first input in canonical mode
 - maintains graph-primary world state
+- maintains hierarchical source typing and verification routing rather than
+  reducing verification to a single hard coarse text class
 - includes exact symbolic reasoning with variables and unification
 - maintains epistemic rule status in the knowledge base
 - keeps reasoning cost in the optimization picture
@@ -358,6 +522,8 @@ An implementation counts as canonically aligned only if it:
 When making architectural decisions in this repository:
 
 - prefer the graph-centered and world-grounded interpretation of state
+- treat source typing as a verification-routing problem, not as a decorative
+  labeling problem
 - treat symbolic reasoning as operational, not decorative
 - treat memory as part of computation
 - treat runtime cost as part of intelligence

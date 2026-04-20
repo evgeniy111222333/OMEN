@@ -12,9 +12,15 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from omen_grounding import (
+    PLAN_ACTIVE_RESOURCE_PRED,
+    PlannerAlternativeWorld,
+    PlannerOperator as GroundPlannerOperator,
+    PlannerResource,
+)
 from omen_osf import OSFConfig, OSFSynthesizer
 from omen_osf_meta import STRATEGY_CAREFUL, STRATEGY_FAST
-from omen_osf_planner import SymbolicPlanner
+from omen_osf_planner import PlanFact, PlanSequence, SymbolicPlanner
 
 
 class OSFProtocolTest(unittest.TestCase):
@@ -111,6 +117,96 @@ class OSFProtocolTest(unittest.TestCase):
         self.assertEqual(tried, 1)
         self.assertEqual(plan_with_strategy.call_count, 1)
         self.assertEqual(verifier.call_count, 1)
+
+    def test_symbolic_planner_builds_grounding_bridge_library(self) -> None:
+        planner = SymbolicPlanner(
+            d_intent=8,
+            d_plan=8,
+            n_operators=8,
+            max_depth=3,
+            beam_width=2,
+        )
+        planner_state = SimpleNamespace(
+            resources=(
+                PlannerResource(symbol="fire", statuses=("active",), support=0.91, confidence=0.89, sources=("r1",)),
+                PlannerResource(symbol="stone", statuses=("active",), support=0.72, confidence=0.70, sources=("r2",)),
+            ),
+            operators=(
+                GroundPlannerOperator(
+                    operator_id="bridge:fire:create:stone",
+                    predicate="creates",
+                    inputs=("fire",),
+                    outputs=("stone",),
+                    status="active",
+                    support=0.90,
+                    conflict=0.04,
+                    confidence=0.93,
+                    repair_action="accept_to_world_state",
+                    provenance=("grounding",),
+                ),
+            ),
+            alternative_worlds=(
+                PlannerAlternativeWorld(
+                    world_id="hypothetical_world",
+                    status="hypothetical",
+                    operator_ids=("bridge:hyp",),
+                    resource_symbols=("water",),
+                    contradiction_symbols=tuple(),
+                    pressure=0.4,
+                    record_count=1,
+                ),
+            ),
+            destructive_effect_symbols=tuple(),
+            persistent_effect_symbols=("fire | creates | stone",),
+            branching_pressure=0.4,
+            contradiction_pressure=0.1,
+        )
+
+        seed = planner._planner_state_seed(planner_state)
+        lib = planner._planner_state_operator_library(planner_state, goal_id=7, device=torch.device("cpu"))
+
+        self.assertTrue(any(fact.pred == PLAN_ACTIVE_RESOURCE_PRED for fact in seed))
+        self.assertGreaterEqual(len(lib), 1)
+        self.assertEqual(lib[0].source, "grounding_bridge")
+        self.assertGreater(lib[0].priority, 0.0)
+        self.assertIn(PlanFact(303, 7), lib[0].add_effects)
+
+    def test_plan_with_strategy_passes_planner_state_to_planner(self) -> None:
+        synth = OSFSynthesizer(
+            OSFConfig(
+                d_intent=8,
+                n_goals=4,
+                d_plan=8,
+                n_operators=6,
+                template_len=4,
+                max_plan_depth=3,
+                beam_width=2,
+            ),
+            d_latent=8,
+            d_tok=8,
+            vocab_size=32,
+        )
+        intent_state = synth.intent_encoder(torch.randn(1, 8))
+        planner_state = SimpleNamespace(resources=tuple(), operators=tuple(), alternative_worlds=tuple())
+        fake_plan = PlanSequence(
+            operators=[],
+            embeddings=torch.zeros(1, 8),
+            goal_reached=False,
+            goal_progress=0.0,
+            goal_facts=tuple(),
+            plan_loss=torch.tensor(0.0),
+        )
+
+        with mock.patch.object(synth.planner, "forward", return_value=fake_plan) as planner_forward:
+            plan = synth._plan_with_strategy(
+                intent_state,
+                STRATEGY_CAREFUL,
+                plan_depth_use=2,
+                planner_state=planner_state,
+            )
+
+        self.assertIs(plan, fake_plan)
+        self.assertIs(planner_forward.call_args.kwargs["planner_state"], planner_state)
 
     def test_fast_mode_forces_fast_strategy_for_high_ce_training_steps(self) -> None:
         synth = OSFSynthesizer(

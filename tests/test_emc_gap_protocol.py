@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from omen_emc import ACTION_ABDUCE, ACTION_FC, ACTION_INTRINSIC, ACTION_RECALL, ACTION_STOP, N_ACTIONS
+from omen_grounding.emc_signals import grounding_emc_features
 from omen_prolog import HornAtom
 from omen_scale import OMENScale
 from omen_scale_config import OMENScaleConfig
@@ -262,6 +263,47 @@ def _scripted_actor(sequence: list[int]):
 
 
 class EMCGapProtocolTest(unittest.TestCase):
+    def test_grounding_emc_features_raise_pressure_for_world_state_branching_and_contradictions(self) -> None:
+        base = grounding_emc_features(
+            {
+                "grounding_uncertainty": 0.25,
+                "grounding_support_ratio": 0.60,
+                "source_confidence": 0.90,
+            }
+        )
+        pressured = grounding_emc_features(
+            {
+                "grounding_uncertainty": 0.25,
+                "grounding_support_ratio": 0.60,
+                "source_confidence": 0.90,
+                "grounding_world_state_branching_pressure": 0.80,
+                "grounding_world_state_contradiction_pressure": 0.65,
+            }
+        )
+
+        self.assertAlmostEqual(
+            pressured["grounding_world_state_branching_pressure"],
+            0.80,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            pressured["grounding_world_state_contradiction_pressure"],
+            0.65,
+            places=6,
+        )
+        self.assertGreater(
+            pressured["grounding_verification_pressure"],
+            base["grounding_verification_pressure"],
+        )
+        self.assertGreater(
+            pressured["grounding_abduction_pressure"],
+            base["grounding_abduction_pressure"],
+        )
+        self.assertGreater(
+            pressured["grounding_control_pressure"],
+            base["grounding_control_pressure"],
+        )
+
     def test_action_masking_is_fp16_safe(self) -> None:
         cfg = _emc_gap_config()
         model = OMENScale(cfg)
@@ -373,6 +415,158 @@ class EMCGapProtocolTest(unittest.TestCase):
         self.assertAlmostEqual(float(captured["gap_relief"].item()), 0.6, places=6)
         self.assertAlmostEqual(float(captured["gap_residual"].item()), 0.4, places=6)
         self.assertAlmostEqual(float(captured["gap_alignment"].item()), 0.25, places=6)
+
+    def test_eval_episode_encodes_grounding_control_channels(self) -> None:
+        cfg = _emc_gap_config()
+        model = OMENScale(cfg)
+        model.emc.eval()
+        prover = _MockProver(cfg.d_latent)
+        prover.task_context = SimpleNamespace(
+            target_facts=frozenset(),
+            provenance="trace",
+            trigger_abduction=True,
+            metadata={
+                "grounding_uncertainty": 0.7,
+                "grounding_support_ratio": 0.25,
+                "source_confidence": 0.4,
+                "source_profile_mixed": 0.6,
+                "source_profile_unknown": 0.1,
+                "memory_grounding_records": 3.0,
+                "trace_grounding_records": 2.0,
+                "trace_interlingua_records": 1.0,
+            },
+        )
+        expected = grounding_emc_features(prover.task_context.metadata)
+        memory = _MockMemory(torch.zeros(1, cfg.d_latent, dtype=torch.float32))
+        z = torch.ones(1, cfg.d_latent, dtype=torch.float32)
+        captured: dict[str, torch.Tensor] = {}
+        original_forward = model.emc.state_enc.forward
+
+        def capture_forward(*args, **kwargs):
+            for key in (
+                "grounding_uncertainty",
+                "grounding_support",
+                "grounding_ambiguity",
+                "grounding_recall",
+                "grounding_verify",
+                "grounding_abduction",
+            ):
+                captured[key] = kwargs[key].detach().clone()
+            return original_forward(*args, **kwargs)
+
+        with mock.patch.object(model.emc.state_enc, "forward", side_effect=capture_forward), \
+             mock.patch.object(model.emc.actor, "forward", side_effect=_scripted_actor([ACTION_STOP])), \
+             mock.patch.object(model.emc.critic, "forward", return_value=torch.zeros(1, dtype=torch.float32)), \
+             mock.patch.object(model.emc.stopping_utility, "forward", return_value=torch.zeros(1, dtype=torch.float32)), \
+             mock.patch.object(model.emc.stopping_utility, "bellman_should_stop", return_value=False), \
+             mock.patch.object(model.emc.voc, "should_continue", return_value=True):
+            model.emc.run_episode_eval(
+                z,
+                torch.tensor([1.0], dtype=torch.float32),
+                None,
+                prover,
+                memory,
+                device=z.device,
+            )
+
+        self.assertAlmostEqual(
+            float(captured["grounding_uncertainty"].item()),
+            expected["grounding_uncertainty"],
+            places=6,
+        )
+        self.assertAlmostEqual(
+            float(captured["grounding_support"].item()),
+            expected["grounding_support"],
+            places=6,
+        )
+        self.assertAlmostEqual(
+            float(captured["grounding_ambiguity"].item()),
+            expected["grounding_ambiguity"],
+            places=6,
+        )
+        self.assertAlmostEqual(
+            float(captured["grounding_recall"].item()),
+            expected["grounding_recall_readiness"],
+            places=6,
+        )
+        self.assertAlmostEqual(
+            float(captured["grounding_verify"].item()),
+            expected["grounding_verification_pressure"],
+            places=6,
+        )
+        self.assertAlmostEqual(
+            float(captured["grounding_abduction"].item()),
+            expected["grounding_abduction_pressure"],
+            places=6,
+        )
+        self.assertAlmostEqual(
+            float(prover.last_forward_info.get("emc_state_grounding_uncertainty", 0.0)),
+            expected["grounding_uncertainty"],
+            places=6,
+        )
+        self.assertAlmostEqual(
+            float(prover.last_forward_info.get("emc_state_grounding_control_pressure", 0.0)),
+            expected["grounding_control_pressure"],
+            places=6,
+        )
+
+    def test_eval_episode_routes_grounding_pressure_into_stopping_utility(self) -> None:
+        cfg = _emc_gap_config()
+        cfg.emc_lambda_grounding_uncertainty = 0.07
+        cfg.emc_lambda_grounding_ambiguity = 0.03
+        cfg.emc_lambda_grounding_verification = 0.05
+        model = OMENScale(cfg)
+        model.emc.eval()
+        prover = _MockProver(cfg.d_latent)
+        prover.task_context = SimpleNamespace(
+            target_facts=frozenset(),
+            provenance="trace",
+            trigger_abduction=True,
+            metadata={
+                "grounding_uncertainty": 0.7,
+                "grounding_support_ratio": 0.25,
+                "source_confidence": 0.4,
+                "source_profile_mixed": 0.6,
+                "memory_grounding_records": 3.0,
+                "trace_grounding_records": 2.0,
+            },
+        )
+        expected = grounding_emc_features(prover.task_context.metadata)
+        memory = _MockMemory(torch.zeros(1, cfg.d_latent, dtype=torch.float32))
+        z = torch.ones(1, cfg.d_latent, dtype=torch.float32)
+        captured: dict[str, float] = {}
+
+        def capture_stop(*args, **kwargs):
+            captured["memory_penalty"] = float(kwargs.get("memory_penalty", 0.0))
+            return torch.zeros(1, dtype=torch.float32)
+
+        with mock.patch.object(model.emc.actor, "forward", side_effect=_scripted_actor([ACTION_STOP])), \
+             mock.patch.object(model.emc.critic, "forward", return_value=torch.zeros(1, dtype=torch.float32)), \
+             mock.patch.object(model.emc.stopping_utility, "forward", side_effect=capture_stop), \
+             mock.patch.object(model.emc.stopping_utility, "bellman_should_stop", return_value=False), \
+             mock.patch.object(model.emc.voc, "should_continue", return_value=True):
+            model.emc.run_episode_eval(
+                z,
+                torch.tensor([1.0], dtype=torch.float32),
+                None,
+                prover,
+                memory,
+                device=z.device,
+                gap_features={
+                    "gap_world_only": 1.0,
+                    "gap_memory_grounded": 1.0,
+                    "gap_memory_relief": 0.0,
+                    "gap_memory_residual": 0.0,
+                    "gap_memory_alignment": 1.0,
+                },
+            )
+
+        expected_penalty = (
+            cfg.emc_lambda_grounding_uncertainty * expected["grounding_uncertainty"]
+            + cfg.emc_lambda_grounding_ambiguity * expected["grounding_ambiguity"]
+            + cfg.emc_lambda_grounding_verification * expected["grounding_verification_pressure"]
+        )
+        self.assertAlmostEqual(captured["memory_penalty"], expected_penalty, places=6)
 
     def test_training_episode_uses_gap_feedback_for_recall(self) -> None:
         cfg = _emc_gap_config()

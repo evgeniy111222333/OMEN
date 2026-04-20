@@ -216,8 +216,15 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertEqual(js_routing.domain, "code")
         self.assertEqual(ts_routing.domain, "code")
         self.assertEqual(bash_routing.domain, "code")
+        self.assertEqual(js_routing.modality, "code")
+        self.assertEqual(js_routing.subtype, "program_source")
+        self.assertEqual(js_routing.verification_path, "ast_program_verification")
         self.assertEqual(obs_routing.domain, "observation_text")
+        self.assertEqual(obs_routing.modality, "natural_text")
+        self.assertEqual(obs_routing.verification_path, "natural_language_claim_verification")
         self.assertEqual(structured_routing.domain, "structured_observation")
+        self.assertEqual(structured_routing.modality, "structured_text")
+        self.assertEqual(structured_routing.verification_path, "structured_state_verification")
         self.assertGreater(js_routing.confidence, 0.5)
         self.assertGreater(structured_routing.confidence, 0.5)
 
@@ -248,7 +255,173 @@ class WorldGraphIntegrationTest(unittest.TestCase):
 
         self.assertEqual(model._ast_lang_from_bytes(body_row), "python")
         self.assertEqual(routing.domain, "code")
+        self.assertEqual(routing.modality, "code")
+        self.assertEqual(routing.subtype, "program_source")
         self.assertGreater(routing.confidence, 0.6)
+
+    def test_ast_language_router_marks_scientific_text_for_claim_verification(self) -> None:
+        cfg = OMENScaleConfig.demo()
+        cfg.allow_noncanonical_ablation = True
+        cfg.net_enabled = False
+        cfg.osf_enabled = False
+        cfg.emc_enabled = False
+        cfg.saliency_enabled = False
+        cfg.continuous_cycle_enabled = False
+        cfg.creative_cycle_enabled = False
+        model = OMENScale(cfg)
+
+        def encode_row(text: str) -> torch.Tensor:
+            encoded = [ord(ch) for ch in text.encode("ascii", errors="ignore").decode("ascii")]
+            encoded = encoded[: cfg.seq_len]
+            if len(encoded) < cfg.seq_len:
+                encoded = encoded + [0] * (cfg.seq_len - len(encoded))
+            return torch.tensor(encoded[:-1], dtype=torch.long)
+
+        sci_row = encode_row(
+            "Abstract: We evaluate a retrieval model on a benchmark dataset. "
+            "Methods: two experiments were run. Results: p < 0.05 and the baseline improved."
+        )
+
+        routing = model._source_routing_from_bytes(sci_row)
+
+        self.assertEqual(routing.modality, "natural_text")
+        self.assertEqual(routing.subtype, "scientific_text")
+        self.assertEqual(routing.verification_path, "scientific_claim_verification")
+
+    def test_ast_language_router_keeps_short_scientific_section_headings_natural(self) -> None:
+        cfg = OMENScaleConfig.demo()
+        cfg.allow_noncanonical_ablation = True
+        cfg.net_enabled = False
+        cfg.osf_enabled = False
+        cfg.emc_enabled = False
+        cfg.saliency_enabled = False
+        cfg.continuous_cycle_enabled = False
+        cfg.creative_cycle_enabled = False
+        model = OMENScale(cfg)
+
+        def encode_row(text: str) -> torch.Tensor:
+            encoded = [ord(ch) for ch in text.encode("ascii", errors="ignore").decode("ascii")]
+            encoded = encoded[: cfg.seq_len]
+            if len(encoded) < cfg.seq_len:
+                encoded = encoded + [0] * (cfg.seq_len - len(encoded))
+            return torch.tensor(encoded[:-1], dtype=torch.long)
+
+        sci_row = encode_row("Abstract: We evaluate a retrieval model")
+
+        routing = model._source_routing_from_bytes(sci_row)
+
+        self.assertEqual(routing.modality, "natural_text")
+        self.assertEqual(routing.subtype, "scientific_text")
+        self.assertEqual(routing.verification_path, "scientific_claim_verification")
+
+    def test_ast_language_router_covers_log_config_table_dialogue_and_mixed_families(self) -> None:
+        cfg = OMENScaleConfig.demo()
+        cfg.allow_noncanonical_ablation = True
+        cfg.net_enabled = False
+        cfg.osf_enabled = False
+        cfg.emc_enabled = False
+        cfg.saliency_enabled = False
+        cfg.continuous_cycle_enabled = False
+        cfg.creative_cycle_enabled = False
+        model = OMENScale(cfg)
+
+        def encode_row(text: str) -> torch.Tensor:
+            encoded = [ord(ch) for ch in text.encode("ascii", errors="ignore").decode("ascii")]
+            encoded = encoded[: cfg.seq_len]
+            if len(encoded) < cfg.seq_len:
+                encoded = encoded + [0] * (cfg.seq_len - len(encoded))
+            return torch.tensor(encoded[:-1], dtype=torch.long)
+
+        cases = {
+            "log": (
+                "2026-04-19 10:15:22 INFO start pipeline\n"
+                "2026-04-19 10:15:24 ERROR traceback: invalid state transition",
+                "structured_text",
+                "log_text",
+                "log_trace_verification",
+            ),
+            "config": (
+                "[service]\nhost = localhost\nport = 8080\nmode = production",
+                "structured_text",
+                "config_text",
+                "config_schema_verification",
+            ),
+            "table": (
+                "metric|baseline|omen\naccuracy|0.71|0.84\nlatency_ms|15|12",
+                "structured_text",
+                "table_text",
+                "table_consistency_verification",
+            ),
+            "dialogue": (
+                "User: the server is slow.\nAssistant: check the database latency first.\nUser: it spikes after deploy.",
+                "natural_text",
+                "dialogue_text",
+                "dialogue_state_verification",
+            ),
+            "mixed": (
+                "def add(a, b):\n    # Step 1: validate inputs\n    if a is None:\n        raise ValueError('missing')\n    return a + b\n",
+                "mixed",
+                "mixed_code_structured",
+                "mixed_hybrid_verification",
+            ),
+        }
+
+        for text, expected_modality, expected_subtype, expected_path in cases.values():
+            routing = model._source_routing_from_bytes(encode_row(text))
+            self.assertEqual(routing.modality, expected_modality)
+            self.assertEqual(routing.subtype, expected_subtype)
+            self.assertEqual(routing.verification_path, expected_path)
+
+    def test_ast_language_router_marks_short_comment_annotated_code_as_mixed(self) -> None:
+        cfg = OMENScaleConfig.demo()
+        cfg.allow_noncanonical_ablation = True
+        cfg.net_enabled = False
+        cfg.osf_enabled = False
+        cfg.emc_enabled = False
+        cfg.saliency_enabled = False
+        cfg.continuous_cycle_enabled = False
+        cfg.creative_cycle_enabled = False
+        model = OMENScale(cfg)
+
+        def encode_row(text: str) -> torch.Tensor:
+            encoded = [ord(ch) for ch in text.encode("ascii", errors="ignore").decode("ascii")]
+            encoded = encoded[: cfg.seq_len]
+            if len(encoded) < cfg.seq_len:
+                encoded = encoded + [0] * (cfg.seq_len - len(encoded))
+            return torch.tensor(encoded[:-1], dtype=torch.long)
+
+        row = encode_row("def add(a, b):\n    # Step 1: validate input")
+
+        routing = model._source_routing_from_bytes(row)
+
+        self.assertEqual(routing.modality, "mixed")
+        self.assertEqual(routing.verification_path, "mixed_hybrid_verification")
+
+    def test_ast_language_router_marks_compact_level_prefixed_logs_as_log_text(self) -> None:
+        cfg = OMENScaleConfig.demo()
+        cfg.allow_noncanonical_ablation = True
+        cfg.net_enabled = False
+        cfg.osf_enabled = False
+        cfg.emc_enabled = False
+        cfg.saliency_enabled = False
+        cfg.continuous_cycle_enabled = False
+        cfg.creative_cycle_enabled = False
+        model = OMENScale(cfg)
+
+        def encode_row(text: str) -> torch.Tensor:
+            encoded = [ord(ch) for ch in text.encode("ascii", errors="ignore").decode("ascii")]
+            encoded = encoded[: cfg.seq_len]
+            if len(encoded) < cfg.seq_len:
+                encoded = encoded + [0] * (cfg.seq_len - len(encoded))
+            return torch.tensor(encoded[:-1], dtype=torch.long)
+
+        row = encode_row("INFO worker=alpha step=load status=ok\nDEBUG worker=alpha")
+
+        routing = model._source_routing_from_bytes(row)
+
+        self.assertEqual(routing.modality, "structured_text")
+        self.assertEqual(routing.subtype, "log_text")
+        self.assertEqual(routing.verification_path, "log_trace_verification")
 
     def test_row_runtime_cache_keeps_full_tokens_but_strips_decode_padding(self) -> None:
         cfg = OMENScaleConfig.demo()
@@ -606,6 +779,7 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertIn("z_graph", out)
         self.assertIn("z_program", out)
         self.assertIn("world_state", out)
+        self.assertIn("planner_state", out)
         self.assertIn("z_dense", out)
         self.assertIn("z_graph_readout", out)
         self.assertEqual(out["z_graph"].shape, (1, cfg.d_latent))
@@ -617,7 +791,11 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertIsInstance(out["z_graph_struct"], WorldGraphState)
         self.assertEqual(out["world_state"].batch_size, 1)
         self.assertIsNotNone(out["world_state"].program_state)
+        self.assertIsNotNone(out["world_state"].planner_state)
         self.assertGreater(len(out["world_state"].target_facts), 0)
+        self.assertGreaterEqual(out["planner_state_active_records"], 0.0)
+        self.assertGreaterEqual(out["planner_state_operators"], 0.0)
+        self.assertGreaterEqual(out["planner_state_world_rules"], 0.0)
         self.assertGreaterEqual(out["world_graph_nodes"], 1.0)
         self.assertGreaterEqual(out["world_graph_edges"], 1.0)
         self.assertGreaterEqual(out["world_graph_trace_steps"], 1.0)
@@ -633,6 +811,12 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertGreaterEqual(out["z_graph_anchor"], 0.0)
         self.assertEqual(out["world_graph_signature_encoder_active"], 1.0)
         self.assertEqual(out["sym_source_domain_code"], 1.0)
+        self.assertEqual(out["source_modality"], "code")
+        self.assertEqual(out["source_subtype"], "program_source")
+        self.assertEqual(out["source_verification_path"], "ast_program_verification")
+        self.assertEqual(out["sym_source_modality_code"], 1.0)
+        self.assertGreater(out["sym_source_profile_code"], 0.5)
+        self.assertEqual(out["sym_source_verification_ast_program"], 1.0)
         self.assertGreater(out["sym_source_confidence"], 0.0)
         self.assertGreater(out["world_graph_context_facts"], 0.0)
         self.assertEqual(out["world_graph_semantic_graph_enriched"], 1.0)
@@ -825,8 +1009,91 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertGreaterEqual(out["world_graph_trace_steps"], 1.0)
         self.assertGreaterEqual(out["world_graph_execution_steps"], 1.0)
         self.assertGreaterEqual(out["sym_trace_steps"], 1.0)
+        self.assertGreaterEqual(out["sym_grounding_derived_facts"], 1.0)
         self.assertGreaterEqual(out["sym_world_context_facts"], 1.0)
         self.assertGreaterEqual(out["world_graph_context_facts"], 1.0)
+        self.assertGreaterEqual(out["world_graph_grounding_facts"], 1.0)
+        self.assertGreaterEqual(out["sym_trace_interlingua_entities"], 2.0)
+        self.assertGreaterEqual(out["sym_trace_interlingua_relations"], 2.0)
+        self.assertGreaterEqual(out["sym_trace_compiled_hypotheses"], 2.0)
+        self.assertGreaterEqual(out["sym_trace_compiled_mean_confidence"], 0.5)
+        self.assertGreaterEqual(out["sym_trace_grounding_world_state_records"], 2.0)
+        self.assertGreaterEqual(out["sym_trace_grounding_world_state_active_facts"], 1.0)
+        self.assertGreaterEqual(out["sym_grounding_hypotheses"], 2.0)
+        self.assertGreaterEqual(out["sym_grounding_world_state_records"], 2.0)
+        self.assertGreaterEqual(out["sym_grounding_world_state_active_facts"], 1.0)
+        self.assertGreaterEqual(out["sym_grounding_verification_records"], 1.0)
+        self.assertGreaterEqual(out["sym_grounding_support_ratio"], 0.5)
+        self.assertGreaterEqual(out["sym_grounding_uncertainty"], 0.0)
+        self.assertGreaterEqual(out["sym_grounding_repair_pressure"], 0.0)
+        self.assertGreaterEqual(out["sym_grounding_world_state_branching_pressure"], 0.0)
+        self.assertGreaterEqual(out["sym_grounding_world_state_contradiction_pressure"], 0.0)
+        self.assertGreaterEqual(out["planner_state_hypothetical_records"], 0.0)
+        self.assertGreaterEqual(out["planner_state_alternative_world_records"], 0.0)
+        self.assertGreaterEqual(out["planner_state_contradiction_pressure"], 0.0)
+        self.assertGreaterEqual(out["planner_state_uncertainty"], 0.0)
+        self.assertGreaterEqual(out["sym_mem_grounding_write_selected"], 0.0)
+        self.assertGreaterEqual(out["sym_grounding_mean_compiled_confidence"], 0.5)
+        self.assertGreaterEqual(out["sym_trace_verification_records"], 1.0)
+        self.assertGreaterEqual(out["world_graph_grounding_world_state_records"], 1.0)
+        self.assertGreaterEqual(out["world_graph_grounding_world_state_active_facts"], 1.0)
+        self.assertGreaterEqual(out["world_graph_grounding_hypotheses"], 1.0)
+        self.assertGreaterEqual(out["world_graph_grounding_verification_records"], 1.0)
+        self.assertGreaterEqual(out["world_graph_interlingua_facts"], 1.0)
+        self.assertEqual(out["source_modality"], "natural_text")
+        self.assertEqual(out["source_verification_path"], "natural_language_claim_verification")
+        self.assertEqual(out["sym_source_modality_natural_text"], 1.0)
+
+    def test_grounding_memory_records_enrich_world_graph_metadata(self) -> None:
+        cfg = OMENScaleConfig.demo()
+        cfg.allow_noncanonical_ablation = True
+        cfg.net_enabled = False
+        cfg.osf_enabled = False
+        cfg.emc_enabled = False
+        cfg.saliency_enabled = False
+        cfg.continuous_cycle_enabled = False
+        cfg.creative_cycle_enabled = False
+        model = OMENScale(cfg)
+
+        text = "goal safe exit. stars generate planets. planets generate moons."
+        encoded = [ord(ch) for ch in text.encode("ascii", errors="ignore").decode("ascii")]
+        encoded = encoded[: cfg.seq_len]
+        if len(encoded) < cfg.seq_len:
+            encoded = encoded + [0] * (cfg.seq_len - len(encoded))
+        src = torch.tensor([encoded[:-1]], dtype=torch.long)
+
+        seeded = model._seed_grounding_memory_records(src)
+        self.assertGreaterEqual(len(seeded), 2)
+        self.assertTrue(any("grounding_world_state:" in getattr(record, "graph_key", "") for record in seeded))
+        self.assertTrue(any("grounding_verification:" in getattr(record, "graph_key", "") for record in seeded))
+        self.assertTrue(any("grounding_hypothesis:" in getattr(record, "graph_key", "") for record in seeded))
+        model._write_grounding_memory_records(seeded, confidence=1.0)
+
+        device = next(model.parameters()).device
+        recalled = model._recall_grounding_memory_records(
+            model.world_graph.encode_records(seeded, device=device)[:1],
+            seeded,
+        )
+        ctx = model._build_generation_task_context(src, memory_grounding_records=recalled)
+        fact_batches, record_batches, extra_count = model._semantic_world_fact_batches(1, ctx)
+        self.assertGreater(extra_count, 0.0)
+
+        graph_batch = model._build_world_graph_batch(
+            src,
+            extra_fact_batches=fact_batches,
+            extra_record_batches=record_batches,
+        )
+
+        self.assertGreaterEqual(
+            graph_batch.metadata.get("memory_grounding_records", 0.0)
+            + graph_batch.metadata.get("grounding_verification_records", 0.0)
+            + graph_batch.metadata.get("grounding_hypotheses", 0.0),
+            1.0,
+        )
+        self.assertGreaterEqual(graph_batch.metadata.get("grounding_world_state_records", 0.0), 1.0)
+        self.assertGreaterEqual(graph_batch.metadata.get("grounding_world_state_active_facts", 0.0), 1.0)
+        self.assertGreaterEqual(graph_batch.metadata.get("grounding_verification_records", 0.0), 1.0)
+        self.assertGreaterEqual(graph_batch.metadata.get("mean_context_facts", 0.0), 1.0)
 
     def test_structured_text_forward_uses_world_grounded_observation_path(self) -> None:
         cfg = OMENScaleConfig.demo()
@@ -860,6 +1127,9 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertGreaterEqual(out["sym_world_context_facts"], 1.0)
         self.assertGreaterEqual(out["world_graph_context_facts"], 1.0)
         self.assertEqual(out["sym_ast_lang_other"], 1.0)
+        self.assertEqual(out["source_modality"], "structured_text")
+        self.assertEqual(out["source_verification_path"], "structured_state_verification")
+        self.assertEqual(out["sym_source_modality_structured_text"], 1.0)
 
     def test_graph_posterior_path_skips_perceiver_when_world_graph_is_available(self) -> None:
         cfg = OMENScaleConfig.demo()

@@ -164,6 +164,42 @@ class TransferSuiteProtocolTest(unittest.TestCase):
         self.assertGreaterEqual(summaries["observation_text"].get("sym_ast_lang_other", 0.0), 0.5)
         self.assertGreaterEqual(summaries["observation_structured"].get("sym_ast_lang_other", 0.0), 0.5)
 
+    def test_transfer_suite_reports_typed_source_routing_metrics(self) -> None:
+        cfg = _transfer_test_config()
+        all_tasks = build_transfer_tasks(cfg, synthetic_samples=4)
+        tasks = {
+            name: all_tasks[name]
+            for name in (
+                "scientific_text",
+                "log_text",
+                "config_text",
+                "table_text",
+                "dialogue_text",
+                "mixed_text",
+            )
+        }
+
+        report = run_transfer_suite(
+            cfg,
+            tasks=tasks,
+            source_task="scientific_text",
+            adapt_steps=0,
+            eval_batches=2,
+            batch_size=1,
+        )
+
+        summaries = report["task_summaries"]
+        self.assertGreaterEqual(summaries["scientific_text"].get("sym_source_modality_natural_text", 0.0), 0.5)
+        self.assertGreaterEqual(summaries["scientific_text"].get("sym_source_verification_scientific_claim", 0.0), 0.5)
+        self.assertGreaterEqual(summaries["log_text"].get("sym_source_modality_structured_text", 0.0), 0.5)
+        self.assertGreaterEqual(summaries["log_text"].get("sym_source_verification_log_trace", 0.0), 0.5)
+        self.assertGreaterEqual(summaries["config_text"].get("sym_source_modality_structured_text", 0.0), 0.5)
+        self.assertGreaterEqual(summaries["config_text"].get("sym_source_verification_config_schema", 0.0), 0.5)
+        self.assertGreaterEqual(summaries["table_text"].get("sym_source_verification_table_consistency", 0.0), 0.5)
+        self.assertGreaterEqual(summaries["dialogue_text"].get("sym_source_verification_dialogue_state", 0.0), 0.5)
+        self.assertGreaterEqual(summaries["mixed_text"].get("sym_source_modality_mixed", 0.0), 0.5)
+        self.assertGreaterEqual(summaries["mixed_text"].get("sym_source_verification_mixed_hybrid", 0.0), 0.5)
+
     def test_transfer_suite_is_order_invariant_under_eval_online_updates(self) -> None:
         cfg = _transfer_test_config()
         files: list[str] = []

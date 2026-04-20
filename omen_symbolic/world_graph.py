@@ -46,6 +46,44 @@ def _atom_term_keys(atom: Any) -> Tuple[str, ...]:
     return tuple(_term_signature(arg) for arg in _atom_args(atom))
 
 
+def _is_symbolic_atom(atom: Any) -> bool:
+    return hasattr(atom, "pred") and hasattr(atom, "args")
+
+
+def _record_signature(atom: Any) -> str:
+    graph_key = getattr(atom, "graph_key", None)
+    if isinstance(graph_key, str) and graph_key:
+        return graph_key
+    if isinstance(atom, str):
+        return f"text:{atom}"
+    return _atom_signature(atom)
+
+
+def _record_term_keys(atom: Any) -> Tuple[str, ...]:
+    graph_terms = getattr(atom, "graph_terms", None)
+    if graph_terms is not None:
+        return tuple(str(term) for term in graph_terms if term is not None)
+    return _atom_term_keys(atom)
+
+
+def _record_family(atom: Any) -> str:
+    graph_family = getattr(atom, "graph_family", None)
+    if isinstance(graph_family, str) and graph_family:
+        return graph_family
+    if _is_symbolic_atom(atom):
+        return f"pred:{_atom_pred(atom)}"
+    return type(atom).__name__
+
+
+def _record_signature_text(atom: Any) -> str:
+    graph_text = getattr(atom, "graph_text", None)
+    if isinstance(graph_text, str) and graph_text:
+        return graph_text
+    if isinstance(atom, str):
+        return atom
+    return _record_signature(atom)
+
+
 @dataclass(frozen=True)
 class WorldGraphEdge:
     src: int
@@ -95,6 +133,7 @@ class CanonicalWorldState:
     symbolic_state: Optional[torch.Tensor] = None
     memory_state: Optional[torch.Tensor] = None
     program_state: Optional[torch.Tensor] = None
+    planner_state: Optional[Any] = None
     symbolic_facts: Tuple[Any, ...] = tuple()
     target_facts: Tuple[Any, ...] = tuple()
     metadata: Dict[str, float] = field(default_factory=dict)
@@ -169,8 +208,11 @@ class CanonicalWorldState:
             float(self.metadata.get("signature_encoder_active", 0.0)),
         )
         summary.setdefault("has_program_state", float(self.program_state is not None))
+        summary.setdefault("has_planner_state", float(self.planner_state is not None))
         summary.setdefault("symbolic_facts", float(len(self.symbolic_facts)))
         summary.setdefault("target_facts", float(len(self.target_facts)))
+        if self.planner_state is not None and hasattr(self.planner_state, "summary"):
+            summary.update(dict(self.planner_state.summary()))
         return summary
 
 
@@ -261,6 +303,13 @@ class WorldGraphEncoder(nn.Module):
         self._text_signature_cache.clear()
         self._atom_encoding_cache.clear()
 
+    def encode_records(
+        self,
+        records: Sequence[Any],
+        device: torch.device,
+    ) -> torch.Tensor:
+        return self._encode_atom_batch(list(records), device)
+
     def _encode_text_signature(self, text: str, device: torch.device) -> torch.Tensor:
         cache_key = (*self._runtime_cache_key(device), text)
         cached = self._text_signature_cache.get(cache_key)
@@ -336,7 +385,9 @@ class WorldGraphEncoder(nn.Module):
         return [tensor if tensor is not None else self.empty_term for tensor in outputs]
 
     def _encode_atom(self, atom: Any, device: torch.device) -> torch.Tensor:
-        atom_key = (*self._runtime_cache_key(device), _atom_signature(atom))
+        if not _is_symbolic_atom(atom):
+            return self._encode_text_signature(_record_signature_text(atom), device)
+        atom_key = (*self._runtime_cache_key(device), _record_signature(atom))
         cached = self._atom_encoding_cache.get(atom_key)
         if cached is not None:
             return cached
@@ -358,7 +409,7 @@ class WorldGraphEncoder(nn.Module):
             "|".join(_term_signature(arg) for arg in args) or "<empty>",
             device,
         )
-        atom_signature = self._encode_text_signature(_atom_signature(atom), device)
+        atom_signature = self._encode_text_signature(_record_signature(atom), device)
         signature_state = self.signature_atom_proj(
             torch.cat([pred_signature, arg_signature, atom_signature], dim=-1)
         )
@@ -374,13 +425,15 @@ class WorldGraphEncoder(nn.Module):
     ) -> torch.Tensor:
         if not atoms:
             return self.empty_state.new_zeros((0, self.d_latent))
+        if any(not _is_symbolic_atom(atom) for atom in atoms):
+            return torch.stack([self._encode_atom(atom, device) for atom in atoms], dim=0)
         cache_prefix = self._runtime_cache_key(device)
         outputs: List[Optional[torch.Tensor]] = [None] * len(atoms)
         missing_atoms: List[Any] = []
         missing_indices: List[int] = []
         missing_keys: List[Tuple[str, bool, str]] = []
         for idx, atom in enumerate(atoms):
-            atom_sig = _atom_signature(atom)
+            atom_sig = _record_signature(atom)
             cache_key = (*cache_prefix, atom_sig)
             cached = self._atom_encoding_cache.get(cache_key)
             if cached is not None:
@@ -415,7 +468,7 @@ class WorldGraphEncoder(nn.Module):
                 arg_terms = [_term_signature(arg) for arg in args]
                 pred_texts.append(f"pred:{_atom_pred(atom)}")
                 arg_texts.append("|".join(arg_terms) or "<empty>")
-                atom_texts.append(_atom_signature(atom))
+                atom_texts.append(_record_signature(atom))
                 for term in arg_terms:
                     arg_bucket_values.append(_stable_bucket(term, self.term_buckets))
                     arg_owner.append(owner_idx)
@@ -460,6 +513,17 @@ class WorldGraphEncoder(nn.Module):
             "trace_target": 7,
             "observed_now": 6,
             "abduced": 5,
+            "grounding": 5,
+            "interlingua": 5,
+            "memory_grounding": 5,
+            "grounding_world_state_active": 7,
+            "grounding_world_state_hypothetical": 6,
+            "grounding_world_state_contradicted": 6,
+            "grounding_world_state_active_fact": 7,
+            "grounding_world_state_hypothetical_fact": 6,
+            "grounding_world_state_contradicted_fact": 6,
+            "grounding_verification": 6,
+            "grounding_hypothesis": 5,
             "memory": 4,
             "saliency": 4,
             "net": 4,
@@ -469,7 +533,7 @@ class WorldGraphEncoder(nn.Module):
         }
         best_by_signature: Dict[str, Tuple[int, int, Tuple[str, Any]]] = {}
         for idx, (node_type, atom) in enumerate(fact_records):
-            signature = _atom_signature(atom)
+            signature = _record_signature(atom)
             rank = type_priority.get(node_type, 0)
             existing = best_by_signature.get(signature)
             if existing is None or rank > existing[1]:
@@ -477,10 +541,27 @@ class WorldGraphEncoder(nn.Module):
                 best_by_signature[signature] = (first_idx, rank, (node_type, atom))
         selected = list(best_by_signature.values())
         if len(selected) > self.max_nodes:
-            selected = sorted(
+            ranked = sorted(
                 selected,
                 key=lambda item: (-item[1], item[0]),
-            )[: self.max_nodes]
+            )
+            reserved: List[Tuple[int, int, Tuple[str, Any]]] = []
+            seen_types = set()
+            for item in ranked:
+                node_type = item[2][0]
+                if node_type in seen_types:
+                    continue
+                seen_types.add(node_type)
+                reserved.append(item)
+                if len(reserved) >= self.max_nodes:
+                    break
+            reserved_set = {(item[0], item[2][0], _record_signature(item[2][1])) for item in reserved}
+            remainder = [
+                item
+                for item in ranked
+                if (item[0], item[2][0], _record_signature(item[2][1])) not in reserved_set
+            ]
+            selected = (reserved + remainder)[: self.max_nodes]
         unique = [
             record
             for _, _, record in sorted(selected, key=lambda item: item[0])
@@ -495,9 +576,9 @@ class WorldGraphEncoder(nn.Module):
         right_atom: Any,
     ) -> Optional[str]:
         relation: Optional[str] = None
-        if set(_atom_term_keys(left_atom)) & set(_atom_term_keys(right_atom)):
+        if set(_record_term_keys(left_atom)) & set(_record_term_keys(right_atom)):
             relation = "shared_term"
-        elif _atom_pred(left_atom) == _atom_pred(right_atom):
+        elif _record_family(left_atom) == _record_family(right_atom):
             relation = "same_pred"
         elif left_type == right_type:
             relation = "cooccurs"
@@ -544,8 +625,8 @@ class WorldGraphEncoder(nn.Module):
         for transition in transitions:
             before_facts = getattr(transition, "before_facts", ())
             after_facts = getattr(transition, "after_facts", ())
-            before_nodes = [node_index[_atom_signature(atom)] for atom in before_facts if _atom_signature(atom) in node_index]
-            after_nodes = [node_index[_atom_signature(atom)] for atom in after_facts if _atom_signature(atom) in node_index]
+            before_nodes = [node_index[_record_signature(atom)] for atom in before_facts if _record_signature(atom) in node_index]
+            after_nodes = [node_index[_record_signature(atom)] for atom in after_facts if _record_signature(atom) in node_index]
             for src in before_nodes[:8]:
                 for dst in after_nodes[:8]:
                     edges.append(WorldGraphEdge(src=src, dst=dst, relation=relation))
@@ -606,7 +687,7 @@ class WorldGraphEncoder(nn.Module):
 
         node_types = tuple(node_type for node_type, _ in deduped)
         atoms = [atom for _, atom in deduped]
-        node_keys = tuple(_atom_signature(atom) for atom in atoms)
+        node_keys = tuple(_record_signature(atom) for atom in atoms)
         node_index = {key: idx for idx, key in enumerate(node_keys)}
         node_states = self._encode_atom_batch(atoms, device)
         edges = self._pairwise_edges(node_types, atoms)
@@ -646,7 +727,7 @@ class WorldGraphEncoder(nn.Module):
         def _pool_atoms(atoms: Iterable[Any]) -> torch.Tensor:
             indices = [
                 node_index[sig]
-                for sig in (_atom_signature(atom) for atom in atoms)
+                for sig in (_record_signature(atom) for atom in atoms)
                 if sig in node_index
             ]
             if not indices:
@@ -669,8 +750,51 @@ class WorldGraphEncoder(nn.Module):
             "observed_facts": float(sum(1 for node_type in node_types if node_type == "observed")),
             "observed_now_facts": float(sum(1 for node_type in node_types if node_type == "observed_now")),
             "memory_facts": float(sum(1 for node_type in node_types if node_type == "memory")),
+            "memory_grounding_records": float(sum(1 for node_type in node_types if node_type == "memory_grounding")),
+            "grounding_world_state_records": float(
+                sum(
+                    1 for node_type in node_types
+                    if node_type in (
+                        "grounding_world_state_active",
+                        "grounding_world_state_hypothetical",
+                        "grounding_world_state_contradicted",
+                    )
+                )
+            ),
+            "grounding_world_state_facts": float(
+                sum(
+                    1 for node_type in node_types
+                    if node_type in (
+                        "grounding_world_state_active_fact",
+                        "grounding_world_state_hypothetical_fact",
+                        "grounding_world_state_contradicted_fact",
+                    )
+                )
+            ),
+            "grounding_world_state_active_records": float(
+                sum(1 for node_type in node_types if node_type == "grounding_world_state_active")
+            ),
+            "grounding_world_state_hypothetical_records": float(
+                sum(1 for node_type in node_types if node_type == "grounding_world_state_hypothetical")
+            ),
+            "grounding_world_state_contradicted_records": float(
+                sum(1 for node_type in node_types if node_type == "grounding_world_state_contradicted")
+            ),
+            "grounding_world_state_active_facts": float(
+                sum(1 for node_type in node_types if node_type == "grounding_world_state_active_fact")
+            ),
+            "grounding_world_state_hypothetical_facts": float(
+                sum(1 for node_type in node_types if node_type == "grounding_world_state_hypothetical_fact")
+            ),
+            "grounding_world_state_contradicted_facts": float(
+                sum(1 for node_type in node_types if node_type == "grounding_world_state_contradicted_fact")
+            ),
+            "grounding_hypotheses": float(sum(1 for node_type in node_types if node_type == "grounding_hypothesis")),
+            "grounding_verification_records": float(sum(1 for node_type in node_types if node_type == "grounding_verification")),
             "saliency_facts": float(sum(1 for node_type in node_types if node_type == "saliency")),
             "net_facts": float(sum(1 for node_type in node_types if node_type == "net")),
+            "grounding_derived_facts": float(sum(1 for node_type in node_types if node_type == "grounding")),
+            "interlingua_facts": float(sum(1 for node_type in node_types if node_type == "interlingua")),
             "context_facts": float(sum(1 for node_type in node_types if node_type == "context")),
             "world_context_facts": float(sum(1 for node_type in node_types if node_type == "world_context")),
             "abduced_support_facts": float(sum(1 for node_type in node_types if node_type == "abduced")),
@@ -724,7 +848,7 @@ class WorldGraphEncoder(nn.Module):
 
         node_types = tuple(node_type for node_type, _ in combined_records)
         atoms = [atom for _, atom in combined_records]
-        node_keys = tuple(_atom_signature(atom) for atom in atoms)
+        node_keys = tuple(_record_signature(atom) for atom in atoms)
         base_index = {key: idx for idx, key in enumerate(base_graph.node_keys)}
         base_states = base_graph.node_states.to(device=device)
         node_states_list: List[torch.Tensor] = []

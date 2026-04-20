@@ -5,8 +5,25 @@ import json
 import math
 import re
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
+
+from omen_grounding import (
+    CompiledSymbolicSegment,
+    SemanticGroundingBackbone,
+    compile_interlingua_graph_records,
+    compile_scene_symbolic_atoms,
+    compile_world_state_symbolic_atoms,
+    extract_goal_hints,
+    extract_relation_hints,
+    extract_structured_pairs,
+    ground_text_to_symbolic,
+    ground_text_document,
+    is_counterexample_text,
+    normalize_symbol_text,
+    split_text_segments,
+    tokenize_semantic_words,
+)
 
 
 TRACE_STATE_VALUE_PRED = 480
@@ -45,6 +62,16 @@ class SymbolicExecutionTraceBundle:
     target_facts: FrozenSet[Any]
     transitions: Tuple[TraceTransitionFacts, ...]
     counterexamples: Tuple[TraceTransitionFacts, ...]
+    grounding_facts: FrozenSet[Any] = field(default_factory=frozenset)
+    grounding_target_facts: FrozenSet[Any] = field(default_factory=frozenset)
+    grounding_hypotheses: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_verification_records: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_world_state_records: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_world_state_active_facts: FrozenSet[Any] = field(default_factory=frozenset)
+    grounding_world_state_hypothetical_facts: FrozenSet[Any] = field(default_factory=frozenset)
+    grounding_world_state_contradicted_facts: FrozenSet[Any] = field(default_factory=frozenset)
+    grounding_graph_records: Tuple[Any, ...] = field(default_factory=tuple)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -282,6 +309,18 @@ class _PythonTraceBuilder:
             target_facts=targets,
             transitions=transitions,
             counterexamples=counterexamples,
+            grounding_facts=frozenset(),
+            grounding_target_facts=frozenset(),
+            metadata={
+                "grounding_mode": "python_ast_trace",
+                "grounding_segments": float(len(transitions)),
+                "grounding_tokens": 0.0,
+                "grounding_state_hints": 0.0,
+                "grounding_relation_hints": 0.0,
+                "grounding_goal_hints": 0.0,
+                "grounding_counterexample_segments": float(len(counterexamples)),
+                "grounding_multilingual": 0.0,
+            },
         )
 
     def _sample_function_inputs(
@@ -1168,46 +1207,35 @@ class _PythonTraceBuilder:
 
 
 class _ObservationTraceBuilder:
-    _RELATION_PATTERNS = (
-        re.compile(
-            r"\b(?P<left>[A-Za-z0-9_.-]+)\s*(?P<rel>=|:|->|=>|is|are|was|were|has|have|becomes|become|contains)\s*(?P<right>[A-Za-z0-9_.-]+)\b",
-            re.IGNORECASE,
-        ),
-        re.compile(
-            r"\b(?P<left>[A-Za-z0-9_.-]+)\s+(?P<rel>causes|cause|triggers|trigger|leads\s+to|results\s+in|because)\s+(?P<right>[A-Za-z0-9_.-]+)\b",
-            re.IGNORECASE,
-        ),
-    )
-    _STATE_PATTERNS = (
-        re.compile(
-            r"\b(?P<key>[A-Za-z][A-Za-z0-9_.-]*)\s*(?P<op>=|:)\s*(?P<value>[A-Za-z0-9_.-]+)\b",
-            re.IGNORECASE,
-        ),
-    )
-    _GOAL_PATTERN = re.compile(
-        r"\b(?:goal|target|desired|expect|expected|should|must|need|needs|want|wants|aim|aims)\b"
-        r"(?:\s+(?:to|be|become|is))?\s+(?P<goal>[A-Za-z0-9_.-]+)"
-        r"(?:\s*(?:=|:|is|becomes?)\s*(?P<value>[A-Za-z0-9_.-]+))?",
-        re.IGNORECASE,
-    )
-    _NEGATION_MARKERS = (" not ", " never ", " no ", " without ", " however ", " but ", " failed ")
-    _GOAL_KEYS = frozenset({"goal", "target", "desired", "expect", "expected"})
-
-    def __init__(self, *, language: str, max_steps: int = 24, max_counterexamples: int = 4):
+    def __init__(
+        self,
+        *,
+        language: str,
+        max_steps: int = 24,
+        max_counterexamples: int = 4,
+        semantic_backbone: Optional[SemanticGroundingBackbone] = None,
+    ):
         self.language = language or "text"
         self.max_steps = max(1, int(max_steps))
         self.max_counterexamples = max(0, int(max_counterexamples))
+        self.semantic_backbone = semantic_backbone
 
     def build(self, text: str) -> Optional[SymbolicExecutionTraceBundle]:
-        segments = self._segments(text)
+        pipeline = ground_text_to_symbolic(
+            text,
+            language=self.language,
+            max_segments=self.max_steps,
+            backbone=self.semantic_backbone,
+        )
+        segments = list(pipeline.compiled.segments)
         if not segments:
             return None
         if (
             len(segments) < 2
-            and not self._relations(text)
-            and not self._structured_pairs(text)
-            and not self._goal_pairs(text)
-            and not self._is_counterexample(text)
+            and pipeline.compiled.metadata.get("compiled_relation_claims", 0.0) <= 0.0
+            and pipeline.compiled.metadata.get("compiled_state_claims", 0.0) <= 0.0
+            and pipeline.compiled.metadata.get("compiled_goal_claims", 0.0) <= 0.0
+            and pipeline.compiled.metadata.get("grounding_counterexample_segments", 0.0) <= 0.0
         ):
             return None
 
@@ -1225,7 +1253,7 @@ class _ObservationTraceBuilder:
                 before_facts=previous_after,
                 after_facts=after_facts,
                 label=f"{self.language}:{step_idx}",
-                counterexample=self._is_counterexample(segment),
+                counterexample=bool(segment.counterexample),
             )
             observed_facts.update(previous_after)
             observed_facts.update(after_facts)
@@ -1258,6 +1286,17 @@ class _ObservationTraceBuilder:
             target_facts.update(transitions[-1].after_facts)
         if counterexamples:
             target_facts.update(counterexamples[-1].after_facts)
+        grounding_facts, grounding_targets, grounding_symbolic_stats = compile_scene_symbolic_atoms(pipeline.scene)
+        grounding_graph_records, grounding_graph_stats = compile_interlingua_graph_records(
+            pipeline.interlingua,
+            max_records=max(self.max_steps * 4, 16),
+        )
+        (
+            grounding_world_state_active_facts,
+            grounding_world_state_hypothetical_facts,
+            grounding_world_state_contradicted_facts,
+            grounding_world_state_symbolic_stats,
+        ) = compile_world_state_symbolic_atoms(pipeline.world_state.records)
         return SymbolicExecutionTraceBundle(
             language=self.language,
             source_text=text,
@@ -1265,29 +1304,38 @@ class _ObservationTraceBuilder:
             target_facts=frozenset(target_facts),
             transitions=tuple(transitions),
             counterexamples=tuple(counterexamples),
+            grounding_facts=grounding_facts,
+            grounding_target_facts=grounding_targets,
+            grounding_hypotheses=tuple(pipeline.compiled.hypotheses),
+            grounding_verification_records=tuple(pipeline.verification.records),
+            grounding_world_state_records=tuple(pipeline.world_state.records),
+            grounding_world_state_active_facts=grounding_world_state_active_facts,
+            grounding_world_state_hypothetical_facts=grounding_world_state_hypothetical_facts,
+            grounding_world_state_contradicted_facts=grounding_world_state_contradicted_facts,
+            grounding_graph_records=grounding_graph_records,
+            metadata={
+                **dict(pipeline.document.metadata),
+                **dict(pipeline.scene.metadata),
+                **dict(pipeline.interlingua.metadata),
+                **dict(pipeline.compiled.metadata),
+                **dict(pipeline.verification.metadata),
+                **dict(pipeline.world_state.metadata),
+                **dict(grounding_world_state_symbolic_stats),
+                **dict(grounding_symbolic_stats),
+                **dict(grounding_graph_stats),
+                "grounding_mode": "semantic_scene_compiler",
+            },
         )
 
     def _segments(self, text: str) -> List[str]:
-        lines = [self._normalize_segment(line) for line in text.splitlines() if line.strip()]
-        if len(lines) >= 2:
-            return lines[: self.max_steps]
-        normalized = text.replace("\r", "\n").strip()
-        if not normalized:
-            return []
-        sentence_like = [
-            self._normalize_segment(chunk)
-            for chunk in re.split(r"(?<=[.!?;])\s+|\n+", normalized)
-            if chunk.strip()
-        ]
-        if sentence_like:
-            return sentence_like[: self.max_steps]
-        return [self._normalize_segment(normalized[:256])]
+        return split_text_segments(text, max_segments=self.max_steps)
 
     @staticmethod
     def _normalize_segment(segment: str) -> str:
-        return re.sub(r"^\s*(?:step\s*\d+[:.)-]*|\d+[:.)-]*)\s*", "", segment.strip(), flags=re.IGNORECASE)
+        normalized = split_text_segments(segment, max_segments=1)
+        return normalized[0] if normalized else segment.strip()
 
-    def _segment_facts(self, segment: str, step_idx: int) -> Tuple[FrozenSet[Any], FrozenSet[Any]]:
+    def _segment_facts(self, segment: CompiledSymbolicSegment, step_idx: int) -> Tuple[FrozenSet[Any], FrozenSet[Any]]:
         facts: List[Any] = []
         targetable: List[Any] = []
         step_symbol = _step_symbol(self.language, step_idx)
@@ -1295,14 +1343,14 @@ class _ObservationTraceBuilder:
         facts.append(self._atom(TRACE_SCOPE_PRED, step_symbol, scope_symbol))
         facts.append(self._atom(TRACE_PRIMARY_PRED, step_symbol))
 
-        tokens = self._tokens(segment)
+        tokens = list(segment.tokens)
         for token in tokens[:8]:
             lex_symbol = _lexeme_symbol(token)
             facts.append(self._atom(TRACE_TEXT_TOKEN_PRED, step_symbol, lex_symbol))
             facts.append(self._atom(TRACE_STATE_VALUE_PRED, step_symbol, lex_symbol, _value_symbol(token)))
             facts.append(self._atom(TRACE_STATE_TYPE_PRED, step_symbol, lex_symbol, _type_symbol("token")))
 
-        for key, value in self._structured_pairs(segment):
+        for key, value in segment.states:
             key_symbol = _lexeme_symbol(key)
             value_symbol = _value_symbol(value)
             state_fact = self._atom(
@@ -1322,12 +1370,12 @@ class _ObservationTraceBuilder:
             facts.append(assign_fact)
             targetable.append(assign_fact)
 
-        for left, rel, right in self._relations(segment):
+        for left, rel, right in segment.relations:
             relation_fact = self._atom(
                 TRACE_TEXT_RELATION_PRED,
                 step_symbol,
                 _lexeme_symbol(left),
-                _op_symbol(rel.lower()),
+                _op_symbol(rel),
                 _lexeme_symbol(right),
             )
             facts.append(relation_fact)
@@ -1341,7 +1389,7 @@ class _ObservationTraceBuilder:
             facts.append(assign_fact)
             targetable.append(assign_fact)
 
-        for goal_name, goal_value in self._goal_pairs(segment):
+        for goal_name, goal_value in segment.goals:
             goal_fact = self._atom(
                 TRACE_TEXT_GOAL_PRED,
                 step_symbol,
@@ -1351,8 +1399,12 @@ class _ObservationTraceBuilder:
             facts.append(goal_fact)
             targetable.append(goal_fact)
 
-        if self._is_counterexample(segment):
-            negation_fact = self._atom(TRACE_TEXT_NEGATION_PRED, step_symbol, _value_symbol(segment.lower()[:64]))
+        if segment.counterexample:
+            negation_fact = self._atom(
+                TRACE_TEXT_NEGATION_PRED,
+                step_symbol,
+                _value_symbol(segment.normalized_text.casefold()[:64]),
+            )
             facts.append(negation_fact)
             targetable.append(negation_fact)
 
@@ -1360,26 +1412,11 @@ class _ObservationTraceBuilder:
 
     @classmethod
     def _tokens(cls, segment: str) -> List[str]:
-        tokens = re.findall(r"[A-Za-z0-9_]+", segment.lower())
-        deduped: List[str] = []
-        seen: Set[str] = set()
-        for token in tokens:
-            if token in seen:
-                continue
-            seen.add(token)
-            deduped.append(token)
-        return deduped
+        return tokenize_semantic_words(segment)
 
     @classmethod
     def _normalize_symbol_text(cls, value: Any) -> Optional[str]:
-        if value is None:
-            return None
-        text = str(value).strip().lower()
-        if not text:
-            return None
-        text = re.sub(r"[^a-z0-9_]+", "_", text)
-        text = text.strip("_")
-        return text[:64] if text else None
+        return normalize_symbol_text(value)
 
     @classmethod
     def _flatten_payload(cls, payload: Any, prefix: str = "") -> List[Tuple[str, str]]:
@@ -1405,93 +1442,25 @@ class _ObservationTraceBuilder:
 
     @classmethod
     def _structured_pairs(cls, segment: str) -> List[Tuple[str, str]]:
-        pairs: List[Tuple[str, str]] = []
-        seen: Set[Tuple[str, str]] = set()
-        stripped = segment.strip()
-        if stripped.startswith("{") or stripped.startswith("["):
-            try:
-                payload = json.loads(stripped)
-            except Exception:
-                payload = None
-            if payload is not None:
-                for key, value in cls._flatten_payload(payload):
-                    pair = (key, value)
-                    if pair in seen:
-                        continue
-                    seen.add(pair)
-                    pairs.append(pair)
-        for pattern in cls._STATE_PATTERNS:
-            for match in pattern.finditer(segment):
-                key = cls._normalize_symbol_text(match.group("key"))
-                value = cls._normalize_symbol_text(match.group("value"))
-                if key is None or value is None:
-                    continue
-                pair = (key, value)
-                if pair in seen:
-                    continue
-                seen.add(pair)
-                pairs.append(pair)
-        return pairs
+        return extract_structured_pairs(segment)
 
     @classmethod
     def _relations(cls, segment: str) -> List[Tuple[str, str, str]]:
-        relations: List[Tuple[str, str, str]] = []
-        seen: Set[Tuple[str, str, str]] = set()
-        for pattern in cls._RELATION_PATTERNS:
-            for match in pattern.finditer(segment):
-                left = cls._normalize_symbol_text(match.group("left"))
-                rel = cls._normalize_symbol_text(match.group("rel"))
-                right = cls._normalize_symbol_text(match.group("right"))
-                if left is None or rel is None or right is None:
-                    continue
-                relation = (left, rel, right)
-                if relation in seen:
-                    continue
-                seen.add(relation)
-                relations.append(relation)
-        chain_parts = [
-            cls._normalize_symbol_text(part)
-            for part in re.split(r"\s*(?:->|=>|then)\s*", segment)
-            if part.strip()
+        return [
+            (hint.left, hint.relation, hint.right)
+            for hint in extract_relation_hints(segment)
         ]
-        chain_parts = [part for part in chain_parts if part]
-        if len(chain_parts) >= 2:
-            for left, right in zip(chain_parts, chain_parts[1:]):
-                relation = (left, "transition", right)
-                if relation in seen:
-                    continue
-                seen.add(relation)
-                relations.append(relation)
-        return relations
 
     @classmethod
     def _goal_pairs(cls, segment: str) -> List[Tuple[str, str]]:
-        goals: List[Tuple[str, str]] = []
-        seen: Set[Tuple[str, str]] = set()
-        for key, value in cls._structured_pairs(segment):
-            if key not in cls._GOAL_KEYS:
-                continue
-            pair = (key, value)
-            if pair in seen:
-                continue
-            seen.add(pair)
-            goals.append(pair)
-        for match in cls._GOAL_PATTERN.finditer(segment):
-            goal_name = cls._normalize_symbol_text(match.group("goal"))
-            goal_value = cls._normalize_symbol_text(match.group("value") or match.group("goal"))
-            if goal_name is None or goal_value is None:
-                continue
-            pair = (goal_name, goal_value)
-            if pair in seen:
-                continue
-            seen.add(pair)
-            goals.append(pair)
-        return goals
+        return [
+            (hint.goal_name, hint.goal_value)
+            for hint in extract_goal_hints(segment)
+        ]
 
     @classmethod
     def _is_counterexample(cls, segment: str) -> bool:
-        lowered = f" {segment.lower()} "
-        return any(marker in lowered for marker in cls._NEGATION_MARKERS)
+        return is_counterexample_text(segment)
 
     @staticmethod
     def _atom(pred: int, *args: int) -> Any:
@@ -1505,6 +1474,7 @@ def build_symbolic_trace_bundle(
     lang_hint: str = "python",
     max_steps: int = 24,
     max_counterexamples: int = 4,
+    semantic_backbone: Optional[SemanticGroundingBackbone] = None,
 ) -> Optional[SymbolicExecutionTraceBundle]:
     normalized_hint = (lang_hint or "python").lower()
     if not code.strip():
@@ -1521,5 +1491,6 @@ def build_symbolic_trace_bundle(
         language=normalized_hint,
         max_steps=max_steps,
         max_counterexamples=max_counterexamples,
+        semantic_backbone=semantic_backbone,
     )
     return observation_builder.build(code)

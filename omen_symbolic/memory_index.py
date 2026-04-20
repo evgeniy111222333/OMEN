@@ -93,6 +93,21 @@ class SymbolicMemoryIndex:
         return values
 
     @staticmethod
+    def _fact_graph_terms(fact: object) -> Set[str]:
+        terms = getattr(fact, "graph_terms", None)
+        if terms is None:
+            return set()
+        return {str(term).strip() for term in terms if str(term).strip()}
+
+    @staticmethod
+    def _fact_graph_family(fact: object) -> Optional[str]:
+        family = getattr(fact, "graph_family", None)
+        if family is None:
+            return None
+        text = str(family).strip()
+        return text or None
+
+    @staticmethod
     def _merge_unique(primary: Sequence[object], secondary: Sequence[object]) -> List[object]:
         merged: List[object] = []
         seen = set()
@@ -107,26 +122,62 @@ class SymbolicMemoryIndex:
         self,
         predicate_hints: Optional[Sequence[int]] = None,
         anchor_values: Optional[Sequence[int]] = None,
+        graph_terms: Optional[Sequence[str]] = None,
+        graph_families: Optional[Sequence[str]] = None,
+        boost_graph_terms: Optional[Sequence[str]] = None,
+        boost_graph_families: Optional[Sequence[str]] = None,
+        suppress_graph_terms: Optional[Sequence[str]] = None,
+        suppress_graph_families: Optional[Sequence[str]] = None,
         limit: int = 8,
     ) -> List[object]:
         if not self._entries:
             return []
         pred_set = {int(pred) for pred in (predicate_hints or ())}
         anchor_set = {int(value) for value in (anchor_values or ())}
-        if not pred_set and not anchor_set:
+        term_set = {str(term).strip() for term in (graph_terms or ()) if str(term).strip()}
+        family_set = {str(family).strip() for family in (graph_families or ()) if str(family).strip()}
+        boost_term_set = {str(term).strip() for term in (boost_graph_terms or ()) if str(term).strip()}
+        boost_family_set = {str(family).strip() for family in (boost_graph_families or ()) if str(family).strip()}
+        suppress_term_set = {str(term).strip() for term in (suppress_graph_terms or ()) if str(term).strip()}
+        suppress_family_set = {str(family).strip() for family in (suppress_graph_families or ()) if str(family).strip()}
+        if (
+            not pred_set
+            and not anchor_set
+            and not term_set
+            and not family_set
+            and not boost_term_set
+            and not boost_family_set
+        ):
             return []
 
-        matched: List[object] = []
-        for fact, _ in reversed(self._entries):
+        scored: List[Tuple[float, int, object]] = []
+        for recency, (fact, _) in enumerate(reversed(self._entries)):
             pred = self._fact_predicate(fact)
             anchors = self._fact_anchor_values(fact)
+            fact_terms = self._fact_graph_terms(fact)
+            fact_family = self._fact_graph_family(fact)
+            score = 0.0
             if pred_set and pred in pred_set:
-                matched.append(fact)
-            elif anchor_set and anchors.intersection(anchor_set):
-                matched.append(fact)
-            if len(matched) >= int(limit):
-                break
-        return list(reversed(matched))
+                score += 1.00
+            if anchor_set and anchors.intersection(anchor_set):
+                score += 0.70
+            if term_set and fact_terms.intersection(term_set):
+                score += 0.60
+            if family_set and fact_family in family_set:
+                score += 0.45
+            if boost_term_set and fact_terms.intersection(boost_term_set):
+                score += 0.35
+            if boost_family_set and fact_family in boost_family_set:
+                score += 0.25
+            if suppress_term_set and fact_terms.intersection(suppress_term_set):
+                score -= 0.20
+            if suppress_family_set and fact_family in suppress_family_set:
+                score -= 0.15
+            if score <= 0.0:
+                continue
+            scored.append((score, -recency, fact))
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [fact for _, _, fact in scored[: max(int(limit), 0)]]
 
     @torch.no_grad()
     def recall(
@@ -136,6 +187,12 @@ class SymbolicMemoryIndex:
         min_sim: float = 0.2,
         predicate_hints: Optional[Sequence[int]] = None,
         anchor_values: Optional[Sequence[int]] = None,
+        graph_terms: Optional[Sequence[str]] = None,
+        graph_families: Optional[Sequence[str]] = None,
+        boost_graph_terms: Optional[Sequence[str]] = None,
+        boost_graph_families: Optional[Sequence[str]] = None,
+        suppress_graph_terms: Optional[Sequence[str]] = None,
+        suppress_graph_families: Optional[Sequence[str]] = None,
         structured_limit: Optional[int] = None,
     ) -> List[object]:
         if not self._entries:
@@ -147,12 +204,42 @@ class SymbolicMemoryIndex:
         sims = F.cosine_similarity(query.unsqueeze(1), embs.unsqueeze(0), dim=-1)
         pred_set = {int(pred) for pred in (predicate_hints or ())}
         anchor_set = {int(value) for value in (anchor_values or ())}
-        if pred_set or anchor_set:
+        term_set = {str(term).strip() for term in (graph_terms or ()) if str(term).strip()}
+        family_set = {str(family).strip() for family in (graph_families or ()) if str(family).strip()}
+        boost_term_set = {str(term).strip() for term in (boost_graph_terms or ()) if str(term).strip()}
+        boost_family_set = {str(family).strip() for family in (boost_graph_families or ()) if str(family).strip()}
+        suppress_term_set = {str(term).strip() for term in (suppress_graph_terms or ()) if str(term).strip()}
+        suppress_family_set = {str(family).strip() for family in (suppress_graph_families or ()) if str(family).strip()}
+        if (
+            pred_set
+            or anchor_set
+            or term_set
+            or family_set
+            or boost_term_set
+            or boost_family_set
+            or suppress_term_set
+            or suppress_family_set
+        ):
             bonus = torch.zeros_like(sims)
             for idx, fact in enumerate(facts):
                 pred_bonus = 0.15 if self._fact_predicate(fact) in pred_set else 0.0
                 anchor_bonus = 0.10 if self._fact_anchor_values(fact).intersection(anchor_set) else 0.0
-                bonus[:, idx] = pred_bonus + anchor_bonus
+                term_bonus = 0.12 if self._fact_graph_terms(fact).intersection(term_set) else 0.0
+                family_bonus = 0.08 if self._fact_graph_family(fact) in family_set else 0.0
+                boost_term_bonus = 0.14 if self._fact_graph_terms(fact).intersection(boost_term_set) else 0.0
+                boost_family_bonus = 0.10 if self._fact_graph_family(fact) in boost_family_set else 0.0
+                suppress_term_penalty = 0.10 if self._fact_graph_terms(fact).intersection(suppress_term_set) else 0.0
+                suppress_family_penalty = 0.08 if self._fact_graph_family(fact) in suppress_family_set else 0.0
+                bonus[:, idx] = (
+                    pred_bonus
+                    + anchor_bonus
+                    + term_bonus
+                    + family_bonus
+                    + boost_term_bonus
+                    + boost_family_bonus
+                    - suppress_term_penalty
+                    - suppress_family_penalty
+                )
             sims = sims + bonus
         k = min(int(top_k), embs.size(0))
         if k <= 0:
@@ -168,6 +255,12 @@ class SymbolicMemoryIndex:
         structured = self.recall_by_pattern(
             predicate_hints=predicate_hints,
             anchor_values=anchor_values,
+            graph_terms=graph_terms,
+            graph_families=graph_families,
+            boost_graph_terms=boost_graph_terms,
+            boost_graph_families=boost_graph_families,
+            suppress_graph_terms=suppress_graph_terms,
+            suppress_graph_families=suppress_graph_families,
             limit=int(structured_limit or top_k),
         )
         return self._merge_unique(structured, selected)[: max(int(top_k), int(structured_limit or top_k))]

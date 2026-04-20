@@ -16,7 +16,7 @@ import json, math, random, re, time, warnings
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from copy import deepcopy
-from dataclasses import dataclass, is_dataclass, replace
+from dataclasses import dataclass, field, is_dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple, Union
 
@@ -74,6 +74,17 @@ from omen_symbolic.execution_trace import (
     TRACE_RETURN_EVENT_PRED,
     TRACE_STATE_VALUE_PRED,
     build_symbolic_trace_bundle,
+)
+from omen_grounding import (
+    build_planner_world_state,
+    grounding_memory_families,
+    grounding_memory_records,
+    grounding_memory_status_counts,
+    grounding_memory_status_families,
+    grounding_memory_status_terms,
+    grounding_memory_terms,
+    grounding_memory_writeback_records,
+    grounding_memory_writeback_status_counts,
 )
 from omen_symbolic.universal_bits import (
     gaussian_kl_bits,
@@ -203,6 +214,10 @@ class SourceRoutingDecision:
     domain: str
     confidence: float
     evidence: Dict[str, float]
+    modality: str = "unknown"
+    subtype: str = "unknown"
+    verification_path: str = "fallback_verification"
+    profile: Dict[str, float] = field(default_factory=dict)
 
 
 _ROUTER_LANGUAGE_MARKERS: Dict[str, Tuple[Tuple[str, float], ...]] = {
@@ -304,6 +319,381 @@ def _weighted_marker_score(text: str, markers: Tuple[Tuple[str, float], ...]) ->
     return score
 
 
+def _normalized_score_map(scores: Dict[str, float]) -> Dict[str, float]:
+    clipped = {key: max(float(value), 0.0) for key, value in scores.items()}
+    total = sum(clipped.values())
+    if total <= 1e-8:
+        return {key: 0.0 for key in clipped}
+    return {key: round(value / total, 4) for key, value in clipped.items()}
+
+
+def _best_scored_label(
+    scores: Dict[str, float],
+    *,
+    default: str,
+    min_score: float,
+) -> str:
+    if not scores:
+        return default
+    label, score = max(scores.items(), key=lambda item: item[1])
+    return label if score >= min_score else default
+
+
+_NATURAL_SECTION_HEADING_MARKERS = {
+    "abstract",
+    "introduction",
+    "background",
+    "method",
+    "methods",
+    "results",
+    "discussion",
+    "conclusion",
+    "references",
+    "summary",
+}
+
+
+def _split_inline_field(line: str) -> Tuple[str, str, str] | None:
+    colon_idx = line.find(":")
+    equals_idx = line.find("=")
+    if colon_idx < 0 and equals_idx < 0:
+        return None
+    if colon_idx >= 0 and (equals_idx < 0 or colon_idx < equals_idx):
+        sep = ":"
+        idx = colon_idx
+    else:
+        sep = "="
+        idx = equals_idx
+    key = line[:idx].strip()
+    value = line[idx + 1 :].strip()
+    if not key or not value:
+        return None
+    return key, value, sep
+
+
+def _looks_natural_section_heading_line(line: str) -> bool:
+    split = _split_inline_field(line)
+    if split is None:
+        return False
+    key, value, sep = split
+    if sep != ":":
+        return False
+    if key.lower() not in _NATURAL_SECTION_HEADING_MARKERS:
+        return False
+    return len(re.findall(r"[A-Za-z]{3,}", value)) >= 2
+
+
+def _looks_structured_field_line(line: str) -> bool:
+    split = _split_inline_field(line)
+    if split is None:
+        return False
+    key, value, sep = split
+    lower_line = line.lower()
+    if re.match(r"^(user|assistant|speaker|q|a)\s*[:>-]", lower_line):
+        return False
+    if sep == ":" and _looks_natural_section_heading_line(line):
+        return False
+    if len(key.split()) > 3:
+        return False
+    if re.search(r"[{}\[\]]", value):
+        return True
+    if "," in value or ";" in value or "\t" in value:
+        return True
+    if "=" in value:
+        return True
+    if re.search(r"\b(true|false|null|none|on|off|yes|no)\b", value.lower()):
+        return True
+    if re.search(r"https?://|postgres://|mysql://|sqlite://", value.lower()):
+        return True
+    if re.search(r"\d", value):
+        return True
+    if len(re.findall(r"[A-Za-z0-9_.-]+", value)) <= 4 and len(value) <= 32:
+        return True
+    return False
+
+
+def _looks_comment_prose_line(line: str) -> bool:
+    stripped = line.strip()
+    marker = ""
+    for candidate in ("//", "#", "/*", "*"):
+        if stripped.startswith(candidate):
+            marker = candidate
+            break
+    if not marker:
+        return False
+    content = stripped[len(marker) :].strip("/*- \t")
+    if len(content) < 12:
+        return False
+    return len(re.findall(r"[A-Za-z]{3,}", content)) >= 2
+
+
+def _infer_structured_text_subtype(
+    stripped: str,
+    lower: str,
+    probe: Sequence[str],
+    *,
+    json_like_records: int,
+) -> str:
+    log_score = 0.0
+    dialogue_like_lines = sum(
+        1
+        for line in probe
+        if re.match(r"^(user|assistant|speaker|q|a)\s*[:>-]", line.lower())
+    )
+    if re.search(r"traceback|exception|stack trace", lower):
+        log_score += 1.6
+    level_prefixed_lines = sum(
+        1
+        for line in probe
+        if re.match(r"^(info|warn|warning|error|debug|trace)\b", line.lower())
+    )
+    if any(
+        re.search(r"^\d{4}-\d{2}-\d{2}", line)
+        or re.match(r"^(info|warn|warning|error|debug|trace)\b", line.lower())
+        for line in probe
+    ):
+        log_score += 1.0
+    if level_prefixed_lines >= 1:
+        log_score += 1.2
+    if any(
+        re.match(r"^(info|warn|warning|error|debug|trace)\b", line.lower())
+        and "=" in line
+        for line in probe
+    ):
+        log_score += 1.2
+    if sum(
+        1
+        for line in probe
+        if re.search(r"^\d{4}-\d{2}-\d{2}", line)
+        or re.search(r"\b(info|warn|warning|error|debug|trace)\b", line.lower())
+    ) >= 2:
+        log_score += 1.6
+
+    table_score = 0.0
+    if sum(1 for line in probe if "|" in line) >= 2:
+        table_score += 1.8
+    if sum(1 for line in probe if "\t" in line) >= 2:
+        table_score += 1.6
+    if sum(1 for line in probe if line.count(",") >= 2) >= 2:
+        table_score += 1.2
+    if any(line.count("|") >= 2 or line.count("\t") >= 2 or line.count(",") >= 3 for line in probe):
+        table_score += 1.0
+
+    config_score = 0.0
+    if sum(1 for line in probe if re.match(r"^\[[^\]]+\]$", line.strip())) >= 1:
+        config_score += 1.8
+    if sum(
+        1
+        for line in probe
+        if _looks_structured_field_line(line)
+    ) >= 2:
+        config_score += 1.4
+    if any(re.match(r"^[A-Za-z0-9_.-]+\.[A-Za-z0-9_.-]+\s*=\s*.+$", line) for line in probe):
+        config_score += 1.0
+    if sum(1 for line in probe if line.startswith(("export ", "--", "set ", "env "))) >= 1:
+        config_score += 1.0
+    if dialogue_like_lines >= 2:
+        config_score = max(config_score - 1.5, 0.0)
+
+    state_score = 0.0
+    state_marker_lines = sum(
+        1
+        for line in probe
+        if re.search(r"\b(step|state|goal|target|status|next)\b", line.lower())
+    )
+    if state_marker_lines >= 1:
+        state_score += 1.0
+    if state_marker_lines >= 2:
+        state_score += 1.0
+    if any(re.match(r"^(step\d+|\d+\)|\d+\.)", line.lower()) for line in probe):
+        state_score += 0.8
+
+    key_value_score = 0.0
+    key_value_score += 0.35 * sum(1 for line in probe if _looks_structured_field_line(line))
+    if re.search(r"^\s*[\[{]", stripped):
+        key_value_score += 0.6
+
+    structured_scores = {
+        "json_records": float(json_like_records) * 2.0 + (1.0 if stripped.startswith(("{", "[")) else 0.0),
+        "log_text": log_score,
+        "table_text": table_score,
+        "config_text": config_score,
+        "key_value_records": key_value_score + state_score,
+    }
+    return _best_scored_label(structured_scores, default="key_value_records", min_score=1.0)
+
+
+def _infer_natural_text_subtype(
+    stripped: str,
+    lower: str,
+    probe: Sequence[str],
+    *,
+    relation_hits: int,
+) -> str:
+    scientific_score = 0.0
+    for marker, weight in (
+        ("abstract", 1.1),
+        ("introduction", 1.0),
+        ("background", 1.0),
+        ("method", 1.0),
+        ("methods", 1.0),
+        ("results", 1.0),
+        ("discussion", 1.0),
+        ("conclusion", 0.8),
+        ("references", 0.7),
+        ("doi", 0.8),
+        ("dataset", 0.8),
+        ("experiment", 0.8),
+        ("baseline", 0.6),
+        ("hypothesis", 0.7),
+        ("statistically significant", 1.0),
+    ):
+        if marker in lower:
+            scientific_score += weight
+    if re.search(r"\[[0-9]{1,3}\]", stripped):
+        scientific_score += 0.8
+    if re.search(r"\bet al\.", lower):
+        scientific_score += 0.8
+    if re.search(r"\bp\s*[<=>]\s*0\.\d+", lower):
+        scientific_score += 1.0
+
+    instructional_score = 0.0
+    for marker, weight in (
+        ("step ", 0.8),
+        ("how to", 1.0),
+        ("install", 0.9),
+        ("run", 0.6),
+        ("usage", 0.8),
+        ("follow", 0.7),
+        ("first", 0.5),
+        ("then", 0.5),
+        ("finally", 0.6),
+        ("must", 0.5),
+        ("should", 0.5),
+    ):
+        if marker in lower:
+            instructional_score += weight
+    if sum(1 for line in probe if re.match(r"^(step|\d+\.)\s", line.lower())) >= 2:
+        instructional_score += 1.0
+
+    dialogue_score = 0.0
+    if sum(1 for line in probe if re.match(r"^(user|assistant|speaker|q|a)\s*[:>-]", line.lower())) >= 1:
+        dialogue_score += 1.6
+    if stripped.count("?") >= 2:
+        dialogue_score += 0.7
+    if stripped.count('"') >= 4:
+        dialogue_score += 0.4
+
+    legal_score = 0.0
+    for marker, weight in (
+        ("hereby", 1.0),
+        ("shall", 0.9),
+        ("pursuant", 0.9),
+        ("agreement", 0.7),
+        ("contract", 0.8),
+        ("section ", 0.6),
+        ("article ", 0.6),
+        ("whereas", 0.8),
+        ("liability", 0.7),
+    ):
+        if marker in lower:
+            legal_score += weight
+
+    medical_score = 0.0
+    for marker, weight in (
+        ("patient", 0.8),
+        ("diagnosis", 0.9),
+        ("symptom", 0.7),
+        ("treatment", 0.8),
+        ("dose", 0.8),
+        ("dosage", 0.8),
+        ("contraindication", 0.9),
+        ("trial", 0.6),
+        ("clinical", 0.8),
+    ):
+        if marker in lower:
+            medical_score += weight
+
+    narrative_score = 0.0
+    for marker, weight in (
+        ("chapter", 0.6),
+        ("suddenly", 0.6),
+        ("she said", 0.7),
+        ("he said", 0.7),
+        ("they said", 0.7),
+        ("once ", 0.5),
+    ):
+        if marker in lower:
+            narrative_score += weight
+
+    claim_score = 0.25 * float(relation_hits)
+    if re.search(r"\btherefore\b|\bwe conclude\b|\bthis shows\b|\bclaim\b", lower):
+        claim_score += 0.8
+
+    natural_scores = {
+        "scientific_text": scientific_score,
+        "instructional_text": instructional_score,
+        "dialogue_text": dialogue_score,
+        "legal_text": legal_score,
+        "medical_text": medical_score,
+        "narrative_text": narrative_score,
+        "claim_text": claim_score,
+        "generic_text": 0.4,
+    }
+    return _best_scored_label(natural_scores, default="generic_text", min_score=0.8)
+
+
+def _verification_path_for_source(modality: str, subtype: str) -> str:
+    if modality == "code":
+        return "ast_program_verification"
+    if modality == "mixed":
+        return "mixed_hybrid_verification"
+    if modality == "structured_text":
+        if subtype == "log_text":
+            return "log_trace_verification"
+        if subtype == "config_text":
+            return "config_schema_verification"
+        if subtype == "table_text":
+            return "table_consistency_verification"
+        return "structured_state_verification"
+    if modality == "natural_text":
+        if subtype == "scientific_text":
+            return "scientific_claim_verification"
+        if subtype == "dialogue_text":
+            return "dialogue_state_verification"
+        return "natural_language_claim_verification"
+    return "fallback_verification"
+
+
+def _fallback_source_routing(language: str, domain: str, confidence: float = 0.5) -> SourceRoutingDecision:
+    if domain == "code":
+        modality = "code"
+        subtype = "program_source"
+        profile = {"code": 1.0, "natural_text": 0.0, "structured_text": 0.0, "mixed": 0.0, "unknown": 0.0}
+    elif language == "json" or domain == "structured_observation":
+        modality = "structured_text"
+        subtype = "json_records" if language == "json" else "key_value_records"
+        profile = {"code": 0.0, "natural_text": 0.0, "structured_text": 1.0, "mixed": 0.0, "unknown": 0.0}
+    elif domain in ("text", "observation_text"):
+        modality = "natural_text"
+        subtype = "generic_text"
+        profile = {"code": 0.0, "natural_text": 1.0, "structured_text": 0.0, "mixed": 0.0, "unknown": 0.0}
+    else:
+        modality = "unknown"
+        subtype = "unknown"
+        profile = {"code": 0.0, "natural_text": 0.0, "structured_text": 0.0, "mixed": 0.0, "unknown": 1.0}
+    return SourceRoutingDecision(
+        language=language,
+        domain=domain,
+        confidence=confidence,
+        evidence={},
+        modality=modality,
+        subtype=subtype,
+        verification_path=_verification_path_for_source(modality, subtype),
+        profile=profile,
+    )
+
+
 def _infer_source_routing(
     text: str,
     *,
@@ -317,6 +707,10 @@ def _infer_source_routing(
             domain="empty",
             confidence=0.0,
             evidence={"code_score": 0.0, "structured_score": 0.0, "observation_score": 0.0},
+            modality="unknown",
+            subtype="empty",
+            verification_path="fallback_verification",
+            profile={"code": 0.0, "natural_text": 0.0, "structured_text": 0.0, "mixed": 0.0, "unknown": 1.0},
         )
 
     lower = stripped.lower()
@@ -360,6 +754,13 @@ def _infer_source_routing(
 
     structured_score = 0.0
     json_like_records = 0
+    dialogue_like_lines = sum(
+        1
+        for line in probe
+        if re.match(r"^(user|assistant|speaker|q|a)\s*[:>-]", line.lower())
+    )
+    natural_heading_lines = sum(1 for line in probe if _looks_natural_section_heading_line(line))
+    comment_prose_lines = sum(1 for line in raw_lines if _looks_comment_prose_line(line))
     for line in probe:
         if line.startswith("{") and line.endswith("}") and ":" in line:
             json_like_records += 1
@@ -369,16 +770,62 @@ def _infer_source_routing(
                 structured_score += 0.8
             except Exception:
                 pass
-        elif "=" in line or ":" in line:
+        elif _looks_structured_field_line(line):
             structured_score += 0.5
+        if line.count("|") >= 2 or line.count("\t") >= 2 or line.count(",") >= 3:
+            structured_score += 0.8
+    log_like_lines = sum(
+        1
+        for line in probe
+        if re.search(r"^\d{4}-\d{2}-\d{2}", line)
+        or re.search(r"\b(info|warn|warning|error|debug|trace)\b", line.lower())
+    )
+    if log_like_lines >= 1:
+        structured_score += 1.0
+    if log_like_lines >= 2:
+        structured_score += 0.8
+    config_like_lines = sum(
+        1
+        for line in probe
+        if (
+            re.match(r"^\[[^\]]+\]$", line.strip())
+            or (
+                not re.match(r"^(user|assistant|speaker|q|a)\s*[:>-]", line.lower())
+                and re.match(r"^[A-Za-z0-9_.-]+\s*[:=]\s*.+$", line)
+            )
+        )
+    )
+    if config_like_lines >= 1:
+        structured_score += 1.0
+    if config_like_lines >= 2:
+        structured_score += 0.6
+    table_like_lines = sum(
+        1
+        for line in probe
+        if "|" in line or "\t" in line or line.count(",") >= 2
+    )
+    if table_like_lines >= 1:
+        structured_score += 1.0
+    if table_like_lines >= 2:
+        structured_score += 0.6
     if json_like_records >= 2:
         structured_score += 1.4
     if any(re.search(r"\b(step|state|goal|target|status|next)\b", line.lower()) for line in probe):
         structured_score += 1.1
+    if dialogue_like_lines >= 2:
+        structured_score = max(structured_score - 1.5, 0.0)
+    if natural_heading_lines >= 1:
+        structured_score = max(structured_score - 0.6 * float(natural_heading_lines), 0.0)
 
     relation_hits = len(re.findall(r"\b(is|becomes|causes|leads to|requires|must|not|after|before|however)\b", lower))
     sentence_hits = len(re.findall(r"[.!?](?:\s|$)", stripped))
     observation_score = min(float(relation_hits) * 0.45, 3.2) + min(float(sentence_hits) * 0.25, 1.5)
+    if natural_heading_lines >= 1:
+        observation_score += 0.9 + 0.35 * float(natural_heading_lines - 1)
+    if comment_prose_lines >= 1:
+        observation_score += 0.55 + 0.25 * float(comment_prose_lines - 1)
+    if dialogue_like_lines >= 2:
+        observation_score += 1.0
 
     ranked_languages = sorted(language_scores.items(), key=lambda item: item[1], reverse=True)
     top_lang, top_score = ranked_languages[0] if ranked_languages else ("python", 0.0)
@@ -394,7 +841,15 @@ def _infer_source_routing(
         "observation_text": observation_score,
     }
 
-    if structured_score >= max(code_score * 1.05, observation_score * 0.95, 2.2):
+    short_structured_hint = (
+        json_like_records >= 1
+        or log_like_lines >= 1
+        or config_like_lines >= 1
+        or table_like_lines >= 1
+    )
+    if structured_score >= max(code_score * 1.05, observation_score * 0.95, 2.2) or (
+        short_structured_hint and structured_score >= 1.4 and code_score < 1.0 and observation_score < 0.8
+    ):
         language = "json" if json_like_records > 0 else "text"
         domain = "structured_observation"
         selected_score = structured_score
@@ -424,10 +879,59 @@ def _infer_source_routing(
     confidence += 0.08 * max(selected_score - domain_runner_up, 0.0) + parser_agreement
     confidence = max(0.05, min(confidence, 0.99))
 
+    natural_text_score = max(observation_score, 0.6 if domain == "text" else 0.0)
+    mixed_score = min(code_score, max(structured_score, natural_text_score))
+    modality_scores = {
+        "code": code_score,
+        "natural_text": natural_text_score,
+        "structured_text": structured_score,
+        "mixed": mixed_score,
+        "unknown": 0.8 if domain == "text" and max(code_score, structured_score, observation_score) < 1.2 else 0.0,
+    }
+    profile = _normalized_score_map(modality_scores)
+
+    if domain == "code":
+        primary_modality = "code"
+    elif domain == "structured_observation":
+        primary_modality = "structured_text"
+    elif domain in ("observation_text", "text"):
+        primary_modality = "natural_text"
+    else:
+        primary_modality = "unknown"
+
+    modality = primary_modality
+    mixed_noncode_signal = natural_text_score >= 0.4 or structured_score >= 2.0
+    if domain != "empty" and code_score >= 1.6 and mixed_score >= 1.0 and mixed_noncode_signal:
+        modality = "mixed"
+
+    if modality == "code":
+        subtype = "program_source"
+    elif modality == "structured_text":
+        subtype = _infer_structured_text_subtype(
+            stripped,
+            lower,
+            probe,
+            json_like_records=json_like_records,
+        )
+    elif modality == "natural_text":
+        subtype = _infer_natural_text_subtype(
+            stripped,
+            lower,
+            probe,
+            relation_hits=relation_hits,
+        )
+    elif modality == "mixed":
+        subtype = "mixed_code_structured" if structured_score >= natural_text_score else "mixed_code_text"
+    else:
+        subtype = "unknown"
+    verification_path = _verification_path_for_source(modality, subtype)
+
     evidence = {
         "code_score": round(code_score, 4),
         "structured_score": round(structured_score, 4),
         "observation_score": round(observation_score, 4),
+        "natural_text_score": round(natural_text_score, 4),
+        "mixed_score": round(mixed_score, 4),
         "top_language_score": round(top_score, 4),
         "second_language_score": round(second_score, 4),
         "parser_agreement": 1.0 if parser_supported is not None and language == parser_supported else 0.0,
@@ -437,6 +941,10 @@ def _infer_source_routing(
         domain=domain,
         confidence=confidence,
         evidence=evidence,
+        modality=modality,
+        subtype=subtype,
+        verification_path=verification_path,
+        profile=profile,
     )
 
 
@@ -648,6 +1156,13 @@ class AsyncTensorProductMemory(nn.Module):
         self.schedule_write(embs, embs, write_conf)
         return added
 
+    def write_grounding_records(
+        self,
+        records: List[object],
+        embeddings: torch.Tensor,
+    ) -> int:
+        return self.write_symbolic_atoms(records, embeddings)
+
     @torch.no_grad()
     def recall_symbolic_atoms(
         self,
@@ -663,6 +1178,32 @@ class AsyncTensorProductMemory(nn.Module):
             min_sim=min_sim,
             predicate_hints=predicate_hints,
             anchor_values=anchor_values,
+            structured_limit=max(2, top_k // 2),
+        )
+
+    @torch.no_grad()
+    def recall_grounding_records(
+        self,
+        z_query: torch.Tensor,
+        top_k: int = 6,
+        min_sim: float = 0.15,
+        graph_terms: Optional[List[str]] = None,
+        graph_families: Optional[List[str]] = None,
+        boost_graph_terms: Optional[List[str]] = None,
+        boost_graph_families: Optional[List[str]] = None,
+        suppress_graph_terms: Optional[List[str]] = None,
+        suppress_graph_families: Optional[List[str]] = None,
+    ) -> List[object]:
+        return self.symbolic_index.recall(
+            z_query,
+            top_k=top_k,
+            min_sim=min_sim,
+            graph_terms=graph_terms,
+            graph_families=graph_families,
+            boost_graph_terms=boost_graph_terms,
+            boost_graph_families=boost_graph_families,
+            suppress_graph_terms=suppress_graph_terms,
+            suppress_graph_families=suppress_graph_families,
             structured_limit=max(2, top_k // 2),
         )
 
@@ -1604,7 +2145,12 @@ class SymbolicQueryGenerator(nn.Module):
         if task_context is not None:
             context_anchor = int(task_context.metadata.get("last_src", 0))
             gold_next = int(task_context.metadata.get("last_tgt", -1))
-            observed_facts = tuple(task_context.observed_facts)
+            reasoning_fn = getattr(task_context, "reasoning_facts", None)
+            reasoning_facts = (
+                reasoning_fn() if callable(reasoning_fn)
+                else frozenset(getattr(task_context, "observed_facts", frozenset()))
+            )
+            observed_facts = tuple(reasoning_facts)
             if observed_facts:
                 pred_hints = {int(fact.pred) for fact in observed_facts if fact.arity() >= 2}
                 if task_context.goal is not None and task_context.goal.arity() >= 2:
@@ -1612,7 +2158,7 @@ class SymbolicQueryGenerator(nn.Module):
                 pred_hints.add(SEQ_PREDICT_NEXT_PRED)
                 candidate_preds = tuple(sorted(pred_hints))
                 context_state = prover.ground(
-                    task_context.observed_facts,
+                    reasoning_facts,
                     logits.device,
                 ).expand(B, -1)
         elif getattr(prover, "last_goal", None) is not None and getattr(prover.last_goal, "args", ()):
@@ -1862,6 +2408,7 @@ class OMENScale(nn.Module):
             nn.Linear(cfg.d_latent, cfg.d_latent),
         )
         self.world_state_prior = nn.Parameter(torch.zeros(cfg.d_latent))
+        self.semantic_grounding_backbone = None
         self.mem_query_proj = nn.Linear(cfg.d_latent, cfg.d_latent, bias=False)
         self.state_integrator = SymbolicStateIntegrator(cfg.d_latent)
         self.symbolic_token_head = nn.Sequential(
@@ -2044,6 +2591,7 @@ class OMENScale(nn.Module):
 
         #  Loss 
         self.loss_fn = OMENScaleLoss(cfg)
+
         self.saliency_enabled = getattr(cfg, 'saliency_enabled', False)
         if self.saliency_enabled:
             self.saliency = SaliencyTraceModule(cfg.d_tok, cfg.d_latent, cfg)
@@ -2141,6 +2689,9 @@ class OMENScale(nn.Module):
         self._prev_ce: float = float("inf")
         self._ce_ema: float = float("inf")   #  smooth EMA  VeM retro
         self.last_generate_info: Dict[str, float] = {}
+
+    def set_semantic_grounding_backbone(self, backbone: Optional[object]) -> None:
+        self.semantic_grounding_backbone = backbone
 
     @staticmethod
     def canonical_architecture() -> CanonicalArchitectureSpec:
@@ -2464,8 +3015,21 @@ class OMENScale(nn.Module):
         source_metric_keys = (
             "observed_now_facts",
             "memory_facts",
+            "memory_grounding_records",
+            "grounding_world_state_records",
+            "grounding_world_state_facts",
+            "grounding_world_state_active_records",
+            "grounding_world_state_hypothetical_records",
+            "grounding_world_state_contradicted_records",
+            "grounding_world_state_active_facts",
+            "grounding_world_state_hypothetical_facts",
+            "grounding_world_state_contradicted_facts",
+            "grounding_verification_records",
+            "grounding_hypotheses",
             "saliency_facts",
             "net_facts",
+            "grounding_derived_facts",
+            "interlingua_facts",
             "world_context_facts",
             "abduced_support_facts",
             "goal_context_facts",
@@ -2533,6 +3097,20 @@ class OMENScale(nn.Module):
                 extra_records = tuple(limited_records)
                 if not context_facts:
                     context_facts = [atom for _, atom in extra_records]
+            if trace_bundle is not None:
+                trace_interlingua_records = tuple(
+                    ("interlingua", record)
+                    for record in getattr(trace_bundle, "grounding_graph_records", ())
+                )
+                if trace_interlingua_records:
+                    extra_records = tuple(
+                        list(extra_records)
+                        + list(
+                            trace_interlingua_records[
+                                : max(int(getattr(self.cfg, "world_graph_context_limit", 32)), 8)
+                            ]
+                        )
+                    )
             if batch_idx < len(base_graphs):
                 graph = self.world_graph.enrich(
                     base_graphs[batch_idx],
@@ -2668,8 +3246,21 @@ class OMENScale(nn.Module):
             source_metric_keys = (
                 "observed_now_facts",
                 "memory_facts",
+                "memory_grounding_records",
+                "grounding_world_state_records",
+                "grounding_world_state_facts",
+                "grounding_world_state_active_records",
+                "grounding_world_state_hypothetical_records",
+                "grounding_world_state_contradicted_records",
+                "grounding_world_state_active_facts",
+                "grounding_world_state_hypothetical_facts",
+                "grounding_world_state_contradicted_facts",
+                "grounding_verification_records",
+                "grounding_hypotheses",
                 "saliency_facts",
                 "net_facts",
+                "grounding_derived_facts",
+                "interlingua_facts",
                 "world_context_facts",
                 "abduced_support_facts",
                 "goal_context_facts",
@@ -2984,13 +3575,14 @@ class OMENScale(nn.Module):
     ) -> CanonicalWorldState:
         if world_graph_batch is None or not world_graph_batch.graphs:
             fallback_graph = self.world_graph(
-                facts=tuple(task_context.observed_facts),
+                facts=tuple(task_context.reasoning_facts()),
                 trace_bundle=task_context.execution_trace,
                 device=z_grounded.device,
             )
             graphs = tuple(fallback_graph for _ in range(z_grounded.size(0)))
         else:
             graphs = tuple(world_graph_batch.graphs)
+        planner_state = build_planner_world_state(task_context)
         metadata = {
             "canonical_stack": 1.0,
             "literal_graph_z": 1.0,
@@ -3019,6 +3611,7 @@ class OMENScale(nn.Module):
             "world_context_slice_facts": float(len(task_context.world_context_facts)),
         }
         metadata.update(task_context.source_counts())
+        metadata.update(planner_state.summary())
         return CanonicalWorldState(
             graphs=graphs,
             neural_state=z_neural.detach(),
@@ -3029,7 +3622,8 @@ class OMENScale(nn.Module):
             symbolic_state=z_symbolic.detach(),
             memory_state=v_mem.detach(),
             program_state=z_program.detach() if has_program_state else None,
-            symbolic_facts=tuple(sorted(list(task_context.observed_facts), key=self._fact_sort_key)),
+            planner_state=planner_state,
+            symbolic_facts=tuple(sorted(list(task_context.reasoning_facts()), key=self._fact_sort_key)),
             target_facts=tuple(sorted(list(task_context.target_facts), key=self._fact_sort_key)),
             metadata=metadata,
         )
@@ -3437,6 +4031,117 @@ class OMENScale(nn.Module):
         )
         return [fact for fact in recalled if isinstance(fact, HornAtom)]
 
+    def _seed_grounding_memory_records(
+        self,
+        tokens: torch.Tensor,
+    ) -> List[object]:
+        if not torch.is_tensor(tokens) or tokens.dim() != 2 or tokens.size(0) == 0:
+            return []
+        row = tokens[0].detach().cpu()
+        trace_bundle = self._ast_trace_from_bytes(row)
+        if trace_bundle is None:
+            return []
+        return list(
+            grounding_memory_records(
+                tuple(getattr(trace_bundle, "grounding_world_state_records", ()))
+                + tuple(getattr(trace_bundle, "grounding_verification_records", ()))
+                + tuple(getattr(trace_bundle, "grounding_hypotheses", ()))
+                + tuple(getattr(trace_bundle, "grounding_graph_records", ())),
+                limit=int(getattr(self.cfg, "mem_grounding_seed_limit", 16)),
+            )
+        )
+
+    def _seed_grounding_memory_record_batches(
+        self,
+        tokens: torch.Tensor,
+    ) -> Tuple[Tuple[object, ...], ...]:
+        if not torch.is_tensor(tokens) or tokens.dim() != 2:
+            return tuple()
+        batches: List[Tuple[object, ...]] = []
+        for row_idx in range(tokens.size(0)):
+            batches.append(tuple(self._seed_grounding_memory_records(tokens[row_idx:row_idx + 1])))
+        return tuple(batches)
+
+    def _recall_grounding_memory_records(
+        self,
+        z_query: torch.Tensor,
+        hint_records: Optional[Sequence[object]] = None,
+    ) -> List[object]:
+        top_k = int(getattr(self.cfg, "mem_grounding_recall_topk", 6))
+        min_sim = float(getattr(self.cfg, "mem_grounding_min_sim", 0.15))
+        hint_records = tuple(hint_records or ())
+        terms = list(grounding_memory_terms(hint_records))
+        families = list(grounding_memory_families(hint_records))
+        if not terms and not families:
+            return []
+        status_counts = grounding_memory_status_counts(hint_records)
+        boost_statuses: List[str] = []
+        suppress_statuses: List[str] = []
+        if status_counts.get("contradicted", 0.0) > 0.0:
+            boost_statuses.extend(["contradicted", "hypothetical"])
+            suppress_statuses.append("active")
+        elif status_counts.get("hypothetical", 0.0) > 0.0:
+            boost_statuses.append("hypothetical")
+        elif status_counts.get("active", 0.0) > 0.0:
+            boost_statuses.append("active")
+        boost_terms = list(grounding_memory_status_terms(hint_records, statuses=boost_statuses, limit=16))
+        boost_families = list(grounding_memory_status_families(hint_records, statuses=boost_statuses, limit=8))
+        suppress_terms = list(grounding_memory_status_terms(hint_records, statuses=suppress_statuses, limit=12))
+        suppress_families = list(
+            grounding_memory_status_families(hint_records, statuses=suppress_statuses, limit=6)
+        )
+        recalled = list(
+            self.memory.recall_grounding_records(
+                z_query[:1],
+                top_k=top_k,
+                min_sim=min_sim,
+                graph_terms=terms,
+                graph_families=families,
+                boost_graph_terms=boost_terms,
+                boost_graph_families=boost_families,
+                suppress_graph_terms=suppress_terms,
+                suppress_graph_families=suppress_families,
+            )
+        )
+        anchored = list(grounding_memory_records(hint_records, limit=max(3, min(top_k, 6))))
+        merged: List[object] = []
+        seen_keys: Set[str] = set()
+        seen_families: Set[str] = set()
+        for record in recalled + anchored:
+            key = str(getattr(record, "graph_key", "") or "")
+            family = str(getattr(record, "graph_family", "") or "")
+            if not key or key in seen_keys:
+                continue
+            if family and family not in seen_families:
+                merged.append(record)
+                seen_keys.add(key)
+                seen_families.add(family)
+                if len(merged) >= top_k:
+                    break
+        if len(merged) < top_k:
+            for record in recalled + anchored:
+                key = str(getattr(record, "graph_key", "") or "")
+                if not key or key in seen_keys:
+                    continue
+                merged.append(record)
+                seen_keys.add(key)
+                if len(merged) >= top_k:
+                    break
+        return list(grounding_memory_records(merged, limit=top_k))
+
+    def _recall_grounding_memory_record_batches(
+        self,
+        z_query: torch.Tensor,
+        hint_record_batches: Optional[Sequence[Sequence[object]]] = None,
+    ) -> Tuple[Tuple[object, ...], ...]:
+        if not torch.is_tensor(z_query) or z_query.dim() != 2:
+            return tuple()
+        recalled_batches: List[Tuple[object, ...]] = []
+        for row_idx in range(z_query.size(0)):
+            hints = hint_record_batches[row_idx] if hint_record_batches and row_idx < len(hint_record_batches) else ()
+            recalled_batches.append(tuple(self._recall_grounding_memory_records(z_query[row_idx:row_idx + 1], hints)))
+        return tuple(recalled_batches)
+
     def _write_symbolic_memory_facts(
         self,
         facts: FrozenSet[HornAtom],
@@ -3447,6 +4152,42 @@ class OMENScale(nn.Module):
         fact_list = list(facts)[: int(getattr(self.cfg, "sym_max_facts", 64))]
         fact_embs = self.prover.term_emb(fact_list, next(self.parameters()).device)
         return self.memory.write_symbolic_atoms(fact_list, fact_embs)
+
+    def _write_grounding_memory_records(
+        self,
+        records: Sequence[object],
+        confidence: float,
+    ) -> Dict[str, float]:
+        empty_stats = {
+            "written": 0.0,
+            "selected": 0.0,
+            "active": 0.0,
+            "hypothetical": 0.0,
+            "contradicted": 0.0,
+            "unknown": 0.0,
+        }
+        if not records or confidence <= float(getattr(self.cfg, "mem_write_tau", 0.3)):
+            return empty_stats
+        record_list = list(
+            grounding_memory_writeback_records(
+                records,
+                limit=int(getattr(self.cfg, "mem_grounding_seed_limit", 16)),
+            )
+        )
+        if not record_list:
+            return empty_stats
+        device = next(self.parameters()).device
+        record_embs = self.world_graph.encode_records(record_list, device=device)
+        written = self.memory.write_grounding_records(record_list, record_embs)
+        status_counts = grounding_memory_writeback_status_counts(record_list)
+        return {
+            "written": float(written),
+            "selected": float(len(record_list)),
+            "active": float(status_counts.get("active", 0.0)),
+            "hypothetical": float(status_counts.get("hypothetical", 0.0)),
+            "contradicted": float(status_counts.get("contradicted", 0.0)),
+            "unknown": float(status_counts.get("unknown", 0.0)),
+        }
 
     def _sample_variational_latent(
         self,
@@ -4112,8 +4853,16 @@ class OMENScale(nn.Module):
         hot_dims: Sequence[int],
         metadata: Dict[str, object],
         memory_derived_facts: Optional[Sequence[HornAtom]] = None,
+        memory_grounding_records: Optional[Sequence[object]] = None,
+        grounding_world_state_records: Optional[Sequence[object]] = None,
+        grounding_world_state_active_facts: Optional[Sequence[HornAtom]] = None,
+        grounding_world_state_hypothetical_facts: Optional[Sequence[HornAtom]] = None,
+        grounding_world_state_contradicted_facts: Optional[Sequence[HornAtom]] = None,
+        grounding_hypotheses: Optional[Sequence[object]] = None,
+        grounding_verification_records: Optional[Sequence[object]] = None,
         saliency_derived_facts: Optional[Sequence[HornAtom]] = None,
         net_derived_facts: Optional[Sequence[HornAtom]] = None,
+        grounding_derived_facts: Optional[Sequence[HornAtom]] = None,
         world_context_facts: Optional[Sequence[HornAtom]] = None,
         abduced_support_facts: Optional[Sequence[HornAtom]] = None,
         world_context_summary: Optional[Dict[str, object]] = None,
@@ -4124,6 +4873,28 @@ class OMENScale(nn.Module):
             list(memory_derived_facts or ()),
             limit=max(8, min(self._ctx_max_facts // 2, 24)),
         )
+        grounding_memory = list(memory_grounding_records or ())
+        grounding_memory = list(
+            grounding_memory_records(
+                grounding_memory,
+                limit=max(4, min(context_limit, int(getattr(self.cfg, "mem_grounding_seed_limit", 16)))),
+            )
+        )
+        grounding_world_state = list(grounding_world_state_records or ())
+        grounding_world_state_active = self._dedupe_facts(
+            list(grounding_world_state_active_facts or ()),
+            limit=max(8, min(self._ctx_max_facts // 2, 24)),
+        )
+        grounding_world_state_hypothetical = self._dedupe_facts(
+            list(grounding_world_state_hypothetical_facts or ()),
+            limit=max(8, min(self._ctx_max_facts // 2, 24)),
+        )
+        grounding_world_state_contradicted = self._dedupe_facts(
+            list(grounding_world_state_contradicted_facts or ()),
+            limit=max(8, min(self._ctx_max_facts // 2, 24)),
+        )
+        grounding_hypothesis_records = list(grounding_hypotheses or ())
+        grounding_verification = list(grounding_verification_records or ())
         saliency_facts = self._dedupe_facts(
             list(saliency_derived_facts or ()),
             limit=max(8, min(self._ctx_max_facts // 2, 32)),
@@ -4131,6 +4902,10 @@ class OMENScale(nn.Module):
         net_facts = self._dedupe_facts(
             list(net_derived_facts or ()),
             limit=max(8, min(self._ctx_max_facts // 2, 24)),
+        )
+        grounding_facts = self._dedupe_facts(
+            list(grounding_derived_facts or ()),
+            limit=max(8, min(self._ctx_max_facts // 2, 32)),
         )
         world_facts = self._dedupe_facts(
             list(world_context_facts or ()),
@@ -4148,8 +4923,16 @@ class OMENScale(nn.Module):
             observed_facts=frozenset(all_observed),
             observed_now_facts=frozenset(observed_now),
             memory_derived_facts=frozenset(memory_facts),
+            memory_grounding_records=tuple(grounding_memory),
+            grounding_world_state_records=tuple(grounding_world_state),
+            grounding_world_state_active_facts=frozenset(grounding_world_state_active),
+            grounding_world_state_hypothetical_facts=frozenset(grounding_world_state_hypothetical),
+            grounding_world_state_contradicted_facts=frozenset(grounding_world_state_contradicted),
+            grounding_hypotheses=tuple(grounding_hypothesis_records),
+            grounding_verification_records=tuple(grounding_verification),
             saliency_derived_facts=frozenset(saliency_facts),
             net_derived_facts=frozenset(net_facts),
+            grounding_derived_facts=frozenset(grounding_facts),
             world_context_facts=frozenset(world_facts),
             abduced_support_facts=frozenset(abduced_facts),
             goal=goal,
@@ -4165,6 +4948,138 @@ class OMENScale(nn.Module):
         return context
 
     @staticmethod
+    def _trace_metadata_features(trace_bundle: Optional[object]) -> Dict[str, object]:
+        raw = dict(getattr(trace_bundle, "metadata", {}) or {}) if trace_bundle is not None else {}
+        features: Dict[str, object] = {}
+        for key, value in raw.items():
+            feature_key = f"trace_{key}"
+            if isinstance(value, bool):
+                features[feature_key] = 1.0 if value else 0.0
+            elif isinstance(value, (int, float)):
+                features[feature_key] = float(value)
+            elif isinstance(value, str):
+                features[feature_key] = value
+        return features
+
+    @staticmethod
+    def _grounding_quality_features(trace_bundle: Optional[object]) -> Dict[str, float]:
+        raw = dict(getattr(trace_bundle, "metadata", {}) or {}) if trace_bundle is not None else {}
+        interlingua_claims = float(
+            raw.get("interlingua_states", 0.0)
+            + raw.get("interlingua_relations", 0.0)
+            + raw.get("interlingua_goals", 0.0)
+        )
+        compiled_claims = float(
+            raw.get("compiled_state_claims", 0.0)
+            + raw.get("compiled_relation_claims", 0.0)
+            + raw.get("compiled_goal_claims", 0.0)
+        )
+        graph_records = float(raw.get("interlingua_graph_records", 0.0))
+        uncertain_claims = float(raw.get("interlingua_uncertain_claims", 0.0))
+        hypothesis_count = float(raw.get("compiled_hypotheses", 0.0))
+        deferred_hypotheses = float(raw.get("compiled_deferred_hypotheses", 0.0))
+        mean_confidence = max(min(float(raw.get("compiled_mean_confidence", 0.5)), 1.0), 0.0)
+        verification_acceptance = max(
+            min(float(raw.get("verification_acceptance_ratio", 0.0)), 1.0),
+            0.0,
+        )
+        verification_conflict = max(
+            min(float(raw.get("verification_conflict_pressure", 0.0)), 1.0),
+            0.0,
+        )
+        verification_repair = max(
+            min(float(raw.get("verification_repair_pressure", 0.0)), 1.0),
+            0.0,
+        )
+        hidden_cause_pressure = max(
+            min(float(raw.get("verification_hidden_cause_pressure", 0.0)), 1.0),
+            0.0,
+        )
+        world_state_acceptance = max(
+            min(float(raw.get("grounding_world_state_acceptance_ratio", 0.0)), 1.0),
+            0.0,
+        )
+        world_state_branching = max(
+            min(
+                float(
+                    raw.get(
+                        "grounding_world_state_branching_pressure",
+                        raw.get("grounding_world_state_hypothetical_ratio", 0.0),
+                    )
+                ),
+                1.0,
+            ),
+            0.0,
+        )
+        world_state_contradiction = max(
+            min(
+                float(
+                    raw.get(
+                        "grounding_world_state_contradiction_pressure",
+                        raw.get("grounding_world_state_conflict_ratio", 0.0),
+                    )
+                ),
+                1.0,
+            ),
+            0.0,
+        )
+        world_state_conflict = max(
+            min(float(raw.get("grounding_world_state_conflict_ratio", 0.0)), 1.0),
+            0.0,
+        )
+        claim_support_base = max(interlingua_claims, compiled_claims, 1.0)
+        compiled_coverage = min(compiled_claims / claim_support_base, 1.0)
+        graph_support = min(graph_records / claim_support_base, 1.0)
+        uncertain_ratio = min(uncertain_claims / claim_support_base, 1.0)
+        deferred_ratio = min(deferred_hypotheses / max(hypothesis_count, 1.0), 1.0)
+        counterexample_sparse = 1.0 if (
+            float(raw.get("grounding_counterexample_segments", 0.0)) > 0.0
+            and compiled_claims < interlingua_claims
+        ) else 0.0
+        support_ratio = min(
+            max(
+                (0.32 * compiled_coverage)
+                + (0.24 * graph_support)
+                + (0.18 * mean_confidence)
+                + (0.16 * verification_acceptance)
+                + (0.10 * world_state_acceptance),
+                0.0,
+            ),
+            1.0,
+        )
+        uncertainty = min(
+            max(
+                (0.40 * uncertain_ratio)
+                + (0.16 * (1.0 - compiled_coverage))
+                + (0.12 * counterexample_sparse)
+                + (0.10 * deferred_ratio)
+                + (0.08 * (1.0 - mean_confidence))
+                + (0.16 * verification_conflict)
+                + (0.14 * verification_repair)
+                + (0.08 * world_state_branching)
+                + (0.08 * world_state_contradiction)
+                + (0.08 * world_state_conflict),
+                0.0,
+            ),
+            1.0,
+        )
+        return {
+            "grounding_claim_support": claim_support_base,
+            "grounding_compiled_coverage": compiled_coverage,
+            "grounding_graph_support": graph_support,
+            "grounding_support_ratio": support_ratio,
+            "grounding_uncertainty": uncertainty,
+            "grounding_verification_support": verification_acceptance,
+            "grounding_conflict_pressure": verification_conflict,
+            "grounding_repair_pressure": verification_repair,
+            "grounding_hidden_cause_pressure": hidden_cause_pressure,
+            "grounding_deferred_hypothesis_ratio": deferred_ratio,
+            "grounding_mean_compiled_confidence": mean_confidence,
+            "grounding_world_state_branching_pressure": world_state_branching,
+            "grounding_world_state_contradiction_pressure": world_state_contradiction,
+        }
+
+    @staticmethod
     def _world_context_slice_from_graph(
         graph,
         *,
@@ -4174,9 +5089,11 @@ class OMENScale(nn.Module):
             "goal",
             "target",
             "trace_target",
+            "grounding",
             "world_context",
             "saliency",
             "memory",
+            "memory_grounding",
             "net",
             "abduced",
             "context",
@@ -4188,6 +5105,8 @@ class OMENScale(nn.Module):
             for node_type, atom in records:
                 if node_type != wanted_type:
                     continue
+                if not hasattr(atom, "pred"):
+                    continue
                 if atom in seen:
                     continue
                 seen.add(atom)
@@ -4197,6 +5116,8 @@ class OMENScale(nn.Module):
         for node_type, atom in records:
             if node_type == "observed":
                 continue
+            if not hasattr(atom, "pred"):
+                continue
             if atom in seen:
                 continue
             seen.add(atom)
@@ -4205,6 +5126,8 @@ class OMENScale(nn.Module):
                 break
         if not selected:
             for _node_type, atom in records:
+                if not hasattr(atom, "pred"):
+                    continue
                 if atom in seen:
                     continue
                 seen.add(atom)
@@ -4245,7 +5168,42 @@ class OMENScale(nn.Module):
                 world_graph_batch.metadata.get("semantic_graph_enriched", 0.0)
             ),
             "world_graph_memory_facts": float(world_graph_batch.metadata.get("memory_facts", 0.0)),
+            "world_graph_memory_grounding_records": float(
+                world_graph_batch.metadata.get("memory_grounding_records", 0.0)
+            ),
+            "world_graph_grounding_world_state_records": float(
+                world_graph_batch.metadata.get("grounding_world_state_records", 0.0)
+            ),
+            "world_graph_grounding_world_state_facts": float(
+                world_graph_batch.metadata.get("grounding_world_state_facts", 0.0)
+            ),
+            "world_graph_grounding_world_state_active_records": float(
+                world_graph_batch.metadata.get("grounding_world_state_active_records", 0.0)
+            ),
+            "world_graph_grounding_world_state_hypothetical_records": float(
+                world_graph_batch.metadata.get("grounding_world_state_hypothetical_records", 0.0)
+            ),
+            "world_graph_grounding_world_state_contradicted_records": float(
+                world_graph_batch.metadata.get("grounding_world_state_contradicted_records", 0.0)
+            ),
+            "world_graph_grounding_world_state_active_facts": float(
+                world_graph_batch.metadata.get("grounding_world_state_active_facts", 0.0)
+            ),
+            "world_graph_grounding_world_state_hypothetical_facts": float(
+                world_graph_batch.metadata.get("grounding_world_state_hypothetical_facts", 0.0)
+            ),
+            "world_graph_grounding_world_state_contradicted_facts": float(
+                world_graph_batch.metadata.get("grounding_world_state_contradicted_facts", 0.0)
+            ),
+            "world_graph_grounding_verification_records": float(
+                world_graph_batch.metadata.get("grounding_verification_records", 0.0)
+            ),
+            "world_graph_grounding_hypotheses": float(
+                world_graph_batch.metadata.get("grounding_hypotheses", 0.0)
+            ),
             "world_graph_net_facts": float(world_graph_batch.metadata.get("net_facts", 0.0)),
+            "world_graph_grounding_facts": float(world_graph_batch.metadata.get("grounding_derived_facts", 0.0)),
+            "world_graph_interlingua_facts": float(world_graph_batch.metadata.get("interlingua_facts", 0.0)),
             "world_graph_abduced_support_facts": float(
                 world_graph_batch.metadata.get("abduced_support_facts", 0.0)
             ),
@@ -4269,7 +5227,42 @@ class OMENScale(nn.Module):
                 "world_graph_edges": float(len(graph.edges)),
                 "world_graph_context_facts": float(graph.metadata.get("context_facts", 0.0)),
                 "world_graph_memory_facts": float(graph.metadata.get("memory_facts", 0.0)),
+                "world_graph_memory_grounding_records": float(
+                    graph.metadata.get("memory_grounding_records", 0.0)
+                ),
+                "world_graph_grounding_world_state_records": float(
+                    graph.metadata.get("grounding_world_state_records", 0.0)
+                ),
+                "world_graph_grounding_world_state_facts": float(
+                    graph.metadata.get("grounding_world_state_facts", 0.0)
+                ),
+                "world_graph_grounding_world_state_active_records": float(
+                    graph.metadata.get("grounding_world_state_active_records", 0.0)
+                ),
+                "world_graph_grounding_world_state_hypothetical_records": float(
+                    graph.metadata.get("grounding_world_state_hypothetical_records", 0.0)
+                ),
+                "world_graph_grounding_world_state_contradicted_records": float(
+                    graph.metadata.get("grounding_world_state_contradicted_records", 0.0)
+                ),
+                "world_graph_grounding_world_state_active_facts": float(
+                    graph.metadata.get("grounding_world_state_active_facts", 0.0)
+                ),
+                "world_graph_grounding_world_state_hypothetical_facts": float(
+                    graph.metadata.get("grounding_world_state_hypothetical_facts", 0.0)
+                ),
+                "world_graph_grounding_world_state_contradicted_facts": float(
+                    graph.metadata.get("grounding_world_state_contradicted_facts", 0.0)
+                ),
+                "world_graph_grounding_verification_records": float(
+                    graph.metadata.get("grounding_verification_records", 0.0)
+                ),
+                "world_graph_grounding_hypotheses": float(
+                    graph.metadata.get("grounding_hypotheses", 0.0)
+                ),
                 "world_graph_net_facts": float(graph.metadata.get("net_facts", 0.0)),
+                "world_graph_grounding_facts": float(graph.metadata.get("grounding_derived_facts", 0.0)),
+                "world_graph_interlingua_facts": float(graph.metadata.get("interlingua_facts", 0.0)),
                 "world_graph_abduced_support_facts": float(graph.metadata.get("abduced_support_facts", 0.0)),
                 "world_graph_observed_now_facts": float(graph.metadata.get("observed_now_facts", 0.0)),
                 "world_graph_target_context_facts": float(graph.metadata.get("target_context_facts", 0.0)),
@@ -4310,15 +5303,55 @@ class OMENScale(nn.Module):
         record_counts: List[float] = []
         for row_context in context_rows:
             source_records = list(row_context.source_fact_records(include_goal=True, include_targets=True))
+            grouped: Dict[str, List[Tuple[str, HornAtom]]] = defaultdict(list)
+            for label, atom in source_records:
+                grouped[label].append((label, atom))
             limited_records: List[Tuple[str, HornAtom]] = []
             seen: Set[HornAtom] = set()
+            reserved_atoms: Set[HornAtom] = set()
+            reserve_order = (
+                "goal",
+                "target",
+                "grounding_world_state_active_fact",
+                "grounding_world_state_hypothetical_fact",
+                "grounding_world_state_contradicted_fact",
+                "grounding_world_state_active",
+                "grounding_world_state_hypothetical",
+                "grounding_world_state_contradicted",
+                "grounding",
+                "world_context",
+                "memory",
+                "memory_grounding",
+                "grounding_verification",
+                "grounding_hypothesis",
+                "saliency",
+                "net",
+                "abduced",
+                "observed_now",
+            )
+            for label in reserve_order:
+                for _entry_label, atom in grouped.get(label, ())[:1]:
+                    if atom in reserved_atoms:
+                        continue
+                    reserved_atoms.add(atom)
+                    break
+                if len(reserved_atoms) >= context_limit:
+                    break
             for label, atom in source_records:
-                if atom in seen:
+                if atom not in reserved_atoms or atom in seen:
                     continue
                 seen.add(atom)
                 limited_records.append((label, atom))
                 if len(limited_records) >= context_limit:
                     break
+            if len(limited_records) < context_limit:
+                for label, atom in source_records:
+                    if atom in seen:
+                        continue
+                    seen.add(atom)
+                    limited_records.append((label, atom))
+                    if len(limited_records) >= context_limit:
+                        break
             record_batch.append(tuple(limited_records))
             fact_batch.append(tuple(atom for _, atom in limited_records))
             record_counts.append(float(len(limited_records)))
@@ -4375,6 +5408,7 @@ class OMENScale(nn.Module):
                 lang_hint=detected_lang,
                 max_steps=int(getattr(self.cfg, "sym_trace_max_steps", 24)),
                 max_counterexamples=int(getattr(self.cfg, "sym_trace_max_counterexamples", 4)),
+                semantic_backbone=self.semantic_grounding_backbone,
             )
         except Exception:
             trace_bundle = None
@@ -4445,11 +5479,10 @@ class OMENScale(nn.Module):
             if routing is not None:
                 return routing
             if isinstance(detected_lang, str) and detected_lang:
-                return SourceRoutingDecision(
-                    language=detected_lang,
-                    domain="code" if detected_lang not in ("text", "json") else "text",
+                return _fallback_source_routing(
+                    detected_lang,
+                    "code" if detected_lang not in ("text", "json") else ("structured_observation" if detected_lang == "json" else "text"),
                     confidence=0.5,
-                    evidence={},
                 )
         self._ast_facts_from_bytes(src_row)
         cached = self._fact_cache.get_by_key(cache_key)
@@ -4458,13 +5491,12 @@ class OMENScale(nn.Module):
             if routing is not None:
                 return routing
             if isinstance(detected_lang, str) and detected_lang:
-                return SourceRoutingDecision(
-                    language=detected_lang,
-                    domain="code" if detected_lang not in ("text", "json") else "text",
+                return _fallback_source_routing(
+                    detected_lang,
+                    "code" if detected_lang not in ("text", "json") else ("structured_observation" if detected_lang == "json" else "text"),
                     confidence=0.5,
-                    evidence={},
                 )
-        return SourceRoutingDecision(language="text", domain="text", confidence=0.0, evidence={})
+        return _fallback_source_routing("text", "text", confidence=0.0)
 
     def _ast_lang_from_bytes(self, src_row: torch.Tensor) -> str:
         cache_key = self._row_fact_cache_key(src_row)
@@ -4611,6 +5643,39 @@ class OMENScale(nn.Module):
         generate_info["world_graph_memory_facts"] = float(
             generate_info.get("world_graph_memory_facts", 0.0)
         ) + float(world_graph_batch.metadata.get("memory_facts", 0.0))
+        generate_info["world_graph_memory_grounding_records"] = float(
+            generate_info.get("world_graph_memory_grounding_records", 0.0)
+        ) + float(world_graph_batch.metadata.get("memory_grounding_records", 0.0))
+        generate_info["world_graph_grounding_world_state_records"] = float(
+            generate_info.get("world_graph_grounding_world_state_records", 0.0)
+        ) + float(world_graph_batch.metadata.get("grounding_world_state_records", 0.0))
+        generate_info["world_graph_grounding_world_state_facts"] = float(
+            generate_info.get("world_graph_grounding_world_state_facts", 0.0)
+        ) + float(world_graph_batch.metadata.get("grounding_world_state_facts", 0.0))
+        generate_info["world_graph_grounding_world_state_active_records"] = float(
+            generate_info.get("world_graph_grounding_world_state_active_records", 0.0)
+        ) + float(world_graph_batch.metadata.get("grounding_world_state_active_records", 0.0))
+        generate_info["world_graph_grounding_world_state_hypothetical_records"] = float(
+            generate_info.get("world_graph_grounding_world_state_hypothetical_records", 0.0)
+        ) + float(world_graph_batch.metadata.get("grounding_world_state_hypothetical_records", 0.0))
+        generate_info["world_graph_grounding_world_state_contradicted_records"] = float(
+            generate_info.get("world_graph_grounding_world_state_contradicted_records", 0.0)
+        ) + float(world_graph_batch.metadata.get("grounding_world_state_contradicted_records", 0.0))
+        generate_info["world_graph_grounding_world_state_active_facts"] = float(
+            generate_info.get("world_graph_grounding_world_state_active_facts", 0.0)
+        ) + float(world_graph_batch.metadata.get("grounding_world_state_active_facts", 0.0))
+        generate_info["world_graph_grounding_world_state_hypothetical_facts"] = float(
+            generate_info.get("world_graph_grounding_world_state_hypothetical_facts", 0.0)
+        ) + float(world_graph_batch.metadata.get("grounding_world_state_hypothetical_facts", 0.0))
+        generate_info["world_graph_grounding_world_state_contradicted_facts"] = float(
+            generate_info.get("world_graph_grounding_world_state_contradicted_facts", 0.0)
+        ) + float(world_graph_batch.metadata.get("grounding_world_state_contradicted_facts", 0.0))
+        generate_info["world_graph_grounding_verification_records"] = float(
+            generate_info.get("world_graph_grounding_verification_records", 0.0)
+        ) + float(world_graph_batch.metadata.get("grounding_verification_records", 0.0))
+        generate_info["world_graph_grounding_hypotheses"] = float(
+            generate_info.get("world_graph_grounding_hypotheses", 0.0)
+        ) + float(world_graph_batch.metadata.get("grounding_hypotheses", 0.0))
         generate_info["world_graph_net_facts"] = float(
             generate_info.get("world_graph_net_facts", 0.0)
         ) + float(world_graph_batch.metadata.get("net_facts", 0.0))
@@ -4843,6 +5908,13 @@ class OMENScale(nn.Module):
             "emc_state_memory_residual",
             "emc_state_memory_alignment",
             "emc_state_memory_pressure",
+            "emc_state_grounding_uncertainty",
+            "emc_state_grounding_support",
+            "emc_state_grounding_ambiguity",
+            "emc_state_grounding_recall_readiness",
+            "emc_state_grounding_verification_pressure",
+            "emc_state_grounding_abduction_pressure",
+            "emc_state_grounding_control_pressure",
         ):
             sum_key = f"{key}_sum"
             generate_info[sum_key] = float(generate_info.get(sum_key, 0.0)) + (
@@ -4864,6 +5936,13 @@ class OMENScale(nn.Module):
         h_tok: Optional[torch.Tensor] = None,
         decoder_signal: Optional[Dict[str, object]] = None,
         memory_facts: Optional[List[HornAtom]] = None,
+        memory_grounding_records: Optional[Sequence[object]] = None,
+        grounding_world_state_records: Optional[Sequence[object]] = None,
+        grounding_world_state_active_facts: Optional[Sequence[HornAtom]] = None,
+        grounding_world_state_hypothetical_facts: Optional[Sequence[HornAtom]] = None,
+        grounding_world_state_contradicted_facts: Optional[Sequence[HornAtom]] = None,
+        grounding_hypotheses: Optional[Sequence[object]] = None,
+        grounding_verification_records: Optional[Sequence[object]] = None,
         net_facts: Optional[List[HornAtom]] = None,
     ) -> SymbolicTaskContext:
         """
@@ -4885,6 +5964,13 @@ class OMENScale(nn.Module):
             tgt_tokens = self._row_token_values(tgt_row)
         observed_now: List[HornAtom] = []
         memory_derived = list(memory_facts or [])
+        recalled_grounding_records = list(memory_grounding_records or [])
+        trace_grounding_world_state_records = list(grounding_world_state_records or [])
+        trace_grounding_world_state_active_facts = list(grounding_world_state_active_facts or [])
+        trace_grounding_world_state_hypothetical_facts = list(grounding_world_state_hypothetical_facts or [])
+        trace_grounding_world_state_contradicted_facts = list(grounding_world_state_contradicted_facts or [])
+        trace_grounding_hypotheses = list(grounding_hypotheses or [])
+        trace_grounding_verification_records = list(grounding_verification_records or [])
         saliency_derived: List[HornAtom] = []
         net_derived = list(net_facts or [])
 
@@ -4961,7 +6047,25 @@ class OMENScale(nn.Module):
         if trace_bundle is not None:
             observed_now.extend(list(trace_bundle.observed_facts)[: max(self._ctx_ast_max_facts // 2, 12)])
             provenance = "ast_trace" if provenance.startswith("ast") else "trace"
-        elif saliency_expected:
+        grounding_derived = list(getattr(trace_bundle, "grounding_facts", ())) if trace_bundle is not None else []
+        if trace_bundle is not None:
+            trace_grounding_world_state_records.extend(
+                list(getattr(trace_bundle, "grounding_world_state_records", ()))
+            )
+            trace_grounding_world_state_active_facts.extend(
+                list(getattr(trace_bundle, "grounding_world_state_active_facts", ()))
+            )
+            trace_grounding_world_state_hypothetical_facts.extend(
+                list(getattr(trace_bundle, "grounding_world_state_hypothetical_facts", ()))
+            )
+            trace_grounding_world_state_contradicted_facts.extend(
+                list(getattr(trace_bundle, "grounding_world_state_contradicted_facts", ()))
+            )
+            trace_grounding_hypotheses.extend(list(getattr(trace_bundle, "grounding_hypotheses", ())))
+            trace_grounding_verification_records.extend(
+                list(getattr(trace_bundle, "grounding_verification_records", ()))
+            )
+        if trace_bundle is None and saliency_expected:
             goal = saliency_expected[0]
             saliency_derived.extend(saliency_expected[1:])
             saliency_derived.append(HornAtom(SEQ_SALIENCY_SUPPORT_PRED, (goal.pred, self._first_const(goal))))
@@ -4976,7 +6080,7 @@ class OMENScale(nn.Module):
         if provenance not in ("ast", "ast_dynamic"):
             observed_now.extend(ast_facts[:4])
         observed = self._dedupe_facts(
-            observed_now + memory_derived + saliency_derived + net_derived,
+            observed_now + memory_derived + saliency_derived + net_derived + grounding_derived,
             self._ctx_max_facts,
         )
         if (
@@ -5019,17 +6123,43 @@ class OMENScale(nn.Module):
             float(getattr(saliency_out, "sal_consistency", 1.0))
             if saliency_out is not None else 1.0
         )
+        grounding_quality = self._grounding_quality_features(trace_bundle)
+        grounding_uncertainty = float(grounding_quality.get("grounding_uncertainty", 0.0))
+        grounding_hidden_cause_pressure = float(
+            grounding_quality.get("grounding_hidden_cause_pressure", 0.0)
+        )
+        grounding_contradiction_pressure = float(
+            grounding_quality.get("grounding_world_state_contradiction_pressure", 0.0)
+        )
+        recalled_grounding_status = grounding_memory_status_counts(recalled_grounding_records)
         trigger_abduction = (
             decoder_miss > 0.0
             or decoder_surprise >= float(getattr(self.cfg, "sym_decoder_surprise_threshold", 0.35))
             or gap_value > float(getattr(self.cfg, "epistemic_tau", 0.3))
             or sal_consistency < float(getattr(self.cfg, "saliency_consistency_threshold", 0.55))
+            or (
+                source_routing.modality in ("natural_text", "mixed", "structured_text")
+                and grounding_uncertainty >= float(
+                    getattr(self.cfg, "sym_grounding_uncertainty_threshold", 0.45)
+                )
+            )
+            or grounding_hidden_cause_pressure >= 0.40
+            or grounding_contradiction_pressure >= 0.35
         )
+        trace_metadata = self._trace_metadata_features(trace_bundle)
         return self._compose_symbolic_task_context(
             observed_now_facts=observed_now,
             memory_derived_facts=memory_derived,
+            memory_grounding_records=recalled_grounding_records,
+            grounding_world_state_records=trace_grounding_world_state_records,
+            grounding_world_state_active_facts=trace_grounding_world_state_active_facts,
+            grounding_world_state_hypothetical_facts=trace_grounding_world_state_hypothetical_facts,
+            grounding_world_state_contradicted_facts=trace_grounding_world_state_contradicted_facts,
+            grounding_hypotheses=trace_grounding_hypotheses,
+            grounding_verification_records=trace_grounding_verification_records,
             saliency_derived_facts=saliency_derived,
             net_derived_facts=net_derived,
+            grounding_derived_facts=grounding_derived,
             goal=goal,
             target_facts=target_facts,
             execution_trace=trace_bundle,
@@ -5047,6 +6177,18 @@ class OMENScale(nn.Module):
                 "decoder_surprise": decoder_surprise,
                 "decoder_probe_ce": decoder_probe_ce,
                 "memory_facts": float(len(memory_derived)),
+                "memory_grounding_records": float(len(recalled_grounding_records)),
+                "memory_grounding_active_records": float(recalled_grounding_status.get("active", 0.0)),
+                "memory_grounding_hypothetical_records": float(recalled_grounding_status.get("hypothetical", 0.0)),
+                "memory_grounding_contradicted_records": float(recalled_grounding_status.get("contradicted", 0.0)),
+                "grounding_world_state_records": float(len(trace_grounding_world_state_records)),
+                "grounding_world_state_active_facts": float(len(trace_grounding_world_state_active_facts)),
+                "grounding_world_state_hypothetical_facts": float(len(trace_grounding_world_state_hypothetical_facts)),
+                "grounding_world_state_contradicted_facts": float(len(trace_grounding_world_state_contradicted_facts)),
+                "grounding_hypotheses": float(len(trace_grounding_hypotheses)),
+                "grounding_verification_records": float(len(trace_grounding_verification_records)),
+                "grounding_facts": float(len(grounding_derived)),
+                **grounding_quality,
                 "net_last_concept": float(net_last_concept) if net_last_concept is not None else -1.0,
                 "net_symbolic_active": net_stats["active"],
                 "net_symbolic_facts": net_stats["facts"],
@@ -5056,7 +6198,16 @@ class OMENScale(nn.Module):
                 "trace_counterexamples": float(len(trace_bundle.counterexamples) if trace_bundle is not None else 0),
                 "ast_lang": ast_lang,
                 "source_domain": source_routing.domain,
+                "source_modality": source_routing.modality,
+                "source_subtype": source_routing.subtype,
+                "source_verification_path": source_routing.verification_path,
                 "source_confidence": float(source_routing.confidence),
+                "source_profile_code": float(source_routing.profile.get("code", 0.0)),
+                "source_profile_natural_text": float(source_routing.profile.get("natural_text", 0.0)),
+                "source_profile_structured_text": float(source_routing.profile.get("structured_text", 0.0)),
+                "source_profile_mixed": float(source_routing.profile.get("mixed", 0.0)),
+                "source_profile_unknown": float(source_routing.profile.get("unknown", 0.0)),
+                **trace_metadata,
             },
         )
 
@@ -5065,6 +6216,13 @@ class OMENScale(nn.Module):
         prompt: torch.Tensor,
         h_tok: Optional[torch.Tensor] = None,
         memory_facts: Optional[List[HornAtom]] = None,
+        memory_grounding_records: Optional[Sequence[object]] = None,
+        grounding_world_state_records: Optional[Sequence[object]] = None,
+        grounding_world_state_active_facts: Optional[Sequence[HornAtom]] = None,
+        grounding_world_state_hypothetical_facts: Optional[Sequence[HornAtom]] = None,
+        grounding_world_state_contradicted_facts: Optional[Sequence[HornAtom]] = None,
+        grounding_hypotheses: Optional[Sequence[object]] = None,
+        grounding_verification_records: Optional[Sequence[object]] = None,
         saliency_out: Optional[object] = None,
         net_facts: Optional[List[HornAtom]] = None,
     ) -> SymbolicTaskContext:
@@ -5074,6 +6232,13 @@ class OMENScale(nn.Module):
             prompt_tokens = self._row_token_values(prompt_row)
         observed_now: List[HornAtom] = []
         memory_derived = list(memory_facts or [])
+        recalled_grounding_records = list(memory_grounding_records or [])
+        trace_grounding_world_state_records = list(grounding_world_state_records or [])
+        trace_grounding_world_state_active_facts = list(grounding_world_state_active_facts or [])
+        trace_grounding_world_state_hypothetical_facts = list(grounding_world_state_hypothetical_facts or [])
+        trace_grounding_world_state_contradicted_facts = list(grounding_world_state_contradicted_facts or [])
+        trace_grounding_hypotheses = list(grounding_hypotheses or [])
+        trace_grounding_verification_records = list(grounding_verification_records or [])
         saliency_derived: List[HornAtom] = []
         net_derived = list(net_facts or [])
         if len(prompt_tokens) > 1:
@@ -5105,6 +6270,24 @@ class OMENScale(nn.Module):
         if trace_bundle is not None:
             observed_now.extend(list(trace_bundle.observed_facts)[: max(self._ctx_ast_max_facts // 2, 12)])
             provenance = "ast_trace" if provenance.startswith("ast") else "trace"
+        grounding_derived = list(getattr(trace_bundle, "grounding_facts", ())) if trace_bundle is not None else []
+        if trace_bundle is not None:
+            trace_grounding_world_state_records.extend(
+                list(getattr(trace_bundle, "grounding_world_state_records", ()))
+            )
+            trace_grounding_world_state_active_facts.extend(
+                list(getattr(trace_bundle, "grounding_world_state_active_facts", ()))
+            )
+            trace_grounding_world_state_hypothetical_facts.extend(
+                list(getattr(trace_bundle, "grounding_world_state_hypothetical_facts", ()))
+            )
+            trace_grounding_world_state_contradicted_facts.extend(
+                list(getattr(trace_bundle, "grounding_world_state_contradicted_facts", ()))
+            )
+            trace_grounding_hypotheses.extend(list(getattr(trace_bundle, "grounding_hypotheses", ())))
+            trace_grounding_verification_records.extend(
+                list(getattr(trace_bundle, "grounding_verification_records", ()))
+            )
         goal = HornAtom(SEQ_PREDICT_NEXT_PRED, (last_token, Var("NEXT")))
         if trace_bundle is None and saliency_expected:
             goal = saliency_expected[0]
@@ -5120,7 +6303,7 @@ class OMENScale(nn.Module):
         if provenance not in ("ast", "ast_dynamic"):
             observed_now.extend(ast_facts[:4])
         observed = self._dedupe_facts(
-            observed_now + memory_derived + saliency_derived + net_derived,
+            observed_now + memory_derived + saliency_derived + net_derived + grounding_derived,
             self._ctx_max_facts,
         )
         if self._sym_qg_enabled and self.sym_query_gen is not None and observed:
@@ -5144,13 +6327,24 @@ class OMENScale(nn.Module):
                     provenance = "token_dynamic"
             except Exception:
                 pass
+        trace_metadata = self._trace_metadata_features(trace_bundle)
+        grounding_quality = self._grounding_quality_features(trace_bundle)
+        recalled_grounding_status = grounding_memory_status_counts(recalled_grounding_records)
         return self._compose_symbolic_task_context(
             observed_now_facts=observed_now,
             memory_derived_facts=memory_derived,
+            memory_grounding_records=recalled_grounding_records,
+            grounding_world_state_records=trace_grounding_world_state_records,
+            grounding_world_state_active_facts=trace_grounding_world_state_active_facts,
+            grounding_world_state_hypothetical_facts=trace_grounding_world_state_hypothetical_facts,
+            grounding_world_state_contradicted_facts=trace_grounding_world_state_contradicted_facts,
+            grounding_hypotheses=trace_grounding_hypotheses,
+            grounding_verification_records=trace_grounding_verification_records,
             saliency_derived_facts=saliency_derived,
             net_derived_facts=net_derived,
+            grounding_derived_facts=grounding_derived,
             goal=goal,
-            target_facts={goal} | (trace_bundle.target_facts if trace_bundle is not None else frozenset()),
+            target_facts={goal, *(trace_bundle.target_facts if trace_bundle is not None else frozenset())},
             execution_trace=trace_bundle,
             provenance=provenance,
             trigger_abduction=False,
@@ -5159,6 +6353,18 @@ class OMENScale(nn.Module):
                 "mode": "generate",
                 "last_src": float(last_token),
                 "memory_facts": float(len(memory_derived)),
+                "memory_grounding_records": float(len(recalled_grounding_records)),
+                "memory_grounding_active_records": float(recalled_grounding_status.get("active", 0.0)),
+                "memory_grounding_hypothetical_records": float(recalled_grounding_status.get("hypothetical", 0.0)),
+                "memory_grounding_contradicted_records": float(recalled_grounding_status.get("contradicted", 0.0)),
+                "grounding_world_state_records": float(len(trace_grounding_world_state_records)),
+                "grounding_world_state_active_facts": float(len(trace_grounding_world_state_active_facts)),
+                "grounding_world_state_hypothetical_facts": float(len(trace_grounding_world_state_hypothetical_facts)),
+                "grounding_world_state_contradicted_facts": float(len(trace_grounding_world_state_contradicted_facts)),
+                "grounding_hypotheses": float(len(trace_grounding_hypotheses)),
+                "grounding_verification_records": float(len(trace_grounding_verification_records)),
+                "grounding_facts": float(len(grounding_derived)),
+                **grounding_quality,
                 "net_last_concept": float(net_last_concept) if net_last_concept is not None else -1.0,
                 "net_symbolic_active": net_stats["active"],
                 "net_symbolic_facts": net_stats["facts"],
@@ -5172,7 +6378,16 @@ class OMENScale(nn.Module):
                 "trace_counterexamples": float(len(trace_bundle.counterexamples) if trace_bundle is not None else 0),
                 "ast_lang": ast_lang,
                 "source_domain": source_routing.domain,
+                "source_modality": source_routing.modality,
+                "source_subtype": source_routing.subtype,
+                "source_verification_path": source_routing.verification_path,
                 "source_confidence": float(source_routing.confidence),
+                "source_profile_code": float(source_routing.profile.get("code", 0.0)),
+                "source_profile_natural_text": float(source_routing.profile.get("natural_text", 0.0)),
+                "source_profile_structured_text": float(source_routing.profile.get("structured_text", 0.0)),
+                "source_profile_mixed": float(source_routing.profile.get("mixed", 0.0)),
+                "source_profile_unknown": float(source_routing.profile.get("unknown", 0.0)),
+                **trace_metadata,
             },
         )
 
@@ -5189,6 +6404,7 @@ class OMENScale(nn.Module):
         h_tok: Optional[torch.Tensor] = None,
         decoder_signal: Optional[Dict[str, object]] = None,
         memory_fact_batches: Optional[Sequence[Sequence[HornAtom]]] = None,
+        memory_grounding_record_batches: Optional[Sequence[Sequence[object]]] = None,
         net_fact_batches: Optional[Sequence[Sequence[HornAtom]]] = None,
         primary_context: Optional[SymbolicTaskContext] = None,
     ) -> Tuple[SymbolicTaskContext, ...]:
@@ -5208,6 +6424,11 @@ class OMENScale(nn.Module):
                 h_tok=self._slice_batch_tensor(h_tok, row_idx),
                 decoder_signal=self._decoder_signal_row(decoder_signal, row_idx),
                 memory_facts=self._fact_batch_row(memory_fact_batches, row_idx),
+                memory_grounding_records=(
+                    memory_grounding_record_batches[row_idx]
+                    if memory_grounding_record_batches and row_idx < len(memory_grounding_record_batches)
+                    else None
+                ),
                 net_facts=self._fact_batch_row(net_fact_batches, row_idx),
             )
             contexts.append(row_context)
@@ -5219,6 +6440,7 @@ class OMENScale(nn.Module):
         *,
         h_tok: Optional[torch.Tensor] = None,
         memory_fact_batches: Optional[Sequence[Sequence[HornAtom]]] = None,
+        memory_grounding_record_batches: Optional[Sequence[Sequence[object]]] = None,
         saliency_out: Optional[object] = None,
         net_fact_batches: Optional[Sequence[Sequence[HornAtom]]] = None,
         primary_context: Optional[SymbolicTaskContext] = None,
@@ -5234,6 +6456,11 @@ class OMENScale(nn.Module):
                 prompt[row_idx:row_idx + 1],
                 h_tok=self._slice_batch_tensor(h_tok, row_idx),
                 memory_facts=self._fact_batch_row(memory_fact_batches, row_idx),
+                memory_grounding_records=(
+                    memory_grounding_record_batches[row_idx]
+                    if memory_grounding_record_batches and row_idx < len(memory_grounding_record_batches)
+                    else None
+                ),
                 saliency_out=self._saliency_output_row(saliency_out, row_idx),
                 net_facts=self._fact_batch_row(net_fact_batches, row_idx),
             )
@@ -5297,6 +6524,21 @@ class OMENScale(nn.Module):
         merged.memory_residuals = [item for stats in valid for item in stats.memory_residuals]
         merged.memory_alignments = [item for stats in valid for item in stats.memory_alignments]
         merged.memory_pressures = [item for stats in valid for item in stats.memory_pressures]
+        merged.grounding_uncertainties = [item for stats in valid for item in stats.grounding_uncertainties]
+        merged.grounding_supports = [item for stats in valid for item in stats.grounding_supports]
+        merged.grounding_ambiguities = [item for stats in valid for item in stats.grounding_ambiguities]
+        merged.grounding_recall_pressures = [
+            item for stats in valid for item in stats.grounding_recall_pressures
+        ]
+        merged.grounding_verification_pressures = [
+            item for stats in valid for item in stats.grounding_verification_pressures
+        ]
+        merged.grounding_abduction_pressures = [
+            item for stats in valid for item in stats.grounding_abduction_pressures
+        ]
+        merged.grounding_control_pressures = [
+            item for stats in valid for item in stats.grounding_control_pressures
+        ]
         merged.gap_deltas = [item for stats in valid for item in stats.gap_deltas]
         merged.recall_gap_deltas = [item for stats in valid for item in stats.recall_gap_deltas]
         merged.recall_gap_reliefs = [item for stats in valid for item in stats.recall_gap_reliefs]
@@ -5353,9 +6595,9 @@ class OMENScale(nn.Module):
         if z_symbolic_in.size(0) == 1:
             task_context = task_contexts[0]
             self.prover.set_task_context(task_context)
-            if task_context.observed_facts:
+            if task_context.reasoning_facts():
                 self.prover.load_observed_facts(
-                    task_context.observed_facts,
+                    task_context.reasoning_facts(),
                     limit=int(getattr(self.cfg, "symbolic_context_max_facts", 96)),
                 )
             if self.emc_enabled and training_mode and self.training:
@@ -5404,9 +6646,9 @@ class OMENScale(nn.Module):
         row_goals: List[Optional[HornAtom]] = []
         for row_idx, task_context in enumerate(task_contexts):
             self.prover.set_task_context(task_context)
-            if task_context.observed_facts:
+            if task_context.reasoning_facts():
                 self.prover.load_observed_facts(
-                    task_context.observed_facts,
+                    task_context.reasoning_facts(),
                     limit=int(getattr(self.cfg, "symbolic_context_max_facts", 96)),
                 )
             row_gap_features = (
@@ -5468,9 +6710,9 @@ class OMENScale(nn.Module):
         self.prover.last_goal = self._goal_batch_value(row_goals)
         if row_contexts:
             self.prover.set_task_context(row_contexts[0])
-            if row_contexts[0].observed_facts:
+            if row_contexts[0].reasoning_facts():
                 self.prover.load_observed_facts(
-                    row_contexts[0].observed_facts,
+                    row_contexts[0].reasoning_facts(),
                     limit=int(getattr(self.cfg, "symbolic_context_max_facts", 96)),
                 )
         z_sym = torch.cat(row_z_sym, dim=0)
@@ -5635,19 +6877,29 @@ class OMENScale(nn.Module):
             saliency_out=saliency_out,
             net_facts=net_facts,
         )
+        seed_grounding_records = self._seed_grounding_memory_records(src)
         seed_memory_fact_batches = self._seed_symbolic_memory_fact_batches(
             src,
             decoder_signal=decoder_signal,
             saliency_out=saliency_out,
             net_fact_batches=net_fact_batches,
         )
+        seed_grounding_record_batches = self._seed_grounding_memory_record_batches(src)
         recalled_memory_facts = self._recall_symbolic_memory_facts(
             z_symbolic_in,
             hint_facts=seed_memory_facts,
         )
+        recalled_memory_grounding_records = self._recall_grounding_memory_records(
+            z_symbolic_in,
+            hint_records=seed_grounding_records,
+        )
         recalled_memory_fact_batches = self._recall_symbolic_memory_fact_batches(
             z_symbolic_in,
             hint_fact_batches=seed_memory_fact_batches,
+        )
+        recalled_memory_grounding_record_batches = self._recall_grounding_memory_record_batches(
+            z_symbolic_in,
+            hint_record_batches=seed_grounding_record_batches,
         )
 
         #   1+3+6:  h_tok      
@@ -5656,6 +6908,7 @@ class OMENScale(nn.Module):
             h_tok=h_tok,  # <--    SymbolicQueryGenerator
             decoder_signal=decoder_signal,
             memory_facts=recalled_memory_facts,
+            memory_grounding_records=recalled_memory_grounding_records,
             net_facts=net_facts,
         )
         task_contexts = self._build_symbolic_task_context_batch(
@@ -5667,6 +6920,7 @@ class OMENScale(nn.Module):
             h_tok=h_tok,
             decoder_signal=decoder_signal,
             memory_fact_batches=recalled_memory_fact_batches,
+            memory_grounding_record_batches=recalled_memory_grounding_record_batches,
             net_fact_batches=net_fact_batches,
             primary_context=task_context,
         )
@@ -5709,9 +6963,9 @@ class OMENScale(nn.Module):
         #   2: load_observed_facts()     WM,   KB 
         # (materialize_task_context_facts    prover.forward(),
         #   load_observed_facts()     prover.forward())
-        if task_context.observed_facts:
+        if task_context.reasoning_facts():
             self.prover.load_observed_facts(
-                task_context.observed_facts,
+                task_context.reasoning_facts(),
                 limit=int(getattr(self.cfg, "symbolic_context_max_facts", 96)),
             )
 
@@ -5830,11 +7084,25 @@ class OMENScale(nn.Module):
             getattr(self.prover, "last_all_facts", frozenset()),
             float(conf.mean().item()),
         )
+        grounding_write_stats = self._write_grounding_memory_records(
+            tuple(getattr(task_context.execution_trace, "grounding_world_state_records", ()))
+            + tuple(getattr(task_context.execution_trace, "grounding_verification_records", ()))
+            + tuple(getattr(task_context.execution_trace, "grounding_hypotheses", ()))
+            + tuple(getattr(task_context.execution_trace, "grounding_graph_records", ()))
+            if task_context.execution_trace is not None else (),
+            float(conf.mean().item()),
+        )
 
         #   1: Decode  
         #  osf_out      
         #  ,     (NET / OSF / classic).
         osf_out: Dict = {}
+        planner_state_for_decode = build_planner_world_state(task_context)
+        planner_goal = planner_state_for_decode.primary_goal or getattr(self.prover, "last_goal", None) or task_context.goal
+        planner_symbolic_facts = (
+            getattr(self.prover, "last_context_facts", frozenset())
+            or frozenset(planner_state_for_decode.symbolic_facts)
+        )
 
         decoder_mode = "token_decoder"
         decoder_uses_net_encoder = 1.0 if self.net_enabled else 0.0
@@ -5859,8 +7127,9 @@ class OMENScale(nn.Module):
                     n_rules    = len(self.prover),
                     n_writes   = self.memory.n_writes,
                     prover     = self.prover,
-                    symbolic_goal = getattr(self.prover, "last_goal", None) or task_context.goal,
-                    symbolic_facts = getattr(self.prover, "last_context_facts", frozenset()) or task_context.observed_facts,
+                    symbolic_goal = planner_goal,
+                    symbolic_facts = planner_symbolic_facts,
+                    planner_state = planner_state_for_decode,
                     fast_mode  = fast_metrics,
                 )
                 logits = osf_logits
@@ -5889,8 +7158,9 @@ class OMENScale(nn.Module):
                 n_rules    = len(self.prover),
                 n_writes   = self.memory.n_writes,
                 prover     = self.prover,
-                symbolic_goal = getattr(self.prover, "last_goal", None) or task_context.goal,
-                symbolic_facts = getattr(self.prover, "last_context_facts", frozenset()) or task_context.observed_facts,
+                symbolic_goal = planner_goal,
+                symbolic_facts = planner_symbolic_facts,
+                planner_state = planner_state_for_decode,
                 fast_mode  = fast_metrics,
             )
             decoder_mode = "osf_decoder"
@@ -6191,14 +7461,148 @@ class OMENScale(nn.Module):
         out["sym_decoder_probe_ce"] = float(task_context.metadata.get("decoder_probe_ce", 0.0))
         out["sym_trigger_abduction"] = float(task_context.trigger_abduction)
         out["sym_mem_recalled"] = float(len(recalled_memory_facts))
+        out["sym_mem_grounding_recalled"] = float(len(recalled_memory_grounding_records))
         out["sym_mem_written"] = float(sym_mem_written)
+        out["sym_mem_grounding_written"] = float(grounding_write_stats.get("written", 0.0))
+        out["sym_mem_grounding_write_selected"] = float(grounding_write_stats.get("selected", 0.0))
+        out["sym_mem_grounding_written_active_records"] = float(grounding_write_stats.get("active", 0.0))
+        out["sym_mem_grounding_written_hypothetical_records"] = float(
+            grounding_write_stats.get("hypothetical", 0.0)
+        )
+        out["sym_mem_grounding_written_contradicted_records"] = float(
+            grounding_write_stats.get("contradicted", 0.0)
+        )
         out["sym_observed_now_facts"] = float(len(task_context.observed_now_facts))
         out["sym_memory_derived_facts"] = float(len(task_context.memory_derived_facts))
+        out["sym_memory_grounding_records"] = float(len(task_context.memory_grounding_records))
+        out["sym_memory_grounding_active_records"] = float(
+            task_context.metadata.get("memory_grounding_active_records", 0.0)
+        )
+        out["sym_memory_grounding_hypothetical_records"] = float(
+            task_context.metadata.get("memory_grounding_hypothetical_records", 0.0)
+        )
+        out["sym_memory_grounding_contradicted_records"] = float(
+            task_context.metadata.get("memory_grounding_contradicted_records", 0.0)
+        )
+        out["sym_grounding_world_state_records"] = float(len(task_context.grounding_world_state_records))
+        out["sym_grounding_world_state_active_records"] = float(
+            task_context.metadata.get("grounding_world_state_active_records", 0.0)
+        )
+        out["sym_grounding_world_state_hypothetical_records"] = float(
+            task_context.metadata.get("grounding_world_state_hypothetical_records", 0.0)
+        )
+        out["sym_grounding_world_state_contradicted_records"] = float(
+            task_context.metadata.get("grounding_world_state_contradicted_records", 0.0)
+        )
+        out["sym_grounding_world_state_active_facts"] = float(len(task_context.grounding_world_state_active_facts))
+        out["sym_grounding_world_state_hypothetical_facts"] = float(
+            len(task_context.grounding_world_state_hypothetical_facts)
+        )
+        out["sym_grounding_world_state_contradicted_facts"] = float(
+            len(task_context.grounding_world_state_contradicted_facts)
+        )
+        out["sym_grounding_verification_records"] = float(len(task_context.grounding_verification_records))
+        out["sym_grounding_hypotheses"] = float(len(task_context.grounding_hypotheses))
         out["sym_saliency_derived_facts"] = float(len(task_context.saliency_derived_facts))
         out["sym_net_derived_facts"] = float(len(task_context.net_derived_facts))
+        out["sym_grounding_derived_facts"] = float(len(task_context.grounding_derived_facts))
+        out["sym_grounding_claim_support"] = float(task_context.metadata.get("grounding_claim_support", 0.0))
+        out["sym_grounding_compiled_coverage"] = float(
+            task_context.metadata.get("grounding_compiled_coverage", 0.0)
+        )
+        out["sym_grounding_graph_support"] = float(task_context.metadata.get("grounding_graph_support", 0.0))
+        out["sym_grounding_support_ratio"] = float(task_context.metadata.get("grounding_support_ratio", 0.0))
+        out["sym_grounding_uncertainty"] = float(task_context.metadata.get("grounding_uncertainty", 0.0))
+        out["sym_grounding_verification_support"] = float(
+            task_context.metadata.get("grounding_verification_support", 0.0)
+        )
+        out["sym_grounding_conflict_pressure"] = float(
+            task_context.metadata.get("grounding_conflict_pressure", 0.0)
+        )
+        out["sym_grounding_repair_pressure"] = float(
+            task_context.metadata.get("grounding_repair_pressure", 0.0)
+        )
+        out["sym_grounding_hidden_cause_pressure"] = float(
+            task_context.metadata.get("grounding_hidden_cause_pressure", 0.0)
+        )
+        out["sym_grounding_world_state_branching_pressure"] = float(
+            task_context.metadata.get("grounding_world_state_branching_pressure", 0.0)
+        )
+        out["sym_grounding_world_state_contradiction_pressure"] = float(
+            task_context.metadata.get("grounding_world_state_contradiction_pressure", 0.0)
+        )
+        out["sym_grounding_deferred_hypothesis_ratio"] = float(
+            task_context.metadata.get("grounding_deferred_hypothesis_ratio", 0.0)
+        )
+        out["sym_grounding_mean_compiled_confidence"] = float(
+            task_context.metadata.get("grounding_mean_compiled_confidence", 0.0)
+        )
         out["sym_world_context_facts"] = float(len(task_context.world_context_facts))
         out["sym_abduced_support_facts"] = float(len(task_context.abduced_support_facts))
         out["sym_world_context_summary_entries"] = float(len(task_context.world_context_summary))
+        out["sym_trace_grounding_segments"] = float(task_context.metadata.get("trace_grounding_segments", 0.0))
+        out["sym_trace_grounding_tokens"] = float(task_context.metadata.get("trace_grounding_tokens", 0.0))
+        out["sym_trace_grounding_state_hints"] = float(task_context.metadata.get("trace_grounding_state_hints", 0.0))
+        out["sym_trace_grounding_relation_hints"] = float(task_context.metadata.get("trace_grounding_relation_hints", 0.0))
+        out["sym_trace_grounding_goal_hints"] = float(task_context.metadata.get("trace_grounding_goal_hints", 0.0))
+        out["sym_trace_grounding_counterexample_segments"] = float(
+            task_context.metadata.get("trace_grounding_counterexample_segments", 0.0)
+        )
+        out["sym_trace_grounding_multilingual"] = float(task_context.metadata.get("trace_grounding_multilingual", 0.0))
+        out["sym_trace_scene_entities"] = float(task_context.metadata.get("trace_scene_entities", 0.0))
+        out["sym_trace_scene_states"] = float(task_context.metadata.get("trace_scene_states", 0.0))
+        out["sym_trace_scene_events"] = float(task_context.metadata.get("trace_scene_events", 0.0))
+        out["sym_trace_scene_goals"] = float(task_context.metadata.get("trace_scene_goals", 0.0))
+        out["sym_trace_scene_claims"] = float(task_context.metadata.get("trace_scene_claims", 0.0))
+        out["sym_trace_interlingua_entities"] = float(task_context.metadata.get("trace_interlingua_entities", 0.0))
+        out["sym_trace_interlingua_states"] = float(task_context.metadata.get("trace_interlingua_states", 0.0))
+        out["sym_trace_interlingua_relations"] = float(task_context.metadata.get("trace_interlingua_relations", 0.0))
+        out["sym_trace_interlingua_goals"] = float(task_context.metadata.get("trace_interlingua_goals", 0.0))
+        out["sym_trace_interlingua_uncertain_claims"] = float(
+            task_context.metadata.get("trace_interlingua_uncertain_claims", 0.0)
+        )
+        out["sym_trace_interlingua_graph_records"] = float(
+            task_context.metadata.get("trace_interlingua_graph_records", 0.0)
+        )
+        out["sym_trace_compiled_segments"] = float(task_context.metadata.get("trace_compiled_segments", 0.0))
+        out["sym_trace_compiled_state_claims"] = float(task_context.metadata.get("trace_compiled_state_claims", 0.0))
+        out["sym_trace_compiled_relation_claims"] = float(task_context.metadata.get("trace_compiled_relation_claims", 0.0))
+        out["sym_trace_compiled_goal_claims"] = float(task_context.metadata.get("trace_compiled_goal_claims", 0.0))
+        out["sym_trace_compiled_hypotheses"] = float(task_context.metadata.get("trace_compiled_hypotheses", 0.0))
+        out["sym_trace_compiled_deferred_hypotheses"] = float(
+            task_context.metadata.get("trace_compiled_deferred_hypotheses", 0.0)
+        )
+        out["sym_trace_compiled_mean_confidence"] = float(
+            task_context.metadata.get("trace_compiled_mean_confidence", 0.0)
+        )
+        out["sym_trace_grounding_world_state_records"] = float(
+            task_context.metadata.get("trace_grounding_world_state_records", 0.0)
+        )
+        out["sym_trace_grounding_world_state_active_records"] = float(
+            task_context.metadata.get("trace_grounding_world_state_active_records", 0.0)
+        )
+        out["sym_trace_grounding_world_state_hypothetical_records"] = float(
+            task_context.metadata.get("trace_grounding_world_state_hypothetical_records", 0.0)
+        )
+        out["sym_trace_grounding_world_state_contradicted_records"] = float(
+            task_context.metadata.get("trace_grounding_world_state_contradicted_records", 0.0)
+        )
+        out["sym_trace_grounding_world_state_active_facts"] = float(
+            task_context.metadata.get("trace_grounding_world_state_active_facts", 0.0)
+        )
+        out["sym_trace_grounding_world_state_hypothetical_facts"] = float(
+            task_context.metadata.get("trace_grounding_world_state_hypothetical_facts", 0.0)
+        )
+        out["sym_trace_grounding_world_state_contradicted_facts"] = float(
+            task_context.metadata.get("trace_grounding_world_state_contradicted_facts", 0.0)
+        )
+        out["sym_trace_verification_records"] = float(task_context.metadata.get("trace_verification_records", 0.0))
+        out["sym_trace_verification_supported_hypotheses"] = float(
+            task_context.metadata.get("trace_verification_supported_hypotheses", 0.0)
+        )
+        out["sym_trace_verification_conflicted_hypotheses"] = float(
+            task_context.metadata.get("trace_verification_conflicted_hypotheses", 0.0)
+        )
         out["net_symbolic_active"] = float(task_context.metadata.get("net_symbolic_active", 0.0))
         out["net_symbolic_facts"] = float(task_context.metadata.get("net_symbolic_facts", 0.0))
         out["net_symbolic_context_edges"] = float(task_context.metadata.get("net_symbolic_context_edges", 0.0))
@@ -6211,11 +7615,37 @@ class OMENScale(nn.Module):
         out["sym_ast_lang_rust"] = 1.0 if ast_lang == "rust" else 0.0
         out["sym_ast_lang_other"] = 1.0 if ast_lang not in ("", "python", "javascript", "rust") else 0.0
         source_domain = str(task_context.metadata.get("source_domain", ""))
+        source_modality = str(task_context.metadata.get("source_modality", "unknown"))
+        source_subtype = str(task_context.metadata.get("source_subtype", "unknown"))
+        source_verification_path = str(task_context.metadata.get("source_verification_path", "fallback_verification"))
         out["sym_source_domain_code"] = 1.0 if source_domain == "code" else 0.0
         out["sym_source_domain_observation"] = 1.0 if source_domain == "observation_text" else 0.0
         out["sym_source_domain_structured"] = 1.0 if source_domain == "structured_observation" else 0.0
         out["sym_source_domain_other"] = 1.0 if source_domain not in ("", "code", "observation_text", "structured_observation") else 0.0
+        out["source_modality"] = source_modality
+        out["source_subtype"] = source_subtype
+        out["source_verification_path"] = source_verification_path
+        out["sym_source_modality_code"] = 1.0 if source_modality == "code" else 0.0
+        out["sym_source_modality_natural_text"] = 1.0 if source_modality == "natural_text" else 0.0
+        out["sym_source_modality_structured_text"] = 1.0 if source_modality == "structured_text" else 0.0
+        out["sym_source_modality_mixed"] = 1.0 if source_modality == "mixed" else 0.0
+        out["sym_source_modality_unknown"] = 1.0 if source_modality == "unknown" else 0.0
         out["sym_source_confidence"] = float(task_context.metadata.get("source_confidence", 0.0))
+        out["sym_source_profile_code"] = float(task_context.metadata.get("source_profile_code", 0.0))
+        out["sym_source_profile_natural_text"] = float(task_context.metadata.get("source_profile_natural_text", 0.0))
+        out["sym_source_profile_structured_text"] = float(task_context.metadata.get("source_profile_structured_text", 0.0))
+        out["sym_source_profile_mixed"] = float(task_context.metadata.get("source_profile_mixed", 0.0))
+        out["sym_source_profile_unknown"] = float(task_context.metadata.get("source_profile_unknown", 0.0))
+        out["sym_source_verification_ast_program"] = 1.0 if source_verification_path == "ast_program_verification" else 0.0
+        out["sym_source_verification_natural_claim"] = 1.0 if source_verification_path == "natural_language_claim_verification" else 0.0
+        out["sym_source_verification_scientific_claim"] = 1.0 if source_verification_path == "scientific_claim_verification" else 0.0
+        out["sym_source_verification_structured_state"] = 1.0 if source_verification_path == "structured_state_verification" else 0.0
+        out["sym_source_verification_log_trace"] = 1.0 if source_verification_path == "log_trace_verification" else 0.0
+        out["sym_source_verification_config_schema"] = 1.0 if source_verification_path == "config_schema_verification" else 0.0
+        out["sym_source_verification_table_consistency"] = 1.0 if source_verification_path == "table_consistency_verification" else 0.0
+        out["sym_source_verification_dialogue_state"] = 1.0 if source_verification_path == "dialogue_state_verification" else 0.0
+        out["sym_source_verification_mixed_hybrid"] = 1.0 if source_verification_path == "mixed_hybrid_verification" else 0.0
+        out["sym_source_verification_fallback"] = 1.0 if source_verification_path == "fallback_verification" else 0.0
         if net_loss_dict:
             out["net_aux"] = float(net_loss_dict.get("net_aux", 0.0))
             out["net_vocab_pen"] = float(net_loss_dict.get("net_vocab_pen", 0.0))
@@ -6234,7 +7664,52 @@ class OMENScale(nn.Module):
         out["z_graph_readout"] = z_graph_readout
         out["z_graph_struct"] = canonical_world_state.z
         out["world_state"] = canonical_world_state
+        out["planner_state"] = canonical_world_state.planner_state
         out["z_world"] = canonical_world_state.dense_state
+        planner_state_summary = (
+            canonical_world_state.planner_state.summary()
+            if canonical_world_state.planner_state is not None and hasattr(canonical_world_state.planner_state, "summary")
+            else {}
+        )
+        out["planner_state_active_records"] = float(planner_state_summary.get("planner_state_active_records", 0.0))
+        out["planner_state_hypothetical_records"] = float(
+            planner_state_summary.get("planner_state_hypothetical_records", 0.0)
+        )
+        out["planner_state_contradicted_records"] = float(
+            planner_state_summary.get("planner_state_contradicted_records", 0.0)
+        )
+        out["planner_state_goal_facts"] = float(planner_state_summary.get("planner_state_goal_facts", 0.0))
+        out["planner_state_resources"] = float(planner_state_summary.get("planner_state_resources", 0.0))
+        out["planner_state_resource_records"] = float(
+            planner_state_summary.get("planner_state_resource_records", 0.0)
+        )
+        out["planner_state_world_rules"] = float(planner_state_summary.get("planner_state_world_rules", 0.0))
+        out["planner_state_hypothetical_rules"] = float(
+            planner_state_summary.get("planner_state_hypothetical_rules", 0.0)
+        )
+        out["planner_state_contradictions"] = float(
+            planner_state_summary.get("planner_state_contradictions", 0.0)
+        )
+        out["planner_state_operators"] = float(planner_state_summary.get("planner_state_operators", 0.0))
+        out["planner_state_active_operators"] = float(
+            planner_state_summary.get("planner_state_active_operators", 0.0)
+        )
+        out["planner_state_hypothetical_operators"] = float(
+            planner_state_summary.get("planner_state_hypothetical_operators", 0.0)
+        )
+        out["planner_state_contradicted_operators"] = float(
+            planner_state_summary.get("planner_state_contradicted_operators", 0.0)
+        )
+        out["planner_state_alternative_world_records"] = float(
+            planner_state_summary.get("planner_state_alternative_world_records", 0.0)
+        )
+        out["planner_state_branching_pressure"] = float(
+            planner_state_summary.get("planner_state_branching_pressure", 0.0)
+        )
+        out["planner_state_contradiction_pressure"] = float(
+            planner_state_summary.get("planner_state_contradiction_pressure", 0.0)
+        )
+        out["planner_state_uncertainty"] = float(planner_state_summary.get("planner_state_uncertainty", 0.0))
         out["program_target_facts"] = (
             float(sum(len(facts) for facts in program_target_fact_batches) / max(len(program_target_fact_batches), 1))
             if program_target_fact_batches else 0.0
@@ -6260,7 +7735,42 @@ class OMENScale(nn.Module):
             world_graph_batch.metadata.get("semantic_graph_enriched", 0.0)
         )
         out["world_graph_memory_facts"] = float(world_graph_batch.metadata.get("memory_facts", 0.0))
+        out["world_graph_memory_grounding_records"] = float(
+            world_graph_batch.metadata.get("memory_grounding_records", 0.0)
+        )
+        out["world_graph_grounding_world_state_records"] = float(
+            world_graph_batch.metadata.get("grounding_world_state_records", 0.0)
+        )
+        out["world_graph_grounding_world_state_facts"] = float(
+            world_graph_batch.metadata.get("grounding_world_state_facts", 0.0)
+        )
+        out["world_graph_grounding_world_state_active_records"] = float(
+            world_graph_batch.metadata.get("grounding_world_state_active_records", 0.0)
+        )
+        out["world_graph_grounding_world_state_hypothetical_records"] = float(
+            world_graph_batch.metadata.get("grounding_world_state_hypothetical_records", 0.0)
+        )
+        out["world_graph_grounding_world_state_contradicted_records"] = float(
+            world_graph_batch.metadata.get("grounding_world_state_contradicted_records", 0.0)
+        )
+        out["world_graph_grounding_world_state_active_facts"] = float(
+            world_graph_batch.metadata.get("grounding_world_state_active_facts", 0.0)
+        )
+        out["world_graph_grounding_world_state_hypothetical_facts"] = float(
+            world_graph_batch.metadata.get("grounding_world_state_hypothetical_facts", 0.0)
+        )
+        out["world_graph_grounding_world_state_contradicted_facts"] = float(
+            world_graph_batch.metadata.get("grounding_world_state_contradicted_facts", 0.0)
+        )
+        out["world_graph_grounding_verification_records"] = float(
+            world_graph_batch.metadata.get("grounding_verification_records", 0.0)
+        )
+        out["world_graph_grounding_hypotheses"] = float(
+            world_graph_batch.metadata.get("grounding_hypotheses", 0.0)
+        )
         out["world_graph_net_facts"] = float(world_graph_batch.metadata.get("net_facts", 0.0))
+        out["world_graph_grounding_facts"] = float(world_graph_batch.metadata.get("grounding_derived_facts", 0.0))
+        out["world_graph_interlingua_facts"] = float(world_graph_batch.metadata.get("interlingua_facts", 0.0))
         out["world_graph_abduced_support_facts"] = float(
             world_graph_batch.metadata.get("abduced_support_facts", 0.0)
         )
@@ -6347,6 +7857,37 @@ class OMENScale(nn.Module):
             out["emc_state_memory_pressure"] = (
                 float(sum(traj_stats.memory_pressures) / len(traj_stats.memory_pressures))
                 if traj_stats.memory_pressures else 0.0
+            )
+            out["emc_state_grounding_uncertainty"] = (
+                float(sum(traj_stats.grounding_uncertainties) / len(traj_stats.grounding_uncertainties))
+                if traj_stats.grounding_uncertainties else 0.0
+            )
+            out["emc_state_grounding_support"] = (
+                float(sum(traj_stats.grounding_supports) / len(traj_stats.grounding_supports))
+                if traj_stats.grounding_supports else 0.0
+            )
+            out["emc_state_grounding_ambiguity"] = (
+                float(sum(traj_stats.grounding_ambiguities) / len(traj_stats.grounding_ambiguities))
+                if traj_stats.grounding_ambiguities else 0.0
+            )
+            out["emc_state_grounding_recall_readiness"] = (
+                float(sum(traj_stats.grounding_recall_pressures) / len(traj_stats.grounding_recall_pressures))
+                if traj_stats.grounding_recall_pressures else 0.0
+            )
+            out["emc_state_grounding_verification_pressure"] = (
+                float(
+                    sum(traj_stats.grounding_verification_pressures)
+                    / len(traj_stats.grounding_verification_pressures)
+                )
+                if traj_stats.grounding_verification_pressures else 0.0
+            )
+            out["emc_state_grounding_abduction_pressure"] = (
+                float(sum(traj_stats.grounding_abduction_pressures) / len(traj_stats.grounding_abduction_pressures))
+                if traj_stats.grounding_abduction_pressures else 0.0
+            )
+            out["emc_state_grounding_control_pressure"] = (
+                float(sum(traj_stats.grounding_control_pressures) / len(traj_stats.grounding_control_pressures))
+                if traj_stats.grounding_control_pressures else 0.0
             )
             out["emc_recall_gap_delta"] = (
                 float(sum(traj_stats.recall_gap_deltas) / len(traj_stats.recall_gap_deltas))
@@ -6443,6 +7984,13 @@ class OMENScale(nn.Module):
             "emc_state_memory_residual": 0.0,
             "emc_state_memory_alignment": 0.0,
             "emc_state_memory_pressure": 0.0,
+            "emc_state_grounding_uncertainty": 0.0,
+            "emc_state_grounding_support": 0.0,
+            "emc_state_grounding_ambiguity": 0.0,
+            "emc_state_grounding_recall_readiness": 0.0,
+            "emc_state_grounding_verification_pressure": 0.0,
+            "emc_state_grounding_abduction_pressure": 0.0,
+            "emc_state_grounding_control_pressure": 0.0,
             "emc_recall_gap_delta": 0.0,
             "emc_recall_gap_relief": 0.0,
             "emc_recall_effective_ratio": 0.0,
@@ -6459,6 +8007,17 @@ class OMENScale(nn.Module):
             "world_graph_context_facts": 0.0,
             "world_graph_semantic_graph_enriched": 0.0,
             "world_graph_memory_facts": 0.0,
+            "world_graph_memory_grounding_records": 0.0,
+            "world_graph_grounding_world_state_records": 0.0,
+            "world_graph_grounding_world_state_facts": 0.0,
+            "world_graph_grounding_world_state_active_records": 0.0,
+            "world_graph_grounding_world_state_hypothetical_records": 0.0,
+            "world_graph_grounding_world_state_contradicted_records": 0.0,
+            "world_graph_grounding_world_state_active_facts": 0.0,
+            "world_graph_grounding_world_state_hypothetical_facts": 0.0,
+            "world_graph_grounding_world_state_contradicted_facts": 0.0,
+            "world_graph_grounding_verification_records": 0.0,
+            "world_graph_grounding_hypotheses": 0.0,
             "world_graph_net_facts": 0.0,
             "world_graph_abduced_support_facts": 0.0,
             "world_graph_observed_now_facts": 0.0,
@@ -6500,23 +8059,34 @@ class OMENScale(nn.Module):
             saliency_out=init_saliency_out,
             net_facts=init_net_facts,
         )
+        seed_grounding_records = self._seed_grounding_memory_records(prompt)
         seed_memory_fact_batches = self._seed_symbolic_memory_fact_batches(
             prompt,
             saliency_out=init_saliency_out,
             net_fact_batches=init_net_fact_batches,
         )
+        seed_grounding_record_batches = self._seed_grounding_memory_record_batches(prompt)
         recalled_memory_facts = self._recall_symbolic_memory_facts(
             z_symbolic_in,
             hint_facts=seed_memory_facts,
+        )
+        recalled_memory_grounding_records = self._recall_grounding_memory_records(
+            z_symbolic_in,
+            hint_records=seed_grounding_records,
         )
         recalled_memory_fact_batches = self._recall_symbolic_memory_fact_batches(
             z_symbolic_in,
             hint_fact_batches=seed_memory_fact_batches,
         )
+        recalled_memory_grounding_record_batches = self._recall_grounding_memory_record_batches(
+            z_symbolic_in,
+            hint_record_batches=seed_grounding_record_batches,
+        )
         init_context = self._build_generation_task_context(
             prompt,
             h_tok=h_tok,
             memory_facts=recalled_memory_facts,
+            memory_grounding_records=recalled_memory_grounding_records,
             saliency_out=init_saliency_out,
             net_facts=init_net_facts,
         )
@@ -6524,14 +8094,15 @@ class OMENScale(nn.Module):
             prompt,
             h_tok=h_tok,
             memory_fact_batches=recalled_memory_fact_batches,
+            memory_grounding_record_batches=recalled_memory_grounding_record_batches,
             saliency_out=init_saliency_out,
             net_fact_batches=init_net_fact_batches,
             primary_context=init_context,
         )
         self.prover.set_task_context(init_context)
-        if init_context.observed_facts:
+        if init_context.reasoning_facts():
             self.prover.load_observed_facts(
-                init_context.observed_facts,
+                init_context.reasoning_facts(),
                 limit=int(getattr(self.cfg, "symbolic_context_max_facts", 96)),
             )
 
@@ -6646,23 +8217,34 @@ class OMENScale(nn.Module):
                 saliency_out=step_saliency_out,
                 net_facts=step_net_facts,
             )
+            step_seed_grounding_records = self._seed_grounding_memory_records(ctx)
             step_seed_fact_batches = self._seed_symbolic_memory_fact_batches(
                 ctx,
                 saliency_out=step_saliency_out,
                 net_fact_batches=step_net_fact_batches,
             )
+            step_seed_grounding_record_batches = self._seed_grounding_memory_record_batches(ctx)
             recalled_step = self._recall_symbolic_memory_facts(
                 z_symbolic_ctx,
                 hint_facts=step_seed_facts,
+            )
+            recalled_step_grounding = self._recall_grounding_memory_records(
+                z_symbolic_ctx,
+                hint_records=step_seed_grounding_records,
             )
             recalled_step_batches = self._recall_symbolic_memory_fact_batches(
                 z_symbolic_ctx,
                 hint_fact_batches=step_seed_fact_batches,
             )
+            recalled_step_grounding_batches = self._recall_grounding_memory_record_batches(
+                z_symbolic_ctx,
+                hint_record_batches=step_seed_grounding_record_batches,
+            )
             step_context = self._build_generation_task_context(
                 ctx,
                 h_tok=h_ctx,
                 memory_facts=recalled_step,
+                memory_grounding_records=recalled_step_grounding,
                 saliency_out=step_saliency_out,
                 net_facts=step_net_facts,
             )
@@ -6670,14 +8252,15 @@ class OMENScale(nn.Module):
                 ctx,
                 h_tok=h_ctx,
                 memory_fact_batches=recalled_step_batches,
+                memory_grounding_record_batches=recalled_step_grounding_batches,
                 saliency_out=step_saliency_out,
                 net_fact_batches=step_net_fact_batches,
                 primary_context=step_context,
             )
             self.prover.set_task_context(step_context)
-            if step_context.observed_facts:
+            if step_context.reasoning_facts():
                 self.prover.load_observed_facts(
-                    step_context.observed_facts,
+                    step_context.reasoning_facts(),
                     limit=int(getattr(self.cfg, "symbolic_context_max_facts", 96)),
                 )
             step_decoder_graph = self._enrich_world_graph_batch(
@@ -6770,8 +8353,33 @@ class OMENScale(nn.Module):
                 z_sym_for_bias = z_sym
 
             h_for_decode = h_ctx if (self.net_enabled or self.osf_enabled) else None
-            symbolic_goal = getattr(self.prover, "last_goal", None) or step_context.goal
-            symbolic_facts = getattr(self.prover, "last_context_facts", frozenset()) or step_context.observed_facts
+            planner_state = build_planner_world_state(step_context)
+            symbolic_goal = planner_state.primary_goal or getattr(self.prover, "last_goal", None) or step_context.goal
+            symbolic_facts = (
+                getattr(self.prover, "last_context_facts", frozenset())
+                or frozenset(planner_state.symbolic_facts)
+            )
+            generate_info["planner_state_active_records"] = float(
+                planner_state.metadata.get("planner_state_active_records", 0.0)
+            )
+            generate_info["planner_state_hypothetical_records"] = float(
+                planner_state.metadata.get("planner_state_hypothetical_records", 0.0)
+            )
+            generate_info["planner_state_contradicted_records"] = float(
+                planner_state.metadata.get("planner_state_contradicted_records", 0.0)
+            )
+            generate_info["planner_state_operators"] = float(
+                planner_state.metadata.get("planner_state_operators", 0.0)
+            )
+            generate_info["planner_state_alternative_world_records"] = float(
+                planner_state.metadata.get("planner_state_alternative_world_records", 0.0)
+            )
+            generate_info["planner_state_branching_pressure"] = float(
+                planner_state.metadata.get("planner_state_branching_pressure", 0.0)
+            )
+            generate_info["planner_state_contradiction_pressure"] = float(
+                planner_state.metadata.get("planner_state_contradiction_pressure", 0.0)
+            )
             if self.osf_enabled:
                 _intent_state = self.osf.intent_encoder(z_final)
                 _plan = self.osf.planner(
@@ -6779,11 +8387,19 @@ class OMENScale(nn.Module):
                     symbolic_goal=symbolic_goal,
                     symbolic_facts=symbolic_facts,
                     prover=self.prover,
+                    planner_state=planner_state,
                 )
                 logits, _ = self.osf.hier_decoder(
                     h_tok=h_for_decode,
                     z_intent=_intent_state.z_intent,
                     plan=_plan,
+                )
+                plan_operators = tuple(getattr(_plan, "operators", ()) or ())
+                generate_info["osf_bridge_operator_steps"] = float(
+                    sum(1 for operator in plan_operators if getattr(operator, "source", "") == "grounding_bridge")
+                )
+                generate_info["osf_symbolic_rule_steps"] = float(
+                    sum(1 for operator in plan_operators if getattr(operator, "source", "") == "symbolic_rule")
                 )
                 generate_info["decoder_path_osf"] = 1.0
                 generate_info["decoder_path_net"] = 0.0
@@ -6852,6 +8468,13 @@ class OMENScale(nn.Module):
                 "emc_state_memory_residual",
                 "emc_state_memory_alignment",
                 "emc_state_memory_pressure",
+                "emc_state_grounding_uncertainty",
+                "emc_state_grounding_support",
+                "emc_state_grounding_ambiguity",
+                "emc_state_grounding_recall_readiness",
+                "emc_state_grounding_verification_pressure",
+                "emc_state_grounding_abduction_pressure",
+                "emc_state_grounding_control_pressure",
             ):
                 sum_key = f"{key}_sum"
                 generate_info[key] = float(generate_info.get(sum_key, 0.0)) / emc_state_steps
@@ -6863,6 +8486,13 @@ class OMENScale(nn.Module):
             generate_info.pop("emc_state_memory_residual_sum", None)
             generate_info.pop("emc_state_memory_alignment_sum", None)
             generate_info.pop("emc_state_memory_pressure_sum", None)
+            generate_info.pop("emc_state_grounding_uncertainty_sum", None)
+            generate_info.pop("emc_state_grounding_support_sum", None)
+            generate_info.pop("emc_state_grounding_ambiguity_sum", None)
+            generate_info.pop("emc_state_grounding_recall_readiness_sum", None)
+            generate_info.pop("emc_state_grounding_verification_pressure_sum", None)
+            generate_info.pop("emc_state_grounding_abduction_pressure_sum", None)
+            generate_info.pop("emc_state_grounding_control_pressure_sum", None)
         emc_recall_steps = float(generate_info.get("emc_recall_steps", 0.0))
         if emc_recall_steps > 0.0:
             for key in ("emc_recall_gap_delta", "emc_recall_gap_relief"):
