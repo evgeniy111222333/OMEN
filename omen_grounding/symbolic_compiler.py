@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import zlib
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .interlingua import build_canonical_interlingua
 from .interlingua_types import CanonicalClaimFrame, CanonicalInterlingua
@@ -20,7 +21,7 @@ class CompiledSymbolicSegment:
     relations: Tuple[Tuple[str, str, str], ...] = field(default_factory=tuple)
     goals: Tuple[Tuple[str, str], ...] = field(default_factory=tuple)
     event_frames: Tuple[Tuple[str, ...], ...] = field(default_factory=tuple)
-    claim_frames: Tuple[Tuple[str, str, str], ...] = field(default_factory=tuple)
+    claim_frames: Tuple[Tuple[str, ...], ...] = field(default_factory=tuple)
     counterexample: bool = False
 
 
@@ -40,6 +41,8 @@ class CompiledSymbolicHypothesis:
     speaker_key: str = ""
     epistemic_status: str = "asserted"
     claim_source: str = "document"
+    semantic_mode: str = "instance"
+    quantifier_mode: str = "instance"
 
     @property
     def graph_key(self) -> str:
@@ -54,6 +57,10 @@ class CompiledSymbolicHypothesis:
             terms.append(f"epistemic:{self.epistemic_status}")
         if self.claim_source:
             terms.append(f"claim_source:{self.claim_source}")
+        if self.semantic_mode:
+            terms.append(f"semantic:{self.semantic_mode}")
+        if self.quantifier_mode:
+            terms.append(f"quantifier:{self.quantifier_mode}")
         return tuple(str(term) for term in terms if str(term).strip())
 
     @property
@@ -67,6 +74,10 @@ class CompiledSymbolicHypothesis:
             parts.append(f"speaker={self.speaker_key}")
         if self.epistemic_status:
             parts.append(f"epistemic={self.epistemic_status}")
+        if self.semantic_mode:
+            parts.append(f"semantic={self.semantic_mode}")
+        if self.quantifier_mode:
+            parts.append(f"quantifier={self.quantifier_mode}")
         if self.conflict_tag:
             parts.append(self.conflict_tag)
         return " | ".join(parts)
@@ -78,6 +89,7 @@ class SymbolicCompilationResult:
     source_text: str
     segments: Tuple[CompiledSymbolicSegment, ...] = field(default_factory=tuple)
     hypotheses: Tuple[CompiledSymbolicHypothesis, ...] = field(default_factory=tuple)
+    candidate_rules: Tuple[Any, ...] = field(default_factory=tuple)
     metadata: Dict[str, float] = field(default_factory=dict)
 
 
@@ -88,6 +100,11 @@ def compile_semantic_scene_graph(
 ) -> SymbolicCompilationResult:
     interlingua = build_canonical_interlingua(scene)
     return compile_canonical_interlingua(interlingua, document=document)
+
+
+def _stable_symbol_id(namespace: str, value: str, *, base: int) -> int:
+    text = f"{namespace}:{value}".encode("utf-8")
+    return int(base + (zlib.adler32(text) & 0x7FFFFFFF) % 100_000)
 
 
 def compile_canonical_interlingua(
@@ -123,6 +140,26 @@ def compile_canonical_interlingua(
         )
         return ranked[0] if ranked else "asserted"
 
+    def _dominant_semantic_mode(claim_frames: Sequence[CanonicalClaimFrame]) -> str:
+        if not claim_frames:
+            return "instance"
+        precedence = {"rule": 0, "obligation": 1, "generic": 2, "instance": 3}
+        ranked = sorted(
+            (str(getattr(frame, "semantic_mode", "instance") or "instance") for frame in claim_frames),
+            key=lambda value: precedence.get(value, 4),
+        )
+        return ranked[0] if ranked else "instance"
+
+    def _dominant_quantifier_mode(claim_frames: Sequence[CanonicalClaimFrame]) -> str:
+        if not claim_frames:
+            return "instance"
+        precedence = {"generic_all": 0, "directive": 1, "instance": 2}
+        ranked = sorted(
+            (str(getattr(frame, "quantifier_mode", "instance") or "instance") for frame in claim_frames),
+            key=lambda value: precedence.get(value, 3),
+        )
+        return ranked[0] if ranked else "instance"
+
     def _append_hypothesis(
         *,
         hypothesis_id: str,
@@ -141,6 +178,8 @@ def compile_canonical_interlingua(
         confidence_value = _clip_confidence(confidence)
         conflict = conflict_tag or ("counterexample_context" if counterexample else "")
         dominant_epistemic_status = _dominant_epistemic_status(claim_frames)
+        dominant_semantic_mode = _dominant_semantic_mode(claim_frames)
+        dominant_quantifier_mode = _dominant_quantifier_mode(claim_frames)
         deferred = bool(
             counterexample
             or confidence_value < 0.57
@@ -156,6 +195,10 @@ def compile_canonical_interlingua(
                 claim_support.append(f"epistemic:{frame.epistemic_status}")
             if getattr(frame, "claim_source", None):
                 claim_support.append(f"claim_source:{frame.claim_source}")
+            if getattr(frame, "semantic_mode", None):
+                claim_support.append(f"semantic:{frame.semantic_mode}")
+            if getattr(frame, "quantifier_mode", None):
+                claim_support.append(f"quantifier:{frame.quantifier_mode}")
             claim_support.extend(
                 str(item) for item in getattr(frame, "evidence_refs", ()) if str(item).strip()
             )
@@ -184,6 +227,8 @@ def compile_canonical_interlingua(
                 speaker_key=speaker_key,
                 epistemic_status=dominant_epistemic_status,
                 claim_source=claim_source,
+                semantic_mode=dominant_semantic_mode,
+                quantifier_mode=dominant_quantifier_mode,
             )
         )
 
@@ -234,6 +279,8 @@ def compile_canonical_interlingua(
             (
                 str(claim.claim_kind),
                 str(claim.epistemic_status),
+                str(getattr(claim, "semantic_mode", "instance") or "instance"),
+                str(getattr(claim, "quantifier_mode", "instance") or "instance"),
                 str(claim.speaker_name or claim.claim_source or ""),
             )
             for claim in tuple(getattr(interlingua, "claims", ()) or ())
@@ -305,6 +352,74 @@ def compile_canonical_interlingua(
                 counterexample=counterexample,
             )
         )
+
+    def _compile_candidate_rule(hypothesis: CompiledSymbolicHypothesis) -> Optional[Any]:
+        if hypothesis.kind != "relation":
+            return None
+        if hypothesis.semantic_mode not in {"generic", "rule", "obligation"}:
+            return None
+        if len(hypothesis.symbols) < 3:
+            return None
+        subject_name, predicate_name, object_name = (str(item) for item in hypothesis.symbols[:3])
+        if not subject_name or not predicate_name or not object_name:
+            return None
+        from omen_prolog import HornAtom, HornClause, Var
+        from omen_symbolic.creative_types import RuleCandidate
+
+        subj_var = Var("X")
+        obj_var = Var("Y")
+        head_pred = _stable_symbol_id("ground_rel", predicate_name, base=2_400_000)
+        subj_type_pred = _stable_symbol_id("ground_type", subject_name, base=2_500_000)
+        obj_type_pred = _stable_symbol_id("ground_type", object_name, base=2_500_000)
+        clause = HornClause(
+            head=HornAtom(pred=head_pred, args=(subj_var, obj_var)),
+            body=(
+                HornAtom(pred=subj_type_pred, args=(subj_var,)),
+                HornAtom(pred=obj_type_pred, args=(obj_var,)),
+            ),
+        )
+        semantic_weight = {"rule": 1.0, "obligation": 0.92, "generic": 0.88}.get(hypothesis.semantic_mode, 0.80)
+        epistemic_weight = {
+            "asserted": 1.0,
+            "cited": 0.78,
+            "hedged": 0.56,
+            "questioned": 0.38,
+        }.get(hypothesis.epistemic_status, 0.72)
+        score = _clip_confidence(hypothesis.confidence * semantic_weight * epistemic_weight)
+        return RuleCandidate(
+            clause=clause,
+            source="grounding_rule_compiler",
+            score=score,
+            utility=score,
+            metadata={
+                "hypothesis_id": str(hypothesis.hypothesis_id),
+                "semantic_mode": str(hypothesis.semantic_mode),
+                "quantifier_mode": str(hypothesis.quantifier_mode),
+                "epistemic_status": str(hypothesis.epistemic_status),
+                "claim_source": str(hypothesis.claim_source),
+                "subject_name": subject_name,
+                "predicate_name": predicate_name,
+                "object_name": object_name,
+                "relation_modifiers": tuple(str(item) for item in hypothesis.symbols[3:] if str(item).strip()),
+                "source_segment": int(hypothesis.segment_index),
+                "support_set": tuple(str(item) for item in hypothesis.support_set),
+                "provenance": tuple(str(item) for item in hypothesis.provenance),
+            },
+        )
+
+    candidate_rule_index: Dict[Any, Any] = {}
+    for hypothesis in hypotheses:
+        candidate_rule = _compile_candidate_rule(hypothesis)
+        if candidate_rule is None:
+            continue
+        clause = candidate_rule.clause
+        existing = candidate_rule_index.get(clause)
+        if existing is None or float(candidate_rule.score) > float(existing.score):
+            candidate_rule_index[clause] = candidate_rule
+    candidate_rules = tuple(
+        sorted(candidate_rule_index.values(), key=lambda item: float(item.score), reverse=True)
+    )
+
     metadata = dict(interlingua.metadata)
     deferred_hypotheses = sum(1 for hypothesis in hypotheses if hypothesis.deferred)
     conflict_hypotheses = sum(1 for hypothesis in hypotheses if hypothesis.conflict_tag)
@@ -340,6 +455,18 @@ def compile_canonical_interlingua(
             "compiled_nonasserted_hypotheses": float(
                 sum(1 for hypothesis in hypotheses if hypothesis.epistemic_status != "asserted")
             ),
+            "compiled_generic_hypotheses": float(
+                sum(1 for hypothesis in hypotheses if hypothesis.semantic_mode == "generic")
+            ),
+            "compiled_rule_hypotheses": float(
+                sum(1 for hypothesis in hypotheses if hypothesis.semantic_mode == "rule")
+            ),
+            "compiled_obligation_hypotheses": float(
+                sum(1 for hypothesis in hypotheses if hypothesis.semantic_mode == "obligation")
+            ),
+            "compiled_quantified_hypotheses": float(
+                sum(1 for hypothesis in hypotheses if hypothesis.quantifier_mode != "instance")
+            ),
             "compiled_cited_hypotheses": float(
                 sum(1 for hypothesis in hypotheses if hypothesis.epistemic_status == "cited")
             ),
@@ -357,6 +484,8 @@ def compile_canonical_interlingua(
                     if str(item).startswith("structural_unit:")
                 )
             ),
+            "compiled_candidate_rules": float(len(candidate_rules)),
+            "compiled_grounding_rule_bridge_active": 1.0 if candidate_rules else 0.0,
         }
     )
     return SymbolicCompilationResult(
@@ -364,5 +493,6 @@ def compile_canonical_interlingua(
         source_text=interlingua.source_text,
         segments=tuple(compiled),
         hypotheses=tuple(hypotheses),
+        candidate_rules=candidate_rules,
         metadata=metadata,
     )

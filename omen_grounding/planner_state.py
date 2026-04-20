@@ -82,6 +82,46 @@ def _record_provenance(record: Any) -> Tuple[str, ...]:
     return tuple(str(item).strip() for item in provenance if str(item).strip())
 
 
+def _candidate_rule_metadata(candidate: Any) -> Dict[str, Any]:
+    metadata = getattr(candidate, "metadata", None)
+    if not isinstance(metadata, dict):
+        return {}
+    return dict(metadata)
+
+
+def _candidate_rule_surface_symbols(candidate: Any) -> Tuple[str, ...]:
+    metadata = _candidate_rule_metadata(candidate)
+    subject = str(metadata.get("subject_name", "") or "").strip()
+    predicate = str(metadata.get("predicate_name", "") or "").strip()
+    obj = str(metadata.get("object_name", "") or "").strip()
+    if not (subject and predicate and obj):
+        return tuple()
+    modifiers = tuple(
+        str(item).strip()
+        for item in tuple(metadata.get("relation_modifiers", ()) or ())
+        if str(item).strip()
+    )
+    return (subject, predicate, obj, *modifiers)
+
+
+def _candidate_rule_lineage(candidate: Any) -> Tuple[str, ...]:
+    metadata = _candidate_rule_metadata(candidate)
+    lineage: List[str] = [str(getattr(candidate, "source", "") or "").strip()]
+    for key in ("hypothesis_id", "semantic_mode", "quantifier_mode", "epistemic_status", "claim_source"):
+        value = str(metadata.get(key, "") or "").strip()
+        if value:
+            lineage.append(f"{key}:{value}")
+    for item in tuple(metadata.get("support_set", ()) or ()):
+        text = str(item).strip()
+        if text:
+            lineage.append(text)
+    for item in tuple(metadata.get("provenance", ()) or ()):
+        text = str(item).strip()
+        if text:
+            lineage.append(text)
+    return tuple(dict.fromkeys(item for item in lineage if item))
+
+
 def _verification_world_status(record: Any) -> str:
     status = str(getattr(record, "verification_status", "") or "").strip().lower()
     if status in {"supported", "accept", "accepted"}:
@@ -164,10 +204,33 @@ def _bridge_graph_record(record: Any) -> _PlannerBridgeRecord:
     )
 
 
+def _bridge_candidate_rule(candidate: Any) -> Optional[_PlannerBridgeRecord]:
+    symbols = _candidate_rule_surface_symbols(candidate)
+    if len(symbols) < 3:
+        return None
+    metadata = _candidate_rule_metadata(candidate)
+    score = _clip01(getattr(candidate, "score", 0.0))
+    utility = _clip01(getattr(candidate, "utility", score))
+    epistemic_status = str(metadata.get("epistemic_status", "") or "").strip().lower()
+    conflict = 0.0 if epistemic_status in {"", "asserted"} else _clip01(1.0 - utility)
+    return _PlannerBridgeRecord(
+        record_id=f"candidate_rule:{metadata.get('hypothesis_id', repr(getattr(candidate, 'clause', candidate)))}",
+        record_type="relation",
+        world_status="hypothetical",
+        symbols=symbols,
+        support=score,
+        conflict=conflict,
+        confidence=max(score, utility),
+        repair_action="evaluate_candidate_rule",
+        provenance=_candidate_rule_lineage(candidate),
+    )
+
+
 def _lineage_symbols(
     verification_records: Sequence[Any],
     hypothesis_records: Sequence[Any],
     graph_records: Sequence[Any],
+    candidate_rules: Sequence[Any],
     *,
     limit: int,
 ) -> Tuple[str, ...]:
@@ -179,6 +242,8 @@ def _lineage_symbols(
             symbols.append(family)
     for record in (*verification_records, *hypothesis_records):
         symbols.extend(_record_provenance(record))
+    for candidate in candidate_rules:
+        symbols.extend(_candidate_rule_lineage(candidate))
     return _unique_strings(symbols, limit=limit)
 
 
@@ -188,6 +253,7 @@ class PlannerWorldState:
     active_records: Tuple[Any, ...] = field(default_factory=tuple)
     hypothetical_records: Tuple[Any, ...] = field(default_factory=tuple)
     contradicted_records: Tuple[Any, ...] = field(default_factory=tuple)
+    candidate_rules: Tuple[Any, ...] = field(default_factory=tuple)
     verification_records: Tuple[Any, ...] = field(default_factory=tuple)
     hypothesis_records: Tuple[Any, ...] = field(default_factory=tuple)
     graph_records: Tuple[Any, ...] = field(default_factory=tuple)
@@ -203,6 +269,7 @@ class PlannerWorldState:
     repair_directives: Tuple[PlannerRepairDirective, ...] = field(default_factory=tuple)
     world_rule_symbols: Tuple[str, ...] = field(default_factory=tuple)
     hypothetical_rule_symbols: Tuple[str, ...] = field(default_factory=tuple)
+    candidate_rule_symbols: Tuple[str, ...] = field(default_factory=tuple)
     contradiction_symbols: Tuple[str, ...] = field(default_factory=tuple)
     destructive_effect_symbols: Tuple[str, ...] = field(default_factory=tuple)
     persistent_effect_symbols: Tuple[str, ...] = field(default_factory=tuple)
@@ -258,6 +325,7 @@ class PlannerWorldState:
             float(sum(1 for record in self.verification_records if bool(getattr(record, "hidden_cause_candidate", False)))),
         )
         summary.setdefault("planner_state_hypothesis_records", float(len(self.hypothesis_records)))
+        summary.setdefault("planner_state_grounding_candidate_rules", float(len(self.candidate_rules)))
         summary.setdefault(
             "planner_state_deferred_hypotheses",
             float(sum(1 for record in self.hypothesis_records if bool(getattr(record, "deferred", False)))),
@@ -311,6 +379,7 @@ class PlannerWorldState:
         )
         summary.setdefault("planner_state_world_rules", float(len(self.world_rule_symbols)))
         summary.setdefault("planner_state_hypothetical_rules", float(len(self.hypothetical_rule_symbols)))
+        summary.setdefault("planner_state_candidate_rule_symbols", float(len(self.candidate_rule_symbols)))
         summary.setdefault("planner_state_contradictions", float(len(self.contradiction_symbols)))
         summary.setdefault("planner_state_destructive_effects", float(len(self.destructive_effect_symbols)))
         summary.setdefault("planner_state_persistent_effects", float(len(self.persistent_effect_symbols)))
@@ -358,6 +427,7 @@ class PlannerWorldState:
 def build_planner_world_state(task_context: Any) -> PlannerWorldState:
     records = _task_context_grounding_values(task_context, "grounding_world_state_records")
     ontology_records = _task_context_grounding_values(task_context, "grounding_ontology_records")
+    candidate_rules = _task_context_grounding_values(task_context, "grounding_candidate_rules")
     verification_records = _task_context_grounding_values(task_context, "grounding_verification_records")
     hypothesis_records = _task_context_grounding_values(task_context, "grounding_hypotheses")
     graph_records = _task_context_grounding_values(task_context, "grounding_graph_records")
@@ -394,6 +464,11 @@ def build_planner_world_state(task_context: Any) -> PlannerWorldState:
     contradiction_pressure = float(
         getattr(task_context, "metadata", {}).get("grounding_world_state_contradiction_pressure", 0.0)
     )
+    candidate_rule_bridge_records = tuple(
+        record
+        for record in (_bridge_candidate_rule(candidate) for candidate in candidate_rules)
+        if record is not None
+    )
     verification_bridge_records = tuple(_bridge_verification_record(record) for record in verification_records)
     hypothesis_bridge_records = tuple(_bridge_hypothesis_record(record) for record in hypothesis_records)
     graph_bridge_records = tuple(_bridge_graph_record(record) for record in graph_records)
@@ -403,6 +478,7 @@ def build_planner_world_state(task_context: Any) -> PlannerWorldState:
     planner_hypothetical_records = tuple(
         (
             *hypothetical_records,
+            *candidate_rule_bridge_records,
             *(record for record in verification_bridge_records if _record_status(record) == "hypothetical"),
             *hypothesis_bridge_records,
             *graph_bridge_records,
@@ -444,6 +520,7 @@ def build_planner_world_state(task_context: Any) -> PlannerWorldState:
         verification_records,
         hypothesis_records,
         graph_records,
+        candidate_rules,
         limit=48,
     )
 
@@ -463,6 +540,14 @@ def build_planner_world_state(task_context: Any) -> PlannerWorldState:
         [
             " | ".join(_record_symbols(record))
             for record in planner_hypothetical_records
+            if _record_type(record) == "relation"
+        ],
+        limit=24,
+    )
+    candidate_rule_symbols = _unique_strings(
+        [
+            " | ".join(_record_symbols(record))
+            for record in candidate_rule_bridge_records
             if _record_type(record) == "relation"
         ],
         limit=24,
@@ -496,6 +581,8 @@ def build_planner_world_state(task_context: Any) -> PlannerWorldState:
         "planner_state_active_records": float(len(active_records)),
         "planner_state_hypothetical_records": float(len(hypothetical_records)),
         "planner_state_contradicted_records": float(len(contradicted_records)),
+        "planner_state_grounding_candidate_rules": float(len(candidate_rules)),
+        "planner_state_grounding_candidate_rule_records": float(len(candidate_rule_bridge_records)),
         "planner_state_verification_records": float(len(verification_records)),
         "planner_state_supported_verification_records": float(
             sum(
@@ -557,6 +644,7 @@ def build_planner_world_state(task_context: Any) -> PlannerWorldState:
         ),
         "planner_state_world_rules": float(len(world_rule_symbols)),
         "planner_state_hypothetical_rules": float(len(hypothetical_rule_symbols)),
+        "planner_state_candidate_rule_symbols": float(len(candidate_rule_symbols)),
         "planner_state_contradictions": float(len(contradiction_symbols)),
         "planner_state_destructive_effects": float(len(destructive_effect_symbols)),
         "planner_state_persistent_effects": float(len(persistent_effect_symbols)),
@@ -587,6 +675,7 @@ def build_planner_world_state(task_context: Any) -> PlannerWorldState:
         active_records=active_records,
         hypothetical_records=hypothetical_records,
         contradicted_records=contradicted_records,
+        candidate_rules=tuple(candidate_rules),
         verification_records=verification_records,
         hypothesis_records=hypothesis_records,
         graph_records=graph_records,
@@ -602,6 +691,7 @@ def build_planner_world_state(task_context: Any) -> PlannerWorldState:
         repair_directives=repair_directives,
         world_rule_symbols=world_rule_symbols,
         hypothetical_rule_symbols=hypothetical_rule_symbols,
+        candidate_rule_symbols=candidate_rule_symbols,
         contradiction_symbols=contradiction_symbols,
         destructive_effect_symbols=destructive_effect_symbols,
         persistent_effect_symbols=persistent_effect_symbols,

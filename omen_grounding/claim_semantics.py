@@ -17,6 +17,27 @@ _HEDGE_RE = re.compile(
     r"можливо|мабуть|ймовірно|схоже|наче)\b",
     re.IGNORECASE | re.UNICODE,
 )
+_RULE_LABEL_RE = re.compile(
+    r"^\s*(?:rule|policy|principle|\u043f\u0440\u0430\u0432\u0438\u043b\u043e)\b(?:\s*[:=-]\s*|\s+)",
+    re.IGNORECASE | re.UNICODE,
+)
+_OBLIGATION_RE = re.compile(
+    r"\b(?:must|should|need(?:s)?(?:\s+to)?|required|ought|"
+    r"\u043f\u043e\u0432\u0438\u043d\u0435\u043d|\u043f\u043e\u0432\u0438\u043d\u043d\u0430|"
+    r"\u043f\u043e\u0442\u0440\u0456\u0431\u043d\u043e|\u0442\u0440\u0435\u0431\u0430|"
+    r"\u043c\u0430\u0454|\u043c\u0430\u044e\u0442\u044c)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+_GENERIC_RE = re.compile(
+    r"\b(?:all|every|each|classes?|types?|kinds?|objects?\s+type|"
+    r"generic|abstract|result|discussion|conclusion|"
+    r"\u0432\u0441\u0456|\u0443\u0441\u0456|\u043a\u043e\u0436\u0435\u043d|"
+    r"\u043a\u043e\u0436\u043d\u0430|\u043a\u043e\u0436\u043d\u0456|"
+    r"\u043a\u043b\u0430\u0441(?:\u0438|\u0443)?|"
+    r"\u0442\u0438\u043f(?:\u0438|\u0443)?|"
+    r"\u043e\u0431'\u0454\u043a\u0442\u0438?\s+\u0442\u0438\u043f\u0443)\b",
+    re.IGNORECASE | re.UNICODE,
+)
 
 
 @dataclass(frozen=True)
@@ -24,6 +45,8 @@ class ClaimSemanticProfile:
     claim_source: str = "document"
     epistemic_status: str = "asserted"
     speaker_name: str = ""
+    semantic_mode: str = "instance"
+    quantifier_mode: str = "instance"
 
 
 def _speaker_name_from_unit(unit: GroundedStructuralUnit) -> str:
@@ -70,10 +93,24 @@ def infer_claim_semantics(
         claim_source = "speaker_turn"
     else:
         claim_source = "document"
+    if _RULE_LABEL_RE.search(normalized_text):
+        semantic_mode = "rule"
+        quantifier_mode = "generic_all"
+    elif _OBLIGATION_RE.search(normalized_text):
+        semantic_mode = "obligation"
+        quantifier_mode = "directive"
+    elif "citation_region" in unit_types or _GENERIC_RE.search(normalized_text):
+        semantic_mode = "generic"
+        quantifier_mode = "generic_all"
+    else:
+        semantic_mode = "instance"
+        quantifier_mode = "instance"
     return ClaimSemanticProfile(
         claim_source=claim_source,
         epistemic_status=epistemic_status,
         speaker_name=speaker_name,
+        semantic_mode=semantic_mode,
+        quantifier_mode=quantifier_mode,
     )
 
 

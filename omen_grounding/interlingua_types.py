@@ -85,6 +85,8 @@ class CanonicalClaimFrame:
     speaker_name: Optional[str] = None
     epistemic_status: str = "asserted"
     claim_source: str = "document"
+    semantic_mode: str = "instance"
+    quantifier_mode: str = "instance"
     source_segment: int = 0
     source_span: Optional[GroundingSpan] = None
     confidence: float = 0.55

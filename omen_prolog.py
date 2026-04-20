@@ -452,6 +452,7 @@ class SymbolicTaskContext:
     grounding_ontology_records: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_ontology_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
     grounding_hypotheses: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_candidate_rules: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_verification_records: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_validation_records: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_repair_actions: Tuple[Any, ...] = field(default_factory=tuple)
@@ -489,6 +490,12 @@ class SymbolicTaskContext:
         self.grounding_ontology_records = tuple(self.grounding_ontology_records or ())
         self.grounding_ontology_facts = _freeze_atoms(self.grounding_ontology_facts)
         self.grounding_hypotheses = tuple(self.grounding_hypotheses or ())
+        if not self.grounding_candidate_rules and self.grounding_artifacts is not None:
+            self.grounding_candidate_rules = tuple(
+                getattr(self.grounding_artifacts, "grounding_candidate_rules", ()) or ()
+            )
+        else:
+            self.grounding_candidate_rules = tuple(self.grounding_candidate_rules or ())
         self.grounding_verification_records = tuple(self.grounding_verification_records or ())
         self.grounding_validation_records = tuple(self.grounding_validation_records or ())
         self.grounding_repair_actions = tuple(self.grounding_repair_actions or ())
@@ -544,20 +551,29 @@ class SymbolicTaskContext:
         include_goal: bool = False,
         include_targets: bool = False,
     ) -> Tuple[Tuple[str, Any], ...]:
+        def _seen_key(value: Any) -> Any:
+            try:
+                hash(value)
+                return value
+            except TypeError:
+                return repr(value)
+
         records: List[Tuple[str, Any]] = []
         seen: Set[Any] = set()
         for record in sorted(self.grounding_world_state_records, key=repr):
             status = str(getattr(record, "world_status", "hypothetical") or "hypothetical").strip().lower()
             label = f"grounding_world_state_{status}"
-            if record in seen:
+            record_key = _seen_key(record)
+            if record_key in seen:
                 continue
-            seen.add(record)
+            seen.add(record_key)
             records.append((label, record))
         source_groups = (
             ("observed_now", self.observed_now_facts),
             ("memory", self.memory_derived_facts),
             ("grounding_ontology", self.grounding_ontology_records),
             ("grounding_ontology_fact", self.grounding_ontology_facts),
+            ("grounding_candidate_rule", self.grounding_candidate_rules),
             ("grounding_world_state_active_fact", self.grounding_world_state_active_facts),
             ("grounding_world_state_hypothetical_fact", self.grounding_world_state_hypothetical_facts),
             ("grounding_world_state_contradicted_fact", self.grounding_world_state_contradicted_facts),
@@ -575,22 +591,25 @@ class SymbolicTaskContext:
         )
         for label, facts in source_groups:
             for atom in sorted(facts, key=repr):
-                if label == "memory_grounding" and atom in seen:
+                atom_key = _seen_key(atom)
+                if label == "memory_grounding" and atom_key in seen:
                     records.append((label, atom))
                     continue
-                if atom in seen:
+                if atom_key in seen:
                     continue
-                seen.add(atom)
+                seen.add(atom_key)
                 records.append((label, atom))
         if include_goal and self.goal is not None:
-            if self.goal not in seen:
-                seen.add(self.goal)
+            goal_key = _seen_key(self.goal)
+            if goal_key not in seen:
+                seen.add(goal_key)
                 records.append(("goal", self.goal))
         if include_targets:
             for atom in sorted(self.target_facts, key=repr):
-                if atom in seen:
+                atom_key = _seen_key(atom)
+                if atom_key in seen:
                     continue
-                seen.add(atom)
+                seen.add(atom_key)
                 records.append(("target", atom))
         return tuple(records)
 
@@ -608,6 +627,7 @@ class SymbolicTaskContext:
             "grounding_ontology_records": float(len(self.grounding_ontology_records)),
             "grounding_ontology_facts": float(len(self.grounding_ontology_facts)),
             "grounding_hypotheses": float(len(self.grounding_hypotheses)),
+            "grounding_candidate_rules": float(len(self.grounding_candidate_rules)),
             "grounding_verification_records": float(len(self.grounding_verification_records)),
             "grounding_validation_records": float(len(self.grounding_validation_records)),
             "grounding_repair_actions": float(len(self.grounding_repair_actions)),

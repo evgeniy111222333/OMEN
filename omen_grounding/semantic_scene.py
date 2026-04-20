@@ -133,6 +133,8 @@ def _rewire_claim(claim: SemanticClaim, entity_id_map: Dict[str, str]) -> Semant
         speaker_name=claim.speaker_name,
         epistemic_status=claim.epistemic_status,
         claim_source=claim.claim_source,
+        semantic_mode=getattr(claim, "semantic_mode", "instance"),
+        quantifier_mode=getattr(claim, "quantifier_mode", "instance"),
         evidence_refs=claim.evidence_refs,
     )
 

@@ -28,6 +28,8 @@ class GroundingWorldStateRecord:
     speaker_key: str = ""
     epistemic_status: str = "asserted"
     claim_source: str = "document"
+    semantic_mode: str = "instance"
+    quantifier_mode: str = "instance"
     provenance: Tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -43,6 +45,10 @@ class GroundingWorldStateRecord:
             terms.append(f"epistemic:{self.epistemic_status}")
         if self.claim_source:
             terms.append(f"claim_source:{self.claim_source}")
+        if self.semantic_mode:
+            terms.append(f"semantic:{self.semantic_mode}")
+        if self.quantifier_mode:
+            terms.append(f"quantifier:{self.quantifier_mode}")
         if self.repair_action:
             terms.append(self.repair_action)
         return tuple(str(term) for term in terms if term)
@@ -58,7 +64,8 @@ class GroundingWorldStateRecord:
         return (
             f"{self.world_status} {self.record_type} support={self.support:.2f} "
             f"conflict={self.conflict:.2f} repair={self.repair_action} "
-            f"epistemic={self.epistemic_status}{attribution} {symbol_text}"
+            f"epistemic={self.epistemic_status} semantic={self.semantic_mode} "
+            f"quantifier={self.quantifier_mode}{attribution} {symbol_text}"
         ).strip()
 
 
@@ -80,17 +87,24 @@ def build_grounding_world_state_writeback(
     for hypothesis in compilation.hypotheses:
         verification_record = verification_by_hypothesis.get(str(hypothesis.hypothesis_id))
         epistemic_status = str(getattr(hypothesis, "epistemic_status", "asserted") or "asserted")
+        semantic_mode = str(getattr(hypothesis, "semantic_mode", "instance") or "instance")
+        quantifier_mode = str(getattr(hypothesis, "quantifier_mode", "instance") or "instance")
         nonasserted = epistemic_status in {"cited", "questioned", "hedged"}
+        rule_lifecycle = semantic_mode in {"generic", "rule", "obligation"} or quantifier_mode in {"generic_all", "directive"}
         if verification_record is None:
             world_status = "hypothetical"
             support = _clip01(hypothesis.confidence)
             conflict = 0.0
-            repair_action = "keep_multiple_hypotheses_alive"
+            repair_action = (
+                "route_to_symbolic_rule_lifecycle"
+                if rule_lifecycle
+                else "keep_multiple_hypotheses_alive"
+            )
             provenance = tuple(str(item) for item in hypothesis.provenance)
         else:
             verification_status = str(verification_record.verification_status)
             if verification_status == "supported":
-                world_status = "hypothetical" if nonasserted else "active"
+                world_status = "hypothetical" if (nonasserted or rule_lifecycle) else "active"
             elif verification_status == "conflicted":
                 world_status = "contradicted"
             else:
@@ -98,6 +112,8 @@ def build_grounding_world_state_writeback(
             support = _clip01(verification_record.support)
             conflict = _clip01(verification_record.conflict)
             repair_action = str(verification_record.repair_action or "none")
+            if rule_lifecycle and verification_status == "supported":
+                repair_action = "route_to_symbolic_rule_lifecycle"
             provenance = tuple(str(item) for item in verification_record.provenance)
         records.append(
             GroundingWorldStateRecord(
@@ -115,6 +131,8 @@ def build_grounding_world_state_writeback(
                 speaker_key=str(getattr(hypothesis, "speaker_key", "") or ""),
                 epistemic_status=epistemic_status,
                 claim_source=str(getattr(hypothesis, "claim_source", "document") or "document"),
+                semantic_mode=semantic_mode,
+                quantifier_mode=quantifier_mode,
                 provenance=provenance,
             )
         )
@@ -128,6 +146,18 @@ def build_grounding_world_state_writeback(
     questioned = sum(1 for record in records if record.epistemic_status == "questioned")
     hedged = sum(1 for record in records if record.epistemic_status == "hedged")
     attributed = sum(1 for record in records if record.speaker_key)
+    generic = sum(1 for record in records if record.semantic_mode == "generic")
+    rule = sum(1 for record in records if record.semantic_mode == "rule")
+    obligation = sum(1 for record in records if record.semantic_mode == "obligation")
+    rule_lifecycle_records = sum(
+        1
+        for record in records
+        if (
+            record.semantic_mode in {"generic", "rule", "obligation"}
+            or record.quantifier_mode in {"generic_all", "directive"}
+        )
+        and record.world_status == "hypothetical"
+    )
     mean_support = (
         sum(float(record.support) for record in records) / max(total, 1.0)
         if records else 0.0
@@ -139,7 +169,12 @@ def build_grounding_world_state_writeback(
     repairable = sum(
         1
         for record in records
-        if str(record.repair_action or "none") not in ("", "none", "keep_multiple_hypotheses_alive")
+        if str(record.repair_action or "none") not in (
+            "",
+            "none",
+            "keep_multiple_hypotheses_alive",
+            "route_to_symbolic_rule_lifecycle",
+        )
     )
     hypothetical_ratio = float(hypothetical) / max(total, 1.0)
     contradicted_ratio = float(contradicted) / max(total, 1.0)
@@ -167,6 +202,11 @@ def build_grounding_world_state_writeback(
         "grounding_world_state_cited_records": float(cited),
         "grounding_world_state_questioned_records": float(questioned),
         "grounding_world_state_hedged_records": float(hedged),
+        "grounding_world_state_generic_records": float(generic),
+        "grounding_world_state_rule_records": float(rule),
+        "grounding_world_state_obligation_records": float(obligation),
+        "grounding_world_state_rule_lifecycle_records": float(rule_lifecycle_records),
+        "grounding_world_state_rule_lifecycle_ratio": float(rule_lifecycle_records) / max(total, 1.0),
         "grounding_world_state_nonasserted_ratio": nonasserted_ratio,
         "grounding_world_state_mean_support": mean_support,
         "grounding_world_state_mean_conflict": mean_conflict,

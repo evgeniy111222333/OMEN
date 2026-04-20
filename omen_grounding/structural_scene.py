@@ -484,6 +484,8 @@ def build_structural_scene_graph(
                         speaker_name=segment_speaker_name,
                         epistemic_status=claim_profile.epistemic_status,
                         claim_source=claim_profile.claim_source,
+                        semantic_mode=claim_profile.semantic_mode,
+                        quantifier_mode=claim_profile.quantifier_mode,
                         evidence_refs=evidence_refs,
                     )
                 )
@@ -537,6 +539,8 @@ def build_structural_scene_graph(
                         speaker_name=segment_speaker_name,
                         epistemic_status=claim_profile.epistemic_status,
                         claim_source=claim_profile.claim_source,
+                        semantic_mode=claim_profile.semantic_mode,
+                        quantifier_mode=claim_profile.quantifier_mode,
                         evidence_refs=evidence_refs,
                     )
                 )
@@ -606,6 +610,8 @@ def build_structural_scene_graph(
                         speaker_name=segment_speaker_name,
                         epistemic_status=claim_profile.epistemic_status,
                         claim_source=claim_profile.claim_source,
+                        semantic_mode=claim_profile.semantic_mode,
+                        quantifier_mode=claim_profile.quantifier_mode,
                         evidence_refs=evidence_refs,
                     )
                 )
@@ -630,6 +636,9 @@ def build_structural_scene_graph(
             "scene_claim_nonasserted": float(
                 sum(1 for claim in claims if str(claim.epistemic_status) != "asserted")
             ),
+            "scene_claim_generic": float(sum(1 for claim in claims if str(claim.semantic_mode) == "generic")),
+            "scene_claim_rule": float(sum(1 for claim in claims if str(claim.semantic_mode) == "rule")),
+            "scene_claim_obligation": float(sum(1 for claim in claims if str(claim.semantic_mode) == "obligation")),
             "scene_mentions": float(len(mentions)),
             "scene_discourse_relations": float(len(discourse_relations)),
             "scene_temporal_markers": float(len(temporal_markers)),
@@ -661,6 +670,12 @@ def build_structural_scene_graph(
             ),
             "scene_structural_primary_nonasserted_claims": float(
                 sum(1 for claim in claims if str(claim.epistemic_status) != "asserted")
+            ),
+            "scene_structural_primary_generic_claims": float(
+                sum(1 for claim in claims if str(claim.semantic_mode) == "generic")
+            ),
+            "scene_structural_primary_rule_claims": float(
+                sum(1 for claim in claims if str(claim.semantic_mode) == "rule")
             ),
             "scene_structural_primary_evidence_refs": float(
                 sum(len(state.evidence_refs) for state in states)

@@ -357,9 +357,11 @@ class GroundingTextSemanticsTest(unittest.TestCase):
         self.assertGreaterEqual(float(bundle.metadata.get("interlingua_claim_frames", 0.0)), 1.0)
         self.assertGreaterEqual(float(bundle.metadata.get("interlingua_cited_claim_frames", 0.0)), 1.0)
         self.assertGreaterEqual(float(bundle.metadata.get("compiled_nonasserted_hypotheses", 0.0)), 1.0)
+        self.assertGreaterEqual(float(bundle.metadata.get("compiled_candidate_rules", 0.0)), 1.0)
         self.assertGreaterEqual(float(bundle.metadata.get("verification_nonasserted_pressure", 0.0)), 1.0)
         self.assertGreaterEqual(float(bundle.metadata.get("grounding_world_state_nonasserted_records", 0.0)), 1.0)
         self.assertGreaterEqual(float(bundle.metadata.get("grounding_world_state_cited_records", 0.0)), 1.0)
+        self.assertGreaterEqual(len(bundle.grounding_candidate_rules), 1)
 
     def test_generation_context_surfaces_trace_grounding_metrics_for_utf8_prompt(self) -> None:
         cfg = OMENScaleConfig.demo()

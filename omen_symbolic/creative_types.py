@@ -49,6 +49,7 @@ class OntologyPredicateState:
 @dataclass
 class CreativeCycleReport:
     abduction_candidates: List[RuleCandidate] = field(default_factory=list)
+    grounding_candidates: List[RuleCandidate] = field(default_factory=list)
     analogy_candidates: List[RuleCandidate] = field(default_factory=list)
     metaphor_candidates: List[RuleCandidate] = field(default_factory=list)
     counterfactual_analogy_candidates: List[RuleCandidate] = field(default_factory=list)

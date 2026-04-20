@@ -321,6 +321,136 @@ class CreativeSymbolicEnginesTest(unittest.TestCase):
         self.assertAlmostEqual(candidates[0].score, 2.0 / 3.0, places=6)
         self.assertAlmostEqual(candidates[0].utility, 2.0 / 3.0, places=6)
 
+    def test_creative_cycle_seeds_and_selects_grounding_candidate_rules(self) -> None:
+        device = torch.device("cpu")
+        prover = DifferentiableProver(
+            d_latent=8,
+            sym_vocab=32,
+            max_rules=16,
+            max_depth=2,
+            n_cands=2,
+        ).to(device)
+        prover.eval()
+        prover.configure_creative_cycle(
+            enabled=True,
+            cycle_every=1,
+            analogy_contrastive_steps=0,
+            aee_generations=1,
+            aee_population=4,
+        )
+        coordinator = prover.creative_cycle
+        coordinator.analogy_engine.state = SimpleNamespace(
+            graph_view=SimpleNamespace(embeddings={}, embedding_source="none"),
+            projector_loss=0.0,
+        )
+
+        grounding_candidate = RuleCandidate(
+            clause=rule(
+                atom(701, Var("X"), Var("Y")),
+                atom(702, Var("X")),
+                atom(703, Var("Y")),
+            ),
+            source="grounding_rule_compiler",
+            score=0.91,
+            utility=0.84,
+            metadata={
+                "hypothesis_id": "rule:stars",
+                "semantic_mode": "rule",
+                "quantifier_mode": "generic_all",
+                "subject_name": "stars",
+                "predicate_name": "generates",
+                "object_name": "planets",
+            },
+        )
+        prover.set_task_context(
+            SymbolicTaskContext(
+                observed_facts=frozenset(),
+                grounding_candidate_rules=(grounding_candidate,),
+                provenance="test",
+                metadata={"gap_norm": 0.0},
+            )
+        )
+
+        captured: dict[str, object] = {}
+
+        def _capture_evolve(seed_candidates, *args, **kwargs):
+            del args, kwargs
+            captured["seed_sources"] = [candidate.source for candidate in seed_candidates]
+            captured["seed_count"] = len(seed_candidates)
+            return list(seed_candidates[:1])
+
+        with mock.patch.object(
+            coordinator.analogy_engine,
+            "fit",
+            return_value=SimpleNamespace(
+                graph_view=SimpleNamespace(embeddings={}, embedding_source="none"),
+                projector_loss=0.0,
+            ),
+        ), mock.patch.object(coordinator.analogy_engine, "generate_candidates", return_value=[]), mock.patch.object(
+            coordinator.analogy_engine,
+            "generate_metaphor_candidates",
+            return_value=[],
+        ), mock.patch.object(
+            coordinator.counterfactual_engine,
+            "explore",
+            return_value=CounterfactualResult(
+                candidates=[],
+                novel_facts=tuple(),
+                contradictions=tuple(),
+                modified_rules=tuple(),
+                surprise=0.0,
+                metadata={},
+            ),
+        ), mock.patch.object(
+            coordinator,
+            "_counterfactual_ame_candidates",
+            return_value=([], []),
+        ), mock.patch.object(
+            coordinator.ontology_engine,
+            "generate_candidates",
+            return_value=[],
+        ), mock.patch.object(
+            coordinator,
+            "_task_gap",
+            return_value=0.0,
+        ), mock.patch.object(
+            coordinator,
+            "_derived_facts",
+            side_effect=[tuple(), tuple()],
+        ), mock.patch.object(
+            coordinator,
+            "_evolve_for_situations",
+            side_effect=_capture_evolve,
+        ), mock.patch.object(
+            prover,
+            "current_goal",
+            return_value=None,
+        ), mock.patch.object(
+            coordinator.intrinsic_engine,
+            "formulate_goal",
+            return_value=IntrinsicGoal(
+                goal=atom(999, Const(1)),
+                value=0.2,
+                kind="explore_structure",
+                provenance="test",
+            ),
+        ):
+            report = coordinator.run(
+                prover,
+                torch.zeros(1, 8, device=device),
+                [],
+                [],
+                device,
+            )
+
+        self.assertEqual(len(report.grounding_candidates), 1)
+        self.assertEqual(captured["seed_count"], 1)
+        self.assertEqual(captured["seed_sources"], ["grounding_rule_compiler"])
+        self.assertEqual(len(report.selected_rules), 1)
+        self.assertEqual(report.selected_rules[0].source, "grounding_rule_compiler")
+        self.assertGreaterEqual(report.metrics["grounding_rule_candidates"], 1.0)
+        self.assertGreaterEqual(report.metrics["grounding_rule_selected"], 1.0)
+
     def test_oee_feedback_preserves_structural_supporting_rules_under_hash_collision(self) -> None:
         engine = OntologyExpansionEngine(gap_threshold=0.2, contradiction_threshold=1)
         pred_id = 900777

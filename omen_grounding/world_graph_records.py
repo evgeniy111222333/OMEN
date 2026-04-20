@@ -91,6 +91,8 @@ def compile_interlingua_graph_records(
             str(claim.claim_kind),
             str(claim.proposition_id),
             str(claim.epistemic_status),
+            str(getattr(claim, "semantic_mode", "instance") or "instance"),
+            str(getattr(claim, "quantifier_mode", "instance") or "instance"),
         ]
         if getattr(claim, "speaker_key", None):
             graph_terms.append(str(claim.speaker_key))
@@ -104,6 +106,8 @@ def compile_interlingua_graph_records(
                 graph_key=f"interlingua:claim:{claim.claim_id}:{claim.epistemic_status}",
                 graph_text=(
                     f"claim {claim.claim_kind} epistemic={claim.epistemic_status}"
+                    f" semantic={getattr(claim, 'semantic_mode', 'instance')}"
+                    f" quantifier={getattr(claim, 'quantifier_mode', 'instance')}"
                     f"{speaker_text} proposition={claim.proposition_id}"
                 ),
                 graph_terms=tuple(term for term in graph_terms if term),

@@ -338,6 +338,25 @@ class GroundingScenePipelineTest(unittest.TestCase):
             all(record.world_status != "active" for record in result.world_state.records if record.epistemic_status == "cited")
         )
 
+    def test_pipeline_compiles_rule_like_relations_into_candidate_rules(self) -> None:
+        text = "Rule all stars generate planets."
+
+        result = ground_text_to_symbolic(text, language="text", max_segments=6)
+
+        self.assertGreaterEqual(result.scene.metadata.get("scene_claim_rule", 0.0), 1.0)
+        self.assertGreaterEqual(result.interlingua.metadata.get("interlingua_rule_claim_frames", 0.0), 1.0)
+        self.assertGreaterEqual(result.compiled.metadata.get("compiled_rule_hypotheses", 0.0), 1.0)
+        self.assertGreaterEqual(result.compiled.metadata.get("compiled_quantified_hypotheses", 0.0), 1.0)
+        self.assertGreaterEqual(result.compiled.metadata.get("compiled_candidate_rules", 0.0), 1.0)
+        self.assertGreaterEqual(len(result.compiled.candidate_rules), 1)
+        top_rule = result.compiled.candidate_rules[0]
+        self.assertEqual(top_rule.source, "grounding_rule_compiler")
+        self.assertEqual(top_rule.metadata.get("semantic_mode"), "rule")
+        self.assertEqual(top_rule.metadata.get("quantifier_mode"), "generic_all")
+        self.assertEqual(top_rule.metadata.get("predicate_name"), "generates")
+        self.assertTrue(hasattr(top_rule.clause, "head"))
+        self.assertTrue(hasattr(top_rule.clause, "body"))
+
     def test_pipeline_uses_injected_backbone_scene_graph(self) -> None:
         result = ground_text_to_symbolic("unstructured placeholder text", language="text", backbone=_FixedBackbone())
 

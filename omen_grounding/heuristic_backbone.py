@@ -960,6 +960,8 @@ class HeuristicFallbackSemanticBackbone(SemanticGroundingBackbone):
                         speaker_name=segment_speaker_name,
                         epistemic_status=claim_profile.epistemic_status,
                         claim_source=claim_profile.claim_source,
+                        semantic_mode=claim_profile.semantic_mode,
+                        quantifier_mode=claim_profile.quantifier_mode,
                         evidence_refs=segment_claim_evidence,
                     )
                 )
@@ -1073,6 +1075,8 @@ class HeuristicFallbackSemanticBackbone(SemanticGroundingBackbone):
                         speaker_name=segment_speaker_name,
                         epistemic_status=claim_profile.epistemic_status,
                         claim_source=claim_profile.claim_source,
+                        semantic_mode=claim_profile.semantic_mode,
+                        quantifier_mode=claim_profile.quantifier_mode,
                         evidence_refs=segment_claim_evidence,
                     )
                 )
@@ -1138,6 +1142,8 @@ class HeuristicFallbackSemanticBackbone(SemanticGroundingBackbone):
                         speaker_name=segment_speaker_name,
                         epistemic_status=claim_profile.epistemic_status,
                         claim_source=claim_profile.claim_source,
+                        semantic_mode=claim_profile.semantic_mode,
+                        quantifier_mode=claim_profile.quantifier_mode,
                         evidence_refs=segment_claim_evidence,
                     )
                 )
@@ -1181,6 +1187,8 @@ class HeuristicFallbackSemanticBackbone(SemanticGroundingBackbone):
                         speaker_name=segment_speaker_name,
                         epistemic_status=claim_profile.epistemic_status,
                         claim_source=claim_profile.claim_source,
+                        semantic_mode=claim_profile.semantic_mode,
+                        quantifier_mode=claim_profile.quantifier_mode,
                         evidence_refs=segment_claim_evidence,
                     )
                 )
@@ -1208,6 +1216,9 @@ class HeuristicFallbackSemanticBackbone(SemanticGroundingBackbone):
                 "scene_claim_nonasserted": float(
                     sum(1 for claim in claims if str(claim.epistemic_status) != "asserted")
                 ),
+                "scene_claim_generic": float(sum(1 for claim in claims if str(claim.semantic_mode) == "generic")),
+                "scene_claim_rule": float(sum(1 for claim in claims if str(claim.semantic_mode) == "rule")),
+                "scene_claim_obligation": float(sum(1 for claim in claims if str(claim.semantic_mode) == "obligation")),
                 "scene_mentions": float(len(mentions)),
                 "scene_discourse_relations": float(len(discourse_relations)),
                 "scene_temporal_markers": float(len(temporal_markers)),
@@ -1235,6 +1246,12 @@ class HeuristicFallbackSemanticBackbone(SemanticGroundingBackbone):
                 "scene_fallback_attributed_claims": float(sum(1 for claim in claims if claim.speaker_entity_id)),
                 "scene_fallback_nonasserted_claims": float(
                     sum(1 for claim in claims if str(claim.epistemic_status) != "asserted")
+                ),
+                "scene_fallback_generic_claims": float(
+                    sum(1 for claim in claims if str(claim.semantic_mode) == "generic")
+                ),
+                "scene_fallback_rule_claims": float(
+                    sum(1 for claim in claims if str(claim.semantic_mode) == "rule")
                 ),
             }
         )

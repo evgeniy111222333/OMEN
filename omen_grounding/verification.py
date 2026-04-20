@@ -30,6 +30,8 @@ class GroundingVerificationRecord:
     speaker_key: str = ""
     epistemic_status: str = "asserted"
     claim_source: str = "document"
+    semantic_mode: str = "instance"
+    quantifier_mode: str = "instance"
     provenance: Tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -45,6 +47,10 @@ class GroundingVerificationRecord:
             terms.append(f"epistemic:{self.epistemic_status}")
         if self.claim_source:
             terms.append(f"claim_source:{self.claim_source}")
+        if self.semantic_mode:
+            terms.append(f"semantic:{self.semantic_mode}")
+        if self.quantifier_mode:
+            terms.append(f"quantifier:{self.quantifier_mode}")
         if self.repair_action:
             terms.append(self.repair_action)
         return tuple(str(term) for term in terms if term)
@@ -61,7 +67,8 @@ class GroundingVerificationRecord:
         return (
             f"{self.kind} {self.verification_status} support={self.support:.2f} "
             f"conflict={self.conflict:.2f} repair={self.repair_action}"
-            f" epistemic={self.epistemic_status}{attribution}{hidden} {symbols}"
+            f" epistemic={self.epistemic_status} semantic={self.semantic_mode}"
+            f" quantifier={self.quantifier_mode}{attribution}{hidden} {symbols}"
         ).strip()
 
 
@@ -508,6 +515,8 @@ def verify_symbolic_hypotheses(
                 speaker_key=str(getattr(hypothesis, "speaker_key", "") or ""),
                 epistemic_status=epistemic_status,
                 claim_source=str(getattr(hypothesis, "claim_source", "document") or "document"),
+                semantic_mode=str(getattr(hypothesis, "semantic_mode", "instance") or "instance"),
+                quantifier_mode=str(getattr(hypothesis, "quantifier_mode", "instance") or "instance"),
                 provenance=tuple(str(item) for item in hypothesis.provenance),
             )
         )

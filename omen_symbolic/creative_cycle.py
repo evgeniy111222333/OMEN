@@ -487,6 +487,46 @@ class CreativeCycleCoordinator:
         return candidates
 
     @staticmethod
+    def _dedupe_rule_candidates(candidates: Sequence[RuleCandidate]) -> List[RuleCandidate]:
+        best_by_clause: Dict[Any, RuleCandidate] = {}
+        for candidate in candidates:
+            clause = getattr(candidate, "clause", None)
+            if clause is None:
+                continue
+            current = best_by_clause.get(clause)
+            if current is None or float(candidate.score) > float(current.score):
+                best_by_clause[clause] = candidate
+        return sorted(best_by_clause.values(), key=lambda item: float(item.score), reverse=True)
+
+    def _grounding_candidate_rules(self, prover: Any) -> List[RuleCandidate]:
+        task_context = getattr(prover, "task_context", None)
+        if task_context is None:
+            return []
+        direct = tuple(getattr(task_context, "grounding_candidate_rules", ()) or ())
+        if not direct:
+            artifacts = getattr(task_context, "grounding_artifacts", None)
+            if artifacts is not None:
+                direct = tuple(getattr(artifacts, "grounding_candidate_rules", ()) or ())
+        grounded: List[RuleCandidate] = []
+        for candidate in direct:
+            if not isinstance(candidate, RuleCandidate):
+                continue
+            metadata = dict(getattr(candidate, "metadata", {}) or {})
+            metadata.setdefault("grounding_seed", 1.0)
+            grounded.append(
+                RuleCandidate(
+                    clause=candidate.clause,
+                    source=str(getattr(candidate, "source", "") or "grounding_rule_compiler"),
+                    score=float(candidate.score),
+                    utility=float(getattr(candidate, "utility", 0.0)),
+                    aesthetic=float(getattr(candidate, "aesthetic", 0.0)),
+                    structural_similarity=float(getattr(candidate, "structural_similarity", 0.0)),
+                    metadata=metadata,
+                )
+            )
+        return self._dedupe_rule_candidates(grounded)
+
+    @staticmethod
     def _goal_supported(goal: Any, facts: Sequence[Any]) -> bool:
         from omen_prolog import unify
 
@@ -886,6 +926,7 @@ class CreativeCycleCoordinator:
         self._runtime_task_gap_cache = {}
         rules = list(getattr(prover.kb, "rules", ()))
         report.abduction_candidates = self._recent_abduction_candidates(prover)
+        report.grounding_candidates = self._grounding_candidate_rules(prover)
         analogy_state = self.analogy_engine.fit(rules)
         report.predicate_embeddings = dict(analogy_state.graph_view.embeddings)
         report.analogy_candidates = self.analogy_engine.generate_candidates(
@@ -958,8 +999,9 @@ class CreativeCycleCoordinator:
                 existing_rules=rules,
             )
 
-        seed_candidates: List[RuleCandidate] = (
-            list(report.abduction_candidates)
+        seed_candidates = self._dedupe_rule_candidates(
+            list(report.grounding_candidates)
+            + list(report.abduction_candidates)
             + list(report.analogy_candidates)
             + list(report.metaphor_candidates)
             + list(report.counterfactual_analogy_candidates)
@@ -1060,16 +1102,9 @@ class CreativeCycleCoordinator:
                 for entry in self.ontology_engine.fixed_entries(ontology_pred_ids)
             ]
 
-        candidate_rule_pool = list(report.selected_rules)
+        candidate_rule_pool = self._dedupe_rule_candidates(list(report.selected_rules))
         if not candidate_rule_pool:
-            candidate_rule_pool = (
-                list(report.analogy_candidates)
-                + list(report.metaphor_candidates)
-                + list(report.counterfactual_analogy_candidates)
-                + list(report.counterfactual_metaphor_candidates)
-                + list(report.counterfactual_candidates)
-                + list(report.ontology_candidates)
-            )
+            candidate_rule_pool = self._dedupe_rule_candidates(seed_candidates)
         candidate_goals = [candidate.clause.head for candidate in candidate_rule_pool]
         if not candidate_goals:
             candidate_goals = [candidate.clause.head for candidate in report.ontology_candidates]
@@ -1098,6 +1133,7 @@ class CreativeCycleCoordinator:
             "train_fast_budgeted": 1.0 if fast_mode else 0.0,
             "contradiction_scope_facts": float(len(contradiction_scope)),
             "abduction_candidates": float(len(report.abduction_candidates)),
+            "grounding_rule_candidates": float(len(report.grounding_candidates)),
             "analogy_candidates": float(len(report.analogy_candidates)),
             "metaphor_candidates": float(len(report.metaphor_candidates)),
             "counterfactual_analogy_candidates": float(len(report.counterfactual_analogy_candidates)),
@@ -1141,6 +1177,9 @@ class CreativeCycleCoordinator:
             **oee_stats,
             "selected_rules": float(added),
             "validated_selected_rules": float(len(accepted_selected)),
+            "grounding_rule_selected": float(
+                sum(1 for candidate in accepted_selected if str(getattr(candidate, "source", "") or "") == "grounding_rule_compiler")
+            ),
             "selected_rule_acceptance_ratio": float(len(accepted_selected)) / float(max(len(attempted_selected), 1)),
             "selected_mean_utility": float(selected_utility / max(added, 1)),
             "ontology_feedback_accepted": 1.0 if ontology_accepted else 0.0,

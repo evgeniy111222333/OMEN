@@ -86,6 +86,8 @@ class SemanticClaim:
     speaker_name: Optional[str] = None
     epistemic_status: str = "asserted"
     claim_source: str = "document"
+    semantic_mode: str = "instance"
+    quantifier_mode: str = "instance"
     evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
 
 

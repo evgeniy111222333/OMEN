@@ -67,6 +67,11 @@ CASES: Sequence[GroundingBenchmarkCase] = (
         language="text",
         text="Abstract: aspirin causes relief (Smith, 2024).",
     ),
+    GroundingBenchmarkCase(
+        name="rule_bridge",
+        language="text",
+        text="Rule all stars generate planets.",
+    ),
 )
 
 
@@ -97,9 +102,13 @@ def _benchmark_pipeline(case: GroundingBenchmarkCase, *, iterations: int, max_se
         "compiled_hypotheses": float(result.compiled.metadata.get("compiled_hypotheses", 0.0)),
         "compiled_attributed_hypotheses": float(result.compiled.metadata.get("compiled_attributed_hypotheses", 0.0)),
         "compiled_nonasserted_hypotheses": float(result.compiled.metadata.get("compiled_nonasserted_hypotheses", 0.0)),
+        "compiled_candidate_rules": float(result.compiled.metadata.get("compiled_candidate_rules", 0.0)),
         "compiled_event_frames": float(result.compiled.metadata.get("compiled_event_frames", 0.0)),
         "world_state_records": float(result.world_state.metadata.get("grounding_world_state_records", 0.0)),
         "world_state_cited_records": float(result.world_state.metadata.get("grounding_world_state_cited_records", 0.0)),
+        "world_state_rule_lifecycle_records": float(
+            result.world_state.metadata.get("grounding_world_state_rule_lifecycle_records", 0.0)
+        ),
         "world_state_nonasserted_records": float(
             result.world_state.metadata.get("grounding_world_state_nonasserted_records", 0.0)
         ),
@@ -154,9 +163,11 @@ def main() -> None:
         "coref".rjust(8),
         "attr".rjust(8),
         "nonasrt".rjust(8),
+        "rules".rjust(8),
         "hyp".rjust(8),
         "world".rjust(8),
         "cited".rjust(8),
+        "rlife".rjust(8),
     )
     for case in CASES:
         pipeline_stats = _benchmark_pipeline(case, iterations=args.iterations, max_segments=args.max_segments)
@@ -176,9 +187,11 @@ def main() -> None:
             f"{pipeline_stats['scene_coreference_links']:.0f}".rjust(8),
             f"{pipeline_stats['compiled_attributed_hypotheses']:.0f}".rjust(8),
             f"{pipeline_stats['compiled_nonasserted_hypotheses']:.0f}".rjust(8),
+            f"{pipeline_stats['compiled_candidate_rules']:.0f}".rjust(8),
             f"{pipeline_stats['compiled_hypotheses']:.0f}".rjust(8),
             f"{pipeline_stats['world_state_records']:.0f}".rjust(8),
             f"{pipeline_stats['world_state_cited_records']:.0f}".rjust(8),
+            f"{pipeline_stats['world_state_rule_lifecycle_records']:.0f}".rjust(8),
         )
 
 

@@ -17,7 +17,8 @@ from omen_grounding import (
     build_planner_world_state,
 )
 from omen_grounding.world_state_writeback import GroundingWorldStateRecord
-from omen_prolog import HornAtom, SymbolicTaskContext
+from omen_prolog import HornAtom, HornClause, SymbolicTaskContext, Var
+from omen_symbolic.creative_types import RuleCandidate
 from omen_symbolic.execution_trace import GroundingRuntimeArtifacts
 
 
@@ -273,6 +274,61 @@ class GroundingPlannerStateTest(unittest.TestCase):
         self.assertGreaterEqual(summary["planner_state_lineage_symbols"], 3.0)
         self.assertGreaterEqual(summary["planner_state_hypothetical_operators"], 1.0)
         self.assertGreaterEqual(summary["planner_state_contradictions"], 1.0)
+
+    def test_build_planner_world_state_projects_grounding_candidate_rules(self) -> None:
+        candidate_rule = RuleCandidate(
+            clause=HornClause(
+                head=HornAtom(901, (Var("X"), Var("Y"))),
+                body=(
+                    HornAtom(902, (Var("X"),)),
+                    HornAtom(903, (Var("Y"),)),
+                ),
+            ),
+            source="grounding_rule_compiler",
+            score=0.88,
+            utility=0.81,
+            metadata={
+                "hypothesis_id": "rule:stars",
+                "semantic_mode": "rule",
+                "quantifier_mode": "generic_all",
+                "epistemic_status": "asserted",
+                "claim_source": "speaker_turn",
+                "subject_name": "stars",
+                "predicate_name": "generates",
+                "object_name": "planets",
+                "relation_modifiers": ("if:dust_cloud", "modal:must"),
+                "support_set": ("semantic:rule",),
+                "provenance": ("scene:claim:stars_rule",),
+            },
+        )
+        ctx = SymbolicTaskContext(
+            observed_now_facts=frozenset(),
+            grounding_candidate_rules=(candidate_rule,),
+            metadata={"grounding_uncertainty": 0.18},
+        )
+
+        planner_state = build_planner_world_state(ctx)
+        summary = planner_state.summary()
+
+        self.assertEqual(len(planner_state.candidate_rules), 1)
+        self.assertIn(
+            "stars | generates | planets | if:dust_cloud | modal:must",
+            planner_state.candidate_rule_symbols,
+        )
+        self.assertIn("grounding_rule_compiler", planner_state.lineage_symbols)
+        self.assertIn("semantic_mode:rule", planner_state.lineage_symbols)
+        self.assertIn("claim_source:speaker_turn", planner_state.lineage_symbols)
+        self.assertTrue(any(operator.predicate == "generates" for operator in planner_state.operators))
+        operator = next(operator for operator in planner_state.operators if operator.predicate == "generates")
+        self.assertEqual(operator.status, "hypothetical")
+        self.assertEqual(operator.inputs, ("stars", "dust_cloud"))
+        self.assertEqual(operator.outputs, ("planets",))
+        self.assertEqual(operator.conditions, ("dust_cloud",))
+        self.assertEqual(operator.modality, "must")
+        self.assertGreaterEqual(summary["planner_state_grounding_candidate_rules"], 1.0)
+        self.assertGreaterEqual(summary["planner_state_grounding_candidate_rule_records"], 1.0)
+        self.assertGreaterEqual(summary["planner_state_candidate_rule_symbols"], 1.0)
+        self.assertGreaterEqual(summary["planner_state_hypothetical_operators"], 1.0)
 
 
 if __name__ == "__main__":

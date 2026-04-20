@@ -79,6 +79,23 @@ class SymbolicTaskContextWorldStateTest(unittest.TestCase):
         self.assertIn("interlingua", labels)
         self.assertGreaterEqual(counts["grounding_graph_records"], 1.0)
 
+    def test_source_records_surface_grounding_candidate_rules_from_artifacts(self) -> None:
+        _bundle, artifacts = build_symbolic_trace_bundle_with_artifacts(
+            "Rule all stars generate planets.",
+            lang_hint="text",
+            max_steps=8,
+            max_counterexamples=2,
+        )
+        self.assertIsNotNone(artifacts)
+        assert artifacts is not None
+
+        ctx = SymbolicTaskContext(grounding_artifacts=artifacts)
+        labels = {label for label, _ in ctx.source_fact_records()}
+        counts = ctx.source_counts()
+
+        self.assertIn("grounding_candidate_rule", labels)
+        self.assertGreaterEqual(counts["grounding_candidate_rules"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

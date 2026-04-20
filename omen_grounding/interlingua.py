@@ -159,10 +159,12 @@ def build_canonical_interlingua(scene: SemanticSceneGraph) -> CanonicalInterling
                 claim_kind=str(claim.claim_kind),
                 proposition_id=proposition_id,
                 speaker_entity_id=speaker.entity_id if speaker is not None else getattr(claim, "speaker_entity_id", None),
-                speaker_key=speaker.canonical_key if speaker is not None else _optional_key(getattr(claim, "speaker_name", None), str(claim.claim_id)),
+                speaker_key=speaker.canonical_key if speaker is not None else _optional_key(getattr(claim, "speaker_name", None), ""),
                 speaker_name=speaker.canonical_name if speaker is not None else getattr(claim, "speaker_name", None),
                 epistemic_status=str(getattr(claim, "epistemic_status", "asserted") or "asserted"),
                 claim_source=str(getattr(claim, "claim_source", "document") or "document"),
+                semantic_mode=str(getattr(claim, "semantic_mode", "instance") or "instance"),
+                quantifier_mode=str(getattr(claim, "quantifier_mode", "instance") or "instance"),
                 source_segment=int(claim.source_segment),
                 source_span=claim.source_span,
                 confidence=float(claim.confidence),
@@ -189,6 +191,14 @@ def build_canonical_interlingua(scene: SemanticSceneGraph) -> CanonicalInterling
                 sum(1 for claim in claims if claim.epistemic_status == "questioned")
             ),
             "interlingua_hedged_claim_frames": float(sum(1 for claim in claims if claim.epistemic_status == "hedged")),
+            "interlingua_generic_claim_frames": float(sum(1 for claim in claims if claim.semantic_mode == "generic")),
+            "interlingua_rule_claim_frames": float(sum(1 for claim in claims if claim.semantic_mode == "rule")),
+            "interlingua_obligation_claim_frames": float(
+                sum(1 for claim in claims if claim.semantic_mode == "obligation")
+            ),
+            "interlingua_quantified_claim_frames": float(
+                sum(1 for claim in claims if claim.quantifier_mode != "instance")
+            ),
             "interlingua_negative_relations": float(
                 sum(1 for relation in relations if relation.polarity == "negative")
             ),

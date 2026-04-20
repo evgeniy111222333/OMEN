@@ -127,6 +127,53 @@ class GroundingWorldStateWritebackTest(unittest.TestCase):
         self.assertEqual(writeback.metadata.get("grounding_world_state_cited_records"), 1.0)
         self.assertEqual(writeback.metadata.get("grounding_world_state_nonasserted_records"), 1.0)
 
+    def test_writeback_routes_supported_rule_claims_to_symbolic_rule_lifecycle(self) -> None:
+        compilation = SymbolicCompilationResult(
+            language="text",
+            source_text="Rule all stars generate planets.",
+            segments=(
+                CompiledSymbolicSegment(
+                    index=0,
+                    text="Rule all stars generate planets.",
+                    normalized_text="rule all stars generate planets",
+                    relations=(("stars", "generates", "planets"),),
+                ),
+            ),
+            hypotheses=(
+                CompiledSymbolicHypothesis(
+                    hypothesis_id="rel:rule",
+                    segment_index=0,
+                    kind="relation",
+                    symbols=("stars", "generates", "planets"),
+                    confidence=0.96,
+                    status="supported",
+                    semantic_mode="rule",
+                    quantifier_mode="generic_all",
+                    provenance=("segment:0",),
+                ),
+            ),
+        )
+
+        verification = verify_symbolic_hypotheses(compilation)
+        writeback = build_grounding_world_state_writeback(compilation, verification)
+
+        self.assertEqual(writeback.records[0].world_status, "hypothetical")
+        self.assertEqual(writeback.records[0].repair_action, "route_to_symbolic_rule_lifecycle")
+        self.assertEqual(writeback.records[0].semantic_mode, "rule")
+        self.assertEqual(writeback.records[0].quantifier_mode, "generic_all")
+        self.assertEqual(writeback.metadata.get("grounding_world_state_active_records"), 0.0)
+        self.assertEqual(writeback.metadata.get("grounding_world_state_hypothetical_records"), 1.0)
+        self.assertEqual(writeback.metadata.get("grounding_world_state_rule_records"), 1.0)
+        self.assertEqual(writeback.metadata.get("grounding_world_state_rule_lifecycle_records"), 1.0)
+        self.assertEqual(writeback.metadata.get("grounding_world_state_rule_lifecycle_ratio"), 1.0)
+
+        active_facts, hypothetical_facts, contradicted_facts, stats = compile_world_state_symbolic_atoms(writeback.records)
+        self.assertEqual(stats.get("grounding_world_state_active_facts"), 0.0)
+        self.assertEqual(stats.get("grounding_world_state_hypothetical_facts"), 1.0)
+        self.assertEqual(len(active_facts), 0)
+        self.assertEqual(len(contradicted_facts), 0)
+        self.assertEqual(len(hypothetical_facts), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
