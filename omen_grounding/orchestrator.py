@@ -54,6 +54,10 @@ def _parser_agreement_score(pipeline: TextGroundingPipelineResult) -> Dict[str, 
     document_segments = tuple(getattr(pipeline.document, "segments", ()) or ())
     compiled_segments = tuple(getattr(pipeline.compiled, "segments", ()) or ())
     by_idx = {int(segment.index): segment for segment in compiled_segments}
+    semantic_authority = float(
+        getattr(pipeline.document, "metadata", {}).get("grounding_document_semantic_authority", 1.0)
+    )
+    semantic_document = semantic_authority > 0.0
     relation_scores = []
     state_scores = []
     goal_scores = []
@@ -64,24 +68,30 @@ def _parser_agreement_score(pipeline: TextGroundingPipelineResult) -> Dict[str, 
             state_scores.append(0.0)
             goal_scores.append(0.0)
             continue
-        relation_scores.append(
-            1.0 - (
-                abs(len(document_segment.relations) - len(compiled_segment.relations))
-                / max(len(document_segment.relations), len(compiled_segment.relations), 1)
+        if semantic_document or len(document_segment.relations) > 0:
+            relation_scores.append(
+                1.0 - (
+                    abs(len(document_segment.relations) - len(compiled_segment.relations))
+                    / max(len(document_segment.relations), len(compiled_segment.relations), 1)
+                )
             )
-        )
+        else:
+            relation_scores.append(1.0)
         state_scores.append(
             1.0 - (
                 abs(len(document_segment.states) - len(compiled_segment.states))
                 / max(len(document_segment.states), len(compiled_segment.states), 1)
             )
         )
-        goal_scores.append(
-            1.0 - (
-                abs(len(document_segment.goals) - len(compiled_segment.goals))
-                / max(len(document_segment.goals), len(compiled_segment.goals), 1)
+        if semantic_document or len(document_segment.goals) > 0:
+            goal_scores.append(
+                1.0 - (
+                    abs(len(document_segment.goals) - len(compiled_segment.goals))
+                    / max(len(document_segment.goals), len(compiled_segment.goals), 1)
+                )
             )
-        )
+        else:
+            goal_scores.append(1.0)
     relation_agreement = sum(relation_scores) / max(len(relation_scores), 1)
     state_agreement = sum(state_scores) / max(len(state_scores), 1)
     goal_agreement = sum(goal_scores) / max(len(goal_scores), 1)
@@ -147,7 +157,11 @@ def run_grounding_orchestrator(
     parser_agreement = _parser_agreement_score(pipeline)
     span_scores = _span_traceability_score(pipeline)
     corroboration = grounding_memory_corroboration(
-        tuple(pipeline.world_state.records) + tuple(pipeline.verification.records) + tuple(pipeline.compiled.hypotheses),
+        tuple(pipeline.world_state.records)
+        + tuple(pipeline.verification.records)
+        + tuple(pipeline.verifier_stack.validation_records)
+        + tuple(pipeline.verifier_stack.repair_actions)
+        + tuple(pipeline.compiled.hypotheses),
         tuple(memory_records or ()),
     )
     metadata = {
@@ -155,6 +169,7 @@ def run_grounding_orchestrator(
         **parser_agreement,
         **span_scores,
         **corroboration,
+        **dict(pipeline.verifier_stack.metadata),
     }
     return GroundingOrchestratorResult(
         pipeline=pipeline,

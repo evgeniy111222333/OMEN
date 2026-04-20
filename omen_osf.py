@@ -257,6 +257,64 @@ class OSFSynthesizer(nn.Module):
             int(sim_result.mismatch_mask.sum().item()),
         )
 
+    @staticmethod
+    def _repair_candidate_specs(
+        strategy_id: int,
+        plan_depth_use: int,
+        planner_state=None,
+        *,
+        max_plan_depth: int,
+    ) -> Tuple[Tuple[int, int], ...]:
+        candidates: list[tuple[int, int]] = []
+        directives = tuple(getattr(planner_state, "repair_directives", ()) or ()) if planner_state is not None else tuple()
+        verification_records = (
+            tuple(getattr(planner_state, "verification_records", ()) or ())
+            if planner_state is not None
+            else tuple()
+        )
+        hypothesis_records = (
+            tuple(getattr(planner_state, "hypothesis_records", ()) or ())
+            if planner_state is not None
+            else tuple()
+        )
+        action_types = {str(getattr(item, "action_type", "") or "").strip() for item in directives}
+        if any(
+            bool(getattr(item, "hidden_cause_candidate", False))
+            or str(getattr(item, "repair_action", "") or "").strip() == "trigger_hidden_cause_abduction"
+            for item in verification_records
+        ):
+            candidates.append((STRATEGY_EXPLORATORY, min(plan_depth_use + 1, max_plan_depth + 2)))
+        if any(
+            str(getattr(item, "verification_status", "") or "").strip().lower() == "conflicted"
+            for item in verification_records
+        ):
+            candidates.append((STRATEGY_CAREFUL, min(plan_depth_use + 1, max_plan_depth + 1)))
+        if any(bool(getattr(item, "deferred", False)) for item in hypothesis_records):
+            candidates.append((STRATEGY_EXPLORATORY, max(plan_depth_use, 2)))
+        if "trigger_hidden_cause_abduction" in action_types:
+            candidates.append((STRATEGY_EXPLORATORY, min(plan_depth_use + 1, max_plan_depth + 2)))
+        if "trigger_temporal_repair" in action_types:
+            candidates.append((STRATEGY_CAREFUL, min(plan_depth_use + 1, max_plan_depth + 1)))
+        if "promote_world_model_supported_claim" in action_types:
+            candidates.append((STRATEGY_CAREFUL, max(plan_depth_use, 2)))
+        if "keep_ontology_hypothesis_alive" in action_types:
+            candidates.append((STRATEGY_EXPLORATORY, max(plan_depth_use, 2)))
+        candidates.extend(
+            [
+                (strategy_id, min(plan_depth_use + 1, max_plan_depth + 2)),
+                (STRATEGY_CAREFUL, max(plan_depth_use, 2)),
+                (STRATEGY_EXPLORATORY, min(plan_depth_use + 1, max_plan_depth + 2)),
+            ]
+        )
+        deduped: list[tuple[int, int]] = []
+        seen = set()
+        for spec in candidates:
+            if spec in seen:
+                continue
+            seen.add(spec)
+            deduped.append(spec)
+        return tuple(deduped)
+
     def _repair_plan_symbolically(
         self,
         intent_state: IntentState,
@@ -277,11 +335,12 @@ class OSFSynthesizer(nn.Module):
         best_summary = self._verify_summary(best_verify)
         seen = {(strategy_id, plan_depth_use)}
         tried = 0
-        candidate_specs = [
-            (strategy_id, min(plan_depth_use + 1, self.cfg.max_plan_depth + 2)),
-            (STRATEGY_CAREFUL, max(plan_depth_use, 2)),
-            (STRATEGY_EXPLORATORY, min(plan_depth_use + 1, self.cfg.max_plan_depth + 2)),
-        ]
+        candidate_specs = self._repair_candidate_specs(
+            strategy_id,
+            plan_depth_use,
+            planner_state=planner_state,
+            max_plan_depth=self.cfg.max_plan_depth,
+        )
         for cand_strategy, cand_depth in candidate_specs:
             spec = (cand_strategy, cand_depth)
             if spec in seen:

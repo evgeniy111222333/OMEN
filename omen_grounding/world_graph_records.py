@@ -52,6 +52,8 @@ def compile_interlingua_graph_records(
             )
         )
     for relation in interlingua.relations:
+        modifier_terms = tuple(str(term) for term in relation.relation_modifiers if str(term).strip())
+        modifier_text = f" modifiers={' '.join(modifier_terms)}" if modifier_terms else ""
         records.append(
             GroundingGraphRecord(
                 record_type="relation",
@@ -62,9 +64,9 @@ def compile_interlingua_graph_records(
                 ),
                 graph_text=(
                     f"relation {relation.subject_name} {relation.predicate} {relation.object_name} "
-                    f"polarity={relation.polarity}"
+                    f"polarity={relation.polarity}{modifier_text}"
                 ),
-                graph_terms=(relation.subject_key, relation.predicate_key, relation.object_key),
+                graph_terms=(relation.subject_key, relation.predicate_key, relation.object_key, *modifier_terms),
                 graph_family="interlingua_relation",
                 confidence=float(relation.confidence),
                 source_segment=int(relation.source_segment),

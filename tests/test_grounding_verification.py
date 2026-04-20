@@ -13,6 +13,7 @@ from omen_grounding.symbolic_compiler import (
     CompiledSymbolicSegment,
     SymbolicCompilationResult,
 )
+from omen_grounding.pipeline import ground_text_to_symbolic
 from omen_grounding.verification import verify_symbolic_hypotheses
 
 
@@ -84,6 +85,18 @@ class GroundingVerificationTest(unittest.TestCase):
         self.assertEqual(report.records[0].verification_status, "conflicted")
         self.assertTrue(report.records[0].hidden_cause_candidate)
         self.assertEqual(report.records[0].repair_action, "trigger_hidden_cause_abduction")
+
+    def test_verification_uses_document_scene_and_interlingua_alignment(self) -> None:
+        result = ground_text_to_symbolic(
+            "weather is rain. rain becomes flood. goal evacuation safe_exit.",
+            language="text",
+            max_segments=6,
+        )
+
+        self.assertGreater(result.verification.metadata.get("verification_document_alignment", 0.0), 0.0)
+        self.assertGreater(result.verification.metadata.get("verification_scene_alignment", 0.0), 0.0)
+        self.assertGreater(result.verification.metadata.get("verification_interlingua_alignment", 0.0), 0.0)
+        self.assertTrue(any(record.provenance for record in result.verification.records))
 
 
 if __name__ == "__main__":

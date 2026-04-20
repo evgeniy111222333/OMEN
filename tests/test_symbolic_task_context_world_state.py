@@ -9,6 +9,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from omen_prolog import HornAtom, SymbolicTaskContext
+from omen_symbolic.execution_trace import build_symbolic_trace_bundle_with_artifacts
 
 
 class SymbolicTaskContextWorldStateTest(unittest.TestCase):
@@ -60,6 +61,23 @@ class SymbolicTaskContextWorldStateTest(unittest.TestCase):
         self.assertEqual(counts["grounding_world_state_active_facts"], 1.0)
         self.assertEqual(counts["grounding_world_state_hypothetical_facts"], 1.0)
         self.assertEqual(counts["grounding_world_state_contradicted_facts"], 1.0)
+
+    def test_source_records_surface_interlingua_records_from_grounding_artifacts(self) -> None:
+        _bundle, artifacts = build_symbolic_trace_bundle_with_artifacts(
+            "weather is rain. rain becomes flood. however flood is not safe.",
+            lang_hint="text",
+            max_steps=8,
+            max_counterexamples=2,
+        )
+        self.assertIsNotNone(artifacts)
+        assert artifacts is not None
+
+        ctx = SymbolicTaskContext(grounding_artifacts=artifacts)
+        labels = {label for label, _ in ctx.source_fact_records()}
+        counts = ctx.source_counts()
+
+        self.assertIn("interlingua", labels)
+        self.assertGreaterEqual(counts["grounding_graph_records"], 1.0)
 
 
 if __name__ == "__main__":

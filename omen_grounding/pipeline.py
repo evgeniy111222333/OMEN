@@ -9,6 +9,7 @@ from .interlingua_types import CanonicalInterlingua
 from .ontology_growth import GroundingOntologyGrowthResult, build_grounding_ontology_growth
 from .semantic_scene import build_semantic_scene_graph
 from .symbolic_compiler import SymbolicCompilationResult, compile_canonical_interlingua
+from .verifier_stack import GroundingVerifierStackResult, run_grounding_verifier_stack
 from .verification import GroundingVerificationReport, verify_symbolic_hypotheses
 from .world_state_writeback import GroundingWorldStateWriteback, build_grounding_world_state_writeback
 from .text_semantics import ground_text_document
@@ -23,6 +24,7 @@ class TextGroundingPipelineResult:
     interlingua: CanonicalInterlingua
     compiled: SymbolicCompilationResult
     verification: GroundingVerificationReport
+    verifier_stack: GroundingVerifierStackResult
     world_state: GroundingWorldStateWriteback
     ontology: GroundingOntologyGrowthResult
 
@@ -50,12 +52,19 @@ def ground_text_to_symbolic(
     )
     world_state = build_grounding_world_state_writeback(compiled, verification)
     ontology = build_grounding_ontology_growth(document, interlingua)
+    verifier_stack = run_grounding_verifier_stack(
+        scene=scene,
+        verification_records=verification.records,
+        world_state_records=world_state.records,
+        ontology_concepts=ontology.concepts,
+    )
     return TextGroundingPipelineResult(
         document=document,
         scene=scene,
         interlingua=interlingua,
         compiled=compiled,
         verification=verification,
+        verifier_stack=verifier_stack,
         world_state=world_state,
         ontology=ontology,
     )

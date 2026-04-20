@@ -21,6 +21,23 @@ def _record_symbols(record: Any) -> Tuple[str, ...]:
     return tuple(str(item).strip() for item in symbols if str(item).strip())
 
 
+def _record_annotations(record: Any) -> Dict[str, Tuple[str, ...]]:
+    annotations: Dict[str, List[str]] = {"if": [], "cause": [], "time": [], "modal": []}
+    for symbol in _record_symbols(record)[3:]:
+        if ":" not in symbol:
+            continue
+        prefix, value = symbol.split(":", 1)
+        prefix = prefix.strip().lower()
+        value = value.strip()
+        if prefix in annotations and value:
+            annotations[prefix].append(value)
+    return {
+        key: tuple(values)
+        for key, values in annotations.items()
+        if values
+    }
+
+
 @dataclass(frozen=True)
 class PlannerResource:
     symbol: str
@@ -37,6 +54,10 @@ class PlannerOperator:
     predicate: str
     inputs: Tuple[str, ...] = field(default_factory=tuple)
     outputs: Tuple[str, ...] = field(default_factory=tuple)
+    modality: str = ""
+    conditions: Tuple[str, ...] = field(default_factory=tuple)
+    causes: Tuple[str, ...] = field(default_factory=tuple)
+    temporals: Tuple[str, ...] = field(default_factory=tuple)
     status: str = "hypothetical"
     support: float = 0.0
     conflict: float = 0.0
@@ -59,8 +80,10 @@ class PlannerAlternativeWorld:
 def _resource_candidates(record: Any) -> Tuple[str, ...]:
     record_type = _record_type(record)
     symbols = _record_symbols(record)
+    annotations = _record_annotations(record)
     if record_type == "relation" and len(symbols) >= 3:
-        return (symbols[0], symbols[2])
+        extra = tuple(annotations.get("if", ())) + tuple(annotations.get("cause", ())) + tuple(annotations.get("time", ()))
+        return (symbols[0], symbols[2], *extra)
     if record_type == "state" and len(symbols) >= 1:
         return (symbols[0],)
     if record_type == "goal" and len(symbols) >= 2:
@@ -142,12 +165,21 @@ def build_planner_operators(
         symbols = _record_symbols(record)
         if len(symbols) < 3:
             continue
+        annotations = _record_annotations(record)
+        conditions = tuple(annotations.get("if", ()))
+        causes = tuple(annotations.get("cause", ()))
+        temporals = tuple(annotations.get("time", ()))
+        modalities = tuple(annotations.get("modal", ()))
         operators.append(
             PlannerOperator(
                 operator_id=str(getattr(record, "record_id", "operator")),
                 predicate=symbols[1],
-                inputs=(symbols[0],),
+                inputs=(symbols[0], *conditions, *causes, *temporals),
                 outputs=(symbols[2],),
+                modality=modalities[0] if modalities else "",
+                conditions=conditions,
+                causes=causes,
+                temporals=temporals,
                 status=_record_status(record),
                 support=_clip01(getattr(record, "support", 0.0)),
                 conflict=_clip01(getattr(record, "conflict", 0.0)),

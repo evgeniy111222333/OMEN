@@ -69,6 +69,8 @@ class SymbolicExecutionTraceBundle:
     grounding_target_facts: FrozenSet[Any] = field(default_factory=frozenset)
     grounding_hypotheses: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_verification_records: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_validation_records: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_repair_actions: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_world_state_records: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_ontology_records: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_ontology_facts: FrozenSet[Any] = field(default_factory=frozenset)
@@ -77,6 +79,113 @@ class SymbolicExecutionTraceBundle:
     grounding_world_state_contradicted_facts: FrozenSet[Any] = field(default_factory=frozenset)
     grounding_graph_records: Tuple[Any, ...] = field(default_factory=tuple)
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class GroundingRuntimeArtifacts:
+    language: str
+    source_text: str
+    segment_spans: Dict[int, Any] = field(default_factory=dict)
+    grounding_facts: FrozenSet[Any] = field(default_factory=frozenset)
+    grounding_target_facts: FrozenSet[Any] = field(default_factory=frozenset)
+    grounding_hypotheses: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_verification_records: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_validation_records: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_repair_actions: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_world_state_records: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_ontology_records: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_ontology_facts: FrozenSet[Any] = field(default_factory=frozenset)
+    grounding_world_state_active_facts: FrozenSet[Any] = field(default_factory=frozenset)
+    grounding_world_state_hypothetical_facts: FrozenSet[Any] = field(default_factory=frozenset)
+    grounding_world_state_contradicted_facts: FrozenSet[Any] = field(default_factory=frozenset)
+    grounding_graph_records: Tuple[Any, ...] = field(default_factory=tuple)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+def _has_grounding_runtime_artifacts(artifacts: Optional[GroundingRuntimeArtifacts]) -> bool:
+    if artifacts is None:
+        return False
+    return any(
+        (
+            artifacts.grounding_facts,
+            artifacts.grounding_target_facts,
+            artifacts.grounding_hypotheses,
+            artifacts.grounding_verification_records,
+            artifacts.grounding_validation_records,
+            artifacts.grounding_repair_actions,
+            artifacts.grounding_world_state_records,
+            artifacts.grounding_ontology_records,
+            artifacts.grounding_graph_records,
+        )
+    )
+
+
+def _build_grounding_runtime_artifacts(
+    orchestrated: Any,
+    *,
+    language: str,
+    source_text: str,
+    max_steps: int,
+) -> GroundingRuntimeArtifacts:
+    pipeline = orchestrated.pipeline
+    grounding_facts, grounding_targets, grounding_symbolic_stats = compile_scene_symbolic_atoms(pipeline.scene)
+    grounding_context_facts, grounding_context_symbolic_stats = compile_scene_context_symbolic_atoms(
+        pipeline.scene
+    )
+    grounding_graph_records, grounding_graph_stats = compile_interlingua_graph_records(
+        pipeline.interlingua,
+        max_records=max(max_steps * 4, 16),
+    )
+    grounding_context_records, grounding_context_stats = compile_scene_context_graph_records(
+        pipeline.scene,
+        max_records=max(max_steps * 3, 12),
+    )
+    (
+        grounding_world_state_active_facts,
+        grounding_world_state_hypothetical_facts,
+        grounding_world_state_contradicted_facts,
+        grounding_world_state_symbolic_stats,
+    ) = compile_world_state_symbolic_atoms(pipeline.world_state.records)
+    grounding_ontology_facts, grounding_ontology_stats = compile_ontology_symbolic_atoms(
+        pipeline.ontology.concepts
+    )
+    return GroundingRuntimeArtifacts(
+        language=language,
+        source_text=source_text,
+        segment_spans=dict(orchestrated.segment_spans),
+        grounding_facts=frozenset(set(grounding_facts).union(grounding_context_facts)),
+        grounding_target_facts=frozenset(grounding_targets),
+        grounding_hypotheses=tuple(pipeline.compiled.hypotheses),
+        grounding_verification_records=tuple(pipeline.verification.records),
+        grounding_validation_records=tuple(pipeline.verifier_stack.validation_records),
+        grounding_repair_actions=tuple(pipeline.verifier_stack.repair_actions),
+        grounding_world_state_records=tuple(pipeline.world_state.records),
+        grounding_ontology_records=tuple(pipeline.ontology.concepts),
+        grounding_ontology_facts=grounding_ontology_facts,
+        grounding_world_state_active_facts=grounding_world_state_active_facts,
+        grounding_world_state_hypothetical_facts=grounding_world_state_hypothetical_facts,
+        grounding_world_state_contradicted_facts=grounding_world_state_contradicted_facts,
+        grounding_graph_records=tuple(grounding_graph_records) + tuple(grounding_context_records),
+        metadata={
+            **dict(pipeline.document.metadata),
+            **dict(pipeline.scene.metadata),
+            **dict(pipeline.interlingua.metadata),
+            **dict(pipeline.compiled.metadata),
+            **dict(pipeline.verification.metadata),
+            **dict(pipeline.verifier_stack.metadata),
+            **dict(pipeline.world_state.metadata),
+            **dict(pipeline.ontology.metadata),
+            **dict(grounding_world_state_symbolic_stats),
+            **dict(grounding_ontology_stats),
+            **dict(grounding_context_symbolic_stats),
+            **dict(grounding_symbolic_stats),
+            **dict(grounding_context_stats),
+            **dict(grounding_graph_stats),
+            **dict(orchestrated.metadata),
+            "grounding_mode": "semantic_scene_compiler",
+            "grounding_orchestrator_active": 1.0,
+        },
+    )
 
 
 @dataclass
@@ -1226,16 +1335,32 @@ class _ObservationTraceBuilder:
         self.semantic_backbone = semantic_backbone
 
     def build(self, text: str) -> Optional[SymbolicExecutionTraceBundle]:
+        bundle, _artifacts = self.build_with_artifacts(text)
+        return bundle
+
+    def build_with_artifacts(
+        self,
+        text: str,
+        *,
+        memory_records: Optional[Sequence[object]] = None,
+    ) -> Tuple[Optional[SymbolicExecutionTraceBundle], Optional[GroundingRuntimeArtifacts]]:
         orchestrated = run_grounding_orchestrator(
             text,
             language=self.language,
             max_segments=self.max_steps,
             backbone=self.semantic_backbone,
+            memory_records=memory_records,
         )
         pipeline = orchestrated.pipeline
+        artifacts = _build_grounding_runtime_artifacts(
+            orchestrated,
+            language=self.language,
+            source_text=text,
+            max_steps=self.max_steps,
+        )
         segments = list(pipeline.compiled.segments)
         if not segments:
-            return None
+            return None, artifacts if _has_grounding_runtime_artifacts(artifacts) else None
         if (
             len(segments) < 2
             and pipeline.compiled.metadata.get("compiled_relation_claims", 0.0) <= 0.0
@@ -1243,7 +1368,7 @@ class _ObservationTraceBuilder:
             and pipeline.compiled.metadata.get("compiled_goal_claims", 0.0) <= 0.0
             and pipeline.compiled.metadata.get("grounding_counterexample_segments", 0.0) <= 0.0
         ):
-            return None
+            return None, artifacts if _has_grounding_runtime_artifacts(artifacts) else None
 
         transitions: List[TraceTransitionFacts] = []
         counterexamples: List[TraceTransitionFacts] = []
@@ -1286,70 +1411,35 @@ class _ObservationTraceBuilder:
             previous_after = after_facts
 
         if not transitions:
-            return None
+            return None, artifacts if _has_grounding_runtime_artifacts(artifacts) else None
 
         if not target_facts:
             target_facts.update(transitions[-1].after_facts)
         if counterexamples:
             target_facts.update(counterexamples[-1].after_facts)
-        grounding_facts, grounding_targets, grounding_symbolic_stats = compile_scene_symbolic_atoms(pipeline.scene)
-        grounding_context_facts, grounding_context_symbolic_stats = compile_scene_context_symbolic_atoms(
-            pipeline.scene
-        )
-        grounding_graph_records, grounding_graph_stats = compile_interlingua_graph_records(
-            pipeline.interlingua,
-            max_records=max(self.max_steps * 4, 16),
-        )
-        grounding_context_records, grounding_context_stats = compile_scene_context_graph_records(
-            pipeline.scene,
-            max_records=max(self.max_steps * 3, 12),
-        )
-        (
-            grounding_world_state_active_facts,
-            grounding_world_state_hypothetical_facts,
-            grounding_world_state_contradicted_facts,
-            grounding_world_state_symbolic_stats,
-        ) = compile_world_state_symbolic_atoms(pipeline.world_state.records)
-        grounding_ontology_facts, grounding_ontology_stats = compile_ontology_symbolic_atoms(
-            pipeline.ontology.concepts
-        )
-        return SymbolicExecutionTraceBundle(
+        bundle = SymbolicExecutionTraceBundle(
             language=self.language,
             source_text=text,
             observed_facts=frozenset(observed_facts),
             target_facts=frozenset(target_facts),
             transitions=tuple(transitions),
             counterexamples=tuple(counterexamples),
-            grounding_facts=frozenset(set(grounding_facts).union(grounding_context_facts)),
-            grounding_target_facts=grounding_targets,
-            grounding_hypotheses=tuple(pipeline.compiled.hypotheses),
-            grounding_verification_records=tuple(pipeline.verification.records),
-            grounding_world_state_records=tuple(pipeline.world_state.records),
-            grounding_ontology_records=tuple(pipeline.ontology.concepts),
-            grounding_ontology_facts=grounding_ontology_facts,
-            grounding_world_state_active_facts=grounding_world_state_active_facts,
-            grounding_world_state_hypothetical_facts=grounding_world_state_hypothetical_facts,
-            grounding_world_state_contradicted_facts=grounding_world_state_contradicted_facts,
-            grounding_graph_records=tuple(grounding_graph_records) + tuple(grounding_context_records),
-            metadata={
-                **dict(pipeline.document.metadata),
-                **dict(pipeline.scene.metadata),
-                **dict(pipeline.interlingua.metadata),
-                **dict(pipeline.compiled.metadata),
-                **dict(pipeline.verification.metadata),
-                **dict(pipeline.world_state.metadata),
-                **dict(pipeline.ontology.metadata),
-                **dict(grounding_world_state_symbolic_stats),
-                **dict(grounding_ontology_stats),
-                **dict(grounding_context_symbolic_stats),
-                **dict(grounding_symbolic_stats),
-                **dict(grounding_context_stats),
-                **dict(grounding_graph_stats),
-                **dict(orchestrated.metadata),
-                "grounding_mode": "semantic_scene_compiler",
-                "grounding_orchestrator_active": 1.0,
-            },
+            grounding_facts=artifacts.grounding_facts,
+            grounding_target_facts=artifacts.grounding_target_facts,
+            grounding_hypotheses=artifacts.grounding_hypotheses,
+            grounding_verification_records=artifacts.grounding_verification_records,
+            grounding_validation_records=artifacts.grounding_validation_records,
+            grounding_repair_actions=artifacts.grounding_repair_actions,
+            grounding_world_state_records=artifacts.grounding_world_state_records,
+            grounding_ontology_records=artifacts.grounding_ontology_records,
+            grounding_ontology_facts=artifacts.grounding_ontology_facts,
+            grounding_world_state_active_facts=artifacts.grounding_world_state_active_facts,
+            grounding_world_state_hypothetical_facts=artifacts.grounding_world_state_hypothetical_facts,
+            grounding_world_state_contradicted_facts=artifacts.grounding_world_state_contradicted_facts,
+            grounding_graph_records=artifacts.grounding_graph_records,
+            metadata=dict(artifacts.metadata),
         )
+        return bundle, artifacts
 
     def _segments(self, text: str) -> List[str]:
         return split_text_segments(text, max_segments=self.max_steps)
@@ -1499,10 +1589,30 @@ def build_symbolic_trace_bundle(
     max_steps: int = 24,
     max_counterexamples: int = 4,
     semantic_backbone: Optional[SemanticGroundingBackbone] = None,
+    memory_records: Optional[Sequence[object]] = None,
 ) -> Optional[SymbolicExecutionTraceBundle]:
+    bundle, _artifacts = build_symbolic_trace_bundle_with_artifacts(
+        code,
+        lang_hint=lang_hint,
+        max_steps=max_steps,
+        max_counterexamples=max_counterexamples,
+        semantic_backbone=semantic_backbone,
+        memory_records=memory_records,
+    )
+    return bundle
+
+
+def build_symbolic_trace_bundle_with_artifacts(
+    code: str,
+    lang_hint: str = "python",
+    max_steps: int = 24,
+    max_counterexamples: int = 4,
+    semantic_backbone: Optional[SemanticGroundingBackbone] = None,
+    memory_records: Optional[Sequence[object]] = None,
+) -> Tuple[Optional[SymbolicExecutionTraceBundle], Optional[GroundingRuntimeArtifacts]]:
     normalized_hint = (lang_hint or "python").lower()
     if not code.strip():
-        return None
+        return None, None
     if normalized_hint == "python":
         builder = _PythonTraceBuilder(
             max_steps=max_steps,
@@ -1510,11 +1620,11 @@ def build_symbolic_trace_bundle(
         )
         bundle = builder.build(code)
         if bundle is not None:
-            return bundle
+            return bundle, None
     observation_builder = _ObservationTraceBuilder(
         language=normalized_hint,
         max_steps=max_steps,
         max_counterexamples=max_counterexamples,
         semantic_backbone=semantic_backbone,
     )
-    return observation_builder.build(code)
+    return observation_builder.build_with_artifacts(code, memory_records=memory_records)

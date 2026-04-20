@@ -10,6 +10,7 @@ GROUND_MENTION_PRED = 932
 GROUND_DISCOURSE_PRED = 933
 GROUND_TEMPORAL_PRED = 934
 GROUND_EXPLANATION_PRED = 935
+GROUND_COREFERENCE_PRED = 936
 
 
 def _stable_hash(text: str) -> int:
@@ -69,6 +70,17 @@ def compile_scene_context_symbolic_atoms(
                 (_lex_symbol(explanation.explanation_type), int(explanation.source_segment)),
             )
         )
+    for link in scene.coreference_links:
+        facts.append(
+            HornAtom(
+                GROUND_COREFERENCE_PRED,
+                (
+                    _entity_symbol(link.source_entity_id),
+                    _entity_symbol(link.target_entity_id),
+                    _lex_symbol(link.relation_type),
+                ),
+            )
+        )
 
     deduped = frozenset(_dedupe_facts(facts))
     stats = {
@@ -77,5 +89,6 @@ def compile_scene_context_symbolic_atoms(
         "scene_context_discourse_facts": float(sum(1 for fact in deduped if getattr(fact, "pred", None) == GROUND_DISCOURSE_PRED)),
         "scene_context_temporal_facts": float(sum(1 for fact in deduped if getattr(fact, "pred", None) == GROUND_TEMPORAL_PRED)),
         "scene_context_explanation_facts": float(sum(1 for fact in deduped if getattr(fact, "pred", None) == GROUND_EXPLANATION_PRED)),
+        "scene_context_coreference_facts": float(sum(1 for fact in deduped if getattr(fact, "pred", None) == GROUND_COREFERENCE_PRED)),
     }
     return deduped, stats

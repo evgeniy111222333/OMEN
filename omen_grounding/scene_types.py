@@ -28,6 +28,7 @@ class SemanticState:
     source_span: Optional[GroundingSpan] = None
     confidence: float = 0.55
     status: str = "hint"
+    evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -36,13 +37,20 @@ class SemanticEvent:
     event_type: str
     subject_entity_id: Optional[str] = None
     object_entity_id: Optional[str] = None
+    agent_entity_id: Optional[str] = None
+    patient_entity_id: Optional[str] = None
     subject_name: Optional[str] = None
     object_name: Optional[str] = None
+    modality: str = ""
+    condition: str = ""
+    explanation: str = ""
+    temporal: str = ""
     source_segment: int = 0
     source_span: Optional[GroundingSpan] = None
     confidence: float = 0.6
     polarity: str = "positive"
     status: str = "hint"
+    evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -56,6 +64,7 @@ class SemanticGoal:
     source_span: Optional[GroundingSpan] = None
     confidence: float = 0.58
     status: str = "hint"
+    evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -72,6 +81,7 @@ class SemanticClaim:
     object_value: Optional[str] = None
     event_id: Optional[str] = None
     goal_id: Optional[str] = None
+    evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -121,6 +131,19 @@ class SemanticExplanation:
     status: str = "proposal"
 
 
+@dataclass(frozen=True)
+class SemanticCoreferenceLink:
+    link_id: str
+    source_entity_id: str
+    target_entity_id: str
+    source_segment: int
+    target_segment: int
+    relation_type: str = "alias"
+    source_span: Optional[GroundingSpan] = None
+    confidence: float = 0.58
+    status: str = "hint"
+
+
 @dataclass
 class SemanticSceneGraph:
     language: str
@@ -134,4 +157,5 @@ class SemanticSceneGraph:
     discourse_relations: Tuple[SemanticDiscourseRelation, ...] = field(default_factory=tuple)
     temporal_markers: Tuple[SemanticTemporalMarker, ...] = field(default_factory=tuple)
     explanations: Tuple[SemanticExplanation, ...] = field(default_factory=tuple)
+    coreference_links: Tuple[SemanticCoreferenceLink, ...] = field(default_factory=tuple)
     metadata: Dict[str, float] = field(default_factory=dict)

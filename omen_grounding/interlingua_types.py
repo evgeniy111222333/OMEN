@@ -31,6 +31,7 @@ class CanonicalStateClaim:
     source_span: Optional[GroundingSpan] = None
     confidence: float = 0.55
     status: str = "proposal"
+    evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -46,9 +47,15 @@ class CanonicalRelationClaim:
     object_name: str
     source_segment: int
     source_span: Optional[GroundingSpan] = None
+    modality: str = ""
+    condition_key: Optional[str] = None
+    explanation_key: Optional[str] = None
+    temporal_key: Optional[str] = None
+    relation_modifiers: Tuple[str, ...] = field(default_factory=tuple)
     confidence: float = 0.6
     polarity: str = "positive"
     status: str = "proposal"
+    evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -65,6 +72,7 @@ class CanonicalGoalClaim:
     source_span: Optional[GroundingSpan] = None
     confidence: float = 0.58
     status: str = "proposal"
+    evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass

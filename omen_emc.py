@@ -99,10 +99,22 @@ class TrajectoryStats:
     grounding_uncertainties: list = field(default_factory=list)
     grounding_supports: list = field(default_factory=list)
     grounding_ambiguities: list = field(default_factory=list)
+    grounding_parser_disagreements: list = field(default_factory=list)
+    grounding_memory_recall_instabilities: list = field(default_factory=list)
+    grounding_proof_instabilities: list = field(default_factory=list)
+    grounding_contradiction_densities: list = field(default_factory=list)
+    grounding_coreference_pressures: list = field(default_factory=list)
+    grounding_world_model_mismatches: list = field(default_factory=list)
+    grounding_hypothesis_branching_pressures: list = field(default_factory=list)
+    grounding_counterfactual_pressures: list = field(default_factory=list)
     grounding_recall_pressures: list = field(default_factory=list)
     grounding_verification_pressures: list = field(default_factory=list)
     grounding_abduction_pressures: list = field(default_factory=list)
     grounding_control_pressures: list = field(default_factory=list)
+    grounding_recall_signals: list = field(default_factory=list)
+    grounding_abduction_signals: list = field(default_factory=list)
+    grounding_recall_logit_biases: list = field(default_factory=list)
+    grounding_abduction_logit_biases: list = field(default_factory=list)
     gap_deltas:        list  = field(default_factory=list)
     recall_gap_deltas: list  = field(default_factory=list)
     recall_gap_reliefs:list  = field(default_factory=list)
@@ -282,6 +294,14 @@ class EMCStateEncoder(nn.Module):
                 grounding_uncertainty: Optional[torch.Tensor] = None,
                 grounding_support: Optional[torch.Tensor] = None,
                 grounding_ambiguity: Optional[torch.Tensor] = None,
+                grounding_parser_disagreement: Optional[torch.Tensor] = None,
+                grounding_memory_instability: Optional[torch.Tensor] = None,
+                grounding_proof_instability: Optional[torch.Tensor] = None,
+                grounding_contradiction_density: Optional[torch.Tensor] = None,
+                grounding_coreference_pressure: Optional[torch.Tensor] = None,
+                grounding_world_model_mismatch: Optional[torch.Tensor] = None,
+                grounding_hypothesis_branching: Optional[torch.Tensor] = None,
+                grounding_counterfactual: Optional[torch.Tensor] = None,
                 grounding_recall: Optional[torch.Tensor] = None,
                 grounding_verify: Optional[torch.Tensor] = None,
                 grounding_abduction: Optional[torch.Tensor] = None,
@@ -369,7 +389,72 @@ class EMCStateEncoder(nn.Module):
         else:
             feat = torch.cat([z_enc, goal_enc, wm_enc, scalars], dim=-1)
 
-        return self.state_proj(feat)  # (B, d)
+        state = self.state_proj(feat)
+        evidence_scalars = torch.cat(
+            [
+                _as_col(
+                    grounding_parser_disagreement
+                    if grounding_parser_disagreement is not None
+                    else torch.zeros((), device=z.device, dtype=z.dtype)
+                ),
+                _as_col(
+                    grounding_memory_instability
+                    if grounding_memory_instability is not None
+                    else torch.zeros((), device=z.device, dtype=z.dtype)
+                ),
+                _as_col(
+                    grounding_proof_instability
+                    if grounding_proof_instability is not None
+                    else torch.zeros((), device=z.device, dtype=z.dtype)
+                ),
+                _as_col(
+                    grounding_contradiction_density
+                    if grounding_contradiction_density is not None
+                    else torch.zeros((), device=z.device, dtype=z.dtype)
+                ),
+                _as_col(
+                    grounding_coreference_pressure
+                    if grounding_coreference_pressure is not None
+                    else torch.zeros((), device=z.device, dtype=z.dtype)
+                ),
+                _as_col(
+                    grounding_world_model_mismatch
+                    if grounding_world_model_mismatch is not None
+                    else torch.zeros((), device=z.device, dtype=z.dtype)
+                ),
+                _as_col(
+                    grounding_hypothesis_branching
+                    if grounding_hypothesis_branching is not None
+                    else torch.zeros((), device=z.device, dtype=z.dtype)
+                ),
+                _as_col(
+                    grounding_counterfactual
+                    if grounding_counterfactual is not None
+                    else torch.zeros((), device=z.device, dtype=z.dtype)
+                ),
+            ],
+            dim=-1,
+        )
+        if torch.any(evidence_scalars != 0):
+            feature_ids = torch.arange(
+                1,
+                evidence_scalars.shape[-1] + 1,
+                device=z.device,
+                dtype=z.dtype,
+            ).unsqueeze(-1)
+            latent_ids = torch.arange(
+                1,
+                z.shape[-1] + 1,
+                device=z.device,
+                dtype=z.dtype,
+            ).unsqueeze(0)
+            evidence_basis = (
+                torch.sin(0.173 * feature_ids * latent_ids)
+                + torch.cos(0.117 * feature_ids * (latent_ids + 1.0))
+            ) / math.sqrt(float(evidence_scalars.shape[-1]))
+            evidence_state = torch.tanh(evidence_scalars @ evidence_basis)
+            state = F.layer_norm(state + (0.20 * evidence_state), (state.shape[-1],))
+        return state  # (B, d)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -491,6 +576,8 @@ class EfficientMetaController(nn.Module):
         self.eta_int      = getattr(cfg, 'emc_eta_int',        0.10)   # bonus for newly useful facts
         self.grounding_recall_bonus = getattr(cfg, 'emc_grounding_recall_bonus', 0.05)
         self.grounding_abduction_bonus = getattr(cfg, 'emc_grounding_abduction_bonus', 0.03)
+        self.grounding_recall_logit_bias = getattr(cfg, 'emc_grounding_recall_logit_bias', 0.24)
+        self.grounding_abduction_logit_bias = getattr(cfg, 'emc_grounding_abduction_logit_bias', 0.20)
         self.c_recall     = getattr(cfg, 'emc_c_recall',       0.01)
         self.c_fc         = getattr(cfg, 'emc_c_fc',           0.05)
         self.c_abduce     = getattr(cfg, 'emc_c_abduce',       0.10)
@@ -616,6 +703,38 @@ class EfficientMetaController(nn.Module):
         grounding_uncertainty = max(min(gap_info.get("grounding_uncertainty", 0.0), 1.0), 0.0)
         grounding_support = max(min(gap_info.get("grounding_support", 0.0), 1.0), 0.0)
         grounding_ambiguity = max(min(gap_info.get("grounding_ambiguity", 0.0), 1.0), 0.0)
+        grounding_parser_disagreement = max(
+            min(gap_info.get("grounding_parser_disagreement", 0.0), 1.0),
+            0.0,
+        )
+        grounding_memory_instability = max(
+            min(gap_info.get("grounding_memory_recall_instability", 0.0), 1.0),
+            0.0,
+        )
+        grounding_proof_instability = max(
+            min(gap_info.get("grounding_proof_instability", 0.0), 1.0),
+            0.0,
+        )
+        grounding_contradiction_density = max(
+            min(gap_info.get("grounding_contradiction_density", 0.0), 1.0),
+            0.0,
+        )
+        grounding_coreference_pressure = max(
+            min(gap_info.get("grounding_coreference_pressure", 0.0), 1.0),
+            0.0,
+        )
+        grounding_world_model_mismatch = max(
+            min(gap_info.get("grounding_world_model_mismatch", 0.0), 1.0),
+            0.0,
+        )
+        grounding_hypothesis_branching = max(
+            min(gap_info.get("grounding_hypothesis_branching_pressure", 0.0), 1.0),
+            0.0,
+        )
+        grounding_counterfactual = max(
+            min(gap_info.get("grounding_counterfactual_pressure", 0.0), 1.0),
+            0.0,
+        )
         grounding_recall = max(min(gap_info.get("grounding_recall_readiness", 0.0), 1.0), 0.0)
         grounding_verify = max(min(gap_info.get("grounding_verification_pressure", 0.0), 1.0), 0.0)
         grounding_abduction = max(min(gap_info.get("grounding_abduction_pressure", 0.0), 1.0), 0.0)
@@ -648,6 +767,14 @@ class EfficientMetaController(nn.Module):
             grounding_uncertainty=_s(grounding_uncertainty),
             grounding_support=_s(grounding_support),
             grounding_ambiguity=_s(grounding_ambiguity),
+            grounding_parser_disagreement=_s(grounding_parser_disagreement),
+            grounding_memory_instability=_s(grounding_memory_instability),
+            grounding_proof_instability=_s(grounding_proof_instability),
+            grounding_contradiction_density=_s(grounding_contradiction_density),
+            grounding_coreference_pressure=_s(grounding_coreference_pressure),
+            grounding_world_model_mismatch=_s(grounding_world_model_mismatch),
+            grounding_hypothesis_branching=_s(grounding_hypothesis_branching),
+            grounding_counterfactual=_s(grounding_counterfactual),
             grounding_recall=_s(grounding_recall),
             grounding_verify=_s(grounding_verify),
             grounding_abduction=_s(grounding_abduction),
@@ -851,22 +978,67 @@ class EfficientMetaController(nn.Module):
             + self.lambda_grounding_verification * verification
         )
 
+    @staticmethod
+    def _bounded_unit(value: object) -> float:
+        try:
+            return max(min(float(value), 1.0), 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _grounding_action_guidance(
+        self,
+        gap_features: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, float]:
+        features = gap_features or {}
+        recall_signal = (
+            0.45 * self._bounded_unit(features.get("grounding_recall_readiness", 0.0))
+            + 0.20 * self._bounded_unit(features.get("grounding_parser_disagreement", 0.0))
+            + 0.20 * self._bounded_unit(features.get("grounding_memory_recall_instability", 0.0))
+            + 0.10 * self._bounded_unit(features.get("grounding_coreference_pressure", 0.0))
+            + 0.05 * self._bounded_unit(features.get("grounding_contradiction_density", 0.0))
+        )
+        abduction_signal = (
+            0.35 * self._bounded_unit(features.get("grounding_abduction_pressure", 0.0))
+            + 0.20 * self._bounded_unit(features.get("grounding_hidden_cause_pressure", 0.0))
+            + 0.15 * self._bounded_unit(features.get("grounding_hypothesis_branching_pressure", 0.0))
+            + 0.15 * self._bounded_unit(features.get("grounding_counterfactual_pressure", 0.0))
+            + 0.10 * self._bounded_unit(features.get("grounding_proof_instability", 0.0))
+            + 0.05 * self._bounded_unit(features.get("grounding_world_model_mismatch", 0.0))
+        )
+        recall_signal = max(min(recall_signal, 1.0), 0.0)
+        abduction_signal = max(min(abduction_signal, 1.0), 0.0)
+        return {
+            "recall_signal": recall_signal,
+            "abduction_signal": abduction_signal,
+            "recall_logit_bias": self.grounding_recall_logit_bias * recall_signal,
+            "abduction_logit_bias": self.grounding_abduction_logit_bias * abduction_signal,
+        }
+
+    def _apply_grounding_action_logit_bias(
+        self,
+        logits: torch.Tensor,
+        gap_features: Optional[Dict[str, float]] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        guidance = self._grounding_action_guidance(gap_features)
+        biased_logits = logits.clone()
+        biased_logits[..., ACTION_RECALL] = (
+            biased_logits[..., ACTION_RECALL] + guidance["recall_logit_bias"]
+        )
+        biased_logits[..., ACTION_ABDUCE] = (
+            biased_logits[..., ACTION_ABDUCE] + guidance["abduction_logit_bias"]
+        )
+        return biased_logits, guidance
+
     def _grounding_action_bonus(
         self,
         action: int,
         gap_features: Optional[Dict[str, float]] = None,
     ) -> float:
-        features = gap_features or {}
+        guidance = self._grounding_action_guidance(gap_features)
         if action == ACTION_RECALL:
-            return self.grounding_recall_bonus * max(
-                min(float(features.get("grounding_recall_readiness", 0.0)), 1.0),
-                0.0,
-            )
+            return self.grounding_recall_bonus * guidance["recall_signal"]
         if action == ACTION_ABDUCE:
-            return self.grounding_abduction_bonus * max(
-                min(float(features.get("grounding_abduction_pressure", 0.0)), 1.0),
-                0.0,
-            )
+            return self.grounding_abduction_bonus * guidance["abduction_signal"]
         return 0.0
 
     # Main loop
@@ -1016,6 +1188,30 @@ class EfficientMetaController(nn.Module):
             traj.grounding_ambiguities.append(
                 float(current_gap_features.get("grounding_ambiguity", 0.0))
             )
+            traj.grounding_parser_disagreements.append(
+                float(current_gap_features.get("grounding_parser_disagreement", 0.0))
+            )
+            traj.grounding_memory_recall_instabilities.append(
+                float(current_gap_features.get("grounding_memory_recall_instability", 0.0))
+            )
+            traj.grounding_proof_instabilities.append(
+                float(current_gap_features.get("grounding_proof_instability", 0.0))
+            )
+            traj.grounding_contradiction_densities.append(
+                float(current_gap_features.get("grounding_contradiction_density", 0.0))
+            )
+            traj.grounding_coreference_pressures.append(
+                float(current_gap_features.get("grounding_coreference_pressure", 0.0))
+            )
+            traj.grounding_world_model_mismatches.append(
+                float(current_gap_features.get("grounding_world_model_mismatch", 0.0))
+            )
+            traj.grounding_hypothesis_branching_pressures.append(
+                float(current_gap_features.get("grounding_hypothesis_branching_pressure", 0.0))
+            )
+            traj.grounding_counterfactual_pressures.append(
+                float(current_gap_features.get("grounding_counterfactual_pressure", 0.0))
+            )
             traj.grounding_recall_pressures.append(
                 float(current_gap_features.get("grounding_recall_readiness", 0.0))
             )
@@ -1059,12 +1255,20 @@ class EfficientMetaController(nn.Module):
             # ── Actor: π_meta(a|s) ───────────────────────────────────────────
             action_logits = self.actor(state_vec)
             mean_logits   = action_logits.mean(0)
+            biased_logits, action_guidance = self._apply_grounding_action_logit_bias(
+                mean_logits,
+                current_gap_features,
+            )
+            traj.grounding_recall_signals.append(action_guidance["recall_signal"])
+            traj.grounding_abduction_signals.append(action_guidance["abduction_signal"])
+            traj.grounding_recall_logit_biases.append(action_guidance["recall_logit_bias"])
+            traj.grounding_abduction_logit_biases.append(action_guidance["abduction_logit_bias"])
             action_mask = self._action_mask(
                 device,
                 allow_abduction=True,
                 allow_intrinsic=intrinsic_goal_available,
             )
-            masked_logits = self._mask_action_logits(mean_logits, action_mask)
+            masked_logits = self._mask_action_logits(biased_logits, action_mask)
             dist          = Categorical(logits=masked_logits)
             action        = dist.sample()
             log_p         = dist.log_prob(action)
@@ -1670,6 +1874,53 @@ class EfficientMetaController(nn.Module):
                 float(sum(traj.grounding_ambiguities) / len(traj.grounding_ambiguities))
                 if traj.grounding_ambiguities else 0.0
             ),
+            "emc_state_grounding_parser_disagreement": (
+                float(sum(traj.grounding_parser_disagreements) / len(traj.grounding_parser_disagreements))
+                if traj.grounding_parser_disagreements else 0.0
+            ),
+            "emc_state_grounding_memory_recall_instability": (
+                float(
+                    sum(traj.grounding_memory_recall_instabilities)
+                    / len(traj.grounding_memory_recall_instabilities)
+                )
+                if traj.grounding_memory_recall_instabilities else 0.0
+            ),
+            "emc_state_grounding_proof_instability": (
+                float(sum(traj.grounding_proof_instabilities) / len(traj.grounding_proof_instabilities))
+                if traj.grounding_proof_instabilities else 0.0
+            ),
+            "emc_state_grounding_contradiction_density": (
+                float(
+                    sum(traj.grounding_contradiction_densities)
+                    / len(traj.grounding_contradiction_densities)
+                )
+                if traj.grounding_contradiction_densities else 0.0
+            ),
+            "emc_state_grounding_coreference_pressure": (
+                float(sum(traj.grounding_coreference_pressures) / len(traj.grounding_coreference_pressures))
+                if traj.grounding_coreference_pressures else 0.0
+            ),
+            "emc_state_grounding_world_model_mismatch": (
+                float(
+                    sum(traj.grounding_world_model_mismatches)
+                    / len(traj.grounding_world_model_mismatches)
+                )
+                if traj.grounding_world_model_mismatches else 0.0
+            ),
+            "emc_state_grounding_hypothesis_branching_pressure": (
+                float(
+                    sum(traj.grounding_hypothesis_branching_pressures)
+                    / len(traj.grounding_hypothesis_branching_pressures)
+                )
+                if traj.grounding_hypothesis_branching_pressures else 0.0
+            ),
+            "emc_state_grounding_counterfactual_pressure": (
+                float(
+                    sum(traj.grounding_counterfactual_pressures)
+                    / len(traj.grounding_counterfactual_pressures)
+                )
+                if traj.grounding_counterfactual_pressures else 0.0
+            ),
             "emc_state_grounding_recall_readiness": (
                 float(sum(traj.grounding_recall_pressures) / len(traj.grounding_recall_pressures))
                 if traj.grounding_recall_pressures else 0.0
@@ -1688,6 +1939,25 @@ class EfficientMetaController(nn.Module):
             "emc_state_grounding_control_pressure": (
                 float(sum(traj.grounding_control_pressures) / len(traj.grounding_control_pressures))
                 if traj.grounding_control_pressures else 0.0
+            ),
+            "emc_policy_grounding_recall_signal": (
+                float(sum(traj.grounding_recall_signals) / len(traj.grounding_recall_signals))
+                if traj.grounding_recall_signals else 0.0
+            ),
+            "emc_policy_grounding_abduction_signal": (
+                float(sum(traj.grounding_abduction_signals) / len(traj.grounding_abduction_signals))
+                if traj.grounding_abduction_signals else 0.0
+            ),
+            "emc_policy_grounding_recall_logit_bias": (
+                float(sum(traj.grounding_recall_logit_biases) / len(traj.grounding_recall_logit_biases))
+                if traj.grounding_recall_logit_biases else 0.0
+            ),
+            "emc_policy_grounding_abduction_logit_bias": (
+                float(
+                    sum(traj.grounding_abduction_logit_biases)
+                    / len(traj.grounding_abduction_logit_biases)
+                )
+                if traj.grounding_abduction_logit_biases else 0.0
             ),
             "emc_gap_events": float(len(traj.gap_deltas)),
             "emc_recall_steps": float(len(traj.recall_gap_deltas)),
@@ -1785,10 +2055,22 @@ class EfficientMetaController(nn.Module):
         grounding_uncertainties: List[float] = []
         grounding_supports: List[float] = []
         grounding_ambiguities: List[float] = []
+        grounding_parser_disagreements: List[float] = []
+        grounding_memory_recall_instabilities: List[float] = []
+        grounding_proof_instabilities: List[float] = []
+        grounding_contradiction_densities: List[float] = []
+        grounding_coreference_pressures: List[float] = []
+        grounding_world_model_mismatches: List[float] = []
+        grounding_hypothesis_branching_pressures: List[float] = []
+        grounding_counterfactual_pressures: List[float] = []
         grounding_recall_pressures: List[float] = []
         grounding_verification_pressures: List[float] = []
         grounding_abduction_pressures: List[float] = []
         grounding_control_pressures: List[float] = []
+        grounding_recall_signals: List[float] = []
+        grounding_abduction_signals: List[float] = []
+        grounding_recall_logit_biases: List[float] = []
+        grounding_abduction_logit_biases: List[float] = []
         recall_gap_deltas: List[float] = []
         recall_gap_reliefs: List[float] = []
         recall_effective_steps = 0.0
@@ -1822,6 +2104,30 @@ class EfficientMetaController(nn.Module):
             grounding_uncertainties.append(float(current_gap_features.get("grounding_uncertainty", 0.0)))
             grounding_supports.append(float(current_gap_features.get("grounding_support", 0.0)))
             grounding_ambiguities.append(float(current_gap_features.get("grounding_ambiguity", 0.0)))
+            grounding_parser_disagreements.append(
+                float(current_gap_features.get("grounding_parser_disagreement", 0.0))
+            )
+            grounding_memory_recall_instabilities.append(
+                float(current_gap_features.get("grounding_memory_recall_instability", 0.0))
+            )
+            grounding_proof_instabilities.append(
+                float(current_gap_features.get("grounding_proof_instability", 0.0))
+            )
+            grounding_contradiction_densities.append(
+                float(current_gap_features.get("grounding_contradiction_density", 0.0))
+            )
+            grounding_coreference_pressures.append(
+                float(current_gap_features.get("grounding_coreference_pressure", 0.0))
+            )
+            grounding_world_model_mismatches.append(
+                float(current_gap_features.get("grounding_world_model_mismatch", 0.0))
+            )
+            grounding_hypothesis_branching_pressures.append(
+                float(current_gap_features.get("grounding_hypothesis_branching_pressure", 0.0))
+            )
+            grounding_counterfactual_pressures.append(
+                float(current_gap_features.get("grounding_counterfactual_pressure", 0.0))
+            )
             grounding_recall_pressures.append(
                 float(current_gap_features.get("grounding_recall_readiness", 0.0))
             )
@@ -1853,12 +2159,20 @@ class EfficientMetaController(nn.Module):
             # Greedy action selection (argmax, not sampling - eval mode)
             action_logits = self.actor(state_vec)
             mean_logits   = action_logits.mean(0)
+            biased_logits, action_guidance = self._apply_grounding_action_logit_bias(
+                mean_logits,
+                current_gap_features,
+            )
+            grounding_recall_signals.append(action_guidance["recall_signal"])
+            grounding_abduction_signals.append(action_guidance["abduction_signal"])
+            grounding_recall_logit_biases.append(action_guidance["recall_logit_bias"])
+            grounding_abduction_logit_biases.append(action_guidance["abduction_logit_bias"])
             action_mask = self._action_mask(
                 device,
                 allow_abduction=True,
                 allow_intrinsic=intrinsic_goal_available,
             )
-            masked_logits = self._mask_action_logits(mean_logits, action_mask)
+            masked_logits = self._mask_action_logits(biased_logits, action_mask)
             a = masked_logits.argmax().item()
 
             action_counts[a] = action_counts[a] + 1
@@ -2173,6 +2487,53 @@ class EfficientMetaController(nn.Module):
                 float(sum(grounding_ambiguities) / len(grounding_ambiguities))
                 if grounding_ambiguities else 0.0
             ),
+            "emc_state_grounding_parser_disagreement": (
+                float(sum(grounding_parser_disagreements) / len(grounding_parser_disagreements))
+                if grounding_parser_disagreements else 0.0
+            ),
+            "emc_state_grounding_memory_recall_instability": (
+                float(
+                    sum(grounding_memory_recall_instabilities)
+                    / len(grounding_memory_recall_instabilities)
+                )
+                if grounding_memory_recall_instabilities else 0.0
+            ),
+            "emc_state_grounding_proof_instability": (
+                float(sum(grounding_proof_instabilities) / len(grounding_proof_instabilities))
+                if grounding_proof_instabilities else 0.0
+            ),
+            "emc_state_grounding_contradiction_density": (
+                float(
+                    sum(grounding_contradiction_densities)
+                    / len(grounding_contradiction_densities)
+                )
+                if grounding_contradiction_densities else 0.0
+            ),
+            "emc_state_grounding_coreference_pressure": (
+                float(sum(grounding_coreference_pressures) / len(grounding_coreference_pressures))
+                if grounding_coreference_pressures else 0.0
+            ),
+            "emc_state_grounding_world_model_mismatch": (
+                float(
+                    sum(grounding_world_model_mismatches)
+                    / len(grounding_world_model_mismatches)
+                )
+                if grounding_world_model_mismatches else 0.0
+            ),
+            "emc_state_grounding_hypothesis_branching_pressure": (
+                float(
+                    sum(grounding_hypothesis_branching_pressures)
+                    / len(grounding_hypothesis_branching_pressures)
+                )
+                if grounding_hypothesis_branching_pressures else 0.0
+            ),
+            "emc_state_grounding_counterfactual_pressure": (
+                float(
+                    sum(grounding_counterfactual_pressures)
+                    / len(grounding_counterfactual_pressures)
+                )
+                if grounding_counterfactual_pressures else 0.0
+            ),
             "emc_state_grounding_recall_readiness": (
                 float(sum(grounding_recall_pressures) / len(grounding_recall_pressures))
                 if grounding_recall_pressures else 0.0
@@ -2188,6 +2549,25 @@ class EfficientMetaController(nn.Module):
             "emc_state_grounding_control_pressure": (
                 float(sum(grounding_control_pressures) / len(grounding_control_pressures))
                 if grounding_control_pressures else 0.0
+            ),
+            "emc_policy_grounding_recall_signal": (
+                float(sum(grounding_recall_signals) / len(grounding_recall_signals))
+                if grounding_recall_signals else 0.0
+            ),
+            "emc_policy_grounding_abduction_signal": (
+                float(sum(grounding_abduction_signals) / len(grounding_abduction_signals))
+                if grounding_abduction_signals else 0.0
+            ),
+            "emc_policy_grounding_recall_logit_bias": (
+                float(sum(grounding_recall_logit_biases) / len(grounding_recall_logit_biases))
+                if grounding_recall_logit_biases else 0.0
+            ),
+            "emc_policy_grounding_abduction_logit_bias": (
+                float(
+                    sum(grounding_abduction_logit_biases)
+                    / len(grounding_abduction_logit_biases)
+                )
+                if grounding_abduction_logit_biases else 0.0
             ),
             "emc_gap_events": float(len(gap_deltas)),
             "emc_recall_steps": float(len(recall_gap_deltas)),

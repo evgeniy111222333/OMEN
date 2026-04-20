@@ -1,5 +1,6 @@
 from .backbone import SemanticGroundingBackbone
 from .context_atoms import (
+    GROUND_COREFERENCE_PRED,
     GROUND_DISCOURSE_PRED,
     GROUND_EXPLANATION_PRED,
     GROUND_MENTION_PRED,
@@ -22,22 +23,42 @@ from .memory_policy import (
     grounding_memory_writeback_records,
     grounding_memory_writeback_status_counts,
 )
+from .heuristic_backbone import (
+    HeuristicFallbackSemanticBackbone,
+    extract_goal_hints,
+    extract_relation_hints,
+)
+from .source_routing import infer_script_profile, infer_source_profile, verification_path_for_source
 from .planner_semantics import (
     PlannerAlternativeWorld,
     PlannerOperator,
     PlannerResource,
+)
+from .planner_guidance import (
+    PlannerConstraint,
+    PlannerRepairDirective,
+    build_planner_guidance,
 )
 from .planner_state import PlannerWorldState, build_planner_world_state
 from .planner_bridge import (
     PLAN_ACTIVE_EFFECT_PRED,
     PLAN_ACTIVE_RESOURCE_PRED,
     PLAN_ACTIVE_WORLD_PRED,
+    PLAN_AVOID_CONSTRAINT_PRED,
+    PLAN_CONFLICTED_VERIFICATION_PRED,
     PLAN_CONTRADICTED_EFFECT_PRED,
     PLAN_CONTRADICTED_RESOURCE_PRED,
     PLAN_CONTRADICTED_WORLD_PRED,
+    PLAN_BRANCH_CONSTRAINT_PRED,
+    PLAN_DEFERRED_VERIFICATION_PRED,
+    PLAN_HYPOTHESIS_PRED,
     PLAN_HYPOTHETICAL_EFFECT_PRED,
     PLAN_HYPOTHETICAL_RESOURCE_PRED,
     PLAN_HYPOTHETICAL_WORLD_PRED,
+    PLAN_LINEAGE_PRED,
+    PLAN_PREFER_CONSTRAINT_PRED,
+    PLAN_REPAIR_DIRECTIVE_PRED,
+    PLAN_SUPPORTED_VERIFICATION_PRED,
     PlannerBridgeOperatorSpec,
     compile_planner_bridge_operator_specs,
     planner_state_seed_facts,
@@ -61,6 +82,7 @@ from .ontology_growth import (
 )
 from .scene_types import (
     SemanticClaim,
+    SemanticCoreferenceLink,
     SemanticDiscourseRelation,
     SemanticEntity,
     SemanticEvent,
@@ -96,6 +118,12 @@ from .verification import (
     GroundingVerificationReport,
     verify_symbolic_hypotheses,
 )
+from .verifier_stack import (
+    GroundingRepairAction,
+    GroundingValidationRecord,
+    GroundingVerifierStackResult,
+    run_grounding_verifier_stack,
+)
 from .symbolic_atoms import (
     GROUND_CLAIM_KIND_PRED,
     GROUND_ENTITY_PRED,
@@ -114,8 +142,6 @@ from .symbolic_compiler import (
     compile_semantic_scene_graph,
 )
 from .text_semantics import (
-    extract_goal_hints,
-    extract_relation_hints,
     extract_structured_pairs,
     ground_text_document,
     is_counterexample_text,
@@ -125,8 +151,13 @@ from .text_semantics import (
     tokenize_semantic_words,
 )
 from .types import (
+    GroundedStructuralUnit,
+    GroundedEntityHint,
+    GroundedEventHint,
     GroundedGoalHint,
+    GroundingParserCandidate,
     GroundedRelationHint,
+    GroundingSourceProfile,
     GroundedStateHint,
     GroundedTextDocument,
     GroundedTextSegment,
@@ -140,8 +171,13 @@ from .memory_hints import (
 )
 
 __all__ = [
+    "GroundedEntityHint",
+    "GroundedEventHint",
     "GroundedGoalHint",
+    "GroundedStructuralUnit",
     "GroundedRelationHint",
+    "GroundingParserCandidate",
+    "GroundingSourceProfile",
     "GroundedStateHint",
     "GroundedTextDocument",
     "GroundedTextSegment",
@@ -149,6 +185,7 @@ __all__ = [
     "GroundingOrchestratorResult",
     "GroundingOntologyConcept",
     "GroundingOntologyGrowthResult",
+    "HeuristicFallbackSemanticBackbone",
     "grounding_emc_features",
     "grounding_memory_families",
     "grounding_memory_records",
@@ -162,10 +199,13 @@ __all__ = [
     "grounding_memory_writeback_status_counts",
     "PlannerAlternativeWorld",
     "PlannerBridgeOperatorSpec",
+    "PlannerConstraint",
     "PlannerOperator",
+    "PlannerRepairDirective",
     "PlannerResource",
     "PlannerWorldState",
     "build_planner_world_state",
+    "build_planner_guidance",
     "CanonicalEntity",
     "CanonicalGoalClaim",
     "CanonicalInterlingua",
@@ -173,6 +213,7 @@ __all__ = [
     "CanonicalStateClaim",
     "SceneContextGraphRecord",
     "SemanticClaim",
+    "SemanticCoreferenceLink",
     "SemanticDiscourseRelation",
     "SemanticEntity",
     "SemanticEvent",
@@ -188,11 +229,15 @@ __all__ = [
     "GroundingGraphRecord",
     "GroundingVerificationRecord",
     "GroundingVerificationReport",
+    "GroundingValidationRecord",
+    "GroundingRepairAction",
+    "GroundingVerifierStackResult",
     "GroundingWorldStateRecord",
     "GroundingWorldStateWriteback",
     "GROUND_ONTOLOGY_CONCEPT_PRED",
     "GROUND_ONTOLOGY_MEMBER_PRED",
     "GROUND_ONTOLOGY_SIGNATURE_PRED",
+    "GROUND_COREFERENCE_PRED",
     "GROUND_DISCOURSE_PRED",
     "GROUND_EXPLANATION_PRED",
     "GROUND_MENTION_PRED",
@@ -216,12 +261,21 @@ __all__ = [
     "PLAN_ACTIVE_EFFECT_PRED",
     "PLAN_ACTIVE_RESOURCE_PRED",
     "PLAN_ACTIVE_WORLD_PRED",
+    "PLAN_AVOID_CONSTRAINT_PRED",
+    "PLAN_CONFLICTED_VERIFICATION_PRED",
     "PLAN_CONTRADICTED_EFFECT_PRED",
     "PLAN_CONTRADICTED_RESOURCE_PRED",
     "PLAN_CONTRADICTED_WORLD_PRED",
+    "PLAN_BRANCH_CONSTRAINT_PRED",
+    "PLAN_DEFERRED_VERIFICATION_PRED",
+    "PLAN_HYPOTHESIS_PRED",
     "PLAN_HYPOTHETICAL_EFFECT_PRED",
     "PLAN_HYPOTHETICAL_RESOURCE_PRED",
     "PLAN_HYPOTHETICAL_WORLD_PRED",
+    "PLAN_LINEAGE_PRED",
+    "PLAN_PREFER_CONSTRAINT_PRED",
+    "PLAN_REPAIR_DIRECTIVE_PRED",
+    "PLAN_SUPPORTED_VERIFICATION_PRED",
     "SymbolicCompilationResult",
     "TextGroundingPipelineResult",
     "build_canonical_interlingua",
@@ -252,4 +306,8 @@ __all__ = [
     "split_text_segments",
     "split_text_segments_with_spans",
     "tokenize_semantic_words",
+    "infer_script_profile",
+    "infer_source_profile",
+    "run_grounding_verifier_stack",
+    "verification_path_for_source",
 ]

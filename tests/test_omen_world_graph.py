@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 
 from omen_scale import OMENScale
 from omen_scale_config import OMENScaleConfig
+from omen_grounding import GroundingSourceProfile
 from omen_prolog import (
     DifferentiableProver,
     HornAtom,
@@ -423,6 +424,69 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertEqual(routing.subtype, "log_text")
         self.assertEqual(routing.verification_path, "log_trace_verification")
 
+    def test_ast_language_router_returns_full_grounding_source_profile_contract(self) -> None:
+        cfg = OMENScaleConfig.demo()
+        cfg.allow_noncanonical_ablation = True
+        cfg.net_enabled = False
+        cfg.osf_enabled = False
+        cfg.emc_enabled = False
+        cfg.saliency_enabled = False
+        cfg.continuous_cycle_enabled = False
+        cfg.creative_cycle_enabled = False
+        model = OMENScale(cfg)
+
+        def encode_row(text: str) -> torch.Tensor:
+            encoded = [ord(ch) for ch in text.encode("ascii", errors="ignore").decode("ascii")]
+            encoded = encoded[: cfg.seq_len]
+            if len(encoded) < cfg.seq_len:
+                encoded = encoded + [0] * (cfg.seq_len - len(encoded))
+            return torch.tensor(encoded[:-1], dtype=torch.long)
+
+        row = encode_row("User: the server is slow.\nAssistant: check the database latency first.")
+
+        routing = model._source_routing_from_bytes(row)
+
+        self.assertIsInstance(routing, GroundingSourceProfile)
+        self.assertEqual(routing.script, "latin")
+        self.assertGreaterEqual(routing.script_profile.get("latin", 0.0), 0.8)
+        self.assertLess(routing.ambiguity, 1.0)
+        self.assertTrue(routing.parser_candidates)
+        self.assertEqual(routing.parser_candidates[0].role, "primary")
+        self.assertEqual(routing.parser_candidates[0].parser_name, "speaker_turn_parser")
+
+    def test_ast_language_router_exposes_json_record_contract_in_runtime(self) -> None:
+        cfg = OMENScaleConfig.demo()
+        cfg.allow_noncanonical_ablation = True
+        cfg.net_enabled = False
+        cfg.osf_enabled = False
+        cfg.emc_enabled = False
+        cfg.saliency_enabled = False
+        cfg.continuous_cycle_enabled = False
+        cfg.creative_cycle_enabled = False
+        model = OMENScale(cfg)
+
+        def encode_row(text: str) -> torch.Tensor:
+            encoded = [ord(ch) for ch in text.encode("ascii", errors="ignore").decode("ascii")]
+            encoded = encoded[: cfg.seq_len]
+            if len(encoded) < cfg.seq_len:
+                encoded = encoded + [0] * (cfg.seq_len - len(encoded))
+            return torch.tensor(encoded[:-1], dtype=torch.long)
+
+        row = encode_row(
+            '{"step":1,"weather":"rain","road":"wet"}\n'
+            '{"step":2,"weather":"storm","road":"closed"}'
+        )
+
+        routing = model._source_routing_from_bytes(row)
+
+        self.assertEqual(routing.language, "json")
+        self.assertEqual(routing.domain, "structured_observation")
+        self.assertEqual(routing.modality, "structured_text")
+        self.assertEqual(routing.subtype, "json_records")
+        self.assertEqual(routing.verification_path, "structured_state_verification")
+        self.assertGreaterEqual(routing.profile.get("structured_text", 0.0), 0.8)
+        self.assertTrue(any(candidate.parser_name == "json_parser" for candidate in routing.parser_candidates))
+
     def test_row_runtime_cache_keeps_full_tokens_but_strips_decode_padding(self) -> None:
         cfg = OMENScaleConfig.demo()
         cfg.allow_noncanonical_ablation = True
@@ -795,6 +859,8 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertGreater(len(out["world_state"].target_facts), 0)
         self.assertGreaterEqual(out["planner_state_active_records"], 0.0)
         self.assertGreaterEqual(out["planner_state_operators"], 0.0)
+        self.assertGreaterEqual(out["planner_state_constraints"], 0.0)
+        self.assertGreaterEqual(out["planner_state_repair_directives"], 0.0)
         self.assertGreaterEqual(out["planner_state_world_rules"], 0.0)
         self.assertGreaterEqual(out["world_graph_nodes"], 1.0)
         self.assertGreaterEqual(out["world_graph_edges"], 1.0)
@@ -1020,17 +1086,32 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertGreaterEqual(out["sym_trace_grounding_world_state_records"], 2.0)
         self.assertGreaterEqual(out["sym_trace_grounding_world_state_active_facts"], 1.0)
         self.assertGreaterEqual(out["sym_grounding_hypotheses"], 2.0)
+        self.assertGreaterEqual(out["sym_grounding_graph_records"], 1.0)
         self.assertGreaterEqual(out["sym_grounding_world_state_records"], 2.0)
         self.assertGreaterEqual(out["sym_grounding_world_state_active_facts"], 1.0)
         self.assertGreaterEqual(out["sym_grounding_verification_records"], 1.0)
         self.assertGreaterEqual(out["sym_grounding_support_ratio"], 0.5)
         self.assertGreaterEqual(out["sym_grounding_uncertainty"], 0.0)
         self.assertGreaterEqual(out["sym_grounding_repair_pressure"], 0.0)
+        self.assertGreaterEqual(out["sym_grounding_parser_disagreement"], 0.0)
+        self.assertGreaterEqual(out["sym_grounding_memory_recall_instability"], 0.0)
+        self.assertGreaterEqual(out["sym_grounding_proof_instability"], 0.0)
+        self.assertGreaterEqual(out["sym_grounding_contradiction_density"], 0.0)
+        self.assertGreaterEqual(out["sym_grounding_coreference_pressure"], 0.0)
+        self.assertGreaterEqual(out["sym_grounding_world_model_mismatch"], 0.0)
+        self.assertGreaterEqual(out["sym_grounding_hypothesis_branching_pressure"], 0.0)
+        self.assertGreaterEqual(out["sym_grounding_counterfactual_pressure"], 0.0)
         self.assertGreaterEqual(out["sym_grounding_world_state_branching_pressure"], 0.0)
         self.assertGreaterEqual(out["sym_grounding_world_state_contradiction_pressure"], 0.0)
         self.assertGreaterEqual(out["planner_state_hypothetical_records"], 0.0)
         self.assertGreaterEqual(out["planner_state_alternative_world_records"], 0.0)
+        self.assertGreaterEqual(out["planner_state_verification_records"], 1.0)
+        self.assertGreaterEqual(out["planner_state_hypothesis_records"], 1.0)
+        self.assertGreaterEqual(out["planner_state_graph_records"], 1.0)
+        self.assertGreaterEqual(out["planner_state_lineage_symbols"], 1.0)
         self.assertGreaterEqual(out["planner_state_contradiction_pressure"], 0.0)
+        self.assertGreaterEqual(out["planner_state_constraint_pressure"], 0.0)
+        self.assertGreaterEqual(out["planner_state_repair_pressure"], 0.0)
         self.assertGreaterEqual(out["planner_state_uncertainty"], 0.0)
         self.assertGreaterEqual(out["sym_mem_grounding_write_selected"], 0.0)
         self.assertGreaterEqual(out["sym_grounding_mean_compiled_confidence"], 0.5)
@@ -1040,6 +1121,7 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertGreaterEqual(out["world_graph_grounding_hypotheses"], 1.0)
         self.assertGreaterEqual(out["world_graph_grounding_verification_records"], 1.0)
         self.assertGreaterEqual(out["world_graph_interlingua_facts"], 1.0)
+        self.assertGreaterEqual(out["world_graph_grounding_graph_records"], 1.0)
         self.assertEqual(out["source_modality"], "natural_text")
         self.assertEqual(out["source_verification_path"], "natural_language_claim_verification")
         self.assertEqual(out["sym_source_modality_natural_text"], 1.0)
@@ -1112,6 +1194,8 @@ class WorldGraphIntegrationTest(unittest.TestCase):
             seeded,
         )
         ctx = model._build_generation_task_context(src, memory_grounding_records=recalled)
+        self.assertGreater(float(ctx.metadata.get("grounding_memory_corroboration", 0.0)), 0.0)
+        self.assertGreater(float(ctx.metadata.get("trace_verification_memory_corroboration", 0.0)), 0.0)
         fact_batches, record_batches, extra_count = model._semantic_world_fact_batches(1, ctx)
         self.assertGreater(extra_count, 0.0)
 
@@ -1127,6 +1211,8 @@ class WorldGraphIntegrationTest(unittest.TestCase):
             + graph_batch.metadata.get("grounding_hypotheses", 0.0),
             1.0,
         )
+        self.assertGreaterEqual(graph_batch.metadata.get("interlingua_facts", 0.0), 1.0)
+        self.assertGreaterEqual(graph_batch.metadata.get("grounding_graph_records", 0.0), 1.0)
         self.assertGreaterEqual(graph_batch.metadata.get("grounding_world_state_records", 0.0), 1.0)
         self.assertGreaterEqual(graph_batch.metadata.get("grounding_world_state_active_facts", 0.0), 1.0)
         self.assertGreaterEqual(graph_batch.metadata.get("grounding_verification_records", 0.0), 1.0)

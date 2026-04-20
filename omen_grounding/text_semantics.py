@@ -3,61 +3,24 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
+from .source_routing import infer_source_profile
 from .types import (
-    GroundedGoalHint,
-    GroundedRelationHint,
+    GroundedStructuralUnit,
     GroundedStateHint,
     GroundedTextDocument,
     GroundedTextSegment,
+    GroundingSourceProfile,
     GroundingSpan,
 )
 
 
-_WORD_RE = re.compile(r"[^\W_][\w'’`.-]*", re.UNICODE)
-_QUOTE_RE = re.compile(r"[\"“”«»]([^\"“”«»]+)[\"“”«»]", re.UNICODE)
+_WORD_RE = re.compile(r"[^\W\d_](?:[\w'’`.-]*[^\W_])?", re.UNICODE)
 _STATE_PAIR_RE = re.compile(
     r"(?P<key>[^\W\d_][\w.-]*)\s*(?P<op>=|:)\s*(?P<value>\"[^\"]+\"|«[^»]+»|[^\s,;|]+)",
     re.UNICODE,
 )
-
-_GOAL_KEYS = frozenset(
-    {
-        "goal",
-        "target",
-        "desired",
-        "expect",
-        "expected",
-        "aim",
-        "objective",
-        "мета",
-        "ціль",
-        "завдання",
-    }
-)
-
-_FOCUS_WRAPPER_TOKENS = frozenset(
-    {
-        "object",
-        "objects",
-        "type",
-        "types",
-        "class",
-        "classes",
-        "entity",
-        "entities",
-        "обєкт",
-        "обєкти",
-        "об'єкт",
-        "об'єкти",
-        "тип",
-        "типу",
-        "клас",
-        "класу",
-    }
-)
-
 _NEGATION_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE | re.UNICODE)
     for pattern in (
@@ -68,6 +31,9 @@ _NEGATION_PATTERNS = tuple(
         r"\bhowever\b",
         r"\bbut\b",
         r"\bfailed\b",
+        r"\bfail(?:ed|s|ure)?\b",
+        r"\bcannot\b",
+        r"\bcan't\b",
         r"\bне\b",
         r"\bнемає\b",
         r"\bбез\b",
@@ -75,81 +41,41 @@ _NEGATION_PATTERNS = tuple(
         r"\bоднак\b",
         r"\bзбій\b",
         r"\bпомилка\b",
+        r"\bневдач\w*\b",
         r"\bнеправиль\w*\b",
     )
 )
 
-_GOAL_MARKERS: Tuple[Tuple[str, float], ...] = (
-    ("expected", 0.60),
-    ("expected result", 0.65),
-    ("goal", 0.60),
-    ("target", 0.60),
-    ("desired", 0.58),
-    ("need", 0.54),
-    ("must", 0.54),
-    ("should", 0.54),
-    ("want", 0.52),
-    ("aim", 0.52),
-    ("мета", 0.60),
-    ("ціль", 0.60),
-    ("завдання", 0.60),
-    ("очікується", 0.60),
-    ("очікуваний результат", 0.65),
-    ("потрібно", 0.56),
-    ("треба", 0.56),
-    ("має", 0.52),
-    ("повинен", 0.56),
-)
 
-_RELATION_MARKERS: Tuple[Tuple[str, str, float], ...] = (
-    ("results in", "causes", 0.72),
-    ("leads to", "causes", 0.72),
-    ("because", "causes", 0.66),
-    ("triggers", "causes", 0.70),
-    ("trigger", "causes", 0.68),
-    ("causes", "causes", 0.70),
-    ("cause", "causes", 0.68),
-    ("contains", "contains", 0.66),
-    ("becomes", "becomes", 0.66),
-    ("become", "becomes", 0.64),
-    ("generates", "generates", 0.76),
-    ("generate", "generates", 0.74),
-    ("creates", "generates", 0.74),
-    ("create", "generates", 0.72),
-    ("opens", "opens", 0.74),
-    ("open", "opens", 0.72),
-    ("has", "has", 0.58),
-    ("have", "has", 0.58),
-    ("were", "is", 0.54),
-    ("was", "is", 0.54),
-    ("are", "is", 0.54),
-    ("is", "is", 0.54),
-    ("призводить до", "causes", 0.74),
-    ("спричиняє", "causes", 0.74),
-    ("викликає", "causes", 0.72),
-    ("містить", "contains", 0.68),
-    ("перетворюється", "becomes", 0.68),
-    ("стає", "becomes", 0.64),
-    ("генерують", "generates", 0.78),
-    ("генерує", "generates", 0.78),
-    ("створюють", "generates", 0.76),
-    ("створює", "generates", 0.76),
-    ("відчиняються", "opens", 0.78),
-    ("відчиняє", "opens", 0.76),
-    ("відкривають", "opens", 0.76),
-    ("відкриває", "opens", 0.76),
-    ("мають", "has", 0.60),
-    ("має", "has", 0.60),
-    ("є", "is", 0.58),
-)
+def _maybe_repair_mojibake(text: str) -> str:
+    raw = str(text or "")
+    mojibake_score = sum(raw.count(marker) for marker in ("Р", "С", "Ѓ", "І", "ї"))
+    if mojibake_score < 4:
+        return raw
+    try:
+        repaired = raw.encode("cp1251").decode("utf-8")
+    except Exception:
+        return raw
+    repaired_score = sum("а" <= ch.casefold() <= "я" or ch in {"є", "і", "ї", "ґ"} for ch in repaired)
+    original_score = sum("а" <= ch.casefold() <= "я" or ch in {"є", "і", "ї", "ґ"} for ch in raw)
+    return repaired if repaired_score > original_score else raw
+
+
+def _normalize_unicode_text(text: str) -> str:
+    return unicodedata.normalize(
+        "NFKC",
+        _maybe_repair_mojibake(str(text or ""))
+        .replace("’", "'")
+        .replace("`", "'")
+        .replace("“", '"')
+        .replace("”", '"')
+        .replace("„", '"'),
+    )
 
 
 def _strip_wrapping_quotes(text: str) -> str:
     stripped = text.strip()
-    if len(stripped) >= 2 and (
-        (stripped[0] == '"' and stripped[-1] == '"')
-        or (stripped[0] == "«" and stripped[-1] == "»")
-    ):
+    if len(stripped) >= 2 and stripped[0] in "\"«“”„" and stripped[-1] in "\"»“”„":
         return stripped[1:-1].strip()
     return stripped
 
@@ -157,29 +83,20 @@ def _strip_wrapping_quotes(text: str) -> str:
 def normalize_symbol_text(value: Any) -> Optional[str]:
     if value is None:
         return None
-    text = unicodedata.normalize("NFKC", str(value)).strip().casefold()
+    text = _normalize_unicode_text(str(value)).strip().casefold()
     if not text:
         return None
-    text = (
-        text.replace("’", "'")
-        .replace("`", "'")
-        .replace("“", '"')
-        .replace("”", '"')
-        .replace("«", '"')
-        .replace("»", '"')
-    )
-    text = _strip_wrapping_quotes(text)
-    text = text.replace("'", "")
-    text = re.sub(r"[^\w\s.-]+", " ", text, flags=re.UNICODE)
+    text = _strip_wrapping_quotes(text).replace("'", "")
+    text = re.sub(r"[^\w\s:.-]+", " ", text, flags=re.UNICODE)
     text = re.sub(r"[\s.-]+", "_", text, flags=re.UNICODE)
     text = text.strip("_")
-    return text[:64] if text else None
+    return text[:80] if text else None
 
 
 def tokenize_semantic_words(segment: str, *, limit: Optional[int] = None) -> List[str]:
     tokens: List[str] = []
     seen: Set[str] = set()
-    for raw in _WORD_RE.findall(unicodedata.normalize("NFKC", segment)):
+    for raw in _WORD_RE.findall(_normalize_unicode_text(segment)):
         normalized = normalize_symbol_text(raw)
         if normalized is None or normalized in seen:
             continue
@@ -192,18 +109,18 @@ def tokenize_semantic_words(segment: str, *, limit: Optional[int] = None) -> Lis
 
 def _normalize_segment(segment: str) -> str:
     return re.sub(
-        r"^\s*(?:step\s*\d+[:.)-]*|\d+[:.)-]*)\s*",
+        r"^\s*(?:step\s*\d+[:.)-]*|\d+[:.)-]*|крок\s*\d+[:.)-]*)\s*",
         "",
-        segment.strip(),
+        _normalize_unicode_text(segment).strip(),
         flags=re.IGNORECASE | re.UNICODE,
     )
 
 
 def split_text_segments(text: str, *, max_segments: int = 24) -> List[str]:
-    lines = [_normalize_segment(line) for line in text.splitlines() if line.strip()]
+    lines = [_normalize_segment(line) for line in str(text or "").splitlines() if line.strip()]
     if len(lines) >= 2:
         return lines[: max(1, int(max_segments))]
-    normalized = text.replace("\r", "\n").strip()
+    normalized = _normalize_unicode_text(text).replace("\r", "\n").strip()
     if not normalized:
         return []
     sentence_like = [
@@ -241,7 +158,7 @@ def split_text_segments_with_spans(
     out: List[Tuple[str, GroundingSpan]] = []
     cursor = 0
     for segment in split_text_segments(text, max_segments=max_segments):
-        span = _locate_segment_span(text, segment, cursor)
+        span = _locate_segment_span(str(text or ""), segment, cursor)
         out.append((segment, span))
         cursor = max(span.end, cursor)
     return out
@@ -272,7 +189,7 @@ def _flatten_payload(payload: Any, prefix: str = "") -> List[Tuple[str, str]]:
 def extract_structured_pairs(segment: str) -> List[Tuple[str, str]]:
     pairs: List[Tuple[str, str]] = []
     seen: Set[Tuple[str, str]] = set()
-    stripped = segment.strip()
+    stripped = _normalize_unicode_text(segment).strip()
     if stripped.startswith("{") or stripped.startswith("["):
         try:
             payload = json.loads(stripped)
@@ -284,7 +201,7 @@ def extract_structured_pairs(segment: str) -> List[Tuple[str, str]]:
                     continue
                 seen.add(pair)
                 pairs.append(pair)
-    for match in _STATE_PAIR_RE.finditer(segment):
+    for match in _STATE_PAIR_RE.finditer(stripped):
         key = normalize_symbol_text(match.group("key"))
         value = normalize_symbol_text(match.group("value"))
         if key is None or value is None:
@@ -297,136 +214,306 @@ def extract_structured_pairs(segment: str) -> List[Tuple[str, str]]:
     return pairs
 
 
-def _quoted_focus(fragment: str, *, left: bool) -> Optional[str]:
-    matches = [normalize_symbol_text(match) for match in _QUOTE_RE.findall(fragment)]
-    matches = [match for match in matches if match]
-    if not matches:
+def is_counterexample_text(segment: str) -> bool:
+    normalized = _normalize_unicode_text(segment).casefold()
+    return any(pattern.search(normalized) is not None for pattern in _NEGATION_PATTERNS)
+
+
+def _subspan(parent_span: Optional[GroundingSpan], parent_text: str, fragment: str, occurrence: int = 0) -> Optional[GroundingSpan]:
+    if parent_span is None:
         return None
-    return matches[-1] if left else matches[0]
-
-
-def _focus_symbol(fragment: str, *, left: bool) -> Optional[str]:
-    quoted = _quoted_focus(fragment, left=left)
-    if quoted is not None:
-        return quoted
-    tokens = tokenize_semantic_words(fragment)
-    filtered = [token for token in tokens if token not in _FOCUS_WRAPPER_TOKENS]
-    tokens = filtered or tokens
-    if not tokens:
+    raw_fragment = str(fragment or "").strip()
+    if not raw_fragment:
         return None
-    if left:
-        phrase = "_".join(tokens[-3:])
-    else:
-        phrase = "_".join(tokens[:3])
-    return normalize_symbol_text(phrase)
+    start_at = 0
+    idx = -1
+    for _ in range(max(1, int(occurrence) + 1)):
+        idx = parent_text.find(raw_fragment, start_at)
+        if idx < 0:
+            break
+        start_at = idx + len(raw_fragment)
+    if idx < 0:
+        idx = parent_text.find(raw_fragment)
+    if idx < 0:
+        return None
+    start = int(parent_span.start) + idx
+    end = start + len(raw_fragment)
+    return GroundingSpan(start=start, end=end, text=parent_text[idx : idx + len(raw_fragment)])
 
 
-def _marker_regex(marker: str) -> re.Pattern[str]:
-    escaped = re.escape(marker)
-    if any(ch.isalnum() for ch in marker):
-        return re.compile(rf"(?<!\w){escaped}(?!\w)", re.IGNORECASE | re.UNICODE)
-    return re.compile(escaped, re.IGNORECASE | re.UNICODE)
+def _field_value(value: str, *, fallback: str = "") -> str:
+    normalized = normalize_symbol_text(value)
+    if normalized:
+        return normalized
+    return fallback or str(value or "").strip()
 
 
-_RELATION_PATTERNS: Tuple[Tuple[re.Pattern[str], str, float], ...] = tuple(
-    (_marker_regex(marker), canonical, confidence)
-    for marker, canonical, confidence in sorted(
-        _RELATION_MARKERS,
-        key=lambda item: len(item[0]),
-        reverse=True,
-    )
-)
-
-_GOAL_PATTERNS: Tuple[Tuple[re.Pattern[str], float], ...] = tuple(
-    (_marker_regex(marker), confidence)
-    for marker, confidence in sorted(
-        _GOAL_MARKERS,
-        key=lambda item: len(item[0]),
-        reverse=True,
-    )
-)
-
-
-def extract_relation_hints(segment: str) -> List[GroundedRelationHint]:
-    relations: List[GroundedRelationHint] = []
-    seen: Set[Tuple[str, str, str]] = set()
-    for pattern, canonical, confidence in _RELATION_PATTERNS:
-        for match in pattern.finditer(segment):
-            left = _focus_symbol(segment[: match.start()], left=True)
-            right = _focus_symbol(segment[match.end() :], left=False)
-            if left is None or right is None:
-                continue
-            relation = (left, canonical, right)
-            if relation in seen:
-                continue
-            seen.add(relation)
-            relations.append(
-                GroundedRelationHint(
-                    left=left,
-                    relation=canonical,
-                    right=right,
-                    confidence=confidence,
-                )
-            )
-    chain_parts = [
-        _focus_symbol(part, left=False)
-        for part in re.split(r"\s*(?:->|=>|then|потім)\s*", segment, flags=re.IGNORECASE | re.UNICODE)
-        if part.strip()
+def _extract_clause_units(
+    segment: str,
+    *,
+    seg_idx: int,
+    span: Optional[GroundingSpan],
+    routing: GroundingSourceProfile,
+) -> List[GroundedStructuralUnit]:
+    units: List[GroundedStructuralUnit] = []
+    clause_chunks = [
+        chunk.strip()
+        for chunk in re.split(r"(?<=[,;])\s+|\s+(?=але\b|однак\b|бо\b|if\b|when\b|because\b|then\b|after\b|before\b|якщо\b|коли\b|потім\b|після\b|перед\b)", segment, flags=re.IGNORECASE | re.UNICODE)
+        if chunk.strip()
     ]
-    chain_parts = [part for part in chain_parts if part]
-    if len(chain_parts) >= 2:
-        for left, right in zip(chain_parts, chain_parts[1:]):
-            relation = (left, "transition", right)
-            if relation in seen:
-                continue
-            seen.add(relation)
-            relations.append(
-                GroundedRelationHint(
-                    left=left,
-                    relation="transition",
-                    right=right,
-                    confidence=0.62,
-                )
-            )
-    return relations
-
-
-def extract_goal_hints(segment: str, *, structured_pairs: Optional[Sequence[Tuple[str, str]]] = None) -> List[GroundedGoalHint]:
-    goals: List[GroundedGoalHint] = []
-    seen: Set[Tuple[str, str]] = set()
-    for key, value in list(structured_pairs or extract_structured_pairs(segment)):
-        if key not in _GOAL_KEYS:
-            continue
-        pair = (key, value)
-        if pair in seen:
-            continue
-        seen.add(pair)
-        goals.append(GroundedGoalHint(goal_name=key, goal_value=value, confidence=0.64))
-    for pattern, confidence in _GOAL_PATTERNS:
-        match = pattern.search(segment)
-        if match is None:
-            continue
-        goal_value = _focus_symbol(segment[match.end() :], left=False)
-        goal_name = normalize_symbol_text(match.group(0))
-        if goal_name is None or goal_value is None:
-            continue
-        pair = (goal_name, goal_value)
-        if pair in seen:
-            continue
-        seen.add(pair)
-        goals.append(
-            GroundedGoalHint(
-                goal_name=goal_name,
-                goal_value=goal_value,
-                confidence=confidence,
+    if not clause_chunks:
+        clause_chunks = [segment.strip()] if segment.strip() else []
+    for idx, clause in enumerate(clause_chunks):
+        markers = [
+            marker
+            for marker in ("if", "when", "because", "then", "after", "before", "якщо", "коли", "бо", "потім", "після", "перед", "але", "однак")
+            if re.search(rf"(?<!\w){re.escape(marker)}(?!\w)", clause, flags=re.IGNORECASE | re.UNICODE)
+        ]
+        units.append(
+            GroundedStructuralUnit(
+                unit_id=f"clause:{seg_idx}:{idx}",
+                unit_type="clause",
+                text=clause,
+                source_segment=seg_idx,
+                span=_subspan(span, segment, clause, idx),
+                confidence=max(0.52, float(routing.confidence) * 0.88),
+                status="supported",
+                references=tuple(f"marker:{marker}" for marker in markers),
             )
         )
-    return goals
+    return units
 
 
-def is_counterexample_text(segment: str) -> bool:
-    normalized = unicodedata.normalize("NFKC", segment).casefold()
-    return any(pattern.search(normalized) is not None for pattern in _NEGATION_PATTERNS)
+def _extract_speaker_turn_unit(
+    segment: str,
+    *,
+    seg_idx: int,
+    span: Optional[GroundingSpan],
+    routing: GroundingSourceProfile,
+) -> List[GroundedStructuralUnit]:
+    match = re.match(r"^(user|assistant|speaker|q|a)\s*[:>-]\s*(.+)$", segment, flags=re.IGNORECASE | re.UNICODE)
+    if match is None:
+        return []
+    speaker = _field_value(match.group(1), fallback=match.group(1).strip().casefold())
+    utterance = match.group(2).strip()
+    return [
+        GroundedStructuralUnit(
+            unit_id=f"speaker_turn:{seg_idx}:0",
+            unit_type="speaker_turn",
+            text=segment.strip(),
+            source_segment=seg_idx,
+            span=span,
+            confidence=max(0.58, float(routing.confidence)),
+            status="supported",
+            fields=(("speaker", speaker), ("utterance", _field_value(utterance, fallback=utterance[:96]))),
+            references=(f"subtype:{routing.subtype}",),
+        )
+    ]
+
+
+def _extract_citation_units(
+    segment: str,
+    *,
+    seg_idx: int,
+    span: Optional[GroundingSpan],
+    routing: GroundingSourceProfile,
+) -> List[GroundedStructuralUnit]:
+    units: List[GroundedStructuralUnit] = []
+    patterns = (
+        r"\[[0-9]{1,3}\]",
+        r"\([A-ZА-ЯІЇЄҐ][A-Za-zА-Яа-яІіЇїЄєҐґ]+,\s*\d{4}\)",
+        r"\bet al\.\b",
+    )
+    match_index = 0
+    for pattern in patterns:
+        for match in re.finditer(pattern, segment):
+            text_value = match.group(0)
+            units.append(
+                GroundedStructuralUnit(
+                    unit_id=f"citation:{seg_idx}:{match_index}",
+                    unit_type="citation_region",
+                    text=text_value,
+                    source_segment=seg_idx,
+                    span=_subspan(span, segment, text_value, match_index),
+                    confidence=max(0.50, float(routing.confidence) * 0.82),
+                    status="supported",
+                    references=(f"subtype:{routing.subtype}",),
+                )
+            )
+            match_index += 1
+    return units
+
+
+def _extract_table_row_unit(
+    segment: str,
+    *,
+    seg_idx: int,
+    span: Optional[GroundingSpan],
+    routing: GroundingSourceProfile,
+) -> List[GroundedStructuralUnit]:
+    delimiter = ""
+    if segment.count("|") >= 2:
+        delimiter = "|"
+    elif segment.count("\t") >= 2:
+        delimiter = "\t"
+    elif segment.count(",") >= 2:
+        delimiter = ","
+    if not delimiter:
+        return []
+    columns = [column.strip() for column in segment.split(delimiter)]
+    fields = tuple(
+        (f"col_{idx}", _field_value(column, fallback=column[:64]))
+        for idx, column in enumerate(columns)
+        if column.strip()
+    )
+    return [
+        GroundedStructuralUnit(
+            unit_id=f"table_row:{seg_idx}:0",
+            unit_type="table_row",
+            text=segment.strip(),
+            source_segment=seg_idx,
+            span=span,
+            confidence=max(0.60, float(routing.confidence)),
+            status="supported",
+            fields=fields,
+            references=(f"delimiter:{repr(delimiter)}",),
+        )
+    ]
+
+
+def _extract_log_entry_unit(
+    segment: str,
+    *,
+    seg_idx: int,
+    span: Optional[GroundingSpan],
+    routing: GroundingSourceProfile,
+) -> List[GroundedStructuralUnit]:
+    timestamp_match = re.search(r"\b\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?\b", segment)
+    level_match = re.search(r"\b(info|warn|warning|error|debug|trace)\b", segment, flags=re.IGNORECASE | re.UNICODE)
+    if timestamp_match is None and level_match is None:
+        return []
+    fields: List[Tuple[str, str]] = []
+    if timestamp_match is not None:
+        fields.append(("timestamp", _field_value(timestamp_match.group(0), fallback=timestamp_match.group(0))))
+    if level_match is not None:
+        fields.append(("level", _field_value(level_match.group(1), fallback=level_match.group(1).lower())))
+    return [
+        GroundedStructuralUnit(
+            unit_id=f"log_entry:{seg_idx}:0",
+            unit_type="log_entry",
+            text=segment.strip(),
+            source_segment=seg_idx,
+            span=span,
+            confidence=max(0.60, float(routing.confidence)),
+            status="supported",
+            fields=tuple(fields),
+            references=(f"subtype:{routing.subtype}",),
+        )
+    ]
+
+
+def _extract_section_header_unit(
+    segment: str,
+    *,
+    seg_idx: int,
+    span: Optional[GroundingSpan],
+    routing: GroundingSourceProfile,
+) -> List[GroundedStructuralUnit]:
+    stripped = segment.strip()
+    if not re.match(r"^\[[^\]]+\]$", stripped):
+        return []
+    header = stripped[1:-1].strip()
+    return [
+        GroundedStructuralUnit(
+            unit_id=f"section_header:{seg_idx}:0",
+            unit_type="section_header",
+            text=stripped,
+            source_segment=seg_idx,
+            span=span,
+            confidence=max(0.60, float(routing.confidence)),
+            status="supported",
+            fields=(("section", _field_value(header, fallback=header)),),
+            references=(f"subtype:{routing.subtype}",),
+        )
+    ]
+
+
+def _extract_key_value_units(
+    segment: str,
+    *,
+    seg_idx: int,
+    span: Optional[GroundingSpan],
+    routing: GroundingSourceProfile,
+    state_pairs: List[Tuple[str, str]],
+) -> List[GroundedStructuralUnit]:
+    units: List[GroundedStructuralUnit] = []
+    for idx, (key, value) in enumerate(state_pairs):
+        units.append(
+            GroundedStructuralUnit(
+                unit_id=f"key_value:{seg_idx}:{idx}",
+                unit_type="key_value_record",
+                text=f"{key}={value}",
+                source_segment=seg_idx,
+                span=span,
+                confidence=max(0.62, float(routing.confidence)),
+                status="supported",
+                fields=((key, value),),
+                references=(f"subtype:{routing.subtype}",),
+            )
+        )
+    if routing.subtype == "json_records" and state_pairs:
+        units.append(
+            GroundedStructuralUnit(
+                unit_id=f"json_record:{seg_idx}:0",
+                unit_type="json_record",
+                text=segment.strip(),
+                source_segment=seg_idx,
+                span=span,
+                confidence=max(0.64, float(routing.confidence)),
+                status="supported",
+                fields=tuple(state_pairs[:16]),
+                references=("parser:json_parser",),
+            )
+        )
+    return units
+
+
+def extract_structural_units(
+    segment: str,
+    *,
+    seg_idx: int,
+    span: Optional[GroundingSpan],
+    routing: GroundingSourceProfile,
+    state_pairs: Optional[List[Tuple[str, str]]] = None,
+) -> List[GroundedStructuralUnit]:
+    units: List[GroundedStructuralUnit] = []
+    structural_pairs = list(state_pairs or extract_structured_pairs(segment))
+    units.extend(_extract_section_header_unit(segment, seg_idx=seg_idx, span=span, routing=routing))
+    if routing.modality in {"structured_text", "mixed"}:
+        units.extend(
+            _extract_key_value_units(
+                segment,
+                seg_idx=seg_idx,
+                span=span,
+                routing=routing,
+                state_pairs=structural_pairs,
+            )
+        )
+        units.extend(_extract_log_entry_unit(segment, seg_idx=seg_idx, span=span, routing=routing))
+        units.extend(_extract_table_row_unit(segment, seg_idx=seg_idx, span=span, routing=routing))
+    if routing.modality in {"natural_text", "mixed"}:
+        units.extend(_extract_speaker_turn_unit(segment, seg_idx=seg_idx, span=span, routing=routing))
+        units.extend(_extract_clause_units(segment, seg_idx=seg_idx, span=span, routing=routing))
+        units.extend(_extract_citation_units(segment, seg_idx=seg_idx, span=span, routing=routing))
+    return units
+
+
+def _modality_flag(profile: GroundingSourceProfile, modality: str) -> float:
+    return 1.0 if str(profile.modality or "") == modality else 0.0
+
+
+def _script_flag(profile: GroundingSourceProfile, script: str) -> float:
+    return 1.0 if str(profile.script or "") == script else 0.0
 
 
 def ground_text_document(
@@ -436,68 +523,148 @@ def ground_text_document(
     max_segments: int = 24,
     token_limit: int = 8,
 ) -> GroundedTextDocument:
+    normalized_text = _normalize_unicode_text(str(text or ""))
+    document_routing = infer_source_profile(normalized_text)
     segments_out: List[GroundedTextSegment] = []
+    document_structural_units: List[GroundedStructuralUnit] = []
     for idx, (segment, span) in enumerate(split_text_segments_with_spans(text, max_segments=max_segments)):
-        normalized = unicodedata.normalize("NFKC", segment)
+        normalized = _normalize_unicode_text(segment)
+        segment_routing = infer_source_profile(normalized)
+        state_pairs = extract_structured_pairs(segment)
         states = [
-            GroundedStateHint(key=key, value=value, span=span)
-            for key, value in extract_structured_pairs(segment)
+            GroundedStateHint(key=key, value=value, confidence=0.62, source="deterministic_structural_parser", status="supported", span=span)
+            for key, value in state_pairs
         ]
-        relations = [
-            GroundedRelationHint(
-                left=relation.left,
-                relation=relation.relation,
-                right=relation.right,
-                confidence=relation.confidence,
-                source=relation.source,
-                status=relation.status,
-                span=relation.span or span,
-            )
-            for relation in extract_relation_hints(segment)
-        ]
-        goals = [
-            GroundedGoalHint(
-                goal_name=goal.goal_name,
-                goal_value=goal.goal_value,
-                confidence=goal.confidence,
-                source=goal.source,
-                status=goal.status,
-                span=goal.span or span,
-            )
-            for goal in extract_goal_hints(segment, structured_pairs=[(state.key, state.value) for state in states])
-        ]
+        structural_units = extract_structural_units(
+            segment,
+            seg_idx=idx,
+            span=span,
+            routing=segment_routing,
+            state_pairs=state_pairs,
+        )
+        document_structural_units.extend(structural_units)
         segments_out.append(
             GroundedTextSegment(
                 index=idx,
                 text=segment,
                 normalized_text=normalized,
                 span=span,
+                routing=segment_routing,
                 tokens=tuple(tokenize_semantic_words(segment, limit=token_limit)),
+                structural_units=tuple(structural_units),
                 states=tuple(states),
-                relations=tuple(relations),
-                goals=tuple(goals),
+                relations=tuple(),
+                goals=tuple(),
+                entities=tuple(),
+                events=tuple(),
                 counterexample=is_counterexample_text(segment),
             )
         )
+    structural_unit_counts: Dict[str, float] = {}
+    for unit in document_structural_units:
+        structural_unit_counts[unit.unit_type] = structural_unit_counts.get(unit.unit_type, 0.0) + 1.0
     metadata: Dict[str, float] = {
         "grounding_segments": float(len(segments_out)),
         "grounding_tokens": float(sum(len(segment.tokens) for segment in segments_out)),
+        "grounding_structural_units": float(len(document_structural_units)),
         "grounding_state_hints": float(sum(len(segment.states) for segment in segments_out)),
-        "grounding_relation_hints": float(sum(len(segment.relations) for segment in segments_out)),
-        "grounding_goal_hints": float(sum(len(segment.goals) for segment in segments_out)),
+        "grounding_relation_hints": 0.0,
+        "grounding_goal_hints": 0.0,
+        "grounding_entity_hints": 0.0,
+        "grounding_event_hints": 0.0,
         "grounding_counterexample_segments": float(sum(1 for segment in segments_out if segment.counterexample)),
-        "grounding_multilingual": 1.0 if any(ord(ch) > 127 for ch in text) else 0.0,
+        "grounding_multilingual": 1.0 if any(ord(ch) > 127 for ch in str(text or "")) else 0.0,
+        "grounding_condition_hints": 0.0,
+        "grounding_explanation_hints": 0.0,
+        "grounding_temporal_hints": 0.0,
+        "grounding_modal_hints": 0.0,
+        "grounding_document_routing_confidence": float(document_routing.confidence),
+        "grounding_document_routing_ambiguity": float(document_routing.ambiguity),
+        "grounding_document_parser_candidates": float(len(document_routing.parser_candidates)),
+        "grounding_segment_parser_candidates": float(
+            sum(len(segment.routing.parser_candidates) for segment in segments_out if segment.routing is not None)
+        ),
+        "grounding_segment_code_segments": float(
+            sum(1 for segment in segments_out if segment.routing is not None and segment.routing.modality == "code")
+        ),
+        "grounding_segment_natural_text_segments": float(
+            sum(1 for segment in segments_out if segment.routing is not None and segment.routing.modality == "natural_text")
+        ),
+        "grounding_segment_structured_text_segments": float(
+            sum(1 for segment in segments_out if segment.routing is not None and segment.routing.modality == "structured_text")
+        ),
+        "grounding_segment_mixed_segments": float(
+            sum(1 for segment in segments_out if segment.routing is not None and segment.routing.modality == "mixed")
+        ),
+        "grounding_segment_unknown_segments": float(
+            sum(1 for segment in segments_out if segment.routing is not None and segment.routing.modality == "unknown")
+        ),
         "grounding_span_coverage": float(
             sum(
                 max(0, int(segment.span.end) - int(segment.span.start))
                 for segment in segments_out
                 if segment.span is not None
-            ) / max(len(text), 1)
+            ) / max(len(str(text or "")), 1)
         ),
+        "grounding_structural_layer": 1.0,
+        "grounding_structural_state_pairs": float(sum(len(segment.states) for segment in segments_out)),
+        "grounding_document_semantic_authority": 0.0,
+        "grounding_document_modality_code": _modality_flag(document_routing, "code"),
+        "grounding_document_modality_natural_text": _modality_flag(document_routing, "natural_text"),
+        "grounding_document_modality_structured_text": _modality_flag(document_routing, "structured_text"),
+        "grounding_document_modality_mixed": _modality_flag(document_routing, "mixed"),
+        "grounding_document_modality_unknown": _modality_flag(document_routing, "unknown"),
+        "grounding_document_script_latin": _script_flag(document_routing, "latin"),
+        "grounding_document_script_cyrillic": _script_flag(document_routing, "cyrillic"),
+        "grounding_document_script_mixed": _script_flag(document_routing, "mixed"),
+        "grounding_document_script_unknown": _script_flag(document_routing, "unknown"),
     }
+    metadata.update(
+        {
+            "grounding_clause_units": float(structural_unit_counts.get("clause", 0.0)),
+            "grounding_speaker_turn_units": float(structural_unit_counts.get("speaker_turn", 0.0)),
+            "grounding_citation_units": float(structural_unit_counts.get("citation_region", 0.0)),
+            "grounding_key_value_units": float(structural_unit_counts.get("key_value_record", 0.0)),
+            "grounding_json_record_units": float(structural_unit_counts.get("json_record", 0.0)),
+            "grounding_log_entry_units": float(structural_unit_counts.get("log_entry", 0.0)),
+            "grounding_table_row_units": float(structural_unit_counts.get("table_row", 0.0)),
+            "grounding_section_header_units": float(structural_unit_counts.get("section_header", 0.0)),
+        }
+    )
     return GroundedTextDocument(
         language=language or "text",
-        source_text=text,
+        source_text=str(text or ""),
+        routing=document_routing,
+        structural_units=tuple(document_structural_units),
         segments=tuple(segments_out),
         metadata=metadata,
     )
+
+
+def extract_relation_hints(segment: str):
+    from .heuristic_backbone import extract_relation_hints as _extract_relation_hints
+
+    return _extract_relation_hints(segment)
+
+
+def extract_goal_hints(segment: str, *, structured_pairs=None):
+    from .heuristic_backbone import extract_goal_hints as _extract_goal_hints
+
+    return _extract_goal_hints(segment, structured_pairs=structured_pairs)
+
+
+def extract_entity_hints(segment: str, *, structured_pairs=None, relations=None, goals=None):
+    from .heuristic_backbone import extract_entity_hints as _extract_entity_hints
+
+    return _extract_entity_hints(
+        segment,
+        structured_pairs=structured_pairs,
+        relations=relations,
+        goals=goals,
+    )
+
+
+def extract_event_hints(segment: str, *, relations=None):
+    from .heuristic_backbone import extract_event_hints as _extract_event_hints
+
+    return _extract_event_hints(segment, relations=relations)

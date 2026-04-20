@@ -299,6 +299,8 @@ class OMENScaleConfig:
     emc_eta_int:       float = 0.10    # bonus for new facts/rules (R_int)
     emc_grounding_recall_bonus: float = 0.05  # bounded prior for recall under grounding uncertainty
     emc_grounding_abduction_bonus: float = 0.03  # bounded prior for abduction under weak support
+    emc_grounding_recall_logit_bias: float = 0.24  # policy prior for recall under parser/coreference instability
+    emc_grounding_abduction_logit_bias: float = 0.20  # policy prior for abduction under hidden-cause pressure
     emc_c_recall:      float = 0.01    # RecallMCore action cost
     emc_c_fc:          float = 0.05    # ForwardChainStep action cost
     emc_c_abduce:      float = 0.10    # Abduce action cost

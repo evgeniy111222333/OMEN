@@ -89,6 +89,28 @@ def compile_scene_context_graph_records(
                 source_segment=int(target),
             )
         )
+    for link in scene.coreference_links:
+        records.append(
+            SceneContextGraphRecord(
+                record_type="coreference",
+                record_id=link.link_id,
+                graph_key=(
+                    f"scene:coreference:{link.relation_type}:{link.source_entity_id}:{link.target_entity_id}:"
+                    f"{link.source_segment}"
+                ),
+                graph_text=f"coreference {link.relation_type} {link.source_entity_id}->{link.target_entity_id}",
+                graph_terms=(
+                    link.relation_type,
+                    link.source_entity_id,
+                    link.target_entity_id,
+                    str(link.source_segment),
+                    str(link.target_segment),
+                ),
+                graph_family="scene_coreference",
+                confidence=float(link.confidence),
+                source_segment=int(link.source_segment),
+            )
+        )
 
     limited = tuple(records[: max(int(max_records), 0)])
     stats = {
@@ -97,5 +119,6 @@ def compile_scene_context_graph_records(
         "scene_context_discourse_records": float(sum(1 for record in limited if record.record_type == "discourse")),
         "scene_context_temporal_records": float(sum(1 for record in limited if record.record_type == "temporal")),
         "scene_context_explanation_records": float(sum(1 for record in limited if record.record_type == "explanation")),
+        "scene_context_coreference_records": float(sum(1 for record in limited if record.record_type == "coreference")),
     }
     return limited, stats

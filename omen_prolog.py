@@ -29,6 +29,7 @@ from omen_symbolic.controller import empty_induction_stats, run_latent_reasoning
 from omen_symbolic.creative_cycle import CreativeCycleCoordinator
 from omen_symbolic.execution_trace import (
     build_symbolic_trace_bundle,
+    GroundingRuntimeArtifacts,
     SymbolicExecutionTraceBundle,
     TRACE_ASSIGN_EVENT_PRED,
     TRACE_BINOP_EVENT_PRED,
@@ -452,6 +453,8 @@ class SymbolicTaskContext:
     grounding_ontology_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
     grounding_hypotheses: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_verification_records: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_validation_records: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_repair_actions: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_world_state_records: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_world_state_active_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
     grounding_world_state_hypothetical_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
@@ -464,6 +467,7 @@ class SymbolicTaskContext:
     goal: Optional[HornAtom] = None
     target_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
     execution_trace: Optional[SymbolicExecutionTraceBundle] = None
+    grounding_artifacts: Optional[GroundingRuntimeArtifacts] = None
     provenance: str = "heuristic"
     trigger_abduction: bool = False
     hot_dims: Tuple[int, ...] = field(default_factory=tuple)
@@ -486,6 +490,8 @@ class SymbolicTaskContext:
         self.grounding_ontology_facts = _freeze_atoms(self.grounding_ontology_facts)
         self.grounding_hypotheses = tuple(self.grounding_hypotheses or ())
         self.grounding_verification_records = tuple(self.grounding_verification_records or ())
+        self.grounding_validation_records = tuple(self.grounding_validation_records or ())
+        self.grounding_repair_actions = tuple(self.grounding_repair_actions or ())
         self.grounding_world_state_records = tuple(self.grounding_world_state_records or ())
         self.grounding_world_state_active_facts = _freeze_atoms(self.grounding_world_state_active_facts)
         self.grounding_world_state_hypothetical_facts = _freeze_atoms(self.grounding_world_state_hypothetical_facts)
@@ -557,7 +563,10 @@ class SymbolicTaskContext:
             ("grounding_world_state_contradicted_fact", self.grounding_world_state_contradicted_facts),
             ("grounding_hypothesis", self.grounding_hypotheses),
             ("grounding_verification", self.grounding_verification_records),
+            ("grounding_validation", self.grounding_validation_records),
+            ("grounding_repair", self.grounding_repair_actions),
             ("memory_grounding", self.memory_grounding_records),
+            ("interlingua", self.grounding_graph_records()),
             ("saliency", self.saliency_derived_facts),
             ("net", self.net_derived_facts),
             ("grounding", self.grounding_derived_facts),
@@ -566,6 +575,9 @@ class SymbolicTaskContext:
         )
         for label, facts in source_groups:
             for atom in sorted(facts, key=repr):
+                if label == "memory_grounding" and atom in seen:
+                    records.append((label, atom))
+                    continue
                 if atom in seen:
                     continue
                 seen.add(atom)
@@ -582,15 +594,23 @@ class SymbolicTaskContext:
                 records.append(("target", atom))
         return tuple(records)
 
+    def grounding_graph_records(self) -> Tuple[Any, ...]:
+        if self.grounding_artifacts is None:
+            return tuple()
+        return tuple(getattr(self.grounding_artifacts, "grounding_graph_records", ()) or ())
+
     def source_counts(self) -> Dict[str, float]:
         return {
             "observed_now_facts": float(len(self.observed_now_facts)),
             "memory_derived_facts": float(len(self.memory_derived_facts)),
             "memory_grounding_records": float(len(self.memory_grounding_records)),
+            "grounding_graph_records": float(len(self.grounding_graph_records())),
             "grounding_ontology_records": float(len(self.grounding_ontology_records)),
             "grounding_ontology_facts": float(len(self.grounding_ontology_facts)),
             "grounding_hypotheses": float(len(self.grounding_hypotheses)),
             "grounding_verification_records": float(len(self.grounding_verification_records)),
+            "grounding_validation_records": float(len(self.grounding_validation_records)),
+            "grounding_repair_actions": float(len(self.grounding_repair_actions)),
             "grounding_world_state_records": float(len(self.grounding_world_state_records)),
             "grounding_world_state_active_records": float(
                 sum(1 for record in self.grounding_world_state_records if getattr(record, "world_status", "") == "active")

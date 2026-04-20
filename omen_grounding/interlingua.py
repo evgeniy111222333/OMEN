@@ -20,6 +20,14 @@ def _canonical_key(value: Optional[str], fallback: str) -> str:
     return normalize_symbol_text(fallback) or fallback
 
 
+def _optional_key(value: Optional[str], fallback: str) -> Optional[str]:
+    normalized = normalize_symbol_text(value)
+    if normalized:
+        return normalized
+    fallback_norm = normalize_symbol_text(fallback)
+    return fallback_norm if fallback_norm else None
+
+
 def build_canonical_interlingua(scene: SemanticSceneGraph) -> CanonicalInterlingua:
     entity_index: Dict[str, CanonicalEntity] = {}
     for entity in scene.entities:
@@ -61,6 +69,7 @@ def build_canonical_interlingua(scene: SemanticSceneGraph) -> CanonicalInterling
                 source_span=state.source_span,
                 confidence=float(state.confidence),
                 status=state.status,
+                evidence_refs=tuple(str(item) for item in getattr(state, "evidence_refs", ()) if str(item).strip()),
             )
         )
 
@@ -72,6 +81,16 @@ def build_canonical_interlingua(scene: SemanticSceneGraph) -> CanonicalInterling
         object_ = entity_index.get(event.object_entity_id)
         if subject is None or object_ is None:
             continue
+        relation_modifiers = tuple(
+            modifier
+            for modifier in (
+                f"modal:{_canonical_key(event.modality, event.event_id)}" if event.modality else "",
+                f"if:{_canonical_key(event.condition, event.event_id)}" if event.condition else "",
+                f"cause:{_canonical_key(event.explanation, event.event_id)}" if event.explanation else "",
+                f"time:{_canonical_key(event.temporal, event.event_id)}" if event.temporal else "",
+            )
+            if modifier
+        )
         relations.append(
             CanonicalRelationClaim(
                 claim_id=event.event_id,
@@ -85,9 +104,15 @@ def build_canonical_interlingua(scene: SemanticSceneGraph) -> CanonicalInterling
                 object_name=object_.canonical_name,
                 source_segment=int(event.source_segment),
                 source_span=event.source_span,
+                modality=_canonical_key(event.modality, event.event_id) if event.modality else "",
+                condition_key=_optional_key(event.condition, event.event_id),
+                explanation_key=_optional_key(event.explanation, event.event_id),
+                temporal_key=_optional_key(event.temporal, event.event_id),
+                relation_modifiers=relation_modifiers,
                 confidence=float(event.confidence),
                 polarity=event.polarity,
                 status=event.status,
+                evidence_refs=tuple(str(item) for item in getattr(event, "evidence_refs", ()) if str(item).strip()),
             )
         )
 
@@ -108,6 +133,7 @@ def build_canonical_interlingua(scene: SemanticSceneGraph) -> CanonicalInterling
                 source_span=goal.source_span,
                 confidence=float(goal.confidence),
                 status=goal.status,
+                evidence_refs=tuple(str(item) for item in getattr(goal, "evidence_refs", ()) if str(item).strip()),
             )
         )
 
@@ -122,6 +148,11 @@ def build_canonical_interlingua(scene: SemanticSceneGraph) -> CanonicalInterling
             "interlingua_negative_relations": float(
                 sum(1 for relation in relations if relation.polarity == "negative")
             ),
+            "interlingua_modal_relations": float(sum(1 for relation in relations if relation.modality)),
+            "interlingua_conditioned_relations": float(sum(1 for relation in relations if relation.condition_key)),
+            "interlingua_explained_relations": float(sum(1 for relation in relations if relation.explanation_key)),
+            "interlingua_temporal_relations": float(sum(1 for relation in relations if relation.temporal_key)),
+            "interlingua_coreference_links": float(len(scene.coreference_links)),
             "interlingua_uncertain_claims": float(
                 sum(1 for relation in relations if relation.confidence < 0.6)
                 + sum(1 for state in states if state.confidence < 0.6)
@@ -132,6 +163,11 @@ def build_canonical_interlingua(scene: SemanticSceneGraph) -> CanonicalInterling
             ),
             "interlingua_mean_relation_confidence": float(
                 sum(relation.confidence for relation in relations) / max(len(relations), 1)
+            ),
+            "interlingua_structural_evidence_refs": float(
+                sum(len(state.evidence_refs) for state in states)
+                + sum(len(relation.evidence_refs) for relation in relations)
+                + sum(len(goal.evidence_refs) for goal in goals)
             ),
         }
     )

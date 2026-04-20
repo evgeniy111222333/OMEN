@@ -19,6 +19,7 @@ class CompiledSymbolicSegment:
     states: Tuple[Tuple[str, str], ...] = field(default_factory=tuple)
     relations: Tuple[Tuple[str, str, str], ...] = field(default_factory=tuple)
     goals: Tuple[Tuple[str, str], ...] = field(default_factory=tuple)
+    event_frames: Tuple[Tuple[str, ...], ...] = field(default_factory=tuple)
     counterexample: bool = False
 
 
@@ -102,10 +103,12 @@ def compile_canonical_interlingua(
         conflict_tag: str = "",
         counterexample: bool = False,
         provenance: Sequence[str] = (),
+        evidence_refs: Sequence[str] = (),
     ) -> None:
         confidence_value = _clip_confidence(confidence)
         conflict = conflict_tag or ("counterexample_context" if counterexample else "")
         deferred = bool(counterexample or confidence_value < 0.57)
+        evidence = tuple(str(item) for item in evidence_refs if str(item).strip())
         hypotheses.append(
             CompiledSymbolicHypothesis(
                 hypothesis_id=hypothesis_id,
@@ -117,7 +120,7 @@ def compile_canonical_interlingua(
                 status=str(status or "proposal"),
                 deferred=deferred,
                 conflict_tag=conflict,
-                provenance=tuple(str(item) for item in provenance),
+                provenance=tuple(str(item) for item in provenance) + evidence,
             )
         )
 
@@ -147,6 +150,19 @@ def compile_canonical_interlingua(
             (relation.subject_name, relation.predicate, relation.object_name)
             for relation in segment_relations
         )
+        event_frames = tuple(
+            tuple(
+                item
+                for item in (
+                    relation.subject_name,
+                    relation.predicate,
+                    relation.object_name,
+                    *tuple(relation.relation_modifiers),
+                )
+                if item
+            )
+            for relation in segment_relations
+        )
         goals = tuple(
             (goal.goal_name, goal.goal_value)
             for goal in segment_goals
@@ -162,19 +178,23 @@ def compile_canonical_interlingua(
                 status=state.status,
                 counterexample=counterexample,
                 provenance=(f"segment:{idx}", f"state:{state.claim_id}"),
+                evidence_refs=getattr(state, "evidence_refs", ()),
             )
         for relation in segment_relations:
+            relation_symbols = [relation.subject_name, relation.predicate, relation.object_name]
+            relation_symbols.extend(str(item) for item in relation.relation_modifiers if str(item).strip())
             _append_hypothesis(
                 hypothesis_id=relation.claim_id,
                 segment_index=idx,
                 kind="relation",
-                symbols=(relation.subject_name, relation.predicate, relation.object_name),
+                symbols=tuple(relation_symbols),
                 source_span=relation.source_span,
                 confidence=relation.confidence,
                 status=relation.status,
                 conflict_tag="negative_polarity" if relation.polarity != "positive" else "",
                 counterexample=counterexample,
                 provenance=(f"segment:{idx}", f"relation:{relation.claim_id}"),
+                evidence_refs=getattr(relation, "evidence_refs", ()),
             )
         for goal in segment_goals:
             goal_symbols = [goal.goal_name, goal.goal_value]
@@ -190,6 +210,7 @@ def compile_canonical_interlingua(
                 status=goal.status,
                 counterexample=counterexample,
                 provenance=(f"segment:{idx}", f"goal:{goal.goal_id}"),
+                evidence_refs=getattr(goal, "evidence_refs", ()),
             )
         compiled.append(
             CompiledSymbolicSegment(
@@ -201,6 +222,7 @@ def compile_canonical_interlingua(
                 states=states,
                 relations=relations,
                 goals=goals,
+                event_frames=event_frames,
                 counterexample=counterexample,
             )
         )
@@ -217,10 +239,31 @@ def compile_canonical_interlingua(
             "compiled_state_claims": float(sum(len(segment.states) for segment in compiled)),
             "compiled_relation_claims": float(sum(len(segment.relations) for segment in compiled)),
             "compiled_goal_claims": float(sum(len(segment.goals) for segment in compiled)),
+            "compiled_event_frames": float(sum(len(segment.event_frames) for segment in compiled)),
+            "compiled_modal_relations": float(
+                sum(1 for hypothesis in hypotheses if hypothesis.kind == "relation" and any(symbol.startswith("modal:") for symbol in hypothesis.symbols[3:]))
+            ),
+            "compiled_conditioned_relations": float(
+                sum(1 for hypothesis in hypotheses if hypothesis.kind == "relation" and any(symbol.startswith("if:") for symbol in hypothesis.symbols[3:]))
+            ),
+            "compiled_explained_relations": float(
+                sum(1 for hypothesis in hypotheses if hypothesis.kind == "relation" and any(symbol.startswith("cause:") for symbol in hypothesis.symbols[3:]))
+            ),
+            "compiled_temporal_relations": float(
+                sum(1 for hypothesis in hypotheses if hypothesis.kind == "relation" and any(symbol.startswith("time:") for symbol in hypothesis.symbols[3:]))
+            ),
             "compiled_hypotheses": float(len(hypotheses)),
             "compiled_deferred_hypotheses": float(deferred_hypotheses),
             "compiled_conflict_hypotheses": float(conflict_hypotheses),
             "compiled_mean_confidence": float(mean_confidence),
+            "compiled_structural_evidence_refs": float(
+                sum(
+                    1
+                    for hypothesis in hypotheses
+                    for item in hypothesis.provenance
+                    if str(item).startswith("structural_unit:")
+                )
+            ),
         }
     )
     return SymbolicCompilationResult(
