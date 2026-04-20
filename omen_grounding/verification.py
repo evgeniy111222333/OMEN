@@ -27,6 +27,9 @@ class GroundingVerificationRecord:
     conflict: float = 0.0
     repair_action: str = "none"
     hidden_cause_candidate: bool = False
+    speaker_key: str = ""
+    epistemic_status: str = "asserted"
+    claim_source: str = "document"
     provenance: Tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -36,6 +39,12 @@ class GroundingVerificationRecord:
     @property
     def graph_terms(self) -> Tuple[str, ...]:
         terms = [*self.symbols, self.verification_status]
+        if self.speaker_key:
+            terms.append(f"speaker:{self.speaker_key}")
+        if self.epistemic_status:
+            terms.append(f"epistemic:{self.epistemic_status}")
+        if self.claim_source:
+            terms.append(f"claim_source:{self.claim_source}")
         if self.repair_action:
             terms.append(self.repair_action)
         return tuple(str(term) for term in terms if term)
@@ -48,9 +57,11 @@ class GroundingVerificationRecord:
     def graph_text(self) -> str:
         symbols = " | ".join(self.symbols)
         hidden = " hidden_cause" if self.hidden_cause_candidate else ""
+        attribution = f" speaker={self.speaker_key}" if self.speaker_key else ""
         return (
             f"{self.kind} {self.verification_status} support={self.support:.2f} "
-            f"conflict={self.conflict:.2f} repair={self.repair_action}{hidden} {symbols}"
+            f"conflict={self.conflict:.2f} repair={self.repair_action}"
+            f" epistemic={self.epistemic_status}{attribution}{hidden} {symbols}"
         ).strip()
 
 
@@ -351,6 +362,8 @@ def verify_symbolic_hypotheses(
                 "verification_hidden_cause_pressure": 0.0,
                 "verification_conflict_pressure": 0.0,
                 "verification_document_alignment": 0.0,
+                "verification_claim_attribution_support": 0.0,
+                "verification_nonasserted_pressure": 0.0,
                 "verification_scene_alignment": 0.0,
                 "verification_interlingua_alignment": 0.0,
             },
@@ -365,6 +378,8 @@ def verify_symbolic_hypotheses(
     structural_provenances: List[float] = []
     dialogue_supports: List[float] = []
     citation_supports: List[float] = []
+    attribution_supports: List[float] = []
+    nonasserted_pressures: List[float] = []
     scene_alignments: List[float] = []
     interlingua_alignments: List[float] = []
 
@@ -387,6 +402,24 @@ def verify_symbolic_hypotheses(
         structural_provenance = float(structural_evidence["provenance_support"])
         dialogue_support = float(structural_evidence["dialogue_support"])
         citation_support = float(structural_evidence["citation_support"])
+        speaker_attribution = 1.0 if str(getattr(hypothesis, "speaker_key", "") or "") else 0.0
+        epistemic_status = str(getattr(hypothesis, "epistemic_status", "asserted") or "asserted")
+        nonasserted_pressure = 1.0 if epistemic_status != "asserted" else 0.0
+        if epistemic_status == "asserted":
+            epistemic_support = 1.0
+            epistemic_conflict = 0.0
+        elif epistemic_status == "cited":
+            epistemic_support = _clip01(0.55 + (0.45 * citation_support))
+            epistemic_conflict = _clip01(0.18 * (1.0 - citation_support))
+        elif epistemic_status == "hedged":
+            epistemic_support = 0.45
+            epistemic_conflict = 0.16
+        elif epistemic_status == "questioned":
+            epistemic_support = 0.20
+            epistemic_conflict = 0.30
+        else:
+            epistemic_support = 0.50
+            epistemic_conflict = 0.12
         scene_alignment = _scene_alignment_score(hypothesis, scene)
         interlingua_alignment = _interlingua_alignment_score(hypothesis, interlingua)
         polarity_conflict = 1.0 if (
@@ -412,6 +445,8 @@ def verify_symbolic_hypotheses(
             + (0.05 * structural_provenance)
             + (0.04 * dialogue_support)
             + (0.03 * citation_support)
+            + (0.04 * speaker_attribution)
+            + (0.06 * epistemic_support)
             + (0.06 * scene_alignment)
             + (0.06 * interlingua_alignment)
             + kind_bonus
@@ -422,6 +457,7 @@ def verify_symbolic_hypotheses(
             + (0.20 * polarity_conflict)
             + (0.15 * low_confidence)
             + (0.10 * conflict_hint)
+            + (0.12 * epistemic_conflict)
             - (0.05 * interlingua_alignment)
             - (0.04 * scene_alignment)
             - (0.03 * document_alignment)
@@ -429,6 +465,7 @@ def verify_symbolic_hypotheses(
             - (0.03 * structural_provenance)
             - (0.03 * dialogue_support)
             - (0.02 * citation_support)
+            - (0.03 * speaker_attribution)
             - (0.04 * causal_support)
             - (0.03 * conditional_support)
             - (0.02 * temporal_support)
@@ -438,6 +475,8 @@ def verify_symbolic_hypotheses(
         structural_provenances.append(float(structural_provenance))
         dialogue_supports.append(float(dialogue_support))
         citation_supports.append(float(citation_support))
+        attribution_supports.append(float(speaker_attribution))
+        nonasserted_pressures.append(float(nonasserted_pressure))
         scene_alignments.append(float(scene_alignment))
         interlingua_alignments.append(float(interlingua_alignment))
         hidden_cause_candidate = bool(
@@ -447,6 +486,12 @@ def verify_symbolic_hypotheses(
             and support < 0.80
         )
         status = _status_from_scores(support, conflict)
+        if (
+            status == "deferred"
+            and conflict >= 0.55
+            and (segment_counterexample > 0.0 or conflict_hint > 0.0 or polarity_conflict > 0.0)
+        ):
+            status = "conflicted"
         repair_action = _repair_action(status, hidden_cause_candidate=hidden_cause_candidate)
         records.append(
             GroundingVerificationRecord(
@@ -460,6 +505,9 @@ def verify_symbolic_hypotheses(
                 conflict=conflict,
                 repair_action=repair_action,
                 hidden_cause_candidate=hidden_cause_candidate,
+                speaker_key=str(getattr(hypothesis, "speaker_key", "") or ""),
+                epistemic_status=epistemic_status,
+                claim_source=str(getattr(hypothesis, "claim_source", "document") or "document"),
                 provenance=tuple(str(item) for item in hypothesis.provenance),
             )
         )
@@ -493,6 +541,14 @@ def verify_symbolic_hypotheses(
         "verification_document_alignment": (
             sum(document_alignments) / max(total, 1.0)
             if document_alignments else 0.0
+        ),
+        "verification_claim_attribution_support": (
+            sum(attribution_supports) / max(total, 1.0)
+            if attribution_supports else 0.0
+        ),
+        "verification_nonasserted_pressure": (
+            sum(nonasserted_pressures) / max(total, 1.0)
+            if nonasserted_pressures else 0.0
         ),
         "verification_structural_alignment": (
             sum(structural_alignments) / max(total, 1.0)

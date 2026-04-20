@@ -13,6 +13,8 @@ GROUND_RELATION_PRED = 913
 GROUND_GOAL_PRED = 914
 GROUND_CLAIM_KIND_PRED = 915
 GROUND_EVENT_POLARITY_PRED = 916
+GROUND_CLAIM_EPISTEMIC_PRED = 917
+GROUND_CLAIM_SPEAKER_PRED = 918
 
 
 def _stable_hash(text: str) -> int:
@@ -90,6 +92,11 @@ def compile_scene_symbolic_atoms(
         claim_sym = _claim_symbol(claim.claim_id)
         kind_sym = _lex_symbol(claim.claim_kind)
         facts.append(HornAtom(GROUND_CLAIM_KIND_PRED, (claim_sym, kind_sym)))
+        epistemic_sym = _lex_symbol(str(getattr(claim, "epistemic_status", "asserted") or "asserted"))
+        facts.append(HornAtom(GROUND_CLAIM_EPISTEMIC_PRED, (claim_sym, epistemic_sym)))
+        speaker_name = str(getattr(claim, "speaker_name", "") or "")
+        if speaker_name:
+            facts.append(HornAtom(GROUND_CLAIM_SPEAKER_PRED, (claim_sym, _lex_symbol(speaker_name))))
 
     deduped_facts = frozenset(_dedupe_facts(facts))
     deduped_targets = frozenset(_dedupe_facts(target_facts))

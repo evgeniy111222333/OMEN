@@ -11,6 +11,7 @@ from .context_graph_records import SceneContextGraphRecord, compile_scene_contex
 from .emc_signals import grounding_emc_features
 from .interlingua import build_canonical_interlingua
 from .interlingua_types import (
+    CanonicalClaimFrame,
     CanonicalEntity,
     CanonicalGoalClaim,
     CanonicalInterlingua,
@@ -125,7 +126,9 @@ from .verifier_stack import (
     run_grounding_verifier_stack,
 )
 from .symbolic_atoms import (
+    GROUND_CLAIM_EPISTEMIC_PRED,
     GROUND_CLAIM_KIND_PRED,
+    GROUND_CLAIM_SPEAKER_PRED,
     GROUND_ENTITY_PRED,
     GROUND_ENTITY_TYPE_PRED,
     GROUND_EVENT_POLARITY_PRED,
@@ -212,6 +215,7 @@ __all__ = [
     "PlannerWorldState",
     "build_planner_world_state",
     "build_planner_guidance",
+    "CanonicalClaimFrame",
     "CanonicalEntity",
     "CanonicalGoalClaim",
     "CanonicalInterlingua",
@@ -257,7 +261,9 @@ __all__ = [
     "GROUND_WORLD_HYPOTHETICAL_GOAL_PRED",
     "GROUND_WORLD_HYPOTHETICAL_RELATION_PRED",
     "GROUND_WORLD_HYPOTHETICAL_STATE_PRED",
+    "GROUND_CLAIM_EPISTEMIC_PRED",
     "GROUND_CLAIM_KIND_PRED",
+    "GROUND_CLAIM_SPEAKER_PRED",
     "GROUND_ENTITY_PRED",
     "GROUND_ENTITY_TYPE_PRED",
     "GROUND_EVENT_POLARITY_PRED",

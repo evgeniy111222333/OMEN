@@ -79,8 +79,13 @@ class SemanticClaim:
     predicate: str = ""
     object_entity_id: Optional[str] = None
     object_value: Optional[str] = None
+    proposition_id: Optional[str] = None
     event_id: Optional[str] = None
     goal_id: Optional[str] = None
+    speaker_entity_id: Optional[str] = None
+    speaker_name: Optional[str] = None
+    epistemic_status: str = "asserted"
+    claim_source: str = "document"
     evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
 
 

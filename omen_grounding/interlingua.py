@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 from .interlingua_types import (
+    CanonicalClaimFrame,
     CanonicalEntity,
     CanonicalGoalClaim,
     CanonicalInterlingua,
@@ -137,6 +138,39 @@ def build_canonical_interlingua(scene: SemanticSceneGraph) -> CanonicalInterling
             )
         )
 
+    claims: List[CanonicalClaimFrame] = []
+    for claim in scene.claims:
+        proposition_id = str(
+            getattr(claim, "proposition_id", None)
+            or getattr(claim, "event_id", None)
+            or getattr(claim, "goal_id", None)
+            or getattr(claim, "claim_id", "")
+        )
+        if not proposition_id:
+            proposition_id = str(getattr(claim, "claim_id", ""))
+        speaker = (
+            entity_index.get(claim.speaker_entity_id)
+            if getattr(claim, "speaker_entity_id", None) is not None
+            else None
+        )
+        claims.append(
+            CanonicalClaimFrame(
+                claim_id=str(claim.claim_id),
+                claim_kind=str(claim.claim_kind),
+                proposition_id=proposition_id,
+                speaker_entity_id=speaker.entity_id if speaker is not None else getattr(claim, "speaker_entity_id", None),
+                speaker_key=speaker.canonical_key if speaker is not None else _optional_key(getattr(claim, "speaker_name", None), str(claim.claim_id)),
+                speaker_name=speaker.canonical_name if speaker is not None else getattr(claim, "speaker_name", None),
+                epistemic_status=str(getattr(claim, "epistemic_status", "asserted") or "asserted"),
+                claim_source=str(getattr(claim, "claim_source", "document") or "document"),
+                source_segment=int(claim.source_segment),
+                source_span=claim.source_span,
+                confidence=float(claim.confidence),
+                status=str(claim.status),
+                evidence_refs=tuple(str(item) for item in getattr(claim, "evidence_refs", ()) if str(item).strip()),
+            )
+        )
+
     entities = tuple(sorted(entity_index.values(), key=lambda item: item.entity_id))
     metadata = dict(scene.metadata)
     metadata.update(
@@ -145,6 +179,16 @@ def build_canonical_interlingua(scene: SemanticSceneGraph) -> CanonicalInterling
             "interlingua_states": float(len(states)),
             "interlingua_relations": float(len(relations)),
             "interlingua_goals": float(len(goals)),
+            "interlingua_claim_frames": float(len(claims)),
+            "interlingua_attributed_claim_frames": float(sum(1 for claim in claims if claim.speaker_key)),
+            "interlingua_nonasserted_claim_frames": float(
+                sum(1 for claim in claims if str(claim.epistemic_status) != "asserted")
+            ),
+            "interlingua_cited_claim_frames": float(sum(1 for claim in claims if claim.epistemic_status == "cited")),
+            "interlingua_questioned_claim_frames": float(
+                sum(1 for claim in claims if claim.epistemic_status == "questioned")
+            ),
+            "interlingua_hedged_claim_frames": float(sum(1 for claim in claims if claim.epistemic_status == "hedged")),
             "interlingua_negative_relations": float(
                 sum(1 for relation in relations if relation.polarity == "negative")
             ),
@@ -157,6 +201,7 @@ def build_canonical_interlingua(scene: SemanticSceneGraph) -> CanonicalInterling
                 sum(1 for relation in relations if relation.confidence < 0.6)
                 + sum(1 for state in states if state.confidence < 0.6)
                 + sum(1 for goal in goals if goal.confidence < 0.6)
+                + sum(1 for claim in claims if claim.confidence < 0.6 or claim.epistemic_status != "asserted")
             ),
             "interlingua_mean_entity_confidence": float(
                 sum(entity.confidence for entity in entities) / max(len(entities), 1)
@@ -178,5 +223,6 @@ def build_canonical_interlingua(scene: SemanticSceneGraph) -> CanonicalInterling
         states=tuple(states),
         relations=tuple(relations),
         goals=tuple(goals),
+        claims=tuple(claims),
         metadata=metadata,
     )

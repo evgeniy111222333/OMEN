@@ -75,6 +75,23 @@ class CanonicalGoalClaim:
     evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
 
 
+@dataclass(frozen=True)
+class CanonicalClaimFrame:
+    claim_id: str
+    claim_kind: str
+    proposition_id: str
+    speaker_entity_id: Optional[str] = None
+    speaker_key: Optional[str] = None
+    speaker_name: Optional[str] = None
+    epistemic_status: str = "asserted"
+    claim_source: str = "document"
+    source_segment: int = 0
+    source_span: Optional[GroundingSpan] = None
+    confidence: float = 0.55
+    status: str = "proposal"
+    evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
+
+
 @dataclass
 class CanonicalInterlingua:
     language: str
@@ -83,4 +100,5 @@ class CanonicalInterlingua:
     states: Tuple[CanonicalStateClaim, ...] = field(default_factory=tuple)
     relations: Tuple[CanonicalRelationClaim, ...] = field(default_factory=tuple)
     goals: Tuple[CanonicalGoalClaim, ...] = field(default_factory=tuple)
+    claims: Tuple[CanonicalClaimFrame, ...] = field(default_factory=tuple)
     metadata: Dict[str, float] = field(default_factory=dict)

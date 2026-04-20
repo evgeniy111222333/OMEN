@@ -86,6 +86,32 @@ def compile_interlingua_graph_records(
                 source_segment=int(goal.source_segment),
             )
         )
+    for claim in tuple(getattr(interlingua, "claims", ()) or ()):
+        graph_terms = [
+            str(claim.claim_kind),
+            str(claim.proposition_id),
+            str(claim.epistemic_status),
+        ]
+        if getattr(claim, "speaker_key", None):
+            graph_terms.append(str(claim.speaker_key))
+        if getattr(claim, "claim_source", None):
+            graph_terms.append(str(claim.claim_source))
+        speaker_text = f" speaker={claim.speaker_name}" if getattr(claim, "speaker_name", None) else ""
+        records.append(
+            GroundingGraphRecord(
+                record_type="claim",
+                record_id=str(claim.claim_id),
+                graph_key=f"interlingua:claim:{claim.claim_id}:{claim.epistemic_status}",
+                graph_text=(
+                    f"claim {claim.claim_kind} epistemic={claim.epistemic_status}"
+                    f"{speaker_text} proposition={claim.proposition_id}"
+                ),
+                graph_terms=tuple(term for term in graph_terms if term),
+                graph_family="interlingua_claim",
+                confidence=float(claim.confidence),
+                source_segment=int(claim.source_segment),
+            )
+        )
 
     limited = tuple(records[: max(int(max_records), 0)])
     stats = {
@@ -94,5 +120,6 @@ def compile_interlingua_graph_records(
         "interlingua_graph_state_records": float(sum(1 for record in limited if record.record_type == "state")),
         "interlingua_graph_relation_records": float(sum(1 for record in limited if record.record_type == "relation")),
         "interlingua_graph_goal_records": float(sum(1 for record in limited if record.record_type == "goal")),
+        "interlingua_graph_claim_records": float(sum(1 for record in limited if record.record_type == "claim")),
     }
     return limited, stats

@@ -62,6 +62,11 @@ CASES: Sequence[GroundingBenchmarkCase] = (
             "goal stable cooling"
         ),
     ),
+    GroundingBenchmarkCase(
+        name="scientific_citation",
+        language="text",
+        text="Abstract: aspirin causes relief (Smith, 2024).",
+    ),
 )
 
 
@@ -86,11 +91,22 @@ def _benchmark_pipeline(case: GroundingBenchmarkCase, *, iterations: int, max_se
         "pipeline_p95_ms": _percentile(latencies_ms, 0.95),
         "scene_entities": float(len(result.scene.entities)),
         "scene_events": float(len(result.scene.events)),
+        "scene_claim_attributed": float(result.scene.metadata.get("scene_claim_attributed", 0.0)),
+        "scene_claim_nonasserted": float(result.scene.metadata.get("scene_claim_nonasserted", 0.0)),
         "scene_coreference_links": float(result.scene.metadata.get("scene_coreference_links", 0.0)),
         "compiled_hypotheses": float(result.compiled.metadata.get("compiled_hypotheses", 0.0)),
+        "compiled_attributed_hypotheses": float(result.compiled.metadata.get("compiled_attributed_hypotheses", 0.0)),
+        "compiled_nonasserted_hypotheses": float(result.compiled.metadata.get("compiled_nonasserted_hypotheses", 0.0)),
         "compiled_event_frames": float(result.compiled.metadata.get("compiled_event_frames", 0.0)),
         "world_state_records": float(result.world_state.metadata.get("grounding_world_state_records", 0.0)),
+        "world_state_cited_records": float(result.world_state.metadata.get("grounding_world_state_cited_records", 0.0)),
+        "world_state_nonasserted_records": float(
+            result.world_state.metadata.get("grounding_world_state_nonasserted_records", 0.0)
+        ),
         "verification_records": float(result.verification.metadata.get("verification_records", 0.0)),
+        "verification_nonasserted_pressure": float(
+            result.verification.metadata.get("verification_nonasserted_pressure", 0.0)
+        ),
         "char_cov": float(result.document.metadata.get("grounding_span_char_coverage", 0.0)),
         "byte_cov": float(result.document.metadata.get("grounding_span_byte_coverage", 0.0)),
         "sem_auth": float(result.document.metadata.get("grounding_document_semantic_authority", 0.0)),
@@ -136,8 +152,11 @@ def main() -> None:
         "byte_tr".rjust(10),
         "events".rjust(8),
         "coref".rjust(8),
+        "attr".rjust(8),
+        "nonasrt".rjust(8),
         "hyp".rjust(8),
         "world".rjust(8),
+        "cited".rjust(8),
     )
     for case in CASES:
         pipeline_stats = _benchmark_pipeline(case, iterations=args.iterations, max_segments=args.max_segments)
@@ -155,8 +174,11 @@ def main() -> None:
             f"{trace_stats['trace_byte_span']:.2f}".rjust(10),
             f"{pipeline_stats['scene_events']:.0f}".rjust(8),
             f"{pipeline_stats['scene_coreference_links']:.0f}".rjust(8),
+            f"{pipeline_stats['compiled_attributed_hypotheses']:.0f}".rjust(8),
+            f"{pipeline_stats['compiled_nonasserted_hypotheses']:.0f}".rjust(8),
             f"{pipeline_stats['compiled_hypotheses']:.0f}".rjust(8),
             f"{pipeline_stats['world_state_records']:.0f}".rjust(8),
+            f"{pipeline_stats['world_state_cited_records']:.0f}".rjust(8),
         )
 
 

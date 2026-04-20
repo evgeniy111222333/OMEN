@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .interlingua import build_canonical_interlingua
-from .interlingua_types import CanonicalInterlingua
+from .interlingua_types import CanonicalClaimFrame, CanonicalInterlingua
 from .scene_types import SemanticSceneGraph
 from .types import GroundedTextDocument, GroundingSpan
 
@@ -20,6 +20,7 @@ class CompiledSymbolicSegment:
     relations: Tuple[Tuple[str, str, str], ...] = field(default_factory=tuple)
     goals: Tuple[Tuple[str, str], ...] = field(default_factory=tuple)
     event_frames: Tuple[Tuple[str, ...], ...] = field(default_factory=tuple)
+    claim_frames: Tuple[Tuple[str, str, str], ...] = field(default_factory=tuple)
     counterexample: bool = False
 
 
@@ -35,6 +36,10 @@ class CompiledSymbolicHypothesis:
     deferred: bool = False
     conflict_tag: str = ""
     provenance: Tuple[str, ...] = field(default_factory=tuple)
+    support_set: Tuple[str, ...] = field(default_factory=tuple)
+    speaker_key: str = ""
+    epistemic_status: str = "asserted"
+    claim_source: str = "document"
 
     @property
     def graph_key(self) -> str:
@@ -42,7 +47,14 @@ class CompiledSymbolicHypothesis:
 
     @property
     def graph_terms(self) -> Tuple[str, ...]:
-        return tuple(self.symbols)
+        terms = [*self.symbols, *self.support_set]
+        if self.speaker_key:
+            terms.append(f"speaker:{self.speaker_key}")
+        if self.epistemic_status:
+            terms.append(f"epistemic:{self.epistemic_status}")
+        if self.claim_source:
+            terms.append(f"claim_source:{self.claim_source}")
+        return tuple(str(term) for term in terms if str(term).strip())
 
     @property
     def graph_family(self) -> str:
@@ -51,6 +63,10 @@ class CompiledSymbolicHypothesis:
     @property
     def graph_text(self) -> str:
         parts = [self.kind, *self.symbols]
+        if self.speaker_key:
+            parts.append(f"speaker={self.speaker_key}")
+        if self.epistemic_status:
+            parts.append(f"epistemic={self.epistemic_status}")
         if self.conflict_tag:
             parts.append(self.conflict_tag)
         return " | ".join(parts)
@@ -87,9 +103,25 @@ def compile_canonical_interlingua(
     )
     compiled: List[CompiledSymbolicSegment] = []
     hypotheses: List[CompiledSymbolicHypothesis] = []
+    claim_frames_by_proposition: Dict[str, Tuple[CanonicalClaimFrame, ...]] = {}
+    for claim in tuple(getattr(interlingua, "claims", ()) or ()):
+        proposition_id = str(getattr(claim, "proposition_id", "") or "")
+        if not proposition_id:
+            continue
+        claim_frames_by_proposition[proposition_id] = claim_frames_by_proposition.get(proposition_id, tuple()) + (claim,)
 
     def _clip_confidence(value: float) -> float:
         return max(0.0, min(1.0, float(value)))
+
+    def _dominant_epistemic_status(claim_frames: Sequence[CanonicalClaimFrame]) -> str:
+        if not claim_frames:
+            return "asserted"
+        precedence = {"questioned": 0, "hedged": 1, "cited": 2, "asserted": 3}
+        ranked = sorted(
+            (str(getattr(frame, "epistemic_status", "asserted") or "asserted") for frame in claim_frames),
+            key=lambda value: precedence.get(value, 4),
+        )
+        return ranked[0] if ranked else "asserted"
 
     def _append_hypothesis(
         *,
@@ -104,11 +136,38 @@ def compile_canonical_interlingua(
         counterexample: bool = False,
         provenance: Sequence[str] = (),
         evidence_refs: Sequence[str] = (),
+        claim_frames: Sequence[CanonicalClaimFrame] = (),
     ) -> None:
         confidence_value = _clip_confidence(confidence)
         conflict = conflict_tag or ("counterexample_context" if counterexample else "")
-        deferred = bool(counterexample or confidence_value < 0.57)
+        dominant_epistemic_status = _dominant_epistemic_status(claim_frames)
+        deferred = bool(
+            counterexample
+            or confidence_value < 0.57
+            or dominant_epistemic_status in {"cited", "questioned", "hedged"}
+        )
         evidence = tuple(str(item) for item in evidence_refs if str(item).strip())
+        claim_support: List[str] = []
+        for frame in claim_frames:
+            claim_support.append(f"claim_frame:{frame.claim_id}")
+            if getattr(frame, "speaker_key", None):
+                claim_support.append(f"speaker:{frame.speaker_key}")
+            if getattr(frame, "epistemic_status", None):
+                claim_support.append(f"epistemic:{frame.epistemic_status}")
+            if getattr(frame, "claim_source", None):
+                claim_support.append(f"claim_source:{frame.claim_source}")
+            claim_support.extend(
+                str(item) for item in getattr(frame, "evidence_refs", ()) if str(item).strip()
+            )
+        support_set = tuple(dict.fromkeys(claim_support))
+        speaker_key = next(
+            (str(frame.speaker_key) for frame in claim_frames if getattr(frame, "speaker_key", None)),
+            "",
+        )
+        claim_source = next(
+            (str(frame.claim_source) for frame in claim_frames if str(getattr(frame, "claim_source", "") or "")),
+            "document",
+        )
         hypotheses.append(
             CompiledSymbolicHypothesis(
                 hypothesis_id=hypothesis_id,
@@ -121,6 +180,10 @@ def compile_canonical_interlingua(
                 deferred=deferred,
                 conflict_tag=conflict,
                 provenance=tuple(str(item) for item in provenance) + evidence,
+                support_set=support_set,
+                speaker_key=speaker_key,
+                epistemic_status=dominant_epistemic_status,
+                claim_source=claim_source,
             )
         )
 
@@ -167,7 +230,17 @@ def compile_canonical_interlingua(
             (goal.goal_name, goal.goal_value)
             for goal in segment_goals
         )
+        segment_claim_frames = tuple(
+            (
+                str(claim.claim_kind),
+                str(claim.epistemic_status),
+                str(claim.speaker_name or claim.claim_source or ""),
+            )
+            for claim in tuple(getattr(interlingua, "claims", ()) or ())
+            if int(getattr(claim, "source_segment", -1)) == idx
+        )
         for state in segment_states:
+            attached_claim_frames = claim_frames_by_proposition.get(str(state.claim_id), tuple())
             _append_hypothesis(
                 hypothesis_id=state.claim_id,
                 segment_index=idx,
@@ -179,10 +252,12 @@ def compile_canonical_interlingua(
                 counterexample=counterexample,
                 provenance=(f"segment:{idx}", f"state:{state.claim_id}"),
                 evidence_refs=getattr(state, "evidence_refs", ()),
+                claim_frames=attached_claim_frames,
             )
         for relation in segment_relations:
             relation_symbols = [relation.subject_name, relation.predicate, relation.object_name]
             relation_symbols.extend(str(item) for item in relation.relation_modifiers if str(item).strip())
+            attached_claim_frames = claim_frames_by_proposition.get(str(relation.claim_id), tuple())
             _append_hypothesis(
                 hypothesis_id=relation.claim_id,
                 segment_index=idx,
@@ -195,11 +270,13 @@ def compile_canonical_interlingua(
                 counterexample=counterexample,
                 provenance=(f"segment:{idx}", f"relation:{relation.claim_id}"),
                 evidence_refs=getattr(relation, "evidence_refs", ()),
+                claim_frames=attached_claim_frames,
             )
         for goal in segment_goals:
             goal_symbols = [goal.goal_name, goal.goal_value]
             if goal.target_name:
                 goal_symbols.append(goal.target_name)
+            attached_claim_frames = claim_frames_by_proposition.get(str(goal.goal_id), tuple())
             _append_hypothesis(
                 hypothesis_id=goal.goal_id,
                 segment_index=idx,
@@ -211,6 +288,7 @@ def compile_canonical_interlingua(
                 counterexample=counterexample,
                 provenance=(f"segment:{idx}", f"goal:{goal.goal_id}"),
                 evidence_refs=getattr(goal, "evidence_refs", ()),
+                claim_frames=attached_claim_frames,
             )
         compiled.append(
             CompiledSymbolicSegment(
@@ -223,6 +301,7 @@ def compile_canonical_interlingua(
                 relations=relations,
                 goals=goals,
                 event_frames=event_frames,
+                claim_frames=segment_claim_frames,
                 counterexample=counterexample,
             )
         )
@@ -253,9 +332,23 @@ def compile_canonical_interlingua(
                 sum(1 for hypothesis in hypotheses if hypothesis.kind == "relation" and any(symbol.startswith("time:") for symbol in hypothesis.symbols[3:]))
             ),
             "compiled_hypotheses": float(len(hypotheses)),
+            "compiled_claim_frames": float(sum(len(segment.claim_frames) for segment in compiled)),
             "compiled_deferred_hypotheses": float(deferred_hypotheses),
             "compiled_conflict_hypotheses": float(conflict_hypotheses),
             "compiled_mean_confidence": float(mean_confidence),
+            "compiled_attributed_hypotheses": float(sum(1 for hypothesis in hypotheses if hypothesis.speaker_key)),
+            "compiled_nonasserted_hypotheses": float(
+                sum(1 for hypothesis in hypotheses if hypothesis.epistemic_status != "asserted")
+            ),
+            "compiled_cited_hypotheses": float(
+                sum(1 for hypothesis in hypotheses if hypothesis.epistemic_status == "cited")
+            ),
+            "compiled_questioned_hypotheses": float(
+                sum(1 for hypothesis in hypotheses if hypothesis.epistemic_status == "questioned")
+            ),
+            "compiled_hedged_hypotheses": float(
+                sum(1 for hypothesis in hypotheses if hypothesis.epistemic_status == "hedged")
+            ),
             "compiled_structural_evidence_refs": float(
                 sum(
                     1

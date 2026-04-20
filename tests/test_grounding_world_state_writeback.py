@@ -88,6 +88,45 @@ class GroundingWorldStateWritebackTest(unittest.TestCase):
             any(getattr(fact, "pred", None) == GROUND_WORLD_CONTRADICTED_RELATION_PRED for fact in contradicted_facts)
         )
 
+    def test_writeback_keeps_supported_cited_claims_hypothetical(self) -> None:
+        compilation = SymbolicCompilationResult(
+            language="text",
+            source_text="Abstract: aspirin causes relief (Smith, 2024).",
+            segments=(
+                CompiledSymbolicSegment(
+                    index=0,
+                    text="Abstract: aspirin causes relief (Smith, 2024).",
+                    normalized_text="abstract aspirin causes relief smith 2024",
+                    relations=(("aspirin", "causes", "relief"),),
+                ),
+            ),
+            hypotheses=(
+                CompiledSymbolicHypothesis(
+                    hypothesis_id="rel:cited",
+                    segment_index=0,
+                    kind="relation",
+                    symbols=("aspirin", "causes", "relief"),
+                    confidence=0.95,
+                    status="supported",
+                    deferred=True,
+                    speaker_key="paper",
+                    epistemic_status="cited",
+                    claim_source="citation_region",
+                    provenance=("segment:0", "structural_unit:citation:0:0"),
+                ),
+            ),
+        )
+
+        verification = verify_symbolic_hypotheses(compilation)
+        writeback = build_grounding_world_state_writeback(compilation, verification)
+
+        self.assertEqual(writeback.records[0].world_status, "hypothetical")
+        self.assertEqual(writeback.records[0].epistemic_status, "cited")
+        self.assertEqual(writeback.metadata.get("grounding_world_state_active_records"), 0.0)
+        self.assertEqual(writeback.metadata.get("grounding_world_state_hypothetical_records"), 1.0)
+        self.assertEqual(writeback.metadata.get("grounding_world_state_cited_records"), 1.0)
+        self.assertEqual(writeback.metadata.get("grounding_world_state_nonasserted_records"), 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

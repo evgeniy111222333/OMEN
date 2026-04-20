@@ -267,12 +267,26 @@ class GroundingScenePipelineTest(unittest.TestCase):
         self.assertGreaterEqual(result.scene.metadata.get("scene_goals", 0.0), 1.0)
         self.assertGreaterEqual(result.compiled.metadata.get("compiled_relation_claims", 0.0), 1.0)
         self.assertGreaterEqual(result.compiled.metadata.get("compiled_goal_claims", 0.0), 1.0)
+        self.assertGreaterEqual(result.scene.metadata.get("scene_claim_attributed", 0.0), 2.0)
+        self.assertGreaterEqual(result.interlingua.metadata.get("interlingua_attributed_claim_frames", 0.0), 2.0)
+        self.assertGreaterEqual(result.compiled.metadata.get("compiled_attributed_hypotheses", 0.0), 2.0)
+        self.assertGreaterEqual(
+            result.world_state.metadata.get("grounding_world_state_attributed_records", 0.0),
+            2.0,
+        )
         self.assertGreaterEqual(result.compiled.metadata.get("compiled_structural_evidence_refs", 0.0), 2.0)
         self.assertTrue(
             any(
                 str(item).startswith("structural_unit:speaker_turn")
                 for hypothesis in result.compiled.hypotheses
                 for item in hypothesis.provenance
+            )
+        )
+        self.assertTrue(any(claim.speaker_entity_id for claim in result.scene.claims))
+        self.assertTrue(
+            any(
+                hypothesis.speaker_key and hypothesis.claim_source == "speaker_turn"
+                for hypothesis in result.compiled.hypotheses
             )
         )
         self.assertTrue(any(event.evidence_refs for event in result.scene.events))
@@ -300,6 +314,29 @@ class GroundingScenePipelineTest(unittest.TestCase):
         self.assertGreaterEqual(len(result.scene.events), 1)
         self.assertGreaterEqual(result.compiled.metadata.get("compiled_goal_claims", 0.0), 1.0)
         self.assertGreaterEqual(result.compiled.metadata.get("compiled_relation_claims", 0.0), 1.0)
+
+    def test_pipeline_keeps_cited_scientific_claims_nonasserted_until_world_state(self) -> None:
+        text = "Abstract: aspirin causes relief (Smith, 2024)."
+
+        result = ground_text_to_symbolic(text, language="text", max_segments=6)
+
+        self.assertIsNotNone(result.document.routing)
+        assert result.document.routing is not None
+        self.assertEqual(result.document.routing.subtype, "scientific_text")
+        self.assertGreaterEqual(result.scene.metadata.get("scene_claim_nonasserted", 0.0), 1.0)
+        self.assertGreaterEqual(result.interlingua.metadata.get("interlingua_cited_claim_frames", 0.0), 1.0)
+        self.assertGreaterEqual(result.compiled.metadata.get("compiled_nonasserted_hypotheses", 0.0), 1.0)
+        self.assertGreaterEqual(result.verification.metadata.get("verification_nonasserted_pressure", 0.0), 1.0)
+        self.assertGreaterEqual(result.world_state.metadata.get("grounding_world_state_cited_records", 0.0), 1.0)
+        self.assertGreaterEqual(
+            result.world_state.metadata.get("grounding_world_state_nonasserted_records", 0.0),
+            1.0,
+        )
+        self.assertTrue(any(claim.epistemic_status == "cited" for claim in result.scene.claims))
+        self.assertTrue(any(hypothesis.epistemic_status == "cited" for hypothesis in result.compiled.hypotheses))
+        self.assertTrue(
+            all(record.world_status != "active" for record in result.world_state.records if record.epistemic_status == "cited")
+        )
 
     def test_pipeline_uses_injected_backbone_scene_graph(self) -> None:
         result = ground_text_to_symbolic("unstructured placeholder text", language="text", backbone=_FixedBackbone())

@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
+from .claim_semantics import infer_claim_semantics
 from .semantic_context import build_semantic_context_objects
 from .scene_types import (
     SemanticClaim,
@@ -318,7 +319,10 @@ def build_structural_scene_graph(
                             predicate=key_name,
                             object_entity_id=target_id,
                             object_value=value_name,
+                            proposition_id=goal_id,
                             goal_id=goal_id,
+                            epistemic_status="asserted",
+                            claim_source="structured_record",
                             evidence_refs=evidence_refs,
                         )
                     )
@@ -360,6 +364,9 @@ def build_structural_scene_graph(
                         subject_entity_id=entity_id,
                         predicate=key_name,
                         object_value=value_name,
+                        proposition_id=state_id,
+                        epistemic_status="asserted",
+                        claim_source="structured_record",
                         evidence_refs=evidence_refs,
                     )
                 )
@@ -374,6 +381,12 @@ def build_structural_scene_graph(
         if natural_primary:
             natural_evidence_refs = _segment_evidence_refs(natural_support_units)
             condition, explanation, temporal = _segment_event_controls(natural_support_units)
+            claim_profile = infer_claim_semantics(
+                segment.text,
+                structural_units=natural_support_units,
+            )
+            segment_speaker_id: Optional[str] = None
+            segment_speaker_name = claim_profile.speaker_name or None
             natural_state_candidates: List[Tuple[str, str, object, float, str]] = []
             natural_goal_candidates = list(tuple(getattr(segment, "goals", ()) or ()))
             natural_relation_candidates = list(tuple(getattr(segment, "relations", ()) or ()))
@@ -386,8 +399,16 @@ def build_structural_scene_graph(
                         (value for key, value in tuple(getattr(unit, "fields", ()) or ()) if str(key) == "speaker"),
                         None,
                     )
+                    if speaker_value is None:
+                        match = re.match(
+                            r"^(user|assistant|speaker|q|a)\s*[:>-]\s*(.+)$",
+                            str(unit.text or ""),
+                            flags=re.IGNORECASE,
+                        )
+                        if match is not None:
+                            speaker_value = match.group(1).strip().casefold()
                     if speaker_value is not None:
-                        ensure_entity(
+                        speaker_entity_id = ensure_entity(
                             speaker_value,
                             semantic_type="speaker",
                             source_segment=seg_idx,
@@ -395,6 +416,10 @@ def build_structural_scene_graph(
                             confidence=max(0.58, float(unit.confidence)),
                             alias=str(speaker_value),
                         )
+                        if segment_speaker_id is None:
+                            segment_speaker_id = speaker_entity_id
+                        if segment_speaker_name is None:
+                            segment_speaker_name = _normalized(speaker_value)
                     match = re.match(r"^(user|assistant|speaker|q|a)\s*[:>-]\s*(.+)$", str(unit.text or ""), flags=re.IGNORECASE)
                     unit_text = match.group(2).strip() if match is not None else str(unit.text or "")
                 structured_pairs = extract_structured_pairs(unit_text)
@@ -454,6 +479,11 @@ def build_structural_scene_graph(
                         subject_entity_id=entity_id,
                         predicate=key_name,
                         object_value=value_name,
+                        proposition_id=state_id,
+                        speaker_entity_id=segment_speaker_id,
+                        speaker_name=segment_speaker_name,
+                        epistemic_status=claim_profile.epistemic_status,
+                        claim_source=claim_profile.claim_source,
                         evidence_refs=evidence_refs,
                     )
                 )
@@ -501,7 +531,12 @@ def build_structural_scene_graph(
                         predicate=goal_name,
                         object_entity_id=target_id,
                         object_value=goal_value,
+                        proposition_id=goal_id,
                         goal_id=goal_id,
+                        speaker_entity_id=segment_speaker_id,
+                        speaker_name=segment_speaker_name,
+                        epistemic_status=claim_profile.epistemic_status,
+                        claim_source=claim_profile.claim_source,
                         evidence_refs=evidence_refs,
                     )
                 )
@@ -565,7 +600,12 @@ def build_structural_scene_graph(
                         predicate=predicate,
                         object_entity_id=object_id,
                         object_value=right_name,
+                        proposition_id=event_id,
                         event_id=event_id,
+                        speaker_entity_id=segment_speaker_id,
+                        speaker_name=segment_speaker_name,
+                        epistemic_status=claim_profile.epistemic_status,
+                        claim_source=claim_profile.claim_source,
                         evidence_refs=evidence_refs,
                     )
                 )
@@ -586,6 +626,10 @@ def build_structural_scene_graph(
             "scene_events": float(len(events)),
             "scene_goals": float(len(goals)),
             "scene_claims": float(len(claims)),
+            "scene_claim_attributed": float(sum(1 for claim in claims if claim.speaker_entity_id)),
+            "scene_claim_nonasserted": float(
+                sum(1 for claim in claims if str(claim.epistemic_status) != "asserted")
+            ),
             "scene_mentions": float(len(mentions)),
             "scene_discourse_relations": float(len(discourse_relations)),
             "scene_temporal_markers": float(len(temporal_markers)),
@@ -612,6 +656,12 @@ def build_structural_scene_graph(
             "scene_structural_primary_state_claims": float(len(states)),
             "scene_structural_primary_relation_claims": float(len(events)),
             "scene_structural_primary_goal_claims": float(len(goals)),
+            "scene_structural_primary_attributed_claims": float(
+                sum(1 for claim in claims if claim.speaker_entity_id)
+            ),
+            "scene_structural_primary_nonasserted_claims": float(
+                sum(1 for claim in claims if str(claim.epistemic_status) != "asserted")
+            ),
             "scene_structural_primary_evidence_refs": float(
                 sum(len(state.evidence_refs) for state in states)
                 + sum(len(event.evidence_refs) for event in events)

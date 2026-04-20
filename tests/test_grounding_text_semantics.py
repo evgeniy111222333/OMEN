@@ -347,6 +347,20 @@ class GroundingTextSemanticsTest(unittest.TestCase):
             )
         )
 
+    def test_trace_builder_surfaces_claim_frame_and_nonasserted_metrics(self) -> None:
+        text = "Abstract: aspirin causes relief (Smith, 2024)."
+
+        bundle = build_symbolic_trace_bundle(text, lang_hint="text", max_steps=8, max_counterexamples=2)
+
+        self.assertIsNotNone(bundle)
+        assert bundle is not None
+        self.assertGreaterEqual(float(bundle.metadata.get("interlingua_claim_frames", 0.0)), 1.0)
+        self.assertGreaterEqual(float(bundle.metadata.get("interlingua_cited_claim_frames", 0.0)), 1.0)
+        self.assertGreaterEqual(float(bundle.metadata.get("compiled_nonasserted_hypotheses", 0.0)), 1.0)
+        self.assertGreaterEqual(float(bundle.metadata.get("verification_nonasserted_pressure", 0.0)), 1.0)
+        self.assertGreaterEqual(float(bundle.metadata.get("grounding_world_state_nonasserted_records", 0.0)), 1.0)
+        self.assertGreaterEqual(float(bundle.metadata.get("grounding_world_state_cited_records", 0.0)), 1.0)
+
     def test_generation_context_surfaces_trace_grounding_metrics_for_utf8_prompt(self) -> None:
         cfg = OMENScaleConfig.demo()
         cfg.allow_noncanonical_ablation = True

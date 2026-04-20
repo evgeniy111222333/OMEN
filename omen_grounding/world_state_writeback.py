@@ -25,6 +25,9 @@ class GroundingWorldStateRecord:
     conflict: float = 0.0
     confidence: float = 0.0
     repair_action: str = "none"
+    speaker_key: str = ""
+    epistemic_status: str = "asserted"
+    claim_source: str = "document"
     provenance: Tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -34,6 +37,12 @@ class GroundingWorldStateRecord:
     @property
     def graph_terms(self) -> Tuple[str, ...]:
         terms = [*self.symbols, self.record_type, self.world_status]
+        if self.speaker_key:
+            terms.append(f"speaker:{self.speaker_key}")
+        if self.epistemic_status:
+            terms.append(f"epistemic:{self.epistemic_status}")
+        if self.claim_source:
+            terms.append(f"claim_source:{self.claim_source}")
         if self.repair_action:
             terms.append(self.repair_action)
         return tuple(str(term) for term in terms if term)
@@ -45,9 +54,11 @@ class GroundingWorldStateRecord:
     @property
     def graph_text(self) -> str:
         symbol_text = " | ".join(self.symbols)
+        attribution = f" speaker={self.speaker_key}" if self.speaker_key else ""
         return (
             f"{self.world_status} {self.record_type} support={self.support:.2f} "
-            f"conflict={self.conflict:.2f} repair={self.repair_action} {symbol_text}"
+            f"conflict={self.conflict:.2f} repair={self.repair_action} "
+            f"epistemic={self.epistemic_status}{attribution} {symbol_text}"
         ).strip()
 
 
@@ -68,6 +79,8 @@ def build_grounding_world_state_writeback(
 
     for hypothesis in compilation.hypotheses:
         verification_record = verification_by_hypothesis.get(str(hypothesis.hypothesis_id))
+        epistemic_status = str(getattr(hypothesis, "epistemic_status", "asserted") or "asserted")
+        nonasserted = epistemic_status in {"cited", "questioned", "hedged"}
         if verification_record is None:
             world_status = "hypothetical"
             support = _clip01(hypothesis.confidence)
@@ -77,7 +90,7 @@ def build_grounding_world_state_writeback(
         else:
             verification_status = str(verification_record.verification_status)
             if verification_status == "supported":
-                world_status = "active"
+                world_status = "hypothetical" if nonasserted else "active"
             elif verification_status == "conflicted":
                 world_status = "contradicted"
             else:
@@ -99,6 +112,9 @@ def build_grounding_world_state_writeback(
                 conflict=conflict,
                 confidence=_clip01(hypothesis.confidence),
                 repair_action=repair_action,
+                speaker_key=str(getattr(hypothesis, "speaker_key", "") or ""),
+                epistemic_status=epistemic_status,
+                claim_source=str(getattr(hypothesis, "claim_source", "document") or "document"),
                 provenance=provenance,
             )
         )
@@ -107,6 +123,11 @@ def build_grounding_world_state_writeback(
     active = sum(1 for record in records if record.world_status == "active")
     hypothetical = sum(1 for record in records if record.world_status == "hypothetical")
     contradicted = sum(1 for record in records if record.world_status == "contradicted")
+    nonasserted = sum(1 for record in records if record.epistemic_status != "asserted")
+    cited = sum(1 for record in records if record.epistemic_status == "cited")
+    questioned = sum(1 for record in records if record.epistemic_status == "questioned")
+    hedged = sum(1 for record in records if record.epistemic_status == "hedged")
+    attributed = sum(1 for record in records if record.speaker_key)
     mean_support = (
         sum(float(record.support) for record in records) / max(total, 1.0)
         if records else 0.0
@@ -123,7 +144,11 @@ def build_grounding_world_state_writeback(
     hypothetical_ratio = float(hypothetical) / max(total, 1.0)
     contradicted_ratio = float(contradicted) / max(total, 1.0)
     repair_ratio = float(repairable) / max(total, 1.0)
-    branching_pressure = _clip01(hypothetical_ratio * (0.50 + 0.50 * mean_support))
+    nonasserted_ratio = float(nonasserted) / max(total, 1.0)
+    branching_pressure = _clip01(
+        (hypothetical_ratio * (0.45 + 0.45 * mean_support))
+        + (0.30 * nonasserted_ratio)
+    )
     contradiction_pressure = _clip01(
         (0.70 * contradicted_ratio)
         + (0.20 * mean_conflict)
@@ -137,6 +162,12 @@ def build_grounding_world_state_writeback(
         "grounding_world_state_acceptance_ratio": float(active) / max(total, 1.0),
         "grounding_world_state_hypothetical_ratio": hypothetical_ratio,
         "grounding_world_state_conflict_ratio": float(contradicted) / max(total, 1.0),
+        "grounding_world_state_attributed_records": float(attributed),
+        "grounding_world_state_nonasserted_records": float(nonasserted),
+        "grounding_world_state_cited_records": float(cited),
+        "grounding_world_state_questioned_records": float(questioned),
+        "grounding_world_state_hedged_records": float(hedged),
+        "grounding_world_state_nonasserted_ratio": nonasserted_ratio,
         "grounding_world_state_mean_support": mean_support,
         "grounding_world_state_mean_conflict": mean_conflict,
         "grounding_world_state_repair_ratio": repair_ratio,

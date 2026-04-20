@@ -33,6 +33,8 @@ def _empty_scene(document: GroundedTextDocument) -> SemanticSceneGraph:
             "scene_entity_aliases": 0.0,
             "scene_mean_entity_confidence": 0.0,
             "scene_mean_event_confidence": 0.0,
+            "scene_claim_attributed": 0.0,
+            "scene_claim_nonasserted": 0.0,
         }
     )
     return SemanticSceneGraph(
@@ -106,7 +108,12 @@ def _rewire_goal(goal: SemanticGoal, entity_id_map: Dict[str, str]) -> SemanticG
 def _rewire_claim(claim: SemanticClaim, entity_id_map: Dict[str, str]) -> SemanticClaim:
     subject_id = entity_id_map.get(claim.subject_entity_id, claim.subject_entity_id) if claim.subject_entity_id else None
     object_id = entity_id_map.get(claim.object_entity_id, claim.object_entity_id) if claim.object_entity_id else None
-    if subject_id == claim.subject_entity_id and object_id == claim.object_entity_id:
+    speaker_id = entity_id_map.get(claim.speaker_entity_id, claim.speaker_entity_id) if claim.speaker_entity_id else None
+    if (
+        subject_id == claim.subject_entity_id
+        and object_id == claim.object_entity_id
+        and speaker_id == claim.speaker_entity_id
+    ):
         return claim
     return SemanticClaim(
         claim_id=claim.claim_id,
@@ -119,8 +126,13 @@ def _rewire_claim(claim: SemanticClaim, entity_id_map: Dict[str, str]) -> Semant
         predicate=claim.predicate,
         object_entity_id=object_id,
         object_value=claim.object_value,
+        proposition_id=claim.proposition_id,
         event_id=claim.event_id,
         goal_id=claim.goal_id,
+        speaker_entity_id=speaker_id,
+        speaker_name=claim.speaker_name,
+        epistemic_status=claim.epistemic_status,
+        claim_source=claim.claim_source,
         evidence_refs=claim.evidence_refs,
     )
 
@@ -175,6 +187,10 @@ def _merge_scene_graphs(
             "scene_events": float(len(fallback_scene.events)),
             "scene_goals": float(len(merged_goals)),
             "scene_claims": float(len(merged_claims)),
+            "scene_claim_attributed": float(sum(1 for claim in merged_claims if claim.speaker_entity_id)),
+            "scene_claim_nonasserted": float(
+                sum(1 for claim in merged_claims if str(claim.epistemic_status) != "asserted")
+            ),
             "scene_mentions": float(len(mentions)),
             "scene_discourse_relations": float(len(discourse_relations)),
             "scene_temporal_markers": float(len(temporal_markers)),

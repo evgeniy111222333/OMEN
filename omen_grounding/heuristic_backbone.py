@@ -4,6 +4,7 @@ import re
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from .backbone import SemanticGroundingBackbone
+from .claim_semantics import infer_claim_semantics
 from .semantic_context import build_semantic_context_objects
 from .scene_types import (
     SemanticClaim,
@@ -403,6 +404,20 @@ def _extract_temporal(segment: str) -> str:
         if marker.casefold() in lowered:
             return normalize_symbol_text(marker) or ""
     return ""
+
+
+def _segment_evidence_refs(segment) -> Tuple[str, ...]:
+    refs: List[str] = []
+    for unit in tuple(getattr(segment, "structural_units", ()) or ()):
+        unit_type = str(getattr(unit, "unit_type", "") or "")
+        refs.append(f"structural_unit:{getattr(unit, 'unit_id', '')}")
+        refs.append(f"unit_type:{unit_type}")
+        refs.extend(
+            str(reference)
+            for reference in tuple(getattr(unit, "references", ()) or ())
+            if str(reference).strip()
+        )
+    return tuple(dict.fromkeys(item for item in refs if item))
 
 
 def _relation_candidates_from_verbs(segment: str, *, span=None) -> List[GroundedRelationHint]:
@@ -835,6 +850,23 @@ class HeuristicFallbackSemanticBackbone(SemanticGroundingBackbone):
             seg_idx = int(segment.index)
             segment_entity_ids: List[str] = []
             segment_salient_entity_id: Optional[str] = None
+            claim_profile = infer_claim_semantics(
+                segment.text,
+                structural_units=tuple(getattr(segment, "structural_units", ()) or ()),
+            )
+            segment_claim_evidence = _segment_evidence_refs(segment)
+            segment_speaker_id: Optional[str] = None
+            segment_speaker_name = claim_profile.speaker_name or None
+            if segment_speaker_name:
+                segment_speaker_id = ensure_entity(
+                    segment_speaker_name,
+                    semantic_type="speaker",
+                    source_segment=seg_idx,
+                    source_span=segment.span,
+                    confidence=max(0.58, float(getattr(segment, "confidence", 0.0) or 0.0)),
+                    status="supported",
+                    alias=segment_speaker_name,
+                )
             structured_pairs = tuple((state.key, state.value) for state in segment.states)
             segment_routing = getattr(segment, "routing", None)
             allow_nl_semantics = (
@@ -923,6 +955,12 @@ class HeuristicFallbackSemanticBackbone(SemanticGroundingBackbone):
                         subject_entity_id=entity_id,
                         predicate="state",
                         object_value=state.value,
+                        proposition_id=f"state:{seg_idx}:{idx}",
+                        speaker_entity_id=segment_speaker_id,
+                        speaker_name=segment_speaker_name,
+                        epistemic_status=claim_profile.epistemic_status,
+                        claim_source=claim_profile.claim_source,
+                        evidence_refs=segment_claim_evidence,
                     )
                 )
 
@@ -1028,7 +1066,14 @@ class HeuristicFallbackSemanticBackbone(SemanticGroundingBackbone):
                         subject_entity_id=subj_id,
                         predicate=event.predicate,
                         object_entity_id=obj_id,
+                        object_value=event.object_name,
+                        proposition_id=event_id,
                         event_id=event_id,
+                        speaker_entity_id=segment_speaker_id,
+                        speaker_name=segment_speaker_name,
+                        epistemic_status=claim_profile.epistemic_status,
+                        claim_source=claim_profile.claim_source,
+                        evidence_refs=segment_claim_evidence,
                     )
                 )
 
@@ -1086,7 +1131,14 @@ class HeuristicFallbackSemanticBackbone(SemanticGroundingBackbone):
                         subject_entity_id=subj_id,
                         predicate=relation.relation,
                         object_entity_id=obj_id,
+                        object_value=relation.right,
+                        proposition_id=event_id,
                         event_id=event_id,
+                        speaker_entity_id=segment_speaker_id,
+                        speaker_name=segment_speaker_name,
+                        epistemic_status=claim_profile.epistemic_status,
+                        claim_source=claim_profile.claim_source,
+                        evidence_refs=segment_claim_evidence,
                     )
                 )
 
@@ -1123,7 +1175,13 @@ class HeuristicFallbackSemanticBackbone(SemanticGroundingBackbone):
                         predicate=goal.goal_name,
                         object_entity_id=target_id,
                         object_value=goal.goal_value,
+                        proposition_id=goal_id,
                         goal_id=goal_id,
+                        speaker_entity_id=segment_speaker_id,
+                        speaker_name=segment_speaker_name,
+                        epistemic_status=claim_profile.epistemic_status,
+                        claim_source=claim_profile.claim_source,
+                        evidence_refs=segment_claim_evidence,
                     )
                 )
 
@@ -1146,6 +1204,10 @@ class HeuristicFallbackSemanticBackbone(SemanticGroundingBackbone):
                 "scene_events": float(len(events)),
                 "scene_goals": float(len(goals)),
                 "scene_claims": float(len(claims)),
+                "scene_claim_attributed": float(sum(1 for claim in claims if claim.speaker_entity_id)),
+                "scene_claim_nonasserted": float(
+                    sum(1 for claim in claims if str(claim.epistemic_status) != "asserted")
+                ),
                 "scene_mentions": float(len(mentions)),
                 "scene_discourse_relations": float(len(discourse_relations)),
                 "scene_temporal_markers": float(len(temporal_markers)),
@@ -1170,6 +1232,10 @@ class HeuristicFallbackSemanticBackbone(SemanticGroundingBackbone):
                 "scene_fallback_goal_proposals": goal_proposals,
                 "scene_fallback_entity_proposals": entity_proposals,
                 "scene_fallback_event_proposals": event_proposals,
+                "scene_fallback_attributed_claims": float(sum(1 for claim in claims if claim.speaker_entity_id)),
+                "scene_fallback_nonasserted_claims": float(
+                    sum(1 for claim in claims if str(claim.epistemic_status) != "asserted")
+                ),
             }
         )
         return SemanticSceneGraph(

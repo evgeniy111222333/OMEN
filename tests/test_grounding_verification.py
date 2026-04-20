@@ -203,6 +203,46 @@ class GroundingVerificationTest(unittest.TestCase):
         self.assertGreater(report_with.records[0].support, report_without.records[0].support)
         self.assertLessEqual(report_with.records[0].conflict, report_without.records[0].conflict)
 
+    def test_verification_tracks_claim_attribution_and_nonasserted_pressure(self) -> None:
+        compilation = SymbolicCompilationResult(
+            language="text",
+            source_text="Assistant: maybe stars generate planets?",
+            segments=(
+                CompiledSymbolicSegment(
+                    index=0,
+                    text="Assistant: maybe stars generate planets?",
+                    normalized_text="assistant maybe stars generate planets",
+                    relations=(("stars", "generates", "planets"),),
+                ),
+            ),
+            hypotheses=(
+                CompiledSymbolicHypothesis(
+                    hypothesis_id="rel:dialogue",
+                    segment_index=0,
+                    kind="relation",
+                    symbols=("stars", "generates", "planets"),
+                    confidence=0.74,
+                    status="proposal",
+                    deferred=True,
+                    speaker_key="assistant",
+                    epistemic_status="questioned",
+                    claim_source="speaker_turn",
+                    provenance=("segment:0", "structural_unit:speaker_turn:0"),
+                ),
+            ),
+        )
+
+        report = verify_symbolic_hypotheses(compilation)
+
+        self.assertEqual(report.metadata.get("verification_claim_attribution_support"), 1.0)
+        self.assertEqual(report.metadata.get("verification_nonasserted_pressure"), 1.0)
+        self.assertEqual(report.records[0].speaker_key, "assistant")
+        self.assertEqual(report.records[0].epistemic_status, "questioned")
+        self.assertEqual(report.records[0].claim_source, "speaker_turn")
+        self.assertIn("speaker:assistant", report.records[0].graph_terms)
+        self.assertIn("epistemic:questioned", report.records[0].graph_terms)
+        self.assertIn("claim_source:speaker_turn", report.records[0].graph_terms)
+
 
 if __name__ == "__main__":
     unittest.main()
