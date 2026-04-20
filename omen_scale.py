@@ -77,6 +77,7 @@ from omen_symbolic.execution_trace import (
 )
 from omen_grounding import (
     build_planner_world_state,
+    grounding_memory_corroboration,
     grounding_memory_families,
     grounding_memory_records,
     grounding_memory_status_counts,
@@ -3016,6 +3017,8 @@ class OMENScale(nn.Module):
             "observed_now_facts",
             "memory_facts",
             "memory_grounding_records",
+            "grounding_ontology_records",
+            "grounding_ontology_facts",
             "grounding_world_state_records",
             "grounding_world_state_facts",
             "grounding_world_state_active_records",
@@ -3247,6 +3250,8 @@ class OMENScale(nn.Module):
                 "observed_now_facts",
                 "memory_facts",
                 "memory_grounding_records",
+                "grounding_ontology_records",
+                "grounding_ontology_facts",
                 "grounding_world_state_records",
                 "grounding_world_state_facts",
                 "grounding_world_state_active_records",
@@ -4044,6 +4049,7 @@ class OMENScale(nn.Module):
         return list(
             grounding_memory_records(
                 tuple(getattr(trace_bundle, "grounding_world_state_records", ()))
+                + tuple(getattr(trace_bundle, "grounding_ontology_records", ()))
                 + tuple(getattr(trace_bundle, "grounding_verification_records", ()))
                 + tuple(getattr(trace_bundle, "grounding_hypotheses", ()))
                 + tuple(getattr(trace_bundle, "grounding_graph_records", ())),
@@ -4854,6 +4860,8 @@ class OMENScale(nn.Module):
         metadata: Dict[str, object],
         memory_derived_facts: Optional[Sequence[HornAtom]] = None,
         memory_grounding_records: Optional[Sequence[object]] = None,
+        grounding_ontology_records: Optional[Sequence[object]] = None,
+        grounding_ontology_facts: Optional[Sequence[HornAtom]] = None,
         grounding_world_state_records: Optional[Sequence[object]] = None,
         grounding_world_state_active_facts: Optional[Sequence[HornAtom]] = None,
         grounding_world_state_hypothetical_facts: Optional[Sequence[HornAtom]] = None,
@@ -4879,6 +4887,11 @@ class OMENScale(nn.Module):
                 grounding_memory,
                 limit=max(4, min(context_limit, int(getattr(self.cfg, "mem_grounding_seed_limit", 16)))),
             )
+        )
+        grounding_ontology = list(grounding_ontology_records or ())
+        grounding_ontology_facts = self._dedupe_facts(
+            list(grounding_ontology_facts or ()),
+            limit=max(4, min(self._ctx_max_facts // 2, 24)),
         )
         grounding_world_state = list(grounding_world_state_records or ())
         grounding_world_state_active = self._dedupe_facts(
@@ -4924,6 +4937,8 @@ class OMENScale(nn.Module):
             observed_now_facts=frozenset(observed_now),
             memory_derived_facts=frozenset(memory_facts),
             memory_grounding_records=tuple(grounding_memory),
+            grounding_ontology_records=tuple(grounding_ontology),
+            grounding_ontology_facts=frozenset(grounding_ontology_facts),
             grounding_world_state_records=tuple(grounding_world_state),
             grounding_world_state_active_facts=frozenset(grounding_world_state_active),
             grounding_world_state_hypothetical_facts=frozenset(grounding_world_state_hypothetical),
@@ -4944,6 +4959,16 @@ class OMENScale(nn.Module):
             world_context_summary=dict(world_context_summary or {}),
             metadata=dict(metadata),
         )
+        corroboration_stats = grounding_memory_corroboration(
+            (
+                tuple(grounding_ontology)
+                + tuple(grounding_world_state)
+                + tuple(grounding_verification)
+                + tuple(grounding_hypothesis_records)
+            ),
+            tuple(grounding_memory),
+        )
+        context.metadata.update(corroboration_stats)
         context.metadata.update(context.source_counts())
         return context
 
@@ -4975,6 +5000,7 @@ class OMENScale(nn.Module):
             + raw.get("compiled_goal_claims", 0.0)
         )
         graph_records = float(raw.get("interlingua_graph_records", 0.0))
+        ontology_support = max(min(float(raw.get("grounding_ontology_support", 0.0)), 1.0), 0.0)
         uncertain_claims = float(raw.get("interlingua_uncertain_claims", 0.0))
         hypothesis_count = float(raw.get("compiled_hypotheses", 0.0))
         deferred_hypotheses = float(raw.get("compiled_deferred_hypotheses", 0.0))
@@ -5027,6 +5053,12 @@ class OMENScale(nn.Module):
             min(float(raw.get("grounding_world_state_conflict_ratio", 0.0)), 1.0),
             0.0,
         )
+        parser_agreement = max(min(float(raw.get("grounding_parser_agreement", 0.0)), 1.0), 0.0)
+        span_traceability = max(min(float(raw.get("grounding_span_traceability", 0.0)), 1.0), 0.0)
+        memory_corroboration = max(
+            min(float(raw.get("verification_memory_corroboration", 0.0)), 1.0),
+            0.0,
+        )
         claim_support_base = max(interlingua_claims, compiled_claims, 1.0)
         compiled_coverage = min(compiled_claims / claim_support_base, 1.0)
         graph_support = min(graph_records / claim_support_base, 1.0)
@@ -5042,7 +5074,11 @@ class OMENScale(nn.Module):
                 + (0.24 * graph_support)
                 + (0.18 * mean_confidence)
                 + (0.16 * verification_acceptance)
-                + (0.10 * world_state_acceptance),
+                + (0.10 * world_state_acceptance)
+                + (0.08 * parser_agreement)
+                + (0.06 * span_traceability)
+                + (0.08 * memory_corroboration)
+                + (0.10 * ontology_support),
                 0.0,
             ),
             1.0,
@@ -5058,7 +5094,11 @@ class OMENScale(nn.Module):
                 + (0.14 * verification_repair)
                 + (0.08 * world_state_branching)
                 + (0.08 * world_state_contradiction)
-                + (0.08 * world_state_conflict),
+                + (0.08 * world_state_conflict)
+                + (0.10 * (1.0 - parser_agreement))
+                + (0.08 * (1.0 - span_traceability))
+                + (0.08 * (1.0 - memory_corroboration))
+                + (0.08 * (1.0 - ontology_support)),
                 0.0,
             ),
             1.0,
@@ -5075,6 +5115,10 @@ class OMENScale(nn.Module):
             "grounding_hidden_cause_pressure": hidden_cause_pressure,
             "grounding_deferred_hypothesis_ratio": deferred_ratio,
             "grounding_mean_compiled_confidence": mean_confidence,
+            "grounding_parser_agreement": parser_agreement,
+            "grounding_span_traceability": span_traceability,
+            "grounding_memory_corroboration": memory_corroboration,
+            "grounding_ontology_support": ontology_support,
             "grounding_world_state_branching_pressure": world_state_branching,
             "grounding_world_state_contradiction_pressure": world_state_contradiction,
         }
@@ -5318,6 +5362,8 @@ class OMENScale(nn.Module):
                 "grounding_world_state_active",
                 "grounding_world_state_hypothetical",
                 "grounding_world_state_contradicted",
+                "grounding_ontology",
+                "grounding_ontology_fact",
                 "grounding",
                 "world_context",
                 "memory",
@@ -5937,6 +5983,8 @@ class OMENScale(nn.Module):
         decoder_signal: Optional[Dict[str, object]] = None,
         memory_facts: Optional[List[HornAtom]] = None,
         memory_grounding_records: Optional[Sequence[object]] = None,
+        grounding_ontology_records: Optional[Sequence[object]] = None,
+        grounding_ontology_facts: Optional[Sequence[HornAtom]] = None,
         grounding_world_state_records: Optional[Sequence[object]] = None,
         grounding_world_state_active_facts: Optional[Sequence[HornAtom]] = None,
         grounding_world_state_hypothetical_facts: Optional[Sequence[HornAtom]] = None,
@@ -5965,6 +6013,8 @@ class OMENScale(nn.Module):
         observed_now: List[HornAtom] = []
         memory_derived = list(memory_facts or [])
         recalled_grounding_records = list(memory_grounding_records or [])
+        trace_grounding_ontology_records = list(grounding_ontology_records or [])
+        trace_grounding_ontology_facts = list(grounding_ontology_facts or [])
         trace_grounding_world_state_records = list(grounding_world_state_records or [])
         trace_grounding_world_state_active_facts = list(grounding_world_state_active_facts or [])
         trace_grounding_world_state_hypothetical_facts = list(grounding_world_state_hypothetical_facts or [])
@@ -6049,6 +6099,12 @@ class OMENScale(nn.Module):
             provenance = "ast_trace" if provenance.startswith("ast") else "trace"
         grounding_derived = list(getattr(trace_bundle, "grounding_facts", ())) if trace_bundle is not None else []
         if trace_bundle is not None:
+            trace_grounding_ontology_records.extend(
+                list(getattr(trace_bundle, "grounding_ontology_records", ()))
+            )
+            trace_grounding_ontology_facts.extend(
+                list(getattr(trace_bundle, "grounding_ontology_facts", ()))
+            )
             trace_grounding_world_state_records.extend(
                 list(getattr(trace_bundle, "grounding_world_state_records", ()))
             )
@@ -6151,6 +6207,8 @@ class OMENScale(nn.Module):
             observed_now_facts=observed_now,
             memory_derived_facts=memory_derived,
             memory_grounding_records=recalled_grounding_records,
+            grounding_ontology_records=trace_grounding_ontology_records,
+            grounding_ontology_facts=trace_grounding_ontology_facts,
             grounding_world_state_records=trace_grounding_world_state_records,
             grounding_world_state_active_facts=trace_grounding_world_state_active_facts,
             grounding_world_state_hypothetical_facts=trace_grounding_world_state_hypothetical_facts,
@@ -6181,6 +6239,8 @@ class OMENScale(nn.Module):
                 "memory_grounding_active_records": float(recalled_grounding_status.get("active", 0.0)),
                 "memory_grounding_hypothetical_records": float(recalled_grounding_status.get("hypothetical", 0.0)),
                 "memory_grounding_contradicted_records": float(recalled_grounding_status.get("contradicted", 0.0)),
+                "grounding_ontology_records": float(len(trace_grounding_ontology_records)),
+                "grounding_ontology_facts": float(len(trace_grounding_ontology_facts)),
                 "grounding_world_state_records": float(len(trace_grounding_world_state_records)),
                 "grounding_world_state_active_facts": float(len(trace_grounding_world_state_active_facts)),
                 "grounding_world_state_hypothetical_facts": float(len(trace_grounding_world_state_hypothetical_facts)),
@@ -6217,6 +6277,8 @@ class OMENScale(nn.Module):
         h_tok: Optional[torch.Tensor] = None,
         memory_facts: Optional[List[HornAtom]] = None,
         memory_grounding_records: Optional[Sequence[object]] = None,
+        grounding_ontology_records: Optional[Sequence[object]] = None,
+        grounding_ontology_facts: Optional[Sequence[HornAtom]] = None,
         grounding_world_state_records: Optional[Sequence[object]] = None,
         grounding_world_state_active_facts: Optional[Sequence[HornAtom]] = None,
         grounding_world_state_hypothetical_facts: Optional[Sequence[HornAtom]] = None,
@@ -6233,6 +6295,8 @@ class OMENScale(nn.Module):
         observed_now: List[HornAtom] = []
         memory_derived = list(memory_facts or [])
         recalled_grounding_records = list(memory_grounding_records or [])
+        trace_grounding_ontology_records = list(grounding_ontology_records or [])
+        trace_grounding_ontology_facts = list(grounding_ontology_facts or [])
         trace_grounding_world_state_records = list(grounding_world_state_records or [])
         trace_grounding_world_state_active_facts = list(grounding_world_state_active_facts or [])
         trace_grounding_world_state_hypothetical_facts = list(grounding_world_state_hypothetical_facts or [])
@@ -6272,6 +6336,12 @@ class OMENScale(nn.Module):
             provenance = "ast_trace" if provenance.startswith("ast") else "trace"
         grounding_derived = list(getattr(trace_bundle, "grounding_facts", ())) if trace_bundle is not None else []
         if trace_bundle is not None:
+            trace_grounding_ontology_records.extend(
+                list(getattr(trace_bundle, "grounding_ontology_records", ()))
+            )
+            trace_grounding_ontology_facts.extend(
+                list(getattr(trace_bundle, "grounding_ontology_facts", ()))
+            )
             trace_grounding_world_state_records.extend(
                 list(getattr(trace_bundle, "grounding_world_state_records", ()))
             )
@@ -6334,6 +6404,8 @@ class OMENScale(nn.Module):
             observed_now_facts=observed_now,
             memory_derived_facts=memory_derived,
             memory_grounding_records=recalled_grounding_records,
+            grounding_ontology_records=trace_grounding_ontology_records,
+            grounding_ontology_facts=trace_grounding_ontology_facts,
             grounding_world_state_records=trace_grounding_world_state_records,
             grounding_world_state_active_facts=trace_grounding_world_state_active_facts,
             grounding_world_state_hypothetical_facts=trace_grounding_world_state_hypothetical_facts,
@@ -6357,6 +6429,8 @@ class OMENScale(nn.Module):
                 "memory_grounding_active_records": float(recalled_grounding_status.get("active", 0.0)),
                 "memory_grounding_hypothetical_records": float(recalled_grounding_status.get("hypothetical", 0.0)),
                 "memory_grounding_contradicted_records": float(recalled_grounding_status.get("contradicted", 0.0)),
+                "grounding_ontology_records": float(len(trace_grounding_ontology_records)),
+                "grounding_ontology_facts": float(len(trace_grounding_ontology_facts)),
                 "grounding_world_state_records": float(len(trace_grounding_world_state_records)),
                 "grounding_world_state_active_facts": float(len(trace_grounding_world_state_active_facts)),
                 "grounding_world_state_hypothetical_facts": float(len(trace_grounding_world_state_hypothetical_facts)),
@@ -7086,6 +7160,7 @@ class OMENScale(nn.Module):
         )
         grounding_write_stats = self._write_grounding_memory_records(
             tuple(getattr(task_context.execution_trace, "grounding_world_state_records", ()))
+            + tuple(getattr(task_context.execution_trace, "grounding_ontology_records", ()))
             + tuple(getattr(task_context.execution_trace, "grounding_verification_records", ()))
             + tuple(getattr(task_context.execution_trace, "grounding_hypotheses", ()))
             + tuple(getattr(task_context.execution_trace, "grounding_graph_records", ()))
@@ -7484,6 +7559,8 @@ class OMENScale(nn.Module):
         out["sym_memory_grounding_contradicted_records"] = float(
             task_context.metadata.get("memory_grounding_contradicted_records", 0.0)
         )
+        out["sym_grounding_ontology_records"] = float(len(task_context.grounding_ontology_records))
+        out["sym_grounding_ontology_facts"] = float(len(task_context.grounding_ontology_facts))
         out["sym_grounding_world_state_records"] = float(len(task_context.grounding_world_state_records))
         out["sym_grounding_world_state_active_records"] = float(
             task_context.metadata.get("grounding_world_state_active_records", 0.0)
@@ -7525,6 +7602,18 @@ class OMENScale(nn.Module):
         out["sym_grounding_hidden_cause_pressure"] = float(
             task_context.metadata.get("grounding_hidden_cause_pressure", 0.0)
         )
+        out["sym_grounding_parser_agreement"] = float(
+            task_context.metadata.get("grounding_parser_agreement", 0.0)
+        )
+        out["sym_grounding_span_traceability"] = float(
+            task_context.metadata.get("grounding_span_traceability", 0.0)
+        )
+        out["sym_grounding_memory_corroboration"] = float(
+            task_context.metadata.get("grounding_memory_corroboration", 0.0)
+        )
+        out["sym_grounding_ontology_support"] = float(
+            task_context.metadata.get("grounding_ontology_support", 0.0)
+        )
         out["sym_grounding_world_state_branching_pressure"] = float(
             task_context.metadata.get("grounding_world_state_branching_pressure", 0.0)
         )
@@ -7554,6 +7643,19 @@ class OMENScale(nn.Module):
         out["sym_trace_scene_events"] = float(task_context.metadata.get("trace_scene_events", 0.0))
         out["sym_trace_scene_goals"] = float(task_context.metadata.get("trace_scene_goals", 0.0))
         out["sym_trace_scene_claims"] = float(task_context.metadata.get("trace_scene_claims", 0.0))
+        out["sym_trace_scene_mentions"] = float(task_context.metadata.get("trace_scene_mentions", 0.0))
+        out["sym_trace_scene_discourse_relations"] = float(
+            task_context.metadata.get("trace_scene_discourse_relations", 0.0)
+        )
+        out["sym_trace_scene_temporal_markers"] = float(
+            task_context.metadata.get("trace_scene_temporal_markers", 0.0)
+        )
+        out["sym_trace_scene_explanations"] = float(
+            task_context.metadata.get("trace_scene_explanations", 0.0)
+        )
+        out["sym_trace_scene_context_records"] = float(
+            task_context.metadata.get("trace_scene_context_records", 0.0)
+        )
         out["sym_trace_interlingua_entities"] = float(task_context.metadata.get("trace_interlingua_entities", 0.0))
         out["sym_trace_interlingua_states"] = float(task_context.metadata.get("trace_interlingua_states", 0.0))
         out["sym_trace_interlingua_relations"] = float(task_context.metadata.get("trace_interlingua_relations", 0.0))
@@ -7577,6 +7679,12 @@ class OMENScale(nn.Module):
         )
         out["sym_trace_grounding_world_state_records"] = float(
             task_context.metadata.get("trace_grounding_world_state_records", 0.0)
+        )
+        out["sym_trace_grounding_ontology_records"] = float(
+            task_context.metadata.get("trace_grounding_ontology_records", 0.0)
+        )
+        out["sym_trace_grounding_ontology_facts"] = float(
+            task_context.metadata.get("trace_grounding_ontology_facts", 0.0)
         )
         out["sym_trace_grounding_world_state_active_records"] = float(
             task_context.metadata.get("trace_grounding_world_state_active_records", 0.0)
@@ -7691,6 +7799,9 @@ class OMENScale(nn.Module):
             planner_state_summary.get("planner_state_contradictions", 0.0)
         )
         out["planner_state_operators"] = float(planner_state_summary.get("planner_state_operators", 0.0))
+        out["planner_state_ontology_records"] = float(
+            planner_state_summary.get("planner_state_ontology_records", 0.0)
+        )
         out["planner_state_active_operators"] = float(
             planner_state_summary.get("planner_state_active_operators", 0.0)
         )
@@ -7737,6 +7848,12 @@ class OMENScale(nn.Module):
         out["world_graph_memory_facts"] = float(world_graph_batch.metadata.get("memory_facts", 0.0))
         out["world_graph_memory_grounding_records"] = float(
             world_graph_batch.metadata.get("memory_grounding_records", 0.0)
+        )
+        out["world_graph_grounding_ontology_records"] = float(
+            world_graph_batch.metadata.get("grounding_ontology_records", 0.0)
+        )
+        out["world_graph_grounding_ontology_facts"] = float(
+            world_graph_batch.metadata.get("grounding_ontology_facts", 0.0)
         )
         out["world_graph_grounding_world_state_records"] = float(
             world_graph_batch.metadata.get("grounding_world_state_records", 0.0)

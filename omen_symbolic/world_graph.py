@@ -516,6 +516,8 @@ class WorldGraphEncoder(nn.Module):
             "grounding": 5,
             "interlingua": 5,
             "memory_grounding": 5,
+            "grounding_ontology": 5,
+            "grounding_ontology_fact": 5,
             "grounding_world_state_active": 7,
             "grounding_world_state_hypothetical": 6,
             "grounding_world_state_contradicted": 6,
@@ -751,6 +753,8 @@ class WorldGraphEncoder(nn.Module):
             "observed_now_facts": float(sum(1 for node_type in node_types if node_type == "observed_now")),
             "memory_facts": float(sum(1 for node_type in node_types if node_type == "memory")),
             "memory_grounding_records": float(sum(1 for node_type in node_types if node_type == "memory_grounding")),
+            "grounding_ontology_records": float(sum(1 for node_type in node_types if node_type == "grounding_ontology")),
+            "grounding_ontology_facts": float(sum(1 for node_type in node_types if node_type == "grounding_ontology_fact")),
             "grounding_world_state_records": float(
                 sum(
                     1 for node_type in node_types

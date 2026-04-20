@@ -11,6 +11,7 @@ from .types import (
     GroundedStateHint,
     GroundedTextDocument,
     GroundedTextSegment,
+    GroundingSpan,
 )
 
 
@@ -215,6 +216,37 @@ def split_text_segments(text: str, *, max_segments: int = 24) -> List[str]:
     return [_normalize_segment(normalized[:256])]
 
 
+def _locate_segment_span(text: str, segment: str, start_cursor: int) -> GroundingSpan:
+    raw = str(segment or "")
+    if not raw:
+        return GroundingSpan(start=max(0, int(start_cursor)), end=max(0, int(start_cursor)), text="")
+    idx = text.find(raw, max(0, int(start_cursor)))
+    if idx < 0:
+        idx = text.find(raw)
+    if idx < 0:
+        stripped = raw.strip()
+        idx = text.find(stripped, max(0, int(start_cursor))) if stripped else -1
+        raw = stripped or raw
+    if idx < 0:
+        idx = max(0, int(start_cursor))
+    end = min(len(text), idx + len(raw))
+    return GroundingSpan(start=int(idx), end=int(end), text=text[idx:end])
+
+
+def split_text_segments_with_spans(
+    text: str,
+    *,
+    max_segments: int = 24,
+) -> List[Tuple[str, GroundingSpan]]:
+    out: List[Tuple[str, GroundingSpan]] = []
+    cursor = 0
+    for segment in split_text_segments(text, max_segments=max_segments):
+        span = _locate_segment_span(text, segment, cursor)
+        out.append((segment, span))
+        cursor = max(span.end, cursor)
+    return out
+
+
 def _flatten_payload(payload: Any, prefix: str = "") -> List[Tuple[str, str]]:
     pairs: List[Tuple[str, str]] = []
     if isinstance(payload, dict):
@@ -405,19 +437,41 @@ def ground_text_document(
     token_limit: int = 8,
 ) -> GroundedTextDocument:
     segments_out: List[GroundedTextSegment] = []
-    for idx, segment in enumerate(split_text_segments(text, max_segments=max_segments)):
+    for idx, (segment, span) in enumerate(split_text_segments_with_spans(text, max_segments=max_segments)):
         normalized = unicodedata.normalize("NFKC", segment)
         states = [
-            GroundedStateHint(key=key, value=value)
+            GroundedStateHint(key=key, value=value, span=span)
             for key, value in extract_structured_pairs(segment)
         ]
-        relations = extract_relation_hints(segment)
-        goals = extract_goal_hints(segment, structured_pairs=[(state.key, state.value) for state in states])
+        relations = [
+            GroundedRelationHint(
+                left=relation.left,
+                relation=relation.relation,
+                right=relation.right,
+                confidence=relation.confidence,
+                source=relation.source,
+                status=relation.status,
+                span=relation.span or span,
+            )
+            for relation in extract_relation_hints(segment)
+        ]
+        goals = [
+            GroundedGoalHint(
+                goal_name=goal.goal_name,
+                goal_value=goal.goal_value,
+                confidence=goal.confidence,
+                source=goal.source,
+                status=goal.status,
+                span=goal.span or span,
+            )
+            for goal in extract_goal_hints(segment, structured_pairs=[(state.key, state.value) for state in states])
+        ]
         segments_out.append(
             GroundedTextSegment(
                 index=idx,
                 text=segment,
                 normalized_text=normalized,
+                span=span,
                 tokens=tuple(tokenize_semantic_words(segment, limit=token_limit)),
                 states=tuple(states),
                 relations=tuple(relations),
@@ -433,6 +487,13 @@ def ground_text_document(
         "grounding_goal_hints": float(sum(len(segment.goals) for segment in segments_out)),
         "grounding_counterexample_segments": float(sum(1 for segment in segments_out if segment.counterexample)),
         "grounding_multilingual": 1.0 if any(ord(ch) > 127 for ch in text) else 0.0,
+        "grounding_span_coverage": float(
+            sum(
+                max(0, int(segment.span.end) - int(segment.span.start))
+                for segment in segments_out
+                if segment.span is not None
+            ) / max(len(text), 1)
+        ),
     }
     return GroundedTextDocument(
         language=language or "text",

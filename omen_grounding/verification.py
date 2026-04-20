@@ -7,7 +7,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from .interlingua_types import CanonicalInterlingua
 from .scene_types import SemanticSceneGraph
 from .symbolic_compiler import CompiledSymbolicHypothesis, SymbolicCompilationResult
-from .types import GroundedTextDocument
+from .types import GroundedTextDocument, GroundingSpan
 
 
 def _clip01(value: float) -> float:
@@ -21,6 +21,7 @@ class GroundingVerificationRecord:
     kind: str
     verification_status: str
     symbols: Tuple[str, ...] = field(default_factory=tuple)
+    source_span: Optional[GroundingSpan] = None
     support: float = 0.0
     conflict: float = 0.0
     repair_action: str = "none"
@@ -177,6 +178,7 @@ def verify_symbolic_hypotheses(
                 kind=str(hypothesis.kind),
                 verification_status=status,
                 symbols=tuple(str(item) for item in hypothesis.symbols),
+                source_span=hypothesis.source_span,
                 support=support,
                 conflict=conflict,
                 repair_action=repair_action,

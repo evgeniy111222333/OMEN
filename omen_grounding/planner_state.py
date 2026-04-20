@@ -47,6 +47,7 @@ def _unique_strings(values: Sequence[str], *, limit: int) -> Tuple[str, ...]:
 
 @dataclass(frozen=True)
 class PlannerWorldState:
+    ontology_records: Tuple[Any, ...] = field(default_factory=tuple)
     active_records: Tuple[Any, ...] = field(default_factory=tuple)
     hypothetical_records: Tuple[Any, ...] = field(default_factory=tuple)
     contradicted_records: Tuple[Any, ...] = field(default_factory=tuple)
@@ -74,6 +75,7 @@ class PlannerWorldState:
 
     def summary(self) -> Dict[str, float]:
         summary = dict(self.metadata)
+        summary.setdefault("planner_state_ontology_records", float(len(self.ontology_records)))
         summary.setdefault("planner_state_active_records", float(len(self.active_records)))
         summary.setdefault("planner_state_hypothetical_records", float(len(self.hypothetical_records)))
         summary.setdefault("planner_state_contradicted_records", float(len(self.contradicted_records)))
@@ -117,6 +119,7 @@ class PlannerWorldState:
 
 def build_planner_world_state(task_context: Any) -> PlannerWorldState:
     records = tuple(getattr(task_context, "grounding_world_state_records", ()) or ())
+    ontology_records = tuple(getattr(task_context, "grounding_ontology_records", ()) or ())
     active_records = tuple(record for record in records if _record_status(record) == "active")
     hypothetical_records = tuple(record for record in records if _record_status(record) == "hypothetical")
     contradicted_records = tuple(record for record in records if _record_status(record) == "contradicted")
@@ -151,7 +154,8 @@ def build_planner_world_state(task_context: Any) -> PlannerWorldState:
         getattr(task_context, "metadata", {}).get("grounding_world_state_contradiction_pressure", 0.0)
     )
 
-    resources = build_planner_resources((*active_records, *hypothetical_records, *contradicted_records), limit=32)
+    planner_records = (*active_records, *hypothetical_records, *contradicted_records, *ontology_records)
+    resources = build_planner_resources(planner_records, limit=32)
     operators = build_planner_operators((*active_records, *hypothetical_records, *contradicted_records), limit=32)
     alternative_worlds = build_planner_alternative_worlds(
         active_records,
@@ -207,6 +211,7 @@ def build_planner_world_state(task_context: Any) -> PlannerWorldState:
     )
 
     metadata = {
+        "planner_state_ontology_records": float(len(ontology_records)),
         "planner_state_active_records": float(len(active_records)),
         "planner_state_hypothetical_records": float(len(hypothetical_records)),
         "planner_state_contradicted_records": float(len(contradicted_records)),
@@ -241,6 +246,7 @@ def build_planner_world_state(task_context: Any) -> PlannerWorldState:
     }
 
     return PlannerWorldState(
+        ontology_records=ontology_records,
         active_records=active_records,
         hypothetical_records=hypothetical_records,
         contradicted_records=contradicted_records,

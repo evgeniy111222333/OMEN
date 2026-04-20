@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from .interlingua import build_canonical_interlingua
 from .interlingua_types import CanonicalInterlingua
 from .scene_types import SemanticSceneGraph
-from .types import GroundedTextDocument
+from .types import GroundedTextDocument, GroundingSpan
 
 
 @dataclass(frozen=True)
@@ -14,6 +14,7 @@ class CompiledSymbolicSegment:
     index: int
     text: str
     normalized_text: str
+    source_span: Optional[GroundingSpan] = None
     tokens: Tuple[str, ...] = field(default_factory=tuple)
     states: Tuple[Tuple[str, str], ...] = field(default_factory=tuple)
     relations: Tuple[Tuple[str, str, str], ...] = field(default_factory=tuple)
@@ -27,6 +28,7 @@ class CompiledSymbolicHypothesis:
     segment_index: int
     kind: str
     symbols: Tuple[str, ...] = field(default_factory=tuple)
+    source_span: Optional[GroundingSpan] = None
     confidence: float = 0.5
     status: str = "proposal"
     deferred: bool = False
@@ -94,6 +96,7 @@ def compile_canonical_interlingua(
         segment_index: int,
         kind: str,
         symbols: Sequence[str],
+        source_span: Optional[GroundingSpan],
         confidence: float,
         status: str,
         conflict_tag: str = "",
@@ -109,6 +112,7 @@ def compile_canonical_interlingua(
                 segment_index=segment_index,
                 kind=kind,
                 symbols=tuple(str(item) for item in symbols),
+                source_span=source_span,
                 confidence=confidence_value,
                 status=str(status or "proposal"),
                 deferred=deferred,
@@ -153,6 +157,7 @@ def compile_canonical_interlingua(
                 segment_index=idx,
                 kind="state",
                 symbols=(state.entity_name, state.value),
+                source_span=state.source_span,
                 confidence=state.confidence,
                 status=state.status,
                 counterexample=counterexample,
@@ -164,6 +169,7 @@ def compile_canonical_interlingua(
                 segment_index=idx,
                 kind="relation",
                 symbols=(relation.subject_name, relation.predicate, relation.object_name),
+                source_span=relation.source_span,
                 confidence=relation.confidence,
                 status=relation.status,
                 conflict_tag="negative_polarity" if relation.polarity != "positive" else "",
@@ -179,6 +185,7 @@ def compile_canonical_interlingua(
                 segment_index=idx,
                 kind="goal",
                 symbols=tuple(goal_symbols),
+                source_span=goal.source_span,
                 confidence=goal.confidence,
                 status=goal.status,
                 counterexample=counterexample,
@@ -189,6 +196,7 @@ def compile_canonical_interlingua(
                 index=idx,
                 text="" if raw_segment is None else raw_segment.text,
                 normalized_text="" if raw_segment is None else raw_segment.normalized_text,
+                source_span=None if raw_segment is None else raw_segment.span,
                 tokens=tuple() if raw_segment is None else tuple(raw_segment.tokens),
                 states=states,
                 relations=relations,

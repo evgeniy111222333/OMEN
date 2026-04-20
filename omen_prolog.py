@@ -448,6 +448,8 @@ class SymbolicTaskContext:
     observed_now_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
     memory_derived_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
     memory_grounding_records: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_ontology_records: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_ontology_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
     grounding_hypotheses: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_verification_records: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_world_state_records: Tuple[Any, ...] = field(default_factory=tuple)
@@ -480,6 +482,8 @@ class SymbolicTaskContext:
         self.observed_now_facts = _freeze_atoms(self.observed_now_facts)
         self.memory_derived_facts = _freeze_atoms(self.memory_derived_facts)
         self.memory_grounding_records = tuple(self.memory_grounding_records or ())
+        self.grounding_ontology_records = tuple(self.grounding_ontology_records or ())
+        self.grounding_ontology_facts = _freeze_atoms(self.grounding_ontology_facts)
         self.grounding_hypotheses = tuple(self.grounding_hypotheses or ())
         self.grounding_verification_records = tuple(self.grounding_verification_records or ())
         self.grounding_world_state_records = tuple(self.grounding_world_state_records or ())
@@ -502,6 +506,7 @@ class SymbolicTaskContext:
         merged = set(self.observed_facts)
         merged.update(self.observed_now_facts)
         merged.update(self.memory_derived_facts)
+        merged.update(self.grounding_ontology_facts)
         merged.update(self.saliency_derived_facts)
         merged.update(self.net_derived_facts)
         merged.update(self.grounding_world_state_active_facts)
@@ -515,6 +520,7 @@ class SymbolicTaskContext:
 
     def reasoning_facts(self) -> FrozenSet[HornAtom]:
         merged = set(self.observed_facts)
+        merged.update(self.grounding_ontology_facts)
         merged.update(self.grounding_world_state_active_facts)
         return frozenset(merged)
 
@@ -544,6 +550,8 @@ class SymbolicTaskContext:
         source_groups = (
             ("observed_now", self.observed_now_facts),
             ("memory", self.memory_derived_facts),
+            ("grounding_ontology", self.grounding_ontology_records),
+            ("grounding_ontology_fact", self.grounding_ontology_facts),
             ("grounding_world_state_active_fact", self.grounding_world_state_active_facts),
             ("grounding_world_state_hypothetical_fact", self.grounding_world_state_hypothetical_facts),
             ("grounding_world_state_contradicted_fact", self.grounding_world_state_contradicted_facts),
@@ -579,6 +587,8 @@ class SymbolicTaskContext:
             "observed_now_facts": float(len(self.observed_now_facts)),
             "memory_derived_facts": float(len(self.memory_derived_facts)),
             "memory_grounding_records": float(len(self.memory_grounding_records)),
+            "grounding_ontology_records": float(len(self.grounding_ontology_records)),
+            "grounding_ontology_facts": float(len(self.grounding_ontology_facts)),
             "grounding_hypotheses": float(len(self.grounding_hypotheses)),
             "grounding_verification_records": float(len(self.grounding_verification_records)),
             "grounding_world_state_records": float(len(self.grounding_world_state_records)),

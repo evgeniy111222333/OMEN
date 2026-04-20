@@ -11,16 +11,19 @@ from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 from omen_grounding import (
     CompiledSymbolicSegment,
     SemanticGroundingBackbone,
+    compile_scene_context_graph_records,
+    compile_scene_context_symbolic_atoms,
     compile_interlingua_graph_records,
+    compile_ontology_symbolic_atoms,
     compile_scene_symbolic_atoms,
     compile_world_state_symbolic_atoms,
     extract_goal_hints,
     extract_relation_hints,
     extract_structured_pairs,
-    ground_text_to_symbolic,
     ground_text_document,
     is_counterexample_text,
     normalize_symbol_text,
+    run_grounding_orchestrator,
     split_text_segments,
     tokenize_semantic_words,
 )
@@ -67,6 +70,8 @@ class SymbolicExecutionTraceBundle:
     grounding_hypotheses: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_verification_records: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_world_state_records: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_ontology_records: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_ontology_facts: FrozenSet[Any] = field(default_factory=frozenset)
     grounding_world_state_active_facts: FrozenSet[Any] = field(default_factory=frozenset)
     grounding_world_state_hypothetical_facts: FrozenSet[Any] = field(default_factory=frozenset)
     grounding_world_state_contradicted_facts: FrozenSet[Any] = field(default_factory=frozenset)
@@ -1221,12 +1226,13 @@ class _ObservationTraceBuilder:
         self.semantic_backbone = semantic_backbone
 
     def build(self, text: str) -> Optional[SymbolicExecutionTraceBundle]:
-        pipeline = ground_text_to_symbolic(
+        orchestrated = run_grounding_orchestrator(
             text,
             language=self.language,
             max_segments=self.max_steps,
             backbone=self.semantic_backbone,
         )
+        pipeline = orchestrated.pipeline
         segments = list(pipeline.compiled.segments)
         if not segments:
             return None
@@ -1287,9 +1293,16 @@ class _ObservationTraceBuilder:
         if counterexamples:
             target_facts.update(counterexamples[-1].after_facts)
         grounding_facts, grounding_targets, grounding_symbolic_stats = compile_scene_symbolic_atoms(pipeline.scene)
+        grounding_context_facts, grounding_context_symbolic_stats = compile_scene_context_symbolic_atoms(
+            pipeline.scene
+        )
         grounding_graph_records, grounding_graph_stats = compile_interlingua_graph_records(
             pipeline.interlingua,
             max_records=max(self.max_steps * 4, 16),
+        )
+        grounding_context_records, grounding_context_stats = compile_scene_context_graph_records(
+            pipeline.scene,
+            max_records=max(self.max_steps * 3, 12),
         )
         (
             grounding_world_state_active_facts,
@@ -1297,6 +1310,9 @@ class _ObservationTraceBuilder:
             grounding_world_state_contradicted_facts,
             grounding_world_state_symbolic_stats,
         ) = compile_world_state_symbolic_atoms(pipeline.world_state.records)
+        grounding_ontology_facts, grounding_ontology_stats = compile_ontology_symbolic_atoms(
+            pipeline.ontology.concepts
+        )
         return SymbolicExecutionTraceBundle(
             language=self.language,
             source_text=text,
@@ -1304,15 +1320,17 @@ class _ObservationTraceBuilder:
             target_facts=frozenset(target_facts),
             transitions=tuple(transitions),
             counterexamples=tuple(counterexamples),
-            grounding_facts=grounding_facts,
+            grounding_facts=frozenset(set(grounding_facts).union(grounding_context_facts)),
             grounding_target_facts=grounding_targets,
             grounding_hypotheses=tuple(pipeline.compiled.hypotheses),
             grounding_verification_records=tuple(pipeline.verification.records),
             grounding_world_state_records=tuple(pipeline.world_state.records),
+            grounding_ontology_records=tuple(pipeline.ontology.concepts),
+            grounding_ontology_facts=grounding_ontology_facts,
             grounding_world_state_active_facts=grounding_world_state_active_facts,
             grounding_world_state_hypothetical_facts=grounding_world_state_hypothetical_facts,
             grounding_world_state_contradicted_facts=grounding_world_state_contradicted_facts,
-            grounding_graph_records=grounding_graph_records,
+            grounding_graph_records=tuple(grounding_graph_records) + tuple(grounding_context_records),
             metadata={
                 **dict(pipeline.document.metadata),
                 **dict(pipeline.scene.metadata),
@@ -1320,10 +1338,16 @@ class _ObservationTraceBuilder:
                 **dict(pipeline.compiled.metadata),
                 **dict(pipeline.verification.metadata),
                 **dict(pipeline.world_state.metadata),
+                **dict(pipeline.ontology.metadata),
                 **dict(grounding_world_state_symbolic_stats),
+                **dict(grounding_ontology_stats),
+                **dict(grounding_context_symbolic_stats),
                 **dict(grounding_symbolic_stats),
+                **dict(grounding_context_stats),
                 **dict(grounding_graph_stats),
+                **dict(orchestrated.metadata),
                 "grounding_mode": "semantic_scene_compiler",
+                "grounding_orchestrator_active": 1.0,
             },
         )
 

@@ -1,4 +1,12 @@
 from .backbone import SemanticGroundingBackbone
+from .context_atoms import (
+    GROUND_DISCOURSE_PRED,
+    GROUND_EXPLANATION_PRED,
+    GROUND_MENTION_PRED,
+    GROUND_TEMPORAL_PRED,
+    compile_scene_context_symbolic_atoms,
+)
+from .context_graph_records import SceneContextGraphRecord, compile_scene_context_graph_records
 from .emc_signals import grounding_emc_features
 from .interlingua import build_canonical_interlingua
 from .interlingua_types import (
@@ -35,14 +43,35 @@ from .planner_bridge import (
     planner_state_seed_facts,
 )
 from .pipeline import TextGroundingPipelineResult, ground_text_to_symbolic
+from .orchestrator import (
+    GroundingOrchestratorResult,
+    grounding_memory_corroboration,
+    run_grounding_orchestrator,
+)
+from .ontology_atoms import (
+    GROUND_ONTOLOGY_CONCEPT_PRED,
+    GROUND_ONTOLOGY_MEMBER_PRED,
+    GROUND_ONTOLOGY_SIGNATURE_PRED,
+    compile_ontology_symbolic_atoms,
+)
+from .ontology_growth import (
+    GroundingOntologyConcept,
+    GroundingOntologyGrowthResult,
+    build_grounding_ontology_growth,
+)
 from .scene_types import (
     SemanticClaim,
+    SemanticDiscourseRelation,
     SemanticEntity,
     SemanticEvent,
+    SemanticExplanation,
     SemanticGoal,
+    SemanticMention,
     SemanticSceneGraph,
     SemanticState,
+    SemanticTemporalMarker,
 )
+from .semantic_context import build_semantic_context_objects
 from .semantic_scene import build_semantic_scene_graph
 from .world_graph_records import GroundingGraphRecord, compile_interlingua_graph_records
 from .world_state_writeback import (
@@ -92,6 +121,7 @@ from .text_semantics import (
     is_counterexample_text,
     normalize_symbol_text,
     split_text_segments,
+    split_text_segments_with_spans,
     tokenize_semantic_words,
 )
 from .types import (
@@ -116,6 +146,9 @@ __all__ = [
     "GroundedTextDocument",
     "GroundedTextSegment",
     "GroundingSpan",
+    "GroundingOrchestratorResult",
+    "GroundingOntologyConcept",
+    "GroundingOntologyGrowthResult",
     "grounding_emc_features",
     "grounding_memory_families",
     "grounding_memory_records",
@@ -138,13 +171,18 @@ __all__ = [
     "CanonicalInterlingua",
     "CanonicalRelationClaim",
     "CanonicalStateClaim",
+    "SceneContextGraphRecord",
     "SemanticClaim",
+    "SemanticDiscourseRelation",
     "SemanticEntity",
     "SemanticEvent",
+    "SemanticExplanation",
     "SemanticGoal",
     "SemanticGroundingBackbone",
+    "SemanticMention",
     "SemanticSceneGraph",
     "SemanticState",
+    "SemanticTemporalMarker",
     "CompiledSymbolicHypothesis",
     "CompiledSymbolicSegment",
     "GroundingGraphRecord",
@@ -152,6 +190,13 @@ __all__ = [
     "GroundingVerificationReport",
     "GroundingWorldStateRecord",
     "GroundingWorldStateWriteback",
+    "GROUND_ONTOLOGY_CONCEPT_PRED",
+    "GROUND_ONTOLOGY_MEMBER_PRED",
+    "GROUND_ONTOLOGY_SIGNATURE_PRED",
+    "GROUND_DISCOURSE_PRED",
+    "GROUND_EXPLANATION_PRED",
+    "GROUND_MENTION_PRED",
+    "GROUND_TEMPORAL_PRED",
     "GROUND_WORLD_ACTIVE_GOAL_PRED",
     "GROUND_WORLD_ACTIVE_RELATION_PRED",
     "GROUND_WORLD_ACTIVE_STATE_PRED",
@@ -180,7 +225,12 @@ __all__ = [
     "SymbolicCompilationResult",
     "TextGroundingPipelineResult",
     "build_canonical_interlingua",
+    "build_semantic_context_objects",
+    "build_grounding_ontology_growth",
     "compile_planner_bridge_operator_specs",
+    "compile_scene_context_graph_records",
+    "compile_scene_context_symbolic_atoms",
+    "compile_ontology_symbolic_atoms",
     "build_semantic_scene_graph",
     "compile_canonical_interlingua",
     "compile_interlingua_graph_records",
@@ -193,10 +243,13 @@ __all__ = [
     "extract_relation_hints",
     "extract_structured_pairs",
     "ground_text_to_symbolic",
+    "grounding_memory_corroboration",
     "ground_text_document",
     "is_counterexample_text",
     "normalize_symbol_text",
     "planner_state_seed_facts",
+    "run_grounding_orchestrator",
     "split_text_segments",
+    "split_text_segments_with_spans",
     "tokenize_semantic_words",
 ]

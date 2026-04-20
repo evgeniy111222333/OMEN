@@ -47,6 +47,7 @@ class GroundedTextSegment:
     index: int
     text: str
     normalized_text: str
+    span: Optional[GroundingSpan] = None
     tokens: Tuple[str, ...] = field(default_factory=tuple)
     states: Tuple[GroundedStateHint, ...] = field(default_factory=tuple)
     relations: Tuple[GroundedRelationHint, ...] = field(default_factory=tuple)

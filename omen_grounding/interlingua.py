@@ -32,6 +32,7 @@ def build_canonical_interlingua(scene: SemanticSceneGraph) -> CanonicalInterling
             semantic_type=entity.semantic_type,
             aliases=tuple(sorted({alias for alias in entity.aliases if alias})),
             source_segments=tuple(sorted(int(seg) for seg in entity.source_segments)),
+            source_spans=tuple(entity.source_spans),
             confidence=float(entity.confidence),
             status=entity.status,
         )
@@ -57,6 +58,7 @@ def build_canonical_interlingua(scene: SemanticSceneGraph) -> CanonicalInterling
                 value=state.value,
                 value_key=_canonical_key(state.value, state.state_id),
                 source_segment=int(state.source_segment),
+                source_span=state.source_span,
                 confidence=float(state.confidence),
                 status=state.status,
             )
@@ -82,6 +84,7 @@ def build_canonical_interlingua(scene: SemanticSceneGraph) -> CanonicalInterling
                 object_key=object_.canonical_key,
                 object_name=object_.canonical_name,
                 source_segment=int(event.source_segment),
+                source_span=event.source_span,
                 confidence=float(event.confidence),
                 polarity=event.polarity,
                 status=event.status,
@@ -102,6 +105,7 @@ def build_canonical_interlingua(scene: SemanticSceneGraph) -> CanonicalInterling
                 target_key=target.canonical_key if target is not None else None,
                 target_name=target.canonical_name if target is not None else goal.goal_value,
                 source_segment=int(goal.source_segment),
+                source_span=goal.source_span,
                 confidence=float(goal.confidence),
                 status=goal.status,
             )

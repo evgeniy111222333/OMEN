@@ -6,6 +6,7 @@ from typing import Optional
 from .backbone import SemanticGroundingBackbone
 from .interlingua import build_canonical_interlingua
 from .interlingua_types import CanonicalInterlingua
+from .ontology_growth import GroundingOntologyGrowthResult, build_grounding_ontology_growth
 from .semantic_scene import build_semantic_scene_graph
 from .symbolic_compiler import SymbolicCompilationResult, compile_canonical_interlingua
 from .verification import GroundingVerificationReport, verify_symbolic_hypotheses
@@ -23,6 +24,7 @@ class TextGroundingPipelineResult:
     compiled: SymbolicCompilationResult
     verification: GroundingVerificationReport
     world_state: GroundingWorldStateWriteback
+    ontology: GroundingOntologyGrowthResult
 
 
 def ground_text_to_symbolic(
@@ -47,6 +49,7 @@ def ground_text_to_symbolic(
         scene=scene,
     )
     world_state = build_grounding_world_state_writeback(compiled, verification)
+    ontology = build_grounding_ontology_growth(document, interlingua)
     return TextGroundingPipelineResult(
         document=document,
         scene=scene,
@@ -54,4 +57,5 @@ def ground_text_to_symbolic(
         compiled=compiled,
         verification=verification,
         world_state=world_state,
+        ontology=ontology,
     )

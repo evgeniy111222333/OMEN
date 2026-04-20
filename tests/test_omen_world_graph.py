@@ -1044,6 +1044,43 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertEqual(out["source_verification_path"], "natural_language_claim_verification")
         self.assertEqual(out["sym_source_modality_natural_text"], 1.0)
 
+    def test_forward_surfaces_grounding_ontology_metrics(self) -> None:
+        cfg = OMENScaleConfig.demo()
+        cfg.allow_noncanonical_ablation = True
+        cfg.net_enabled = False
+        cfg.osf_enabled = False
+        cfg.emc_enabled = False
+        cfg.saliency_enabled = False
+        cfg.continuous_cycle_enabled = False
+        cfg.creative_cycle_enabled = False
+        model = OMENScale(cfg)
+
+        text = "\n".join(
+            [
+                "user=guest result=failed_login ip=external alert=triggered",
+                "user=unknown result=failed_login ip=external alert=triggered",
+                "user=hacker result=failed_login ip=external alert=triggered",
+                "user=admin result=success ip=internal alert=none",
+            ]
+        )
+        encoded = [ord(ch) for ch in text.encode("ascii", errors="ignore").decode("ascii")]
+        encoded = encoded[: cfg.seq_len]
+        if len(encoded) < cfg.seq_len:
+            encoded = encoded + [0] * (cfg.seq_len - len(encoded))
+        full = torch.tensor([encoded], dtype=torch.long)
+        src = full[:, :-1]
+        tgt = full[:, 1:]
+
+        out = model(src, tgt)
+
+        self.assertGreaterEqual(out["sym_grounding_ontology_records"], 1.0)
+        self.assertGreaterEqual(out["sym_grounding_ontology_facts"], 1.0)
+        self.assertGreaterEqual(out["sym_grounding_ontology_support"], 0.5)
+        self.assertGreaterEqual(out["sym_trace_grounding_ontology_records"], 1.0)
+        self.assertGreaterEqual(out["planner_state_ontology_records"], 1.0)
+        self.assertGreaterEqual(out["world_graph_grounding_ontology_records"], 1.0)
+        self.assertGreaterEqual(out["world_graph_grounding_ontology_facts"], 1.0)
+
     def test_grounding_memory_records_enrich_world_graph_metadata(self) -> None:
         cfg = OMENScaleConfig.demo()
         cfg.allow_noncanonical_ablation = True

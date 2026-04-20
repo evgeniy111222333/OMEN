@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
+from .types import GroundingSpan
+
 
 @dataclass(frozen=True)
 class CanonicalEntity:
@@ -12,6 +14,7 @@ class CanonicalEntity:
     semantic_type: str = "entity"
     aliases: Tuple[str, ...] = field(default_factory=tuple)
     source_segments: Tuple[int, ...] = field(default_factory=tuple)
+    source_spans: Tuple[GroundingSpan, ...] = field(default_factory=tuple)
     confidence: float = 0.5
     status: str = "candidate"
 
@@ -25,6 +28,7 @@ class CanonicalStateClaim:
     value: str
     value_key: str
     source_segment: int
+    source_span: Optional[GroundingSpan] = None
     confidence: float = 0.55
     status: str = "proposal"
 
@@ -41,6 +45,7 @@ class CanonicalRelationClaim:
     object_key: str
     object_name: str
     source_segment: int
+    source_span: Optional[GroundingSpan] = None
     confidence: float = 0.6
     polarity: str = "positive"
     status: str = "proposal"
@@ -57,6 +62,7 @@ class CanonicalGoalClaim:
     target_key: Optional[str]
     target_name: Optional[str]
     source_segment: int
+    source_span: Optional[GroundingSpan] = None
     confidence: float = 0.58
     status: str = "proposal"
 

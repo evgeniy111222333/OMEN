@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Tuple
 
 from .symbolic_compiler import SymbolicCompilationResult
+from .types import GroundingSpan
 from .verification import GroundingVerificationReport, GroundingVerificationRecord
 
 
@@ -19,6 +20,7 @@ class GroundingWorldStateRecord:
     world_status: str
     segment_index: int
     symbols: Tuple[str, ...] = field(default_factory=tuple)
+    source_span: GroundingSpan | None = None
     support: float = 0.0
     conflict: float = 0.0
     confidence: float = 0.0
@@ -92,6 +94,7 @@ def build_grounding_world_state_writeback(
                 world_status=world_status,
                 segment_index=int(hypothesis.segment_index),
                 symbols=tuple(str(item) for item in hypothesis.symbols),
+                source_span=hypothesis.source_span,
                 support=support,
                 conflict=conflict,
                 confidence=_clip01(hypothesis.confidence),
