@@ -454,6 +454,39 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertEqual(routing.parser_candidates[0].role, "primary")
         self.assertEqual(routing.parser_candidates[0].parser_name, "speaker_turn_parser")
 
+    def test_text_runtime_prefers_grounding_artifact_contract_for_source_routing(self) -> None:
+        cfg = OMENScaleConfig.demo()
+        cfg.allow_noncanonical_ablation = True
+        cfg.net_enabled = False
+        cfg.osf_enabled = False
+        cfg.emc_enabled = False
+        cfg.saliency_enabled = False
+        cfg.continuous_cycle_enabled = False
+        cfg.creative_cycle_enabled = False
+        model = OMENScale(cfg)
+
+        def encode_row(text: str) -> torch.Tensor:
+            encoded = [ord(ch) for ch in text.encode("ascii", errors="ignore").decode("ascii")]
+            encoded = encoded[: cfg.seq_len]
+            if len(encoded) < cfg.seq_len:
+                encoded = encoded + [0] * (cfg.seq_len - len(encoded))
+            return torch.tensor(encoded[:-1], dtype=torch.long)
+
+        row = encode_row("User: the server is slow.\nAssistant: check the database latency first.")
+
+        _ = model._ast_facts_from_bytes(row)
+        artifacts = model._ast_grounding_artifacts_from_bytes(row)
+        routing = model._source_routing_from_bytes(row)
+
+        self.assertIsNotNone(artifacts)
+        assert artifacts is not None
+        self.assertEqual(artifacts.schema_version, "grounding-runtime/v1")
+        self.assertIsNotNone(artifacts.source_profile)
+        self.assertEqual(routing.modality, artifacts.source_profile.modality)
+        self.assertEqual(routing.subtype, artifacts.source_profile.subtype)
+        self.assertEqual(routing.verification_path, artifacts.source_profile.verification_path)
+        self.assertGreaterEqual(float(artifacts.document_summary.segment_count), 2.0)
+
     def test_ast_language_router_exposes_json_record_contract_in_runtime(self) -> None:
         cfg = OMENScaleConfig.demo()
         cfg.allow_noncanonical_ablation = True
@@ -1125,6 +1158,46 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertEqual(out["source_modality"], "natural_text")
         self.assertEqual(out["source_verification_path"], "natural_language_claim_verification")
         self.assertEqual(out["sym_source_modality_natural_text"], 1.0)
+        self.assertEqual(out["sym_grounding_schema_v1"], 1.0)
+        self.assertGreaterEqual(out["sym_source_ambiguity"], 0.0)
+        self.assertGreaterEqual(out["sym_source_parser_candidates"], 1.0)
+        self.assertGreater(out["sym_source_script_latin"], 0.5)
+        self.assertGreaterEqual(out["sym_grounding_contract_document_segments"], 2.0)
+        self.assertGreaterEqual(out["sym_grounding_contract_document_structural_units"], 1.0)
+
+    def test_dialogue_forward_uses_structural_primary_scene_path(self) -> None:
+        cfg = OMENScaleConfig.demo()
+        cfg.allow_noncanonical_ablation = True
+        cfg.net_enabled = False
+        cfg.osf_enabled = False
+        cfg.emc_enabled = False
+        cfg.saliency_enabled = False
+        cfg.continuous_cycle_enabled = False
+        cfg.creative_cycle_enabled = False
+        model = OMENScale(cfg)
+
+        text = "User: goal safe_exit.\nAssistant: stars generate planets."
+        encoded = [ord(ch) for ch in text.encode("ascii", errors="ignore").decode("ascii")]
+        encoded = encoded[: cfg.seq_len]
+        if len(encoded) < cfg.seq_len:
+            encoded = encoded + [0] * (cfg.seq_len - len(encoded))
+        full = torch.tensor([encoded], dtype=torch.long)
+        src = full[:, :-1]
+        tgt = full[:, 1:]
+
+        out = model(src, tgt)
+
+        self.assertEqual(out["source_subtype"], "dialogue_text")
+        self.assertEqual(out["source_verification_path"], "dialogue_state_verification")
+        self.assertEqual(out["sym_source_modality_natural_text"], 1.0)
+        self.assertEqual(out["sym_trace_scene_structural_primary_active"], 1.0)
+        self.assertGreaterEqual(out["sym_trace_scene_structural_primary_segments"], 2.0)
+        self.assertGreaterEqual(out["sym_trace_scene_structural_primary_units_used"], 2.0)
+        self.assertGreaterEqual(out["sym_trace_scene_events"], 1.0)
+        self.assertGreaterEqual(out["sym_trace_scene_goals"], 1.0)
+        self.assertGreaterEqual(out["sym_trace_compiled_relation_claims"], 1.0)
+        self.assertGreaterEqual(out["sym_trace_compiled_goal_claims"], 1.0)
+        self.assertGreaterEqual(out["sym_trace_verification_records"], 1.0)
 
     def test_forward_surfaces_grounding_ontology_metrics(self) -> None:
         cfg = OMENScaleConfig.demo()
@@ -1196,6 +1269,7 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         ctx = model._build_generation_task_context(src, memory_grounding_records=recalled)
         self.assertGreater(float(ctx.metadata.get("grounding_memory_corroboration", 0.0)), 0.0)
         self.assertGreater(float(ctx.metadata.get("trace_verification_memory_corroboration", 0.0)), 0.0)
+        self.assertGreater(float(ctx.metadata.get("verifier_memory_corroboration", 0.0)), 0.0)
         fact_batches, record_batches, extra_count = model._semantic_world_fact_batches(1, ctx)
         self.assertGreater(extra_count, 0.0)
 
@@ -1211,6 +1285,10 @@ class WorldGraphIntegrationTest(unittest.TestCase):
             + graph_batch.metadata.get("grounding_hypotheses", 0.0),
             1.0,
         )
+
+        out = model(src, src.clone())
+        self.assertGreaterEqual(out["sym_verifier_memory_records"], 1.0)
+        self.assertGreater(out["sym_verifier_memory_corroboration"], 0.0)
         self.assertGreaterEqual(graph_batch.metadata.get("interlingua_facts", 0.0), 1.0)
         self.assertGreaterEqual(graph_batch.metadata.get("grounding_graph_records", 0.0), 1.0)
         self.assertGreaterEqual(graph_batch.metadata.get("grounding_world_state_records", 0.0), 1.0)

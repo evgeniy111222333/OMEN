@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 from .backbone import SemanticGroundingBackbone
 from .interlingua import build_canonical_interlingua
@@ -35,6 +35,7 @@ def ground_text_to_symbolic(
     language: str = "text",
     max_segments: int = 24,
     backbone: Optional[SemanticGroundingBackbone] = None,
+    memory_records: Optional[Sequence[object]] = None,
 ) -> TextGroundingPipelineResult:
     document = ground_text_document(
         text,
@@ -57,6 +58,7 @@ def ground_text_to_symbolic(
         verification_records=verification.records,
         world_state_records=world_state.records,
         ontology_concepts=ontology.concepts,
+        memory_records=memory_records,
     )
     return TextGroundingPipelineResult(
         document=document,

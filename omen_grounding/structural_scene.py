@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -7,11 +8,12 @@ from .semantic_context import build_semantic_context_objects
 from .scene_types import (
     SemanticClaim,
     SemanticEntity,
+    SemanticEvent,
     SemanticGoal,
     SemanticSceneGraph,
     SemanticState,
 )
-from .text_semantics import normalize_symbol_text
+from .text_semantics import extract_goal_hints, extract_relation_hints, extract_structured_pairs, normalize_symbol_text
 from .types import GroundedTextDocument, GroundedStructuralUnit
 
 
@@ -38,6 +40,13 @@ _STRUCTURED_RECORD_UNITS = frozenset(
         "table_row",
     }
 )
+
+_NATURAL_PRIMARY_UNITS = frozenset({"speaker_turn", "clause"})
+_NATURAL_SUPPORT_UNITS = frozenset({"speaker_turn", "clause", "citation_region"})
+_NATURAL_STRUCTURAL_SUBTYPES = frozenset({"dialogue_text", "instructional_text"})
+_CONDITIONAL_MARKERS = frozenset({"if", "when", "якщо", "коли"})
+_EXPLANATION_MARKERS = frozenset({"because", "бо", "тому_що", "через"})
+_TEMPORAL_MARKERS = frozenset({"after", "before", "then", "потім", "після", "перед"})
 
 
 @dataclass
@@ -109,11 +118,47 @@ def _structured_only_for_segments(
     return len(selected) == len(active_segments) and all(int(segment.index) in selected for segment in active_segments)
 
 
+def _segment_evidence_refs(units: Tuple[GroundedStructuralUnit, ...]) -> Tuple[str, ...]:
+    refs: List[str] = []
+    for unit in units:
+        unit_type = str(getattr(unit, "unit_type", "") or "")
+        refs.append(f"structural_unit:{unit.unit_id}")
+        refs.append(f"unit_type:{unit_type}")
+        refs.extend(
+            str(reference)
+            for reference in tuple(getattr(unit, "references", ()) or ())
+            if str(reference).strip()
+        )
+    return tuple(dict.fromkeys(refs))
+
+
+def _clause_markers(units: Tuple[GroundedStructuralUnit, ...]) -> Tuple[str, ...]:
+    markers: List[str] = []
+    for unit in units:
+        for reference in tuple(getattr(unit, "references", ()) or ()):
+            ref_text = str(reference or "")
+            if not ref_text.startswith("marker:"):
+                continue
+            marker = _normalized(ref_text.split(":", 1)[1])
+            if marker:
+                markers.append(marker)
+    return tuple(dict.fromkeys(markers))
+
+
+def _segment_event_controls(units: Tuple[GroundedStructuralUnit, ...]) -> Tuple[str, str, str]:
+    markers = _clause_markers(units)
+    condition = next((marker for marker in markers if marker in _CONDITIONAL_MARKERS), "")
+    explanation = next((marker for marker in markers if marker in _EXPLANATION_MARKERS), "")
+    temporal = next((marker for marker in markers if marker in _TEMPORAL_MARKERS), "")
+    return condition, explanation, temporal
+
+
 def structural_primary_segment_indices(document: GroundedTextDocument) -> Tuple[int, ...]:
     selected: List[int] = []
     for segment in tuple(getattr(document, "segments", ()) or ()):
         routing = getattr(segment, "routing", None)
         modality = str(getattr(routing, "modality", "") or "")
+        subtype = str(getattr(routing, "subtype", "") or "")
         unit_types = {
             str(getattr(unit, "unit_type", "") or "")
             for unit in tuple(getattr(segment, "structural_units", ()) or ())
@@ -121,9 +166,14 @@ def structural_primary_segment_indices(document: GroundedTextDocument) -> Tuple[
         if "section_header" in unit_types:
             selected.append(int(segment.index))
             continue
-        if modality != "structured_text":
+        if modality == "structured_text" and unit_types.intersection(_STRUCTURED_RECORD_UNITS):
+            selected.append(int(segment.index))
             continue
-        if unit_types.intersection(_STRUCTURED_RECORD_UNITS):
+        if (
+            modality in {"natural_text", "mixed"}
+            and subtype in _NATURAL_STRUCTURAL_SUBTYPES
+            and unit_types.intersection(_NATURAL_PRIMARY_UNITS)
+        ):
             selected.append(int(segment.index))
     return tuple(sorted(dict.fromkeys(selected)))
 
@@ -155,10 +205,12 @@ def build_structural_scene_graph(
     entity_ids: Dict[str, str] = {}
     entities: Dict[str, _EntityAccumulator] = {}
     states: List[SemanticState] = []
+    events: List[SemanticEvent] = []
     goals: List[SemanticGoal] = []
     claims: List[SemanticClaim] = []
     used_unit_ids: Set[str] = set()
     used_state_signatures: Set[Tuple[int, str, str]] = set()
+    used_event_signatures: Set[Tuple[int, str, str, str]] = set()
     used_goal_signatures: Set[Tuple[int, str, str]] = set()
     unit_type_counts: Dict[str, float] = {}
 
@@ -190,6 +242,8 @@ def build_structural_scene_graph(
             continue
         seg_idx = int(segment.index)
         structured_units = sorted(tuple(segment.structural_units or ()), key=_unit_priority)
+        routing = getattr(segment, "routing", None)
+        subtype = str(getattr(routing, "subtype", "") or "")
         for unit in structured_units:
             unit_type = str(unit.unit_type or "")
             unit_type_counts[unit_type] = unit_type_counts.get(unit_type, 0.0) + 1.0
@@ -310,6 +364,212 @@ def build_structural_scene_graph(
                     )
                 )
 
+        natural_support_units = tuple(
+            unit for unit in structured_units if str(getattr(unit, "unit_type", "") or "") in _NATURAL_SUPPORT_UNITS
+        )
+        natural_primary = bool(
+            subtype in _NATURAL_STRUCTURAL_SUBTYPES
+            and any(str(getattr(unit, "unit_type", "") or "") in _NATURAL_PRIMARY_UNITS for unit in natural_support_units)
+        )
+        if natural_primary:
+            natural_evidence_refs = _segment_evidence_refs(natural_support_units)
+            condition, explanation, temporal = _segment_event_controls(natural_support_units)
+            natural_state_candidates: List[Tuple[str, str, object, float, str]] = []
+            natural_goal_candidates = list(tuple(getattr(segment, "goals", ()) or ()))
+            natural_relation_candidates = list(tuple(getattr(segment, "relations", ()) or ()))
+            for unit in natural_support_units:
+                used_unit_ids.add(unit.unit_id)
+                if str(getattr(unit, "unit_type", "") or "") != "speaker_turn":
+                    unit_text = str(unit.text or "")
+                else:
+                    speaker_value = next(
+                        (value for key, value in tuple(getattr(unit, "fields", ()) or ()) if str(key) == "speaker"),
+                        None,
+                    )
+                    if speaker_value is not None:
+                        ensure_entity(
+                            speaker_value,
+                            semantic_type="speaker",
+                            source_segment=seg_idx,
+                            source_span=unit.span or segment.span,
+                            confidence=max(0.58, float(unit.confidence)),
+                            alias=str(speaker_value),
+                        )
+                    match = re.match(r"^(user|assistant|speaker|q|a)\s*[:>-]\s*(.+)$", str(unit.text or ""), flags=re.IGNORECASE)
+                    unit_text = match.group(2).strip() if match is not None else str(unit.text or "")
+                structured_pairs = extract_structured_pairs(unit_text)
+                goal_pairs = {
+                    (_normalized(getattr(goal, "goal_name", "")), _normalized(getattr(goal, "goal_value", "")))
+                    for goal in extract_goal_hints(unit_text, structured_pairs=structured_pairs)
+                    if _normalized(getattr(goal, "goal_name", "")) and _normalized(getattr(goal, "goal_value", ""))
+                }
+                natural_goal_candidates.extend(extract_goal_hints(unit_text, structured_pairs=structured_pairs))
+                natural_relation_candidates.extend(extract_relation_hints(unit_text))
+                for key, value in structured_pairs:
+                    key_name = _normalized(key)
+                    value_name = _normalized(value)
+                    if not key_name or not value_name or (key_name, value_name) in goal_pairs:
+                        continue
+                    natural_state_candidates.append(
+                        (key_name, value_name, unit.span or segment.span, max(0.56, float(unit.confidence)), str(key))
+                    )
+            for state_idx, (key_name, value_name, state_span, state_confidence, raw_key) in enumerate(natural_state_candidates):
+                if not key_name or not value_name:
+                    continue
+                state_signature = (seg_idx, key_name, value_name)
+                if state_signature in used_state_signatures:
+                    continue
+                used_state_signatures.add(state_signature)
+                entity_id = ensure_entity(
+                    key_name,
+                    semantic_type="attribute",
+                    source_segment=seg_idx,
+                    source_span=state_span,
+                    confidence=state_confidence,
+                    alias=raw_key,
+                )
+                state_id = f"state:struct:natural:{seg_idx}:{state_idx}"
+                evidence_refs = natural_evidence_refs + (f"state_hint:{key_name}",)
+                states.append(
+                    SemanticState(
+                        state_id=state_id,
+                        key_entity_id=entity_id,
+                        key_name=key_name,
+                        value=value_name,
+                        source_segment=seg_idx,
+                        source_span=state_span,
+                        confidence=state_confidence,
+                        status="supported",
+                        evidence_refs=evidence_refs,
+                    )
+                )
+                claims.append(
+                    SemanticClaim(
+                        claim_id=f"claim:struct:natural:state:{seg_idx}:{state_idx}",
+                        claim_kind="state",
+                        source_segment=seg_idx,
+                        source_span=state_span,
+                        confidence=state_confidence,
+                        status="supported",
+                        subject_entity_id=entity_id,
+                        predicate=key_name,
+                        object_value=value_name,
+                        evidence_refs=evidence_refs,
+                    )
+                )
+            for goal_idx, goal in enumerate(natural_goal_candidates):
+                goal_name = _normalized(getattr(goal, "goal_name", ""))
+                goal_value = _normalized(getattr(goal, "goal_value", ""))
+                if not goal_name or not goal_value:
+                    continue
+                goal_signature = (seg_idx, goal_name, goal_value)
+                if goal_signature in used_goal_signatures:
+                    continue
+                used_goal_signatures.add(goal_signature)
+                confidence = max(0.60, float(getattr(goal, "confidence", 0.0)))
+                target_id = ensure_entity(
+                    goal_value,
+                    semantic_type="entity",
+                    source_segment=seg_idx,
+                    source_span=getattr(goal, "span", None) or segment.span,
+                    confidence=confidence,
+                    alias=str(getattr(goal, "goal_value", goal_value)),
+                )
+                goal_id = f"goal:struct:natural:{seg_idx}:{goal_idx}"
+                evidence_refs = natural_evidence_refs + (f"goal_hint:{goal_name}",)
+                goals.append(
+                    SemanticGoal(
+                        goal_id=goal_id,
+                        goal_name=goal_name,
+                        goal_value=goal_value,
+                        target_entity_id=target_id,
+                        source_segment=seg_idx,
+                        source_span=getattr(goal, "span", None) or segment.span,
+                        confidence=confidence,
+                        status="supported",
+                        evidence_refs=evidence_refs,
+                    )
+                )
+                claims.append(
+                    SemanticClaim(
+                        claim_id=f"claim:struct:natural:goal:{seg_idx}:{goal_idx}",
+                        claim_kind="goal",
+                        source_segment=seg_idx,
+                        source_span=getattr(goal, "span", None) or segment.span,
+                        confidence=confidence,
+                        status="supported",
+                        predicate=goal_name,
+                        object_entity_id=target_id,
+                        object_value=goal_value,
+                        goal_id=goal_id,
+                        evidence_refs=evidence_refs,
+                    )
+                )
+            for relation_idx, relation in enumerate(natural_relation_candidates):
+                left_name = _normalized(getattr(relation, "left", ""))
+                predicate = _normalized(getattr(relation, "relation", ""))
+                right_name = _normalized(getattr(relation, "right", ""))
+                if not left_name or not predicate or not right_name:
+                    continue
+                event_signature = (seg_idx, left_name, predicate, right_name)
+                if event_signature in used_event_signatures:
+                    continue
+                used_event_signatures.add(event_signature)
+                confidence = max(0.60, float(getattr(relation, "confidence", 0.0)))
+                subject_id = ensure_entity(
+                    left_name,
+                    semantic_type="entity",
+                    source_segment=seg_idx,
+                    source_span=getattr(relation, "span", None) or segment.span,
+                    confidence=confidence,
+                    alias=str(getattr(relation, "left", left_name)),
+                )
+                object_id = ensure_entity(
+                    right_name,
+                    semantic_type="entity",
+                    source_segment=seg_idx,
+                    source_span=getattr(relation, "span", None) or segment.span,
+                    confidence=confidence,
+                    alias=str(getattr(relation, "right", right_name)),
+                )
+                event_id = f"event:struct:natural:{seg_idx}:{relation_idx}"
+                evidence_refs = natural_evidence_refs + (f"relation_hint:{predicate}",)
+                events.append(
+                    SemanticEvent(
+                        event_id=event_id,
+                        event_type=predicate,
+                        subject_entity_id=subject_id,
+                        object_entity_id=object_id,
+                        subject_name=left_name,
+                        object_name=right_name,
+                        condition=condition,
+                        explanation=explanation,
+                        temporal=temporal,
+                        source_segment=seg_idx,
+                        source_span=getattr(relation, "span", None) or segment.span,
+                        confidence=confidence,
+                        polarity="negative" if bool(getattr(segment, "counterexample", False)) else "positive",
+                        status="supported",
+                        evidence_refs=evidence_refs,
+                    )
+                )
+                claims.append(
+                    SemanticClaim(
+                        claim_id=f"claim:struct:natural:relation:{seg_idx}:{relation_idx}",
+                        claim_kind="relation",
+                        source_segment=seg_idx,
+                        source_span=getattr(relation, "span", None) or segment.span,
+                        confidence=confidence,
+                        status="supported",
+                        subject_entity_id=subject_id,
+                        predicate=predicate,
+                        object_entity_id=object_id,
+                        object_value=right_name,
+                        event_id=event_id,
+                        evidence_refs=evidence_refs,
+                    )
+                )
+
     entities_out = tuple(
         entities[entity_id].finalize(entity_id)
         for entity_id in sorted(entities.keys())
@@ -323,7 +583,7 @@ def build_structural_scene_graph(
         {
             "scene_entities": float(len(entities_out)),
             "scene_states": float(len(states)),
-            "scene_events": 0.0,
+            "scene_events": float(len(events)),
             "scene_goals": float(len(goals)),
             "scene_claims": float(len(claims)),
             "scene_mentions": float(len(mentions)),
@@ -331,16 +591,18 @@ def build_structural_scene_graph(
             "scene_temporal_markers": float(len(temporal_markers)),
             "scene_explanations": float(len(explanations)),
             "scene_coreference_links": 0.0,
-            "scene_negative_events": 0.0,
-            "scene_event_modalities": 0.0,
-            "scene_event_conditions": 0.0,
-            "scene_event_explanations": 0.0,
-            "scene_event_temporal_anchors": 0.0,
+            "scene_negative_events": float(sum(1 for event in events if event.polarity != "positive")),
+            "scene_event_modalities": float(sum(1 for event in events if event.modality)),
+            "scene_event_conditions": float(sum(1 for event in events if event.condition)),
+            "scene_event_explanations": float(sum(1 for event in events if event.explanation)),
+            "scene_event_temporal_anchors": float(sum(1 for event in events if event.temporal)),
             "scene_entity_aliases": float(sum(max(len(entity.aliases) - 1, 0) for entity in entities_out)),
             "scene_mean_entity_confidence": float(
                 sum(entity.confidence for entity in entities_out) / max(len(entities_out), 1)
             ),
-            "scene_mean_event_confidence": 0.0,
+            "scene_mean_event_confidence": float(
+                sum(event.confidence for event in events) / max(len(events), 1)
+            ),
             "scene_fallback_backbone_active": 0.0,
             "scene_fallback_low_authority": 0.0,
             "scene_backbone_replaceable": 1.0,
@@ -348,9 +610,11 @@ def build_structural_scene_graph(
             "scene_structural_primary_segments": float(len(selected_segments)),
             "scene_structural_primary_units_used": float(len(used_unit_ids)),
             "scene_structural_primary_state_claims": float(len(states)),
+            "scene_structural_primary_relation_claims": float(len(events)),
             "scene_structural_primary_goal_claims": float(len(goals)),
             "scene_structural_primary_evidence_refs": float(
                 sum(len(state.evidence_refs) for state in states)
+                + sum(len(event.evidence_refs) for event in events)
                 + sum(len(goal.evidence_refs) for goal in goals)
             ),
             "scene_structural_primary_partial_active": 0.0 if structured_only else 1.0,
@@ -363,7 +627,7 @@ def build_structural_scene_graph(
         source_text=document.source_text,
         entities=entities_out,
         states=tuple(states),
-        events=tuple(),
+        events=tuple(events),
         goals=tuple(goals),
         claims=tuple(claims),
         mentions=mentions,

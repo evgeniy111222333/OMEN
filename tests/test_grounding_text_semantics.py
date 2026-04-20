@@ -176,11 +176,19 @@ class GroundingTextSemanticsTest(unittest.TestCase):
         self.assertIsNotNone(artifacts)
         assert bundle is not None
         assert artifacts is not None
+        self.assertEqual(artifacts.schema_version, "grounding-runtime/v1")
+        self.assertIsNotNone(artifacts.source_profile)
+        self.assertIsNotNone(artifacts.document_summary)
         self.assertEqual(bundle.grounding_world_state_records, artifacts.grounding_world_state_records)
         self.assertEqual(bundle.grounding_verification_records, artifacts.grounding_verification_records)
         self.assertEqual(bundle.grounding_hypotheses, artifacts.grounding_hypotheses)
+        self.assertGreaterEqual(float(artifacts.document_summary.segment_count), 2.0)
+        self.assertGreaterEqual(float(artifacts.document_summary.structural_unit_count), 1.0)
+        self.assertEqual(artifacts.source_profile.modality, "natural_text")
         self.assertGreaterEqual(float(artifacts.metadata.get("grounding_parser_agreement", 0.0)), 0.0)
         self.assertGreaterEqual(float(artifacts.metadata.get("grounding_span_traceability", 0.0)), 0.0)
+        self.assertEqual(float(artifacts.metadata.get("grounding_schema_version_v1", 0.0)), 1.0)
+        self.assertGreaterEqual(float(artifacts.metadata.get("grounding_contract_document_segments", 0.0)), 2.0)
 
         supporting_memory = (
             tuple(artifacts.grounding_world_state_records)
@@ -201,9 +209,16 @@ class GroundingTextSemanticsTest(unittest.TestCase):
         self.assertIsNotNone(artifacts_with_memory)
         assert artifacts_with_memory is not None
         self.assertGreater(float(artifacts_with_memory.metadata.get("verification_memory_corroboration", 0.0)), 0.0)
+        self.assertGreater(float(artifacts_with_memory.metadata.get("verifier_memory_corroboration", 0.0)), 0.0)
         self.assertGreater(
             float(artifacts_with_memory.metadata.get("verification_memory_corroborated_records", 0.0)),
             0.0,
+        )
+        self.assertTrue(
+            any(
+                record.validator_family == "memory_corroboration"
+                for record in artifacts_with_memory.grounding_validation_records
+            )
         )
 
     def test_generation_context_surfaces_trace_grounding_metrics_for_utf8_prompt(self) -> None:
@@ -257,6 +272,11 @@ class GroundingTextSemanticsTest(unittest.TestCase):
         self.assertGreaterEqual(float(ctx.metadata.get("grounding_hypotheses", 0.0)), 1.0)
         self.assertGreaterEqual(float(ctx.metadata.get("grounding_verification_records", 0.0)), 1.0)
         self.assertGreaterEqual(float(ctx.metadata.get("grounding_ontology_records", 0.0)), 0.0)
+        self.assertEqual(float(ctx.metadata.get("grounding_schema_version_v1", 0.0)), 1.0)
+        self.assertGreaterEqual(float(ctx.metadata.get("source_ambiguity", 0.0)), 0.0)
+        self.assertGreaterEqual(float(ctx.metadata.get("source_parser_candidates", 0.0)), 1.0)
+        self.assertGreaterEqual(float(ctx.metadata.get("grounding_contract_document_segments", 0.0)), 1.0)
+        self.assertGreaterEqual(float(ctx.metadata.get("grounding_contract_document_structural_units", 0.0)), 1.0)
         self.assertIsNotNone(ctx.grounding_artifacts)
         self.assertGreaterEqual(len(ctx.grounding_world_state_active_facts), 1)
         self.assertGreaterEqual(len(ctx.reasoning_facts()), len(ctx.observed_facts))

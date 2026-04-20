@@ -10,6 +10,8 @@ from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 
 from omen_grounding import (
     CompiledSymbolicSegment,
+    GroundingDocumentSummary,
+    GroundingRuntimeContract,
     SemanticGroundingBackbone,
     compile_scene_context_graph_records,
     compile_scene_context_symbolic_atoms,
@@ -85,6 +87,7 @@ class SymbolicExecutionTraceBundle:
 class GroundingRuntimeArtifacts:
     language: str
     source_text: str
+    runtime_contract: GroundingRuntimeContract = field(default_factory=GroundingRuntimeContract)
     segment_spans: Dict[int, Any] = field(default_factory=dict)
     grounding_facts: FrozenSet[Any] = field(default_factory=frozenset)
     grounding_target_facts: FrozenSet[Any] = field(default_factory=frozenset)
@@ -100,6 +103,21 @@ class GroundingRuntimeArtifacts:
     grounding_world_state_contradicted_facts: FrozenSet[Any] = field(default_factory=frozenset)
     grounding_graph_records: Tuple[Any, ...] = field(default_factory=tuple)
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def schema_version(self) -> str:
+        return str(getattr(self.runtime_contract, "schema_version", ""))
+
+    @property
+    def source_profile(self) -> Optional[Any]:
+        return getattr(self.runtime_contract, "source_profile", None)
+
+    @property
+    def document_summary(self) -> GroundingDocumentSummary:
+        document_summary = getattr(self.runtime_contract, "document", None)
+        if isinstance(document_summary, GroundingDocumentSummary):
+            return document_summary
+        return GroundingDocumentSummary()
 
 
 def _has_grounding_runtime_artifacts(artifacts: Optional[GroundingRuntimeArtifacts]) -> bool:
@@ -128,6 +146,15 @@ def _build_grounding_runtime_artifacts(
     max_steps: int,
 ) -> GroundingRuntimeArtifacts:
     pipeline = orchestrated.pipeline
+    document = pipeline.document
+    document_routing = getattr(document, "routing", None)
+    document_summary = GroundingDocumentSummary(
+        routing=document_routing,
+        segment_count=len(tuple(getattr(document, "segments", ()) or ())),
+        structural_unit_count=len(tuple(getattr(document, "structural_units", ()) or ())),
+        semantic_authority=float(getattr(document, "metadata", {}).get("grounding_document_semantic_authority", 0.0)),
+        multilingual=float(getattr(document, "metadata", {}).get("grounding_multilingual", 0.0)),
+    )
     grounding_facts, grounding_targets, grounding_symbolic_stats = compile_scene_symbolic_atoms(pipeline.scene)
     grounding_context_facts, grounding_context_symbolic_stats = compile_scene_context_symbolic_atoms(
         pipeline.scene
@@ -152,6 +179,12 @@ def _build_grounding_runtime_artifacts(
     return GroundingRuntimeArtifacts(
         language=language,
         source_text=source_text,
+        runtime_contract=GroundingRuntimeContract(
+            source_profile=document_routing,
+            document=document_summary,
+            grounding_mode="semantic_scene_compiler",
+            orchestrator_active=True,
+        ),
         segment_spans=dict(orchestrated.segment_spans),
         grounding_facts=frozenset(set(grounding_facts).union(grounding_context_facts)),
         grounding_target_facts=frozenset(grounding_targets),
@@ -182,6 +215,9 @@ def _build_grounding_runtime_artifacts(
             **dict(grounding_context_stats),
             **dict(grounding_graph_stats),
             **dict(orchestrated.metadata),
+            "grounding_schema_version_v1": 1.0,
+            "grounding_contract_document_segments": float(document_summary.segment_count),
+            "grounding_contract_document_structural_units": float(document_summary.structural_unit_count),
             "grounding_mode": "semantic_scene_compiler",
             "grounding_orchestrator_active": 1.0,
         },

@@ -4342,6 +4342,74 @@ class OMENScale(nn.Module):
         return dict(getattr(source, "metadata", {}) or {})
 
     @staticmethod
+    def _grounding_source_profile(source: Optional[object]) -> Optional[GroundingSourceProfile]:
+        if source is None:
+            return None
+        profile = getattr(source, "source_profile", None)
+        if isinstance(profile, GroundingSourceProfile):
+            return profile
+        runtime_contract = getattr(source, "runtime_contract", None)
+        if runtime_contract is None:
+            return None
+        profile = getattr(runtime_contract, "source_profile", None)
+        if isinstance(profile, GroundingSourceProfile):
+            return profile
+        return None
+
+    @staticmethod
+    def _preferred_source_routing(
+        artifact_profile: Optional[GroundingSourceProfile],
+        fallback_routing: Optional[GroundingSourceProfile],
+    ) -> Optional[GroundingSourceProfile]:
+        if artifact_profile is None:
+            return fallback_routing
+        if fallback_routing is None:
+            return artifact_profile
+        if fallback_routing.domain == "code" and artifact_profile.domain != "code":
+            return fallback_routing
+        return artifact_profile
+
+    @classmethod
+    def _grounding_contract_features(cls, source: Optional[object]) -> Dict[str, float]:
+        if source is None:
+            return {}
+        features: Dict[str, float] = {}
+        schema_version = str(getattr(source, "schema_version", ""))
+        if schema_version:
+            features["grounding_schema_version_v1"] = 1.0 if schema_version == "grounding-runtime/v1" else 0.0
+        source_profile = cls._grounding_source_profile(source)
+        if source_profile is not None:
+            features.update(
+                {
+                    "source_ambiguity": float(source_profile.ambiguity),
+                    "source_parser_candidates": float(len(source_profile.parser_candidates)),
+                    "source_script_latin": float(source_profile.script_profile.get("latin", 0.0)),
+                    "source_script_cyrillic": float(source_profile.script_profile.get("cyrillic", 0.0)),
+                    "source_script_mixed": float(source_profile.script_profile.get("mixed", 0.0)),
+                    "source_script_unknown": float(source_profile.script_profile.get("unknown", 0.0)),
+                }
+            )
+        document_summary = getattr(source, "document_summary", None)
+        if document_summary is not None:
+            features.update(
+                {
+                    "grounding_contract_document_segments": float(
+                        getattr(document_summary, "segment_count", 0.0)
+                    ),
+                    "grounding_contract_document_structural_units": float(
+                        getattr(document_summary, "structural_unit_count", 0.0)
+                    ),
+                    "grounding_contract_document_semantic_authority": float(
+                        getattr(document_summary, "semantic_authority", 0.0)
+                    ),
+                    "grounding_contract_document_multilingual": float(
+                        getattr(document_summary, "multilingual", 0.0)
+                    ),
+                }
+            )
+        return features
+
+    @staticmethod
     def _grounding_candidate_records(source: Optional[object], *, include_graph_records: bool = False) -> Tuple[object, ...]:
         if source is None:
             return tuple()
@@ -5034,6 +5102,10 @@ class OMENScale(nn.Module):
         except Exception:
             trace_bundle = None
             grounding_artifacts = None
+        artifact_routing = self._grounding_source_profile(grounding_artifacts)
+        routing = self._preferred_source_routing(artifact_routing, routing) or routing
+        if artifact_routing is not None and routing is artifact_routing:
+            detected_lang = artifact_routing.language or detected_lang
         trace_lang = getattr(trace_bundle, "language", None) if trace_bundle is not None else None
         if isinstance(trace_lang, str) and trace_lang:
             if routing.domain != "code" and trace_lang in ("json", "text"):
@@ -5068,6 +5140,20 @@ class OMENScale(nn.Module):
                 routing = replace(routing, parser_candidates=build_parser_candidates(routing))
             elif not facts or trace_lang not in ("python", "javascript", "rust"):
                 detected_lang = trace_lang
+        if grounding_artifacts is not None and self._grounding_source_profile(grounding_artifacts) is not None:
+            runtime_contract = getattr(grounding_artifacts, "runtime_contract", None)
+            if runtime_contract is not None:
+                document_summary = getattr(runtime_contract, "document", None)
+                if document_summary is not None:
+                    document_summary = replace(document_summary, routing=routing)
+                grounding_artifacts = replace(
+                    grounding_artifacts,
+                    runtime_contract=replace(
+                        runtime_contract,
+                        source_profile=routing,
+                        document=document_summary if document_summary is not None else runtime_contract.document,
+                    ),
+                )
         if not facts and trace_bundle is not None:
             facts = self._dedupe_facts(
                 list(getattr(trace_bundle, "observed_facts", ())),
@@ -5122,6 +5208,33 @@ class OMENScale(nn.Module):
             return cached[2]
         return None
 
+    def _ast_trace_and_grounding_from_bytes(
+        self,
+        src_row: torch.Tensor,
+        *,
+        memory_records: Optional[Sequence[object]] = None,
+    ):
+        if not memory_records:
+            return self._ast_trace_from_bytes(src_row), self._ast_grounding_artifacts_from_bytes(src_row)
+        try:
+            code = self._decode_source_bytes(src_row)
+        except Exception:
+            return self._ast_trace_from_bytes(src_row), self._ast_grounding_artifacts_from_bytes(src_row)
+        if not str(code or "").strip():
+            return None, None
+        detected_lang = self._ast_lang_from_bytes(src_row)
+        try:
+            return build_symbolic_trace_bundle_with_artifacts(
+                code,
+                lang_hint=detected_lang,
+                max_steps=int(getattr(self.cfg, "sym_trace_max_steps", 24)),
+                max_counterexamples=int(getattr(self.cfg, "sym_trace_max_counterexamples", 4)),
+                semantic_backbone=self.semantic_grounding_backbone,
+                memory_records=tuple(memory_records or ()),
+            )
+        except Exception:
+            return self._ast_trace_from_bytes(src_row), self._ast_grounding_artifacts_from_bytes(src_row)
+
     def _ast_grounding_artifacts_from_bytes(self, src_row: torch.Tensor):
         cache_key = self._row_fact_cache_key(src_row)
         cached = self._fact_cache.get_by_key(cache_key)
@@ -5138,7 +5251,11 @@ class OMENScale(nn.Module):
         cache_key = self._row_fact_cache_key(src_row)
         cached = self._fact_cache.get_by_key(cache_key)
         if cached is not None:
-            _facts, _rules, _trace, detected_lang, routing, _grounding = cached
+            _facts, _rules, _trace, detected_lang, routing, grounding_artifacts = cached
+            artifact_routing = self._grounding_source_profile(grounding_artifacts)
+            preferred_routing = self._preferred_source_routing(artifact_routing, routing)
+            if preferred_routing is not None:
+                return preferred_routing
             if routing is not None:
                 return routing
             if isinstance(detected_lang, str) and detected_lang:
@@ -5150,7 +5267,11 @@ class OMENScale(nn.Module):
         self._ast_facts_from_bytes(src_row)
         cached = self._fact_cache.get_by_key(cache_key)
         if cached is not None:
-            _facts, _rules, _trace, detected_lang, routing, _grounding = cached
+            _facts, _rules, _trace, detected_lang, routing, grounding_artifacts = cached
+            artifact_routing = self._grounding_source_profile(grounding_artifacts)
+            preferred_routing = self._preferred_source_routing(artifact_routing, routing)
+            if preferred_routing is not None:
+                return preferred_routing
             if routing is not None:
                 return routing
             if isinstance(detected_lang, str) and detected_lang:
@@ -5701,8 +5822,10 @@ class OMENScale(nn.Module):
 
         #   1:    ( on-the-fly  miss) 
         ast_facts = self._ast_facts_from_bytes(src_row)
-        trace_bundle = self._ast_trace_from_bytes(src_row)
-        grounding_artifacts = self._ast_grounding_artifacts_from_bytes(src_row)
+        trace_bundle, grounding_artifacts = self._ast_trace_and_grounding_from_bytes(
+            src_row,
+            memory_records=recalled_grounding_records,
+        )
         grounding_source = grounding_artifacts if grounding_artifacts is not None else trace_bundle
         ast_lang = self._ast_lang_from_bytes(src_row)
         source_routing = self._source_routing_from_bytes(src_row)
@@ -5862,6 +5985,7 @@ class OMENScale(nn.Module):
             or verifier_repair_pressure >= 0.40
         )
         trace_metadata = self._trace_metadata_features(grounding_metadata)
+        grounding_contract_features = self._grounding_contract_features(grounding_artifacts)
         return self._compose_symbolic_task_context(
             observed_now_facts=observed_now,
             memory_derived_facts=memory_derived,
@@ -5913,6 +6037,15 @@ class OMENScale(nn.Module):
                 "grounding_repair_actions": float(len(trace_grounding_repair_actions)),
                 "grounding_facts": float(len(grounding_derived)),
                 **grounding_quality,
+                "verifier_stack_memory_records": float(
+                    grounding_metadata.get("verifier_stack_memory_records", 0.0)
+                ),
+                "verifier_memory_corroboration": float(
+                    grounding_metadata.get("verifier_memory_corroboration", 0.0)
+                ),
+                "verifier_memory_conflict": float(
+                    grounding_metadata.get("verifier_memory_conflict", 0.0)
+                ),
                 "net_last_concept": float(net_last_concept) if net_last_concept is not None else -1.0,
                 "net_symbolic_active": net_stats["active"],
                 "net_symbolic_facts": net_stats["facts"],
@@ -5931,6 +6064,7 @@ class OMENScale(nn.Module):
                 "source_profile_structured_text": float(source_routing.profile.get("structured_text", 0.0)),
                 "source_profile_mixed": float(source_routing.profile.get("mixed", 0.0)),
                 "source_profile_unknown": float(source_routing.profile.get("unknown", 0.0)),
+                **grounding_contract_features,
                 **trace_metadata,
             },
         )
@@ -5987,8 +6121,10 @@ class OMENScale(nn.Module):
         observed_now.append(HornAtom(SEQ_LAST_TOKEN_PRED, (last_token, last_pos)))
 
         ast_facts = self._ast_facts_from_bytes(prompt_row)
-        trace_bundle = self._ast_trace_from_bytes(prompt_row)
-        grounding_artifacts = self._ast_grounding_artifacts_from_bytes(prompt_row)
+        trace_bundle, grounding_artifacts = self._ast_trace_and_grounding_from_bytes(
+            prompt_row,
+            memory_records=recalled_grounding_records,
+        )
         grounding_source = grounding_artifacts if grounding_artifacts is not None else trace_bundle
         ast_lang = self._ast_lang_from_bytes(prompt_row)
         source_routing = self._source_routing_from_bytes(prompt_row)
@@ -6082,6 +6218,7 @@ class OMENScale(nn.Module):
         )
         trace_metadata = self._trace_metadata_features(grounding_metadata)
         grounding_quality = self._grounding_quality_features(grounding_metadata)
+        grounding_contract_features = self._grounding_contract_features(grounding_artifacts)
         recalled_grounding_status = grounding_memory_status_counts(recalled_grounding_records)
         target_seed_facts = set(getattr(trace_bundle, "target_facts", frozenset())) if trace_bundle is not None else set()
         target_seed_facts.update(getattr(grounding_source, "grounding_target_facts", frozenset()) if grounding_source is not None else ())
@@ -6129,6 +6266,15 @@ class OMENScale(nn.Module):
                 "grounding_repair_actions": float(len(trace_grounding_repair_actions)),
                 "grounding_facts": float(len(grounding_derived)),
                 **grounding_quality,
+                "verifier_stack_memory_records": float(
+                    grounding_metadata.get("verifier_stack_memory_records", 0.0)
+                ),
+                "verifier_memory_corroboration": float(
+                    grounding_metadata.get("verifier_memory_corroboration", 0.0)
+                ),
+                "verifier_memory_conflict": float(
+                    grounding_metadata.get("verifier_memory_conflict", 0.0)
+                ),
                 "net_last_concept": float(net_last_concept) if net_last_concept is not None else -1.0,
                 "net_symbolic_active": net_stats["active"],
                 "net_symbolic_facts": net_stats["facts"],
@@ -6151,6 +6297,7 @@ class OMENScale(nn.Module):
                 "source_profile_structured_text": float(source_routing.profile.get("structured_text", 0.0)),
                 "source_profile_mixed": float(source_routing.profile.get("mixed", 0.0)),
                 "source_profile_unknown": float(source_routing.profile.get("unknown", 0.0)),
+                **grounding_contract_features,
                 **trace_metadata,
             },
         )
@@ -7379,6 +7526,15 @@ class OMENScale(nn.Module):
         out["sym_verifier_temporal_conflict"] = float(
             task_context.metadata.get("verifier_temporal_conflict", 0.0)
         )
+        out["sym_verifier_memory_records"] = float(
+            task_context.metadata.get("verifier_stack_memory_records", 0.0)
+        )
+        out["sym_verifier_memory_corroboration"] = float(
+            task_context.metadata.get("verifier_memory_corroboration", 0.0)
+        )
+        out["sym_verifier_memory_conflict"] = float(
+            task_context.metadata.get("verifier_memory_conflict", 0.0)
+        )
         out["sym_verifier_stack_repair_actions"] = float(
             task_context.metadata.get("verifier_stack_repair_actions", 0.0)
         )
@@ -7426,6 +7582,15 @@ class OMENScale(nn.Module):
         )
         out["sym_trace_scene_explanations"] = float(
             task_context.metadata.get("trace_scene_explanations", 0.0)
+        )
+        out["sym_trace_scene_structural_primary_active"] = float(
+            task_context.metadata.get("trace_scene_structural_primary_active", 0.0)
+        )
+        out["sym_trace_scene_structural_primary_segments"] = float(
+            task_context.metadata.get("trace_scene_structural_primary_segments", 0.0)
+        )
+        out["sym_trace_scene_structural_primary_units_used"] = float(
+            task_context.metadata.get("trace_scene_structural_primary_units_used", 0.0)
         )
         out["sym_trace_scene_context_records"] = float(
             task_context.metadata.get("trace_scene_context_records", 0.0)
@@ -7517,11 +7682,24 @@ class OMENScale(nn.Module):
         out["sym_source_modality_mixed"] = 1.0 if source_modality == "mixed" else 0.0
         out["sym_source_modality_unknown"] = 1.0 if source_modality == "unknown" else 0.0
         out["sym_source_confidence"] = float(task_context.metadata.get("source_confidence", 0.0))
+        out["sym_source_ambiguity"] = float(task_context.metadata.get("source_ambiguity", 0.0))
+        out["sym_source_parser_candidates"] = float(task_context.metadata.get("source_parser_candidates", 0.0))
+        out["sym_source_script_latin"] = float(task_context.metadata.get("source_script_latin", 0.0))
+        out["sym_source_script_cyrillic"] = float(task_context.metadata.get("source_script_cyrillic", 0.0))
+        out["sym_source_script_mixed"] = float(task_context.metadata.get("source_script_mixed", 0.0))
+        out["sym_source_script_unknown"] = float(task_context.metadata.get("source_script_unknown", 0.0))
         out["sym_source_profile_code"] = float(task_context.metadata.get("source_profile_code", 0.0))
         out["sym_source_profile_natural_text"] = float(task_context.metadata.get("source_profile_natural_text", 0.0))
         out["sym_source_profile_structured_text"] = float(task_context.metadata.get("source_profile_structured_text", 0.0))
         out["sym_source_profile_mixed"] = float(task_context.metadata.get("source_profile_mixed", 0.0))
         out["sym_source_profile_unknown"] = float(task_context.metadata.get("source_profile_unknown", 0.0))
+        out["sym_grounding_schema_v1"] = float(task_context.metadata.get("grounding_schema_version_v1", 0.0))
+        out["sym_grounding_contract_document_segments"] = float(
+            task_context.metadata.get("grounding_contract_document_segments", 0.0)
+        )
+        out["sym_grounding_contract_document_structural_units"] = float(
+            task_context.metadata.get("grounding_contract_document_structural_units", 0.0)
+        )
         out["sym_source_verification_ast_program"] = 1.0 if source_verification_path == "ast_program_verification" else 0.0
         out["sym_source_verification_natural_claim"] = 1.0 if source_verification_path == "natural_language_claim_verification" else 0.0
         out["sym_source_verification_scientific_claim"] = 1.0 if source_verification_path == "scientific_claim_verification" else 0.0

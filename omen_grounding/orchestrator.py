@@ -148,6 +148,7 @@ def run_grounding_orchestrator(
         language=language,
         max_segments=max_segments,
         backbone=backbone,
+        memory_records=memory_records,
     )
     segment_spans = {
         int(segment.index): segment.span

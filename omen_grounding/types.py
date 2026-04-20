@@ -35,6 +35,27 @@ class GroundingSourceProfile:
     parser_candidates: Tuple[GroundingParserCandidate, ...] = field(default_factory=tuple)
 
 
+GROUNDING_RUNTIME_CONTRACT_VERSION = "grounding-runtime/v1"
+
+
+@dataclass(frozen=True)
+class GroundingDocumentSummary:
+    routing: Optional[GroundingSourceProfile] = None
+    segment_count: int = 0
+    structural_unit_count: int = 0
+    semantic_authority: float = 0.0
+    multilingual: float = 0.0
+
+
+@dataclass(frozen=True)
+class GroundingRuntimeContract:
+    schema_version: str = GROUNDING_RUNTIME_CONTRACT_VERSION
+    source_profile: Optional[GroundingSourceProfile] = None
+    document: GroundingDocumentSummary = field(default_factory=GroundingDocumentSummary)
+    grounding_mode: str = "unknown"
+    orchestrator_active: bool = False
+
+
 @dataclass(frozen=True)
 class GroundedStructuralUnit:
     unit_id: str

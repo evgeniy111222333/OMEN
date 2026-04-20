@@ -122,6 +122,69 @@ def _claim_id_from_provenance(hypothesis: CompiledSymbolicHypothesis) -> str:
     return ""
 
 
+def _structural_evidence_scores(
+    hypothesis: CompiledSymbolicHypothesis,
+    document: Optional[GroundedTextDocument],
+) -> Dict[str, float]:
+    empty = {
+        "alignment": 0.0,
+        "provenance_support": 0.0,
+        "dialogue_support": 0.0,
+        "citation_support": 0.0,
+    }
+    if document is None:
+        return empty
+    segment_index = int(hypothesis.segment_index)
+    if segment_index < 0 or segment_index >= len(document.segments):
+        return empty
+    segment = document.segments[segment_index]
+    routing = getattr(segment, "routing", None)
+    subtype = str(getattr(routing, "subtype", "") or "")
+    structural_units = tuple(getattr(segment, "structural_units", ()) or ())
+    structural_types = {str(getattr(unit, "unit_type", "") or "") for unit in structural_units}
+    structural_text_parts: List[str] = []
+    for unit in structural_units:
+        unit_text = _normalize_symbol(getattr(unit, "text", ""))
+        if unit_text:
+            structural_text_parts.append(unit_text)
+        for key, value in tuple(getattr(unit, "fields", ()) or ()):
+            for item in (_normalize_symbol(key), _normalize_symbol(value)):
+                if item:
+                    structural_text_parts.append(item)
+    structural_text = " ".join(structural_text_parts)
+    normalized_symbols = tuple(
+        _normalize_symbol(symbol)
+        for symbol in hypothesis.symbols[:3]
+        if _normalize_symbol(symbol)
+    )
+    matched = sum(
+        1
+        for symbol in normalized_symbols
+        if symbol and symbol in structural_text
+    )
+    alignment = float(matched) / max(float(len(normalized_symbols)), 1.0)
+    provenance_support = 1.0 if any(
+        str(item).startswith("structural_unit:")
+        for item in hypothesis.provenance
+    ) else 0.0
+    dialogue_support = 1.0 if (
+        subtype in {"dialogue_text", "instructional_text"}
+        and structural_types.intersection({"speaker_turn", "clause"})
+        and hypothesis.kind in {"relation", "goal", "state"}
+    ) else 0.0
+    citation_support = 1.0 if (
+        subtype == "scientific_text"
+        and "citation_region" in structural_types
+        and hypothesis.kind in {"relation", "state"}
+    ) else 0.0
+    return {
+        "alignment": _clip01(alignment),
+        "provenance_support": float(provenance_support),
+        "dialogue_support": float(dialogue_support),
+        "citation_support": float(citation_support),
+    }
+
+
 def _document_alignment_score(
     hypothesis: CompiledSymbolicHypothesis,
     document: Optional[GroundedTextDocument],
@@ -298,6 +361,10 @@ def verify_symbolic_hypotheses(
     counterexample_by_segment = _segment_counterexample_map(compilation)
     records: List[GroundingVerificationRecord] = []
     document_alignments: List[float] = []
+    structural_alignments: List[float] = []
+    structural_provenances: List[float] = []
+    dialogue_supports: List[float] = []
+    citation_supports: List[float] = []
     scene_alignments: List[float] = []
     interlingua_alignments: List[float] = []
 
@@ -315,6 +382,11 @@ def verify_symbolic_hypotheses(
         temporal_support = 1.0 if any(symbol.startswith("time:") for symbol in extra_symbols) else 0.0
         modal_support = 1.0 if any(symbol.startswith("modal:") for symbol in extra_symbols) else 0.0
         document_alignment = _document_alignment_score(hypothesis, document)
+        structural_evidence = _structural_evidence_scores(hypothesis, document)
+        structural_alignment = float(structural_evidence["alignment"])
+        structural_provenance = float(structural_evidence["provenance_support"])
+        dialogue_support = float(structural_evidence["dialogue_support"])
+        citation_support = float(structural_evidence["citation_support"])
         scene_alignment = _scene_alignment_score(hypothesis, scene)
         interlingua_alignment = _interlingua_alignment_score(hypothesis, interlingua)
         polarity_conflict = 1.0 if (
@@ -336,6 +408,10 @@ def verify_symbolic_hypotheses(
             + (0.02 * temporal_support)
             + (0.02 * modal_support)
             + (0.08 * document_alignment)
+            + (0.07 * structural_alignment)
+            + (0.05 * structural_provenance)
+            + (0.04 * dialogue_support)
+            + (0.03 * citation_support)
             + (0.06 * scene_alignment)
             + (0.06 * interlingua_alignment)
             + kind_bonus
@@ -349,11 +425,19 @@ def verify_symbolic_hypotheses(
             - (0.05 * interlingua_alignment)
             - (0.04 * scene_alignment)
             - (0.03 * document_alignment)
+            - (0.04 * structural_alignment)
+            - (0.03 * structural_provenance)
+            - (0.03 * dialogue_support)
+            - (0.02 * citation_support)
             - (0.04 * causal_support)
             - (0.03 * conditional_support)
             - (0.02 * temporal_support)
         )
         document_alignments.append(float(document_alignment))
+        structural_alignments.append(float(structural_alignment))
+        structural_provenances.append(float(structural_provenance))
+        dialogue_supports.append(float(dialogue_support))
+        citation_supports.append(float(citation_support))
         scene_alignments.append(float(scene_alignment))
         interlingua_alignments.append(float(interlingua_alignment))
         hidden_cause_candidate = bool(
@@ -409,6 +493,22 @@ def verify_symbolic_hypotheses(
         "verification_document_alignment": (
             sum(document_alignments) / max(total, 1.0)
             if document_alignments else 0.0
+        ),
+        "verification_structural_alignment": (
+            sum(structural_alignments) / max(total, 1.0)
+            if structural_alignments else 0.0
+        ),
+        "verification_structural_provenance_support": (
+            sum(structural_provenances) / max(total, 1.0)
+            if structural_provenances else 0.0
+        ),
+        "verification_dialogue_structural_support": (
+            sum(dialogue_supports) / max(total, 1.0)
+            if dialogue_supports else 0.0
+        ),
+        "verification_citation_support": (
+            sum(citation_supports) / max(total, 1.0)
+            if citation_supports else 0.0
         ),
         "verification_scene_alignment": (
             sum(scene_alignments) / max(total, 1.0)

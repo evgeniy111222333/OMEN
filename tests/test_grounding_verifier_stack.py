@@ -43,7 +43,12 @@ class GroundingVerifierStackTest(unittest.TestCase):
         self.assertGreaterEqual(result.verifier_stack.metadata.get("verifier_temporal_consistency", 0.0), 0.2)
         self.assertTrue(any(record.validator_family == "world_model" for record in result.verifier_stack.validation_records))
         self.assertTrue(any(record.validator_family == "temporal" for record in result.verifier_stack.validation_records))
-        self.assertTrue(any(action.action_type == "trigger_hidden_cause_abduction" for action in result.verifier_stack.repair_actions))
+        self.assertTrue(
+            any(
+                action.action_type in {"trigger_hidden_cause_abduction", "promote_world_model_supported_claim"}
+                for action in result.verifier_stack.repair_actions
+            )
+        )
 
     def test_trace_and_runtime_surface_verifier_stack_metrics(self) -> None:
         text = "\n".join(
@@ -85,6 +90,37 @@ class GroundingVerifierStackTest(unittest.TestCase):
         self.assertGreaterEqual(out["sym_trace_repair_actions"], 1.0)
         self.assertGreaterEqual(out["world_graph_grounding_validation_records"], 1.0)
         self.assertGreaterEqual(out["world_graph_grounding_repair_actions"], 1.0)
+
+    def test_memory_corroboration_becomes_validator_family_when_memory_is_available(self) -> None:
+        text = "\n".join(
+            [
+                "dispatcher opens door",
+                "at 10:00 dispatcher opens door because alarm triggered",
+            ]
+        )
+
+        seeded = ground_text_to_symbolic(text, language="text", max_segments=8)
+        memory_records = (
+            tuple(seeded.world_state.records)
+            + tuple(seeded.verification.records)
+            + tuple(seeded.compiled.hypotheses)
+        )
+        result = ground_text_to_symbolic(
+            text,
+            language="text",
+            max_segments=8,
+            memory_records=memory_records,
+        )
+
+        self.assertGreaterEqual(result.verifier_stack.metadata.get("verifier_stack_memory_records", 0.0), 1.0)
+        self.assertGreater(result.verifier_stack.metadata.get("verifier_memory_corroboration", 0.0), 0.0)
+        self.assertTrue(
+            any(
+                record.validator_family == "memory_corroboration"
+                and record.validation_status == "supported"
+                for record in result.verifier_stack.validation_records
+            )
+        )
 
 
 if __name__ == "__main__":

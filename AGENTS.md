@@ -38,8 +38,8 @@ When a change spans multiple modules, use `codegraph` to estimate blast radius b
 Use tools according to the shape of the task:
 - `codegraph` for structural relationships, call chains, dependency tracing, impact analysis, and cross-file architecture flow
 - `filesystem` and direct file reads for exact local file contents, configs, prompts, docs, fixtures, and non-code assets
-- `memory` for durable cross-session knowledge about the user, the repository, and long-lived operating constraints
-- `SYSTEM_NOTEBOOK.md` for the repository-local working notebook, durable investigation notes, migration maps, and navigation aids
+- `memory` for canonical durable cross-session knowledge about the user, the repository, and long-lived operating constraints
+- `SYSTEM_NOTEBOOK.md` for the repository-local operating manual, memory taxonomy, retrieval recipes, and templates
 - `github` for remote repository state, PRs, issues, CI, review threads, branch metadata, and remote code search
 - `context7` for third-party library/framework/package documentation and version-sensitive external API behavior
 
@@ -47,33 +47,49 @@ Never substitute one tool class for another when a more authoritative tool is av
 
 ## Memory Guidance
 
-Treat memory as a two-layer system:
-- `memory` MCP is the durable cross-session knowledge graph
-- `SYSTEM_NOTEBOOK.md` is the repository-local working notebook and navigation map
+Treat `memory` MCP as the canonical durable memory store.
 
-The assistant should use both together for long-running work.
+`SYSTEM_NOTEBOOK.md` is not the primary store for session-derived durable knowledge.
+It exists only for:
+- memory policy
+- category taxonomy
+- retrieval recipes
+- naming conventions
+- templates
+- navigation rules
+
+Absolute durable-write rule:
+- durable findings must be written to `memory`
+- durable preferences must be written to `memory`
+- durable architecture conclusions must be written to `memory`
+- refactor maps must be written to `memory`
+- verified-search results must be written to `memory`
+- module-understanding notes must be written to `memory`
+- open questions that should survive the session must be written to `memory`
+- do not use repo files as the primary store for those facts
+- only write durable knowledge into a file if the user explicitly asks for file-based documentation or if a repository artifact is required for non-memory consumers
 
 Read protocol:
-- before major architecture analysis, deep debugging, repo-wide refactors, or grounding/canonical/symbolic investigation, read the relevant parts of `SYSTEM_NOTEBOOK.md`
-- search `memory` before repeating questions about stable preferences, durable constraints, prior architecture conclusions, or recurring workflow rules
-- for small local edits, use notebook or memory only when they are likely to reduce repeated exploration
-
-Write-back protocol:
-- after an important architecture conclusion, write a concise durable summary to both `SYSTEM_NOTEBOOK.md` and `memory`
-- after a successful refactor, record a migration map covering renamed functions, moved files, replaced entry points, and important compatibility notes
-- after a deep module analysis, record a module-understanding note
-- after a long search chain that produced a durable answer, record the verified result with a verification date
-- after discovering a stable user preference, store it in `memory` and, when it affects repository workflow, also capture it in `SYSTEM_NOTEBOOK.md`
-- after a blocked investigation with a clear follow-up path, record the unresolved question and next verification plan
+- before major architecture analysis, deep debugging, repo-wide refactors, or grounding/canonical/symbolic investigation, search `memory` first
+- read `SYSTEM_NOTEBOOK.md` for policy, taxonomy, and retrieval rules
+- for small local edits, use memory only when it is likely to reduce repeated exploration
 
 Operational memory flow:
-- start with `search_nodes` using the category and topic, not a vague natural-language query
-- if matching nodes exist, use `open_nodes` on the most relevant ones before doing repeated exploration
-- when adding durable facts, prefer updating an existing entity over creating near-duplicate entities
-- create entities only when the fact is likely to matter again across sessions
-- use relations to connect modules, subsystems, users, and durable decisions when that link will improve future retrieval
-- after a structural discovery from `codegraph`, decide whether the result is durable enough to mirror into `memory`
-- after writing to `memory`, ensure the same topic can be found later by category name, module name, or subsystem name
+- start with `search_nodes` using the category, module name, subsystem name, or durable topic
+- if matching nodes exist, use `open_nodes` on the most relevant ones before repeating exploration
+- prefer updating an existing entity over creating a near-duplicate entity
+- create new entities only when the fact is likely to matter again across sessions
+- use relations when they improve future retrieval of architecture or workflow facts
+- after writing to `memory`, ensure the topic can be found later by category name, module name, or subsystem name
+
+Write-back protocol:
+- after an important architecture conclusion, write a concise durable summary to `memory`
+- after a successful refactor, record a migration map in `memory`
+- after a deep module analysis, record a module-understanding note in `memory`
+- after a long search chain that produced a durable answer, record the verified result with a verification date in `memory`
+- after discovering a stable user preference, store it in `memory`
+- after a blocked investigation with a clear follow-up path, record the unresolved question and next verification plan in `memory`
+- update `SYSTEM_NOTEBOOK.md` only when the memory policy, navigation instructions, templates, or user-requested file documentation should change
 
 Memory categories and priorities:
 - `architecture` for durable structure, hub modules, ownership boundaries, or central abstractions
@@ -92,9 +108,8 @@ Priority rules:
 - `P2` useful context that helps navigation but is not session-critical
 - `P3` optional background or historical notes
 
-Entity and notebook naming conventions:
-- use memory entity names such as `Architecture:<topic>`, `GroundingFlow:<topic>`, `ConfigDefault:<module>`, `TestStrategy:<subsystem>`, `UserPreference:<topic>`, `RefactorMap:<topic>`, `ModuleUnderstanding:<module>`, `VerifiedSearch:<topic>`, `OpenQuestion:<topic>`
-- use the same category names and note IDs in `SYSTEM_NOTEBOOK.md` so the notebook and memory can cross-reference each other
+Memory naming conventions:
+- use entity names such as `Architecture:<topic>`, `GroundingFlow:<topic>`, `ConfigDefault:<module>`, `TestStrategy:<subsystem>`, `UserPreference:<topic>`, `RefactorMap:<topic>`, `ModuleUnderstanding:<module>`, `VerifiedSearch:<topic>`, `OpenQuestion:<topic>`
 - prefer short searchable IDs such as `ARCH-2026-04-20-01`, `FLOW-2026-04-20-01`, `REF-2026-04-20-01`, `MOD-2026-04-20-01`
 - when possible, include the module path, subsystem name, or user-facing topic in the entity name so future `search_nodes` calls are predictable
 
@@ -114,34 +129,25 @@ What must not be stored in durable memory:
 - details of an error that was fixed immediately and has no durable diagnostic value
 - ephemeral code states, temporary branches, or short-lived experiments
 
-Module-understanding template:
-- purpose of the module in one or two sentences
-- main public entry points
-- key inbound dependencies
-- key outbound dependencies
-- where config or defaults live
-- what tests are most relevant
-- current confidence and verification date
-
 Refactor-memory policy:
-- after a structural refactor, record the old and new names, moved files, changed entry points, and any compatibility shims
-- if a refactor invalidates old notebook or memory notes, mark them as `stale` or `needs-revalidation`
+- after a structural refactor, record the old and new names, moved files, changed entry points, and any compatibility shims in `memory`
+- if a refactor invalidates old memory notes, mark them as `stale` or `needs-revalidation`
 - prefer recording the migration map immediately after the refactor is verified
 
 Verified-search policy:
-- if the assistant spends multiple search steps finding callers, callees, ownership boundaries, or rare symbol usage, summarize the result as a reusable verified-search note
+- if the assistant spends multiple search steps finding callers, callees, ownership boundaries, or rare symbol usage, summarize the result as a reusable verified-search note in `memory`
 - include the scope, source of verification, and date
 - do not store full raw search dumps; store the compact answer and where it was verified
 
 Revalidation policy:
 - if `codegraph` is re-indexed, the repository structure changes materially, or a module is split or renamed, treat related architecture, flow, and refactor notes as potentially stale
-- mark stale notes explicitly in `SYSTEM_NOTEBOOK.md`
+- mark stale notes explicitly in `memory`
 - when using stale notes, re-check them against the repo before relying on them
-- if notebook or memory conflicts with the repository, trust the repository and update the stale note later
+- if memory conflicts with the repository, trust the repository and update memory later
 
 Codegraph-synergy rule:
-- if `codegraph` is temporarily unavailable, the assistant may use recent notebook or memory notes as a navigation map for `filesystem` exploration
-- once `codegraph` is available again, verify any structural claim that came from the notebook or memory rather than fresh graph inspection
+- if `codegraph` is temporarily unavailable, the assistant may use recent memory notes as a navigation map for `filesystem` exploration
+- once `codegraph` is available again, verify any structural claim that came from memory rather than fresh graph inspection
 
 User-preference policy:
 - treat as stable preferences only things the user has expressed repeatedly or explicitly as a standing rule
@@ -152,15 +158,15 @@ Open-question policy:
 - if a high-value question could not be answered in the current session, record it as an `open-question` with a short reason, current blockers, and the next concrete investigation step
 - revisit open questions when future work touches the same subsystem
 
-Notebook-first navigation rule:
-- for repository-wide or multi-step work, read the `Quick Index` and the relevant category sections in `SYSTEM_NOTEBOOK.md` before deep exploration
-- update the notebook when the session produces durable knowledge, not just when code changes
-- keep notes concise, dated, and easy to scan
+Memory-first navigation rule:
+- for repository-wide or multi-step work, search `memory` first by category, subsystem, and module name
+- use `SYSTEM_NOTEBOOK.md` as the operating manual for how to search and structure memory, not as the canonical fact store
+- keep durable knowledge in `memory`, not in ad hoc repo files
 
 Memory workflow:
 - search or read memory before asking repeated questions about stable preferences or constraints
-- read `SYSTEM_NOTEBOOK.md` before deep work that spans multiple files or sessions
-- treat notebook and memory as hints, then verify against the repo when accuracy matters
+- read `SYSTEM_NOTEBOOK.md` for the retrieval rules and templates before deep work that spans multiple files or sessions
+- treat memory as a durable hint layer, then verify against the repo when accuracy matters
 - after learning a durable fact, write it back succinctly
 - if memory conflicts with the repo, trust the repo and update memory later
 

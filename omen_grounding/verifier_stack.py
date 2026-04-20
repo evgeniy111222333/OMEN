@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from .memory_hints import grounding_memory_status
 from .ontology_growth import GroundingOntologyConcept
 from .scene_types import SemanticSceneGraph
 from .verification import GroundingVerificationRecord
@@ -159,15 +160,77 @@ def _segment_marker_density(
     }
 
 
+def _memory_overlap_score(
+    symbols: Tuple[str, ...],
+    memory_records: Sequence[object],
+) -> Dict[str, float | str]:
+    empty: Dict[str, float | str] = {
+        "active_overlap": 0.0,
+        "hypothetical_overlap": 0.0,
+        "contradicted_overlap": 0.0,
+        "support": 0.0,
+        "conflict": 0.0,
+        "rationale": "memory_unavailable",
+    }
+    if not memory_records:
+        return empty
+    symbol_set = {str(item).strip() for item in symbols if str(item).strip()}
+    if not symbol_set:
+        empty["rationale"] = "empty_symbols"
+        return empty
+    grouped_terms: Dict[str, set[str]] = {
+        "active": set(),
+        "hypothetical": set(),
+        "contradicted": set(),
+    }
+    for record in memory_records:
+        status = grounding_memory_status(record)
+        if status not in grouped_terms:
+            continue
+        grouped_terms[status].update(
+            str(term).strip()
+            for term in (getattr(record, "graph_terms", ()) or ())
+            if str(term).strip()
+        )
+    active_overlap = float(len(symbol_set.intersection(grouped_terms["active"]))) / max(float(len(symbol_set)), 1.0)
+    hypothetical_overlap = float(len(symbol_set.intersection(grouped_terms["hypothetical"]))) / max(
+        float(len(symbol_set)), 1.0
+    )
+    contradicted_overlap = float(len(symbol_set.intersection(grouped_terms["contradicted"]))) / max(
+        float(len(symbol_set)), 1.0
+    )
+    support = _clip01((0.72 * active_overlap) + (0.18 * hypothetical_overlap))
+    conflict = _clip01((0.74 * contradicted_overlap) + (0.12 * max(0.0, hypothetical_overlap - active_overlap)))
+    rationale = "memory_unmatched"
+    if contradicted_overlap > 0.0 and active_overlap > 0.0:
+        rationale = "memory_status_split"
+    elif contradicted_overlap > 0.0:
+        rationale = "contradicted_memory_overlap"
+    elif active_overlap > 0.0:
+        rationale = "active_memory_overlap"
+    elif hypothetical_overlap > 0.0:
+        rationale = "hypothetical_memory_overlap"
+    return {
+        "active_overlap": float(active_overlap),
+        "hypothetical_overlap": float(hypothetical_overlap),
+        "contradicted_overlap": float(contradicted_overlap),
+        "support": float(support),
+        "conflict": float(conflict),
+        "rationale": rationale,
+    }
+
+
 def run_grounding_verifier_stack(
     *,
     scene: SemanticSceneGraph,
     verification_records: Sequence[GroundingVerificationRecord],
     world_state_records: Sequence[GroundingWorldStateRecord],
     ontology_concepts: Sequence[GroundingOntologyConcept],
+    memory_records: Optional[Sequence[object]] = None,
 ) -> GroundingVerifierStackResult:
     validations: List[GroundingValidationRecord] = []
     repairs: List[GroundingRepairAction] = []
+    memory_records = tuple(memory_records or ())
 
     for record in verification_records:
         symbols = _record_terms(record)
@@ -242,6 +305,37 @@ def run_grounding_verifier_stack(
             )
         )
 
+        if memory_records:
+            memory_overlap = _memory_overlap_score(symbols, memory_records)
+            memory_support = _clip01(
+                (0.62 * float(memory_overlap["support"]))
+                + (0.18 * float(record.support))
+                + (0.10 * (1.0 - float(record.conflict)))
+                + (0.10 * float(memory_overlap["active_overlap"]))
+            )
+            memory_conflict = _clip01(
+                (0.58 * float(memory_overlap["conflict"]))
+                + (0.18 * float(record.conflict))
+                + (0.10 * float(memory_overlap["contradicted_overlap"]))
+                + (0.08 * max(0.0, 1.0 - float(memory_overlap["support"])))
+            )
+            memory_status = _status_from_scores(memory_support, memory_conflict)
+            validations.append(
+                GroundingValidationRecord(
+                    validation_id=f"validation:memory:{record.hypothesis_id}",
+                    target_id=str(record.hypothesis_id),
+                    validator_family="memory_corroboration",
+                    validation_status=memory_status,
+                    source_segment=segment_index,
+                    symbols=symbols,
+                    support=memory_support,
+                    conflict=memory_conflict,
+                    confidence=_clip01(0.55 * memory_support + 0.45 * (1.0 - memory_conflict)),
+                    rationale=str(memory_overlap["rationale"]),
+                    provenance=tuple(record.provenance),
+                )
+            )
+
         if record.hidden_cause_candidate or world_status == "conflicted":
             repairs.append(
                 GroundingRepairAction(
@@ -251,6 +345,19 @@ def run_grounding_verifier_stack(
                     priority=_clip01(0.55 + (0.25 * world_conflict) + (0.20 * float(record.hidden_cause_candidate))),
                     pressure=_clip01(max(world_conflict, float(record.conflict))),
                     reason="world_model_conflict",
+                    source_segment=segment_index,
+                    provenance=tuple(record.provenance),
+                )
+            )
+        if memory_records and memory_status == "conflicted":
+            repairs.append(
+                GroundingRepairAction(
+                    action_id=f"repair:memory:{record.hypothesis_id}",
+                    target_id=str(record.hypothesis_id),
+                    action_type="trigger_memory_reconciliation",
+                    priority=_clip01(0.44 + (0.34 * memory_conflict)),
+                    pressure=_clip01(memory_conflict),
+                    reason=str(memory_overlap["rationale"]),
                     source_segment=segment_index,
                     provenance=tuple(record.provenance),
                 )
@@ -281,6 +388,19 @@ def run_grounding_verifier_stack(
                     provenance=tuple(record.provenance),
                 )
             )
+        if memory_records and record.verification_status == "deferred" and memory_status == "supported":
+            repairs.append(
+                GroundingRepairAction(
+                    action_id=f"repair:memory_promote:{record.hypothesis_id}",
+                    target_id=str(record.hypothesis_id),
+                    action_type="promote_memory_corroborated_claim",
+                    priority=_clip01(0.40 + (0.30 * memory_support)),
+                    pressure=_clip01(0.20 + (0.25 * memory_support)),
+                    reason="memory_backing",
+                    source_segment=segment_index,
+                    provenance=tuple(record.provenance),
+                )
+            )
         if world_status == "supported" and temporal_status == "supported" and record.verification_status == "supported":
             repairs.append(
                 GroundingRepairAction(
@@ -297,10 +417,12 @@ def run_grounding_verifier_stack(
 
     world_records = [record for record in validations if record.validator_family == "world_model"]
     temporal_records = [record for record in validations if record.validator_family == "temporal"]
+    memory_validation_records = [record for record in validations if record.validator_family == "memory_corroboration"]
     metadata = {
         "verifier_stack_records": float(len(validations)),
         "verifier_stack_world_model_records": float(len(world_records)),
         "verifier_stack_temporal_records": float(len(temporal_records)),
+        "verifier_stack_memory_records": float(len(memory_validation_records)),
         "verifier_world_model_support": (
             sum(float(record.support) for record in world_records) / max(float(len(world_records)), 1.0)
             if world_records else 0.0
@@ -316,6 +438,14 @@ def run_grounding_verifier_stack(
         "verifier_temporal_conflict": (
             sum(float(record.conflict) for record in temporal_records) / max(float(len(temporal_records)), 1.0)
             if temporal_records else 0.0
+        ),
+        "verifier_memory_corroboration": (
+            sum(float(record.support) for record in memory_validation_records) / max(float(len(memory_validation_records)), 1.0)
+            if memory_validation_records else 0.0
+        ),
+        "verifier_memory_conflict": (
+            sum(float(record.conflict) for record in memory_validation_records) / max(float(len(memory_validation_records)), 1.0)
+            if memory_validation_records else 0.0
         ),
         "verifier_stack_repair_actions": float(len(repairs)),
         "verifier_stack_repair_priority": (
