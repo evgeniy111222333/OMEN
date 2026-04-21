@@ -5,7 +5,7 @@ from typing import Dict, Optional, Set
 from .backbone import SemanticGroundingBackbone
 from .heuristic_backbone import HeuristicFallbackSemanticBackbone
 from .semantic_context import build_semantic_context_objects
-from .scene_types import SemanticClaim, SemanticEntity, SemanticGoal, SemanticSceneGraph, SemanticState
+from .scene_types import SemanticClaim, SemanticEntity, SemanticEvent, SemanticGoal, SemanticSceneGraph, SemanticState
 from .structural_scene import build_structural_scene_graph, structural_primary_segment_indices
 from .text_semantics import normalize_symbol_text
 from .types import GroundedTextDocument
@@ -107,6 +107,41 @@ def _rewire_goal(goal: SemanticGoal, entity_id_map: Dict[str, str]) -> SemanticG
     )
 
 
+def _rewire_event(event: SemanticEvent, entity_id_map: Dict[str, str]) -> SemanticEvent:
+    subject_id = entity_id_map.get(event.subject_entity_id, event.subject_entity_id) if event.subject_entity_id else None
+    object_id = entity_id_map.get(event.object_entity_id, event.object_entity_id) if event.object_entity_id else None
+    agent_id = entity_id_map.get(event.agent_entity_id, event.agent_entity_id) if event.agent_entity_id else None
+    patient_id = entity_id_map.get(event.patient_entity_id, event.patient_entity_id) if event.patient_entity_id else None
+    if (
+        subject_id == event.subject_entity_id
+        and object_id == event.object_entity_id
+        and agent_id == event.agent_entity_id
+        and patient_id == event.patient_entity_id
+    ):
+        return event
+    return SemanticEvent(
+        event_id=event.event_id,
+        event_type=event.event_type,
+        subject_entity_id=subject_id,
+        object_entity_id=object_id,
+        agent_entity_id=agent_id,
+        patient_entity_id=patient_id,
+        subject_name=event.subject_name,
+        object_name=event.object_name,
+        modality=event.modality,
+        condition=event.condition,
+        explanation=event.explanation,
+        temporal=event.temporal,
+        source_segment=event.source_segment,
+        source_span=event.source_span,
+        confidence=event.confidence,
+        polarity=event.polarity,
+        status=event.status,
+        evidence_refs=event.evidence_refs,
+        metadata=event.metadata,
+    )
+
+
 def _rewire_claim(claim: SemanticClaim, entity_id_map: Dict[str, str]) -> SemanticClaim:
     subject_id = entity_id_map.get(claim.subject_entity_id, claim.subject_entity_id) if claim.subject_entity_id else None
     object_id = entity_id_map.get(claim.object_entity_id, claim.object_entity_id) if claim.object_entity_id else None
@@ -164,16 +199,12 @@ def _segment_owner_map(
 
 def _keep_fallback_claim(claim: SemanticClaim, segment_owners: Dict[int, str]) -> bool:
     owner = segment_owners.get(int(claim.source_segment), "fallback_primary")
-    if owner == "fallback_primary":
-        return True
-    if owner == "structural_primary":
-        return False
-    return str(claim.claim_kind or "") == "relation" and not claim.speaker_entity_id
+    return owner == "fallback_primary"
 
 
 def _keep_fallback_event(source_segment: int, segment_owners: Dict[int, str]) -> bool:
     owner = segment_owners.get(int(source_segment), "fallback_primary")
-    return owner in {"fallback_primary", "hybrid"}
+    return owner == "fallback_primary"
 
 
 def _keep_fallback_coreference(source_segment: int, target_segment: int, segment_owners: Dict[int, str]) -> bool:
@@ -233,6 +264,9 @@ def _merge_scene_graphs(
         for link in fallback_scene.coreference_links
         if _keep_fallback_coreference(int(link.source_segment), int(link.target_segment), segment_owners)
     ]
+    merged_events = tuple(filtered_events) + tuple(
+        _rewire_event(event, entity_id_map) for event in structural_scene.events
+    )
     merged_states = tuple(filtered_states) + tuple(_rewire_state(state, entity_id_map) for state in structural_scene.states)
     merged_goals = tuple(filtered_goals) + tuple(_rewire_goal(goal, entity_id_map) for goal in structural_scene.goals)
     merged_claims = tuple(filtered_claims) + tuple(_rewire_claim(claim, entity_id_map) for claim in structural_scene.claims)
@@ -252,7 +286,7 @@ def _merge_scene_graphs(
         {
             "scene_entities": float(len(merged_entities)),
             "scene_states": float(len(merged_states)),
-            "scene_events": float(len(filtered_events)),
+            "scene_events": float(len(merged_events)),
             "scene_goals": float(len(merged_goals)),
             "scene_claims": float(len(merged_claims)),
             "scene_claim_attributed": float(sum(1 for claim in merged_claims if claim.speaker_entity_id)),
@@ -268,8 +302,13 @@ def _merge_scene_graphs(
                 sum(entity.confidence for entity in merged_entities) / max(len(merged_entities), 1)
             ),
             "scene_mean_event_confidence": float(
-                sum(event.confidence for event in filtered_events) / max(len(filtered_events), 1)
+                sum(event.confidence for event in merged_events) / max(len(merged_events), 1)
             ),
+            "scene_negative_events": float(sum(1 for event in merged_events if event.polarity != "positive")),
+            "scene_event_modalities": float(sum(1 for event in merged_events if event.modality)),
+            "scene_event_conditions": float(sum(1 for event in merged_events if event.condition)),
+            "scene_event_explanations": float(sum(1 for event in merged_events if event.explanation)),
+            "scene_event_temporal_anchors": float(sum(1 for event in merged_events if event.temporal)),
             "scene_fallback_backbone_active": float(fallback_scene.metadata.get("scene_fallback_backbone_active", 1.0)),
             "scene_fallback_low_authority": float(fallback_scene.metadata.get("scene_fallback_low_authority", 1.0)),
             "scene_backbone_replaceable": 1.0,
@@ -306,7 +345,7 @@ def _merge_scene_graphs(
         source_text=document.source_text,
         entities=tuple(merged_entities),
         states=tuple(merged_states),
-        events=tuple(filtered_events),
+        events=tuple(merged_events),
         goals=tuple(merged_goals),
         claims=tuple(merged_claims),
         mentions=mentions,

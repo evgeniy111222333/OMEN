@@ -699,6 +699,13 @@ def verify_symbolic_hypotheses(
         scene_alignment = _scene_alignment_score(hypothesis, scene)
         interlingua_alignment = _interlingua_alignment_score(hypothesis, interlingua)
         heuristic_claim = is_heuristic_claim_source(getattr(hypothesis, "claim_source", ""))
+        structural_dialogue_anchor = bool(
+            heuristic_claim
+            and dialogue_support > 0.0
+            and structural_alignment >= 0.66
+            and structural_provenance > 0.0
+            and speaker_attribution > 0.0
+        )
         polarity_conflict = 1.0 if (
             hypothesis.kind == "relation"
             and len(relation_polarities.get(tuple(hypothesis.symbols), ())) > 1
@@ -752,8 +759,12 @@ def verify_symbolic_hypotheses(
             - (0.02 * temporal_support)
         )
         if heuristic_claim:
-            support = min(support, 0.54)
-            conflict = max(conflict, 0.18)
+            if structural_dialogue_anchor:
+                support = max(support, 0.58)
+                conflict = min(conflict, 0.16)
+            else:
+                support = min(support, 0.54)
+                conflict = max(conflict, 0.18)
         document_alignments.append(float(document_alignment))
         structural_alignments.append(float(structural_alignment))
         structural_provenances.append(float(structural_provenance))
@@ -807,6 +818,7 @@ def verify_symbolic_hypotheses(
         if (
             heuristic_claim
             and status in {"supported", "conflicted"}
+            and not structural_dialogue_anchor
         ):
             status = "deferred"
         elif status == "supported" and hidden_cause_candidate:
@@ -816,6 +828,8 @@ def verify_symbolic_hypotheses(
             hidden_cause_candidate=hidden_cause_candidate,
             heuristic_only=heuristic_claim,
         )
+        if heuristic_gap_signal and repair_action == "require_grounding_confirmation":
+            repair_action = "trigger_hidden_cause_abduction"
         if hidden_cause_candidate or heuristic_gap_signal:
             hidden_cause_records.append(
                 _build_hidden_cause_record(

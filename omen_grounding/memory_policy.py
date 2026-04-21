@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Sequence, Tuple
 
-from .memory_hints import grounding_memory_status
+from .memory_hints import grounding_memory_record_eligible, grounding_memory_status
 
 
 def _clip01(value: float) -> float:
@@ -53,6 +53,8 @@ def grounding_memory_writeback_records(
         return tuple()
     deduped: Dict[str, Any] = {}
     for record in records:
+        if not grounding_memory_record_eligible(record):
+            continue
         key = _graph_key(record)
         current = deduped.get(key)
         if current is None or grounding_memory_priority(record) > grounding_memory_priority(current):
@@ -132,6 +134,8 @@ def grounding_memory_writeback_status_counts(records: Sequence[Any]) -> Dict[str
         "unknown": 0.0,
     }
     for record in records:
+        if not grounding_memory_record_eligible(record):
+            continue
         status = grounding_memory_status(record)
         counts[status] = counts.get(status, 0.0) + 1.0
     return counts

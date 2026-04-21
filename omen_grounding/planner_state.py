@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from .heuristic_policy import candidate_rule_is_heuristic
+from .heuristic_policy import candidate_rule_is_heuristic, record_is_heuristic
 from .planner_guidance import PlannerConstraint, PlannerRepairDirective, build_planner_guidance
 from .planner_semantics import (
     PlannerAlternativeWorld,
@@ -191,24 +191,6 @@ def _bridge_hypothesis_record(record: Any) -> _PlannerBridgeRecord:
     )
 
 
-def _bridge_graph_record(record: Any) -> _PlannerBridgeRecord:
-    return _PlannerBridgeRecord(
-        record_id=f"graph:{getattr(record, 'record_id', 'unknown')}",
-        record_type=_record_type(record),
-        world_status="hypothetical",
-        claim_source="graph_context",
-        symbols=_record_graph_terms(record),
-        support=0.0,
-        conflict=0.0,
-        confidence=_clip01(getattr(record, "confidence", 0.0)),
-        repair_action="none",
-        provenance=(
-            str(getattr(record, "graph_family", "") or "").strip(),
-            str(getattr(record, "graph_key", "") or "").strip(),
-        ),
-    )
-
-
 def _bridge_candidate_rule(candidate: Any) -> Optional[_PlannerBridgeRecord]:
     symbols = _candidate_rule_surface_symbols(candidate)
     if len(symbols) < 3:
@@ -230,6 +212,17 @@ def _bridge_candidate_rule(candidate: Any) -> Optional[_PlannerBridgeRecord]:
         repair_action="evaluate_candidate_rule",
         provenance=_candidate_rule_lineage(candidate),
     )
+
+
+def _split_planner_visible_records(records: Sequence[Any]) -> Tuple[Tuple[Any, ...], Tuple[Any, ...]]:
+    visible: List[Any] = []
+    proposal: List[Any] = []
+    for record in tuple(records or ()):
+        if record_is_heuristic(record):
+            proposal.append(record)
+        else:
+            visible.append(record)
+    return tuple(visible), tuple(proposal)
 
 
 def _lineage_symbols(
@@ -259,6 +252,7 @@ class PlannerWorldState:
     active_records: Tuple[Any, ...] = field(default_factory=tuple)
     hypothetical_records: Tuple[Any, ...] = field(default_factory=tuple)
     contradicted_records: Tuple[Any, ...] = field(default_factory=tuple)
+    proposal_records: Tuple[Any, ...] = field(default_factory=tuple)
     candidate_rules: Tuple[Any, ...] = field(default_factory=tuple)
     verification_records: Tuple[Any, ...] = field(default_factory=tuple)
     hypothesis_records: Tuple[Any, ...] = field(default_factory=tuple)
@@ -295,6 +289,7 @@ class PlannerWorldState:
         summary.setdefault("planner_state_active_records", float(len(self.active_records)))
         summary.setdefault("planner_state_hypothetical_records", float(len(self.hypothetical_records)))
         summary.setdefault("planner_state_contradicted_records", float(len(self.contradicted_records)))
+        summary.setdefault("planner_state_proposal_records", float(len(self.proposal_records)))
         summary.setdefault("planner_state_verification_records", float(len(self.verification_records)))
         summary.setdefault(
             "planner_state_supported_verification_records",
@@ -345,6 +340,18 @@ class PlannerWorldState:
         summary.setdefault(
             "planner_state_heuristic_candidate_rules",
             float(self.metadata.get("planner_state_heuristic_candidate_rules", 0.0)),
+        )
+        summary.setdefault(
+            "planner_state_heuristic_world_state_records",
+            float(self.metadata.get("planner_state_heuristic_world_state_records", 0.0)),
+        )
+        summary.setdefault(
+            "planner_state_heuristic_verification_records",
+            float(self.metadata.get("planner_state_heuristic_verification_records", 0.0)),
+        )
+        summary.setdefault(
+            "planner_state_heuristic_hypothesis_records",
+            float(self.metadata.get("planner_state_heuristic_hypothesis_records", 0.0)),
         )
         summary.setdefault(
             "planner_state_deferred_hypotheses",
@@ -462,6 +469,13 @@ def build_planner_world_state(task_context: Any) -> PlannerWorldState:
     active_records = tuple(record for record in records if _record_status(record) == "active")
     hypothetical_records = tuple(record for record in records if _record_status(record) == "hypothetical")
     contradicted_records = tuple(record for record in records if _record_status(record) == "contradicted")
+    planner_active_world_state_records, proposal_active_records = _split_planner_visible_records(active_records)
+    planner_hypothetical_world_state_records, proposal_hypothetical_records = _split_planner_visible_records(
+        hypothetical_records
+    )
+    planner_contradicted_world_state_records, proposal_contradicted_records = _split_planner_visible_records(
+        contradicted_records
+    )
 
     active_facts = tuple(sorted(_task_context_grounding_values(task_context, "grounding_world_state_active_facts"), key=repr))
     hypothetical_facts = tuple(
@@ -499,24 +513,18 @@ def build_planner_world_state(task_context: Any) -> PlannerWorldState:
     )
     verification_bridge_records = tuple(_bridge_verification_record(record) for record in verification_records)
     hypothesis_bridge_records = tuple(_bridge_hypothesis_record(record) for record in hypothesis_records)
-    graph_bridge_records = tuple(_bridge_graph_record(record) for record in graph_records)
-    planner_active_records = tuple(
-        (*active_records, *(record for record in verification_bridge_records if _record_status(record) == "active"))
-    )
-    planner_hypothetical_records = tuple(
+    _, proposal_verification_records = _split_planner_visible_records(verification_bridge_records)
+    _, proposal_hypothesis_records = _split_planner_visible_records(hypothesis_bridge_records)
+    planner_active_records = tuple(planner_active_world_state_records)
+    planner_hypothetical_records = tuple(planner_hypothetical_world_state_records)
+    planner_contradicted_records = tuple(planner_contradicted_world_state_records)
+    proposal_records = tuple(
         (
-            *hypothetical_records,
-            *candidate_rule_bridge_records,
-            *(record for record in verification_bridge_records if _record_status(record) == "hypothetical"),
-            *hypothesis_bridge_records,
-            *graph_bridge_records,
-        )
-    )
-    planner_contradicted_records = tuple(
-        (
-            *contradicted_records,
-            *(record for record in verification_bridge_records if _record_status(record) == "contradicted"),
-            *(record for record in hypothesis_bridge_records if _record_status(record) == "contradicted"),
+            *proposal_active_records,
+            *proposal_hypothetical_records,
+            *proposal_contradicted_records,
+            *proposal_verification_records,
+            *proposal_hypothesis_records,
         )
     )
 
@@ -606,13 +614,21 @@ def build_planner_world_state(task_context: Any) -> PlannerWorldState:
 
     metadata = {
         "planner_state_ontology_records": float(len(ontology_records)),
-        "planner_state_active_records": float(len(active_records)),
-        "planner_state_hypothetical_records": float(len(hypothetical_records)),
-        "planner_state_contradicted_records": float(len(contradicted_records)),
+        "planner_state_active_records": float(len(planner_active_world_state_records)),
+        "planner_state_hypothetical_records": float(len(planner_hypothetical_world_state_records)),
+        "planner_state_contradicted_records": float(len(planner_contradicted_world_state_records)),
+        "planner_state_source_active_records": float(len(active_records)),
+        "planner_state_source_hypothetical_records": float(len(hypothetical_records)),
+        "planner_state_source_contradicted_records": float(len(contradicted_records)),
+        "planner_state_proposal_records": float(len(proposal_records)),
+        "planner_state_heuristic_world_state_records": float(
+            len(proposal_active_records) + len(proposal_hypothetical_records) + len(proposal_contradicted_records)
+        ),
         "planner_state_grounding_candidate_rules": float(len(candidate_rules)),
         "planner_state_heuristic_candidate_rules": heuristic_candidate_rules,
         "planner_state_grounding_candidate_rule_records": float(len(candidate_rule_bridge_records)),
         "planner_state_verification_records": float(len(verification_records)),
+        "planner_state_heuristic_verification_records": float(len(proposal_verification_records)),
         "planner_state_supported_verification_records": float(
             sum(
                 1
@@ -645,6 +661,7 @@ def build_planner_world_state(task_context: Any) -> PlannerWorldState:
             )
         ),
         "planner_state_hypothesis_records": float(len(hypothesis_records)),
+        "planner_state_heuristic_hypothesis_records": float(len(proposal_hypothesis_records)),
         "planner_state_deferred_hypotheses": float(
             sum(1 for record in hypothesis_records if bool(getattr(record, "deferred", False)))
         ),
@@ -711,9 +728,10 @@ def build_planner_world_state(task_context: Any) -> PlannerWorldState:
 
     return PlannerWorldState(
         ontology_records=ontology_records,
-        active_records=active_records,
-        hypothetical_records=hypothetical_records,
-        contradicted_records=contradicted_records,
+        active_records=planner_active_world_state_records,
+        hypothetical_records=planner_hypothetical_world_state_records,
+        contradicted_records=planner_contradicted_world_state_records,
+        proposal_records=proposal_records,
         candidate_rules=tuple(candidate_rules),
         verification_records=verification_records,
         hypothesis_records=hypothesis_records,

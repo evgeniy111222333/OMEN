@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Iterable, Optional, Sequence, Set, Tuple
 
 from .backbone import SemanticGroundingBackbone
-from .memory_hints import grounding_memory_terms
+from .memory_hints import grounding_memory_record_eligible, grounding_memory_terms
 from .pipeline import TextGroundingPipelineResult, ground_text_to_symbolic
 from .types import GroundingSpan
 
@@ -24,6 +24,8 @@ def grounding_memory_corroboration(
     candidate_records: Sequence[object],
     memory_records: Sequence[object],
 ) -> Dict[str, float]:
+    candidate_records = tuple(record for record in candidate_records if grounding_memory_record_eligible(record))
+    memory_records = tuple(record for record in memory_records if grounding_memory_record_eligible(record))
     memory_terms = {str(term).strip() for term in grounding_memory_terms(memory_records, limit=128) if str(term).strip()}
     if not candidate_records:
         return {

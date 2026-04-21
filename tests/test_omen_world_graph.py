@@ -29,7 +29,10 @@ from omen_symbolic.execution_trace import (
     build_symbolic_trace_bundle,
 )
 from omen_symbolic.world_graph import (
+    ABDUCED_PROPOSAL_NODE_TYPE,
     CanonicalWorldState,
+    NET_PROPOSAL_NODE_TYPE,
+    SALIENCY_PROPOSAL_NODE_TYPE,
     WorldGraphBatch,
     WorldGraphEdge,
     WorldGraphEncoder,
@@ -152,6 +155,43 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertEqual({atom for _, atom in enriched.fact_records}, {target, goal})
         self.assertEqual(enriched.metadata["target_context_facts"], 1.0)
         self.assertEqual(enriched.metadata["goal_context_facts"], 1.0)
+
+    def test_world_graph_tracks_proposal_authority_without_losing_base_metrics(self) -> None:
+        encoder = WorldGraphEncoder(
+            d_latent=16,
+            max_nodes=8,
+            max_edges=16,
+            max_transitions=4,
+        )
+        saliency = HornAtom(pred=14, args=(5,))
+        net = HornAtom(pred=15, args=(6,))
+        abduced = HornAtom(pred=16, args=(7,))
+
+        graph = encoder(
+            facts=tuple(),
+            saliency_facts=(saliency,),
+            extra_records=(
+                (NET_PROPOSAL_NODE_TYPE, net),
+                (ABDUCED_PROPOSAL_NODE_TYPE, abduced),
+            ),
+            device=torch.device("cpu"),
+        )
+
+        self.assertEqual(
+            graph.node_types,
+            (
+                SALIENCY_PROPOSAL_NODE_TYPE,
+                NET_PROPOSAL_NODE_TYPE,
+                ABDUCED_PROPOSAL_NODE_TYPE,
+            ),
+        )
+        self.assertEqual(graph.metadata["proposal_facts"], 3.0)
+        self.assertEqual(graph.metadata["saliency_proposal_facts"], 1.0)
+        self.assertEqual(graph.metadata["net_proposal_facts"], 1.0)
+        self.assertEqual(graph.metadata["abduced_proposal_facts"], 1.0)
+        self.assertEqual(graph.metadata["saliency_facts"], 1.0)
+        self.assertEqual(graph.metadata["net_facts"], 1.0)
+        self.assertEqual(graph.metadata["abduced_support_facts"], 1.0)
 
     def test_observation_trace_builder_supports_plain_text_sequences(self) -> None:
         text = "weather is rain. rain becomes flood. however flood is not safe."
@@ -1257,8 +1297,8 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         seeded = model._seed_grounding_memory_records(src)
         self.assertGreaterEqual(len(seeded), 2)
         self.assertTrue(any("grounding_world_state:" in getattr(record, "graph_key", "") for record in seeded))
-        self.assertTrue(any("grounding_verification:" in getattr(record, "graph_key", "") for record in seeded))
-        self.assertTrue(any("grounding_hypothesis:" in getattr(record, "graph_key", "") for record in seeded))
+        self.assertFalse(any("grounding_verification:" in getattr(record, "graph_key", "") for record in seeded))
+        self.assertFalse(any("grounding_hypothesis:" in getattr(record, "graph_key", "") for record in seeded))
         model._write_grounding_memory_records(seeded, confidence=1.0)
 
         device = next(model.parameters()).device

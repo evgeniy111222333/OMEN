@@ -4,6 +4,15 @@ from collections import Counter
 from typing import Any, Dict, List, Sequence, Tuple
 
 
+def grounding_memory_record_eligible(record: Any) -> bool:
+    family = str(getattr(record, "graph_family", "") or "").strip().lower()
+    if "grounding_world_state" in family:
+        return True
+    if "grounding_ontology" in family:
+        return True
+    return False
+
+
 def grounding_memory_status(record: Any) -> str:
     world_status = str(getattr(record, "world_status", "") or "").strip().lower()
     if world_status in {"active", "hypothetical", "contradicted"}:
@@ -35,6 +44,8 @@ def grounding_memory_status(record: Any) -> str:
 def grounding_memory_status_counts(records: Sequence[Any]) -> Dict[str, float]:
     counts: Counter[str] = Counter()
     for record in records:
+        if not grounding_memory_record_eligible(record):
+            continue
         counts[grounding_memory_status(record)] += 1
     return {
         "active": float(counts.get("active", 0)),
@@ -48,6 +59,8 @@ def grounding_memory_terms(records: Sequence[Any], *, limit: int = 24) -> Tuple[
     terms: List[str] = []
     seen = set()
     for record in records:
+        if not grounding_memory_record_eligible(record):
+            continue
         for term in getattr(record, "graph_terms", ()) or ():
             text = str(term).strip()
             if not text or text in seen:
@@ -63,6 +76,8 @@ def grounding_memory_families(records: Sequence[Any], *, limit: int = 12) -> Tup
     families: List[str] = []
     seen = set()
     for record in records:
+        if not grounding_memory_record_eligible(record):
+            continue
         family = str(getattr(record, "graph_family", "") or "").strip()
         if not family or family in seen:
             continue
@@ -85,6 +100,8 @@ def grounding_memory_status_terms(
     terms: List[str] = []
     seen = set()
     for record in records:
+        if not grounding_memory_record_eligible(record):
+            continue
         if grounding_memory_status(record) not in wanted:
             continue
         for term in getattr(record, "graph_terms", ()) or ():
@@ -110,6 +127,8 @@ def grounding_memory_status_families(
     families: List[str] = []
     seen = set()
     for record in records:
+        if not grounding_memory_record_eligible(record):
+            continue
         if grounding_memory_status(record) not in wanted:
             continue
         family = str(getattr(record, "graph_family", "") or "").strip()
@@ -126,6 +145,8 @@ def grounding_memory_records(records: Sequence[Any], *, limit: int = 16) -> Tupl
     selected: List[Any] = []
     seen = set()
     for record in records:
+        if not grounding_memory_record_eligible(record):
+            continue
         key = getattr(record, "graph_key", None)
         if not isinstance(key, str) or not key or key in seen:
             continue

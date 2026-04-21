@@ -1916,7 +1916,7 @@ class CreativeSymbolicEnginesTest(unittest.TestCase):
         self.assertIn(validated_support, prover.task_context.abduced_support_facts)
         self.assertIn(novel_fact, prover.task_context.world_context_facts)
         self.assertIn(intrinsic_goal, prover.task_context.world_context_facts)
-        self.assertIn(creative_head, prover.task_context.observed_facts)
+        self.assertNotIn(creative_head, prover.task_context.reasoning_facts())
         self.assertGreaterEqual(
             float(prover.task_context.world_context_summary.get("creative_selected_rules", 0.0)),
             1.0,

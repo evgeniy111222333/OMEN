@@ -261,8 +261,19 @@ class GroundingScenePipelineTest(unittest.TestCase):
         self.assertEqual(result.scene.metadata.get("scene_fallback_backbone_active", 0.0), 1.0)
         self.assertGreaterEqual(result.scene.metadata.get("scene_segment_owner_hybrid", 0.0), 2.0)
         self.assertGreaterEqual(result.scene.metadata.get("scene_segment_owner_fallback_primary", 0.0), 1.0)
-        self.assertGreaterEqual(result.scene.metadata.get("scene_hybrid_retained_fallback_events", 0.0), 1.0)
+        self.assertEqual(result.scene.metadata.get("scene_hybrid_retained_fallback_events", 1.0), 0.0)
+        self.assertEqual(result.scene.metadata.get("scene_hybrid_retained_fallback_claims", 1.0), 0.0)
         self.assertTrue(any(int(event.source_segment) in {0, 1} for event in result.scene.events))
+        self.assertTrue(
+            all(
+                int(event.source_segment) not in {0, 1}
+                or not float(getattr(event, "metadata", {}).get("fallback_backbone", 0.0))
+                for event in result.scene.events
+            )
+        )
+        self.assertTrue(any(event.evidence_refs for event in result.scene.events if int(event.source_segment) in {0, 1}))
+        self.assertGreaterEqual(result.scene.metadata.get("scene_event_conditions", 0.0), 1.0)
+        self.assertGreaterEqual(result.scene.metadata.get("scene_event_temporal_anchors", 0.0), 1.0)
         self.assertFalse(
             any(
                 int(claim.source_segment) in {0, 1}

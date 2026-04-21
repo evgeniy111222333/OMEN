@@ -226,30 +226,6 @@ def planner_state_seed_facts(planner_state: Any) -> Tuple[Tuple[int, int], ...]:
         target_id = str(getattr(directive, "target_id", "") or "").strip()
         if action_type:
             facts.append(_repair_fact(action_type, target_id))
-    for record in tuple(getattr(planner_state, "verification_records", ()) or ()):
-        signature = _verification_signature(record)
-        status = str(getattr(record, "verification_status", "") or "deferred").strip().lower()
-        if signature:
-            facts.append(_verification_fact(status, signature))
-        repair_action = str(getattr(record, "repair_action", "") or "").strip()
-        hypothesis_id = str(getattr(record, "hypothesis_id", "") or "").strip()
-        if repair_action and repair_action not in {"", "none"}:
-            facts.append(_repair_fact(repair_action, hypothesis_id))
-    for record in tuple(getattr(planner_state, "hypothesis_records", ()) or ()):
-        signature = _hypothesis_signature(record)
-        kind = str(getattr(record, "kind", "") or "hypothesis").strip().lower() or "hypothesis"
-        if signature:
-            facts.append(_hypothesis_fact(kind, signature))
-    for record in tuple(getattr(planner_state, "graph_records", ()) or ()):
-        family = str(getattr(record, "graph_family", "") or "").strip()
-        if family:
-            facts.append(_lineage_fact(family))
-        for term in _record_terms(getattr(record, "graph_terms", ()) or ())[:3]:
-            facts.append(_lineage_fact(term))
-    for symbol in tuple(getattr(planner_state, "lineage_symbols", ()) or ()):
-        text = str(symbol or "").strip()
-        if text:
-            facts.append(_lineage_fact(text))
     return _unique_fact_tuples(facts)
 
 
@@ -325,116 +301,13 @@ def _constraint_priority_adjustment(operator: Any, signature: str, planner_state
 
 
 def _evidence_priority_adjustment(operator: Any, signature: str, planner_state: Any) -> float:
-    terms = _operator_terms(operator, signature)
-    status = str(getattr(operator, "status", "") or "hypothetical").strip().lower()
-    predicate = str(getattr(operator, "predicate", "") or "").strip().lower()
-    adjustment = 0.0
-
-    for record in tuple(getattr(planner_state, "verification_records", ()) or ()):
-        record_terms = _verification_terms(record)
-        overlap = _overlap_score(terms, record_terms)
-        hypothesis_id = str(getattr(record, "hypothesis_id", "") or "").strip()
-        repair_action = str(getattr(record, "repair_action", "") or "").strip().lower()
-        match = max(overlap, 0.45 if hypothesis_id and hypothesis_id in terms else 0.0)
-        if match <= 0.0:
-            continue
-        support = _clip01(getattr(record, "support", 0.0))
-        conflict = _clip01(getattr(record, "conflict", 0.0))
-        verification_status = str(getattr(record, "verification_status", "") or "deferred").strip().lower()
-        if verification_status == "supported":
-            adjustment += 0.24 * max(support, 1.0 - conflict) * match
-        elif verification_status == "deferred":
-            if status == "hypothetical":
-                adjustment += 0.16 * max(support, 1.0 - conflict) * match
-            else:
-                adjustment -= 0.04 * conflict * match
-        elif verification_status == "conflicted":
-            if repair_action and (predicate == repair_action or predicate.endswith(repair_action)):
-                adjustment += 0.24 * max(conflict, support) * max(match, 0.5)
-            elif status == "contradicted":
-                adjustment += 0.16 * conflict * match
-            else:
-                adjustment -= 0.18 * conflict * match
-        if bool(getattr(record, "hidden_cause_candidate", False)) and (
-            predicate == "trigger_hidden_cause_abduction" or status in {"hypothetical", "contradicted"}
-        ):
-            adjustment += 0.14 * max(conflict, support) * max(match, 0.35)
-
-    for record in tuple(getattr(planner_state, "hypothesis_records", ()) or ()):
-        record_terms = _hypothesis_terms(record)
-        overlap = _overlap_score(terms, record_terms)
-        hypothesis_id = str(getattr(record, "hypothesis_id", "") or "").strip()
-        match = max(overlap, 0.40 if hypothesis_id and hypothesis_id in terms else 0.0)
-        if match <= 0.0:
-            continue
-        confidence = _clip01(getattr(record, "confidence", 0.0))
-        conflict_tag = str(getattr(record, "conflict_tag", "") or "").strip()
-        deferred = bool(getattr(record, "deferred", False))
-        if status == "hypothetical":
-            adjustment += (0.18 if deferred else 0.14) * confidence * match
-        elif status == "contradicted" and conflict_tag:
-            adjustment += 0.12 * max(confidence, 0.5) * match
-        elif status == "active":
-            adjustment += 0.08 * confidence * match
-
-    lineage_symbols = tuple(str(item).strip() for item in (getattr(planner_state, "lineage_symbols", ()) or ()) if str(item).strip())
-    lineage_overlap = _overlap_score(terms, lineage_symbols)
-    if lineage_overlap > 0.0:
-        adjustment += 0.12 * lineage_overlap
-    for record in tuple(getattr(planner_state, "graph_records", ()) or ()):
-        match = _overlap_score(terms, _graph_terms(record))
-        if match <= 0.0:
-            continue
-        adjustment += 0.10 * _clip01(getattr(record, "confidence", 0.0)) * match
-
-    return float(adjustment)
+    del operator, signature, planner_state
+    return 0.0
 
 
 def _evidence_preconditions(operator: Any, signature: str, planner_state: Any) -> Tuple[Tuple[int, int], ...]:
-    terms = _operator_terms(operator, signature)
-    facts: List[Tuple[int, int]] = []
-
-    verification_matches: List[Tuple[float, Any]] = []
-    for record in tuple(getattr(planner_state, "verification_records", ()) or ()):
-        record_terms = _verification_terms(record)
-        hypothesis_id = str(getattr(record, "hypothesis_id", "") or "").strip()
-        match = max(_overlap_score(terms, record_terms), 0.45 if hypothesis_id and hypothesis_id in terms else 0.0)
-        if match > 0.0:
-            verification_matches.append((match, record))
-    verification_matches.sort(key=lambda item: (-float(item[0]), str(getattr(item[1], "hypothesis_id", "") or "")))
-    for _match, record in verification_matches[:2]:
-        signature_text = _verification_signature(record)
-        status = str(getattr(record, "verification_status", "") or "deferred").strip().lower()
-        if signature_text:
-            facts.append(_verification_fact(status, signature_text))
-
-    hypothesis_matches: List[Tuple[float, Any]] = []
-    for record in tuple(getattr(planner_state, "hypothesis_records", ()) or ()):
-        record_terms = _hypothesis_terms(record)
-        hypothesis_id = str(getattr(record, "hypothesis_id", "") or "").strip()
-        match = max(_overlap_score(terms, record_terms), 0.40 if hypothesis_id and hypothesis_id in terms else 0.0)
-        if match > 0.0:
-            hypothesis_matches.append((match, record))
-    hypothesis_matches.sort(key=lambda item: (-float(item[0]), str(getattr(item[1], "hypothesis_id", "") or "")))
-    for _match, record in hypothesis_matches[:2]:
-        signature_text = _hypothesis_signature(record)
-        kind = str(getattr(record, "kind", "") or "hypothesis").strip().lower() or "hypothesis"
-        if signature_text:
-            facts.append(_hypothesis_fact(kind, signature_text))
-
-    lineage_matches: List[Tuple[float, str]] = []
-    for symbol in tuple(getattr(planner_state, "lineage_symbols", ()) or ()):
-        text = str(symbol or "").strip()
-        if not text:
-            continue
-        match = _overlap_score(terms, (text,))
-        if match > 0.0:
-            lineage_matches.append((match, text))
-    lineage_matches.sort(key=lambda item: (-float(item[0]), item[1]))
-    for _match, text in lineage_matches[:2]:
-        facts.append(_lineage_fact(text))
-
-    return _unique_fact_tuples(facts)
+    del operator, signature, planner_state
+    return tuple()
 
 
 def compile_planner_bridge_operator_specs(
@@ -516,54 +389,6 @@ def compile_planner_bridge_operator_specs(
                 add_effects=_unique_fact_tuples(add_effects),
                 del_effects=_unique_fact_tuples(del_effects),
                 priority=float(priority),
-            )
-        )
-    for record in tuple(getattr(planner_state, "verification_records", ()) or ()):
-        repair_action = str(getattr(record, "repair_action", "") or "").strip()
-        verification_status = str(getattr(record, "verification_status", "") or "deferred").strip().lower()
-        hypothesis_id = str(getattr(record, "hypothesis_id", "") or "").strip()
-        signature = _verification_signature(record)
-        if not signature:
-            continue
-        if repair_action in {"", "none"} and verification_status == "supported":
-            continue
-        symbols = _record_terms(getattr(record, "symbols", ()) or ())
-        preconditions: List[Tuple[int, int]] = [_verification_fact(verification_status, signature)]
-        add_effects: List[Tuple[int, int]] = []
-        del_effects: List[Tuple[int, int]] = []
-        resource_status = "active" if verification_status == "supported" else "hypothetical"
-        for symbol in symbols[:2]:
-            preconditions.append(_resource_fact(resource_status, symbol))
-        if repair_action == "trigger_hidden_cause_abduction":
-            add_effects.extend([(302, int(goal_id)), (305, int(goal_id))])
-        elif repair_action == "trigger_temporal_repair":
-            add_effects.append((301, int(goal_id)))
-            del_effects.append((303, int(goal_id)))
-        elif repair_action == "accept_to_world_state":
-            add_effects.append((303, int(goal_id)))
-        else:
-            add_effects.append((305, int(goal_id)))
-        if bool(getattr(record, "hidden_cause_candidate", False)):
-            add_effects.append((302, int(goal_id)))
-        specs.append(
-            PlannerBridgeOperatorSpec(
-                operator_id=f"verification:{repair_action or verification_status}:{hypothesis_id or goal_id}",
-                source="verification_bridge",
-                status="hypothetical" if verification_status != "supported" else "active",
-                predicate=repair_action or f"verification_{verification_status}",
-                preconditions=_unique_fact_tuples(preconditions),
-                add_effects=_unique_fact_tuples(add_effects),
-                del_effects=_unique_fact_tuples(del_effects),
-                priority=float(
-                    0.14
-                    + 0.26 * _clip01(getattr(record, "support", 0.0))
-                    + 0.18 * _clip01(getattr(record, "conflict", 0.0))
-                    + (
-                        0.16
-                        if bool(getattr(record, "hidden_cause_candidate", False))
-                        else 0.0
-                    )
-                ),
             )
         )
     for directive in tuple(getattr(planner_state, "repair_directives", ()) or ()):

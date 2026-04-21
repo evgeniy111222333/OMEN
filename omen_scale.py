@@ -65,7 +65,14 @@ from omen_net_tokenizer import NeuralEpistemicTokenizer
 from omen_saliency import SaliencyTraceModule
 from omen_symbolic.integration import SymbolicStateIntegrator
 from omen_symbolic.memory_index import SymbolicMemoryIndex
-from omen_symbolic.world_graph import CanonicalWorldState, WorldGraphBatch, WorldGraphEncoder
+from omen_symbolic.world_graph import (
+    ABDUCED_PROPOSAL_NODE_TYPE,
+    CanonicalWorldState,
+    NET_PROPOSAL_NODE_TYPE,
+    SALIENCY_PROPOSAL_NODE_TYPE,
+    WorldGraphBatch,
+    WorldGraphEncoder,
+)
 from omen_symbolic.execution_trace import (
     TRACE_ASSIGN_EVENT_PRED,
     TRACE_BINOP_EVENT_PRED,
@@ -2357,11 +2364,15 @@ class OMENScale(nn.Module):
             "grounding_hypotheses",
             "grounding_graph_records",
             "saliency_facts",
+            "saliency_proposal_facts",
             "net_facts",
+            "net_proposal_facts",
             "grounding_derived_facts",
             "interlingua_facts",
             "world_context_facts",
             "abduced_support_facts",
+            "abduced_proposal_facts",
+            "proposal_facts",
             "goal_context_facts",
             "target_context_facts",
             "trace_target_facts",
@@ -2595,11 +2606,15 @@ class OMENScale(nn.Module):
                 "grounding_repair_actions",
                 "grounding_hypotheses",
                 "saliency_facts",
+                "saliency_proposal_facts",
                 "net_facts",
+                "net_proposal_facts",
                 "grounding_derived_facts",
                 "interlingua_facts",
                 "world_context_facts",
                 "abduced_support_facts",
+                "abduced_proposal_facts",
+                "proposal_facts",
                 "goal_context_facts",
                 "target_context_facts",
                 "trace_target_facts",
@@ -4048,18 +4063,18 @@ class OMENScale(nn.Module):
                     limit=8,
                 )
             )
-        trace_bundle = task_context.execution_trace
-        if trace_bundle is not None:
-            facts.extend(
-                sorted(list(trace_bundle.observed_facts), key=self._fact_sort_key)[:8]
+        canonical_support = sorted(
+            list(task_context.grounding_world_state_active_facts),
+            key=self._fact_sort_key,
+        )
+        canonical_support.extend(
+            sorted(list(task_context.grounding_ontology_facts), key=self._fact_sort_key)
+        )
+        if not canonical_support:
+            canonical_support.extend(
+                sorted(list(task_context.reasoning_facts()), key=self._fact_sort_key)
             )
-        elif task_context.grounding_artifacts is not None:
-            facts.extend(
-                sorted(
-                    list(getattr(task_context.grounding_artifacts, "grounding_world_state_active_facts", ())),
-                    key=self._fact_sort_key,
-                )[:8]
-            )
+        facts.extend(canonical_support[:8])
         return frozenset(self._dedupe_facts(facts, limit=limit))
 
     def _program_anchor_fact_batches(
@@ -4289,7 +4304,7 @@ class OMENScale(nn.Module):
             limit=16,
         )
         all_observed = self._dedupe_facts(
-            observed_now + memory_facts + saliency_facts + net_facts + world_facts + abduced_facts,
+            observed_now + memory_facts,
             limit=max(self._ctx_max_facts * 2, self._ctx_max_facts + 48),
         )
         context = SymbolicTaskContext(
@@ -4797,10 +4812,13 @@ class OMENScale(nn.Module):
             "trace_target",
             "grounding",
             "world_context",
+            SALIENCY_PROPOSAL_NODE_TYPE,
             "saliency",
             "memory",
             "memory_grounding",
+            NET_PROPOSAL_NODE_TYPE,
             "net",
+            ABDUCED_PROPOSAL_NODE_TYPE,
             "abduced",
             "context",
         )
@@ -4907,12 +4925,23 @@ class OMENScale(nn.Module):
             "world_graph_grounding_hypotheses": float(
                 world_graph_batch.metadata.get("grounding_hypotheses", 0.0)
             ),
+            "world_graph_saliency_facts": float(world_graph_batch.metadata.get("saliency_facts", 0.0)),
+            "world_graph_saliency_proposal_facts": float(
+                world_graph_batch.metadata.get("saliency_proposal_facts", 0.0)
+            ),
             "world_graph_net_facts": float(world_graph_batch.metadata.get("net_facts", 0.0)),
+            "world_graph_net_proposal_facts": float(
+                world_graph_batch.metadata.get("net_proposal_facts", 0.0)
+            ),
             "world_graph_grounding_facts": float(world_graph_batch.metadata.get("grounding_derived_facts", 0.0)),
             "world_graph_interlingua_facts": float(world_graph_batch.metadata.get("interlingua_facts", 0.0)),
             "world_graph_abduced_support_facts": float(
                 world_graph_batch.metadata.get("abduced_support_facts", 0.0)
             ),
+            "world_graph_abduced_proposal_facts": float(
+                world_graph_batch.metadata.get("abduced_proposal_facts", 0.0)
+            ),
+            "world_graph_proposal_facts": float(world_graph_batch.metadata.get("proposal_facts", 0.0)),
         }
         context_limit = int(getattr(self.cfg, "world_graph_context_limit", 32))
         if not task_contexts:
@@ -4966,10 +4995,21 @@ class OMENScale(nn.Module):
                 "world_graph_grounding_hypotheses": float(
                     graph.metadata.get("grounding_hypotheses", 0.0)
                 ),
+                "world_graph_saliency_facts": float(graph.metadata.get("saliency_facts", 0.0)),
+                "world_graph_saliency_proposal_facts": float(
+                    graph.metadata.get("saliency_proposal_facts", 0.0)
+                ),
                 "world_graph_net_facts": float(graph.metadata.get("net_facts", 0.0)),
+                "world_graph_net_proposal_facts": float(
+                    graph.metadata.get("net_proposal_facts", 0.0)
+                ),
                 "world_graph_grounding_facts": float(graph.metadata.get("grounding_derived_facts", 0.0)),
                 "world_graph_interlingua_facts": float(graph.metadata.get("interlingua_facts", 0.0)),
                 "world_graph_abduced_support_facts": float(graph.metadata.get("abduced_support_facts", 0.0)),
+                "world_graph_abduced_proposal_facts": float(
+                    graph.metadata.get("abduced_proposal_facts", 0.0)
+                ),
+                "world_graph_proposal_facts": float(graph.metadata.get("proposal_facts", 0.0)),
                 "world_graph_observed_now_facts": float(graph.metadata.get("observed_now_facts", 0.0)),
                 "world_graph_target_context_facts": float(graph.metadata.get("target_context_facts", 0.0)),
             })
@@ -5035,9 +5075,9 @@ class OMENScale(nn.Module):
                 "grounding_validation",
                 "grounding_repair",
                 "grounding_hypothesis",
-                "saliency",
-                "net",
-                "abduced",
+                SALIENCY_PROPOSAL_NODE_TYPE,
+                NET_PROPOSAL_NODE_TYPE,
+                ABDUCED_PROPOSAL_NODE_TYPE,
                 "observed_now",
             )
             for label in reserve_order:
@@ -5482,12 +5522,27 @@ class OMENScale(nn.Module):
         generate_info["world_graph_grounding_hypotheses"] = float(
             generate_info.get("world_graph_grounding_hypotheses", 0.0)
         ) + float(world_graph_batch.metadata.get("grounding_hypotheses", 0.0))
+        generate_info["world_graph_saliency_facts"] = float(
+            generate_info.get("world_graph_saliency_facts", 0.0)
+        ) + float(world_graph_batch.metadata.get("saliency_facts", 0.0))
+        generate_info["world_graph_saliency_proposal_facts"] = float(
+            generate_info.get("world_graph_saliency_proposal_facts", 0.0)
+        ) + float(world_graph_batch.metadata.get("saliency_proposal_facts", 0.0))
         generate_info["world_graph_net_facts"] = float(
             generate_info.get("world_graph_net_facts", 0.0)
         ) + float(world_graph_batch.metadata.get("net_facts", 0.0))
+        generate_info["world_graph_net_proposal_facts"] = float(
+            generate_info.get("world_graph_net_proposal_facts", 0.0)
+        ) + float(world_graph_batch.metadata.get("net_proposal_facts", 0.0))
         generate_info["world_graph_abduced_support_facts"] = float(
             generate_info.get("world_graph_abduced_support_facts", 0.0)
         ) + float(world_graph_batch.metadata.get("abduced_support_facts", 0.0))
+        generate_info["world_graph_abduced_proposal_facts"] = float(
+            generate_info.get("world_graph_abduced_proposal_facts", 0.0)
+        ) + float(world_graph_batch.metadata.get("abduced_proposal_facts", 0.0))
+        generate_info["world_graph_proposal_facts"] = float(
+            generate_info.get("world_graph_proposal_facts", 0.0)
+        ) + float(world_graph_batch.metadata.get("proposal_facts", 0.0))
         generate_info["world_graph_observed_now_facts"] = float(
             generate_info.get("world_graph_observed_now_facts", 0.0)
         ) + float(world_graph_batch.metadata.get("observed_now_facts", 0.0))
@@ -7493,8 +7548,11 @@ class OMENScale(nn.Module):
         out["sym_grounding_validation_records"] = float(len(task_context.grounding_validation_records))
         out["sym_grounding_repair_actions"] = float(len(task_context.grounding_repair_actions))
         out["sym_grounding_hypotheses"] = float(len(task_context.grounding_hypotheses))
+        out["sym_proposal_facts"] = float(task_context.metadata.get("proposal_facts", 0.0))
         out["sym_saliency_derived_facts"] = float(len(task_context.saliency_derived_facts))
+        out["sym_saliency_proposal_facts"] = float(task_context.metadata.get("saliency_proposal_facts", 0.0))
         out["sym_net_derived_facts"] = float(len(task_context.net_derived_facts))
+        out["sym_net_proposal_facts"] = float(task_context.metadata.get("net_proposal_facts", 0.0))
         out["sym_grounding_derived_facts"] = float(len(task_context.grounding_derived_facts))
         out["sym_grounding_claim_support"] = float(task_context.metadata.get("grounding_claim_support", 0.0))
         out["sym_grounding_compiled_coverage"] = float(
@@ -7595,6 +7653,7 @@ class OMENScale(nn.Module):
         )
         out["sym_world_context_facts"] = float(len(task_context.world_context_facts))
         out["sym_abduced_support_facts"] = float(len(task_context.abduced_support_facts))
+        out["sym_abduced_proposal_facts"] = float(task_context.metadata.get("abduced_proposal_facts", 0.0))
         out["sym_world_context_summary_entries"] = float(len(task_context.world_context_summary))
         out["sym_trace_grounding_segments"] = float(task_context.metadata.get("trace_grounding_segments", 0.0))
         out["sym_trace_grounding_tokens"] = float(task_context.metadata.get("trace_grounding_tokens", 0.0))
@@ -7782,6 +7841,12 @@ class OMENScale(nn.Module):
         out["planner_state_contradicted_records"] = float(
             planner_state_summary.get("planner_state_contradicted_records", 0.0)
         )
+        out["planner_state_proposal_records"] = float(
+            planner_state_summary.get("planner_state_proposal_records", 0.0)
+        )
+        out["planner_state_heuristic_world_state_records"] = float(
+            planner_state_summary.get("planner_state_heuristic_world_state_records", 0.0)
+        )
         out["planner_state_verification_records"] = float(
             planner_state_summary.get("planner_state_verification_records", 0.0)
         )
@@ -7930,7 +7995,14 @@ class OMENScale(nn.Module):
         out["world_graph_grounding_hypotheses"] = float(
             world_graph_batch.metadata.get("grounding_hypotheses", 0.0)
         )
+        out["world_graph_saliency_facts"] = float(world_graph_batch.metadata.get("saliency_facts", 0.0))
+        out["world_graph_saliency_proposal_facts"] = float(
+            world_graph_batch.metadata.get("saliency_proposal_facts", 0.0)
+        )
         out["world_graph_net_facts"] = float(world_graph_batch.metadata.get("net_facts", 0.0))
+        out["world_graph_net_proposal_facts"] = float(
+            world_graph_batch.metadata.get("net_proposal_facts", 0.0)
+        )
         out["world_graph_grounding_facts"] = float(world_graph_batch.metadata.get("grounding_derived_facts", 0.0))
         out["world_graph_interlingua_facts"] = float(world_graph_batch.metadata.get("interlingua_facts", 0.0))
         out["world_graph_grounding_graph_records"] = float(
@@ -7939,6 +8011,10 @@ class OMENScale(nn.Module):
         out["world_graph_abduced_support_facts"] = float(
             world_graph_batch.metadata.get("abduced_support_facts", 0.0)
         )
+        out["world_graph_abduced_proposal_facts"] = float(
+            world_graph_batch.metadata.get("abduced_proposal_facts", 0.0)
+        )
+        out["world_graph_proposal_facts"] = float(world_graph_batch.metadata.get("proposal_facts", 0.0))
         out["world_graph_observed_now_facts"] = float(
             world_graph_batch.metadata.get("observed_now_facts", 0.0)
         )
@@ -8273,8 +8349,13 @@ class OMENScale(nn.Module):
             "world_graph_grounding_world_state_contradicted_facts": 0.0,
             "world_graph_grounding_verification_records": 0.0,
             "world_graph_grounding_hypotheses": 0.0,
+            "world_graph_saliency_facts": 0.0,
+            "world_graph_saliency_proposal_facts": 0.0,
             "world_graph_net_facts": 0.0,
+            "world_graph_net_proposal_facts": 0.0,
             "world_graph_abduced_support_facts": 0.0,
+            "world_graph_abduced_proposal_facts": 0.0,
+            "world_graph_proposal_facts": 0.0,
             "world_graph_observed_now_facts": 0.0,
             "z_posterior_graph_native": 0.0,
             "z_posterior_perceiver_fallback": 0.0,
@@ -8622,6 +8703,12 @@ class OMENScale(nn.Module):
             )
             generate_info["planner_state_contradicted_records"] = float(
                 planner_state.metadata.get("planner_state_contradicted_records", 0.0)
+            )
+            generate_info["planner_state_proposal_records"] = float(
+                planner_state.metadata.get("planner_state_proposal_records", 0.0)
+            )
+            generate_info["planner_state_heuristic_world_state_records"] = float(
+                planner_state.metadata.get("planner_state_heuristic_world_state_records", 0.0)
             )
             generate_info["planner_state_verification_records"] = float(
                 planner_state.metadata.get("planner_state_verification_records", 0.0)

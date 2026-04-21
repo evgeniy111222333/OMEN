@@ -215,7 +215,7 @@ class OSFProtocolTest(unittest.TestCase):
         self.assertIn(PlanFact(303, 7), lib[0].add_effects)
         self.assertTrue(any(op.op_type == "promote_world_model_supported_claim" for op in lib))
 
-    def test_symbolic_planner_consumes_verification_hypothesis_and_lineage_evidence(self) -> None:
+    def test_symbolic_planner_keeps_verification_hypothesis_and_lineage_out_of_planner_bridge(self) -> None:
         planner = SymbolicPlanner(
             d_intent=8,
             d_plan=8,
@@ -308,15 +308,14 @@ class OSFProtocolTest(unittest.TestCase):
         seed = planner._planner_state_seed(planner_state)
         lib = planner._planner_state_operator_library(planner_state, goal_id=7, device=torch.device("cpu"))
 
-        self.assertTrue(any(fact.pred == PLAN_SUPPORTED_VERIFICATION_PRED for fact in seed))
-        self.assertTrue(any(fact.pred == PLAN_CONFLICTED_VERIFICATION_PRED for fact in seed))
-        self.assertTrue(any(fact.pred == PLAN_HYPOTHESIS_PRED for fact in seed))
-        self.assertTrue(any(fact.pred == PLAN_LINEAGE_PRED for fact in seed))
-        self.assertTrue(any(op.source == "verification_bridge" for op in lib))
-        self.assertTrue(any(op.op_type == "trigger_hidden_cause_abduction" for op in lib))
+        self.assertFalse(any(fact.pred == PLAN_SUPPORTED_VERIFICATION_PRED for fact in seed))
+        self.assertFalse(any(fact.pred == PLAN_CONFLICTED_VERIFICATION_PRED for fact in seed))
+        self.assertFalse(any(fact.pred == PLAN_HYPOTHESIS_PRED for fact in seed))
+        self.assertFalse(any(fact.pred == PLAN_LINEAGE_PRED for fact in seed))
+        self.assertFalse(any(op.source == "verification_bridge" for op in lib))
         opens_ops = [op for op in lib if op.op_type == "opens"]
         self.assertTrue(opens_ops)
-        self.assertTrue(any(fact.pred == PLAN_SUPPORTED_VERIFICATION_PRED for fact in opens_ops[0].preconditions))
+        self.assertFalse(any(fact.pred == PLAN_SUPPORTED_VERIFICATION_PRED for fact in opens_ops[0].preconditions))
 
     def test_plan_with_strategy_passes_planner_state_to_planner(self) -> None:
         synth = OSFSynthesizer(
@@ -397,7 +396,7 @@ class OSFProtocolTest(unittest.TestCase):
         self.assertEqual(specs[0][0], STRATEGY_EXPLORATORY)
         self.assertGreaterEqual(specs[0][1], 2)
 
-    def test_repair_candidate_specs_prioritize_verification_and_hypothesis_evidence(self) -> None:
+    def test_repair_candidate_specs_ignore_verification_and_hypothesis_evidence_without_directives(self) -> None:
         synth = OSFSynthesizer(
             OSFConfig(
                 d_intent=8,
@@ -447,7 +446,7 @@ class OSFProtocolTest(unittest.TestCase):
         )
 
         self.assertGreaterEqual(len(specs), 1)
-        self.assertEqual(specs[0][0], STRATEGY_EXPLORATORY)
+        self.assertEqual(specs[0][0], STRATEGY_CAREFUL)
         self.assertTrue(any(spec[0] == STRATEGY_CAREFUL for spec in specs))
 
     def test_fast_mode_forces_fast_strategy_for_high_ce_training_steps(self) -> None:

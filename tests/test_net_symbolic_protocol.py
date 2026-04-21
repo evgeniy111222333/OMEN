@@ -152,10 +152,10 @@ class NetSymbolicProtocolTest(unittest.TestCase):
         context = symbolic_contexts[-1]
         self.assertEqual(context.provenance, "net")
         self.assertEqual(context.goal.pred, NET_MEANS_PRED)
-        self.assertIn(HornAtom(pred=NET_TOKEN_PRED, args=(41,)), context.observed_facts)
-        self.assertIn(HornAtom(pred=NET_CONTEXT_PRED, args=(41, 42)), context.observed_facts)
         self.assertIn(HornAtom(pred=NET_TOKEN_PRED, args=(41,)), context.net_derived_facts)
         self.assertIn(HornAtom(pred=NET_CONTEXT_PRED, args=(41, 42)), context.net_derived_facts)
+        self.assertNotIn(HornAtom(pred=NET_TOKEN_PRED, args=(41,)), context.reasoning_facts())
+        self.assertNotIn(HornAtom(pred=NET_CONTEXT_PRED, args=(41, 42)), context.reasoning_facts())
         self.assertTrue(recall_kwargs)
         self.assertIn(NET_TOKEN_PRED, recall_kwargs[-1].get("predicate_hints", []))
         self.assertIn(NET_CONTEXT_PRED, recall_kwargs[-1].get("predicate_hints", []))
@@ -353,7 +353,7 @@ class NetSymbolicProtocolTest(unittest.TestCase):
         self.assertTrue(all(ctx.provenance == "net" for ctx in generation_contexts))
         self.assertTrue(all(ctx.goal.pred == NET_MEANS_PRED for ctx in generation_contexts[:2]))
         self.assertTrue(
-            all(HornAtom(pred=NET_CONTEXT_PRED, args=(41, 42)) in ctx.observed_facts for ctx in generation_contexts[:2])
+            all(HornAtom(pred=NET_CONTEXT_PRED, args=(41, 42)) not in ctx.reasoning_facts() for ctx in generation_contexts[:2])
         )
         self.assertTrue(
             all(HornAtom(pred=NET_CONTEXT_PRED, args=(41, 42)) in ctx.net_derived_facts for ctx in generation_contexts[:2])

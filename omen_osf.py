@@ -267,30 +267,7 @@ class OSFSynthesizer(nn.Module):
     ) -> Tuple[Tuple[int, int], ...]:
         candidates: list[tuple[int, int]] = []
         directives = tuple(getattr(planner_state, "repair_directives", ()) or ()) if planner_state is not None else tuple()
-        verification_records = (
-            tuple(getattr(planner_state, "verification_records", ()) or ())
-            if planner_state is not None
-            else tuple()
-        )
-        hypothesis_records = (
-            tuple(getattr(planner_state, "hypothesis_records", ()) or ())
-            if planner_state is not None
-            else tuple()
-        )
         action_types = {str(getattr(item, "action_type", "") or "").strip() for item in directives}
-        if any(
-            bool(getattr(item, "hidden_cause_candidate", False))
-            or str(getattr(item, "repair_action", "") or "").strip() == "trigger_hidden_cause_abduction"
-            for item in verification_records
-        ):
-            candidates.append((STRATEGY_EXPLORATORY, min(plan_depth_use + 1, max_plan_depth + 2)))
-        if any(
-            str(getattr(item, "verification_status", "") or "").strip().lower() == "conflicted"
-            for item in verification_records
-        ):
-            candidates.append((STRATEGY_CAREFUL, min(plan_depth_use + 1, max_plan_depth + 1)))
-        if any(bool(getattr(item, "deferred", False)) for item in hypothesis_records):
-            candidates.append((STRATEGY_EXPLORATORY, max(plan_depth_use, 2)))
         if "trigger_hidden_cause_abduction" in action_types:
             candidates.append((STRATEGY_EXPLORATORY, min(plan_depth_use + 1, max_plan_depth + 2)))
         if "trigger_temporal_repair" in action_types:

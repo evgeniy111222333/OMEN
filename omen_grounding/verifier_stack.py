@@ -200,6 +200,9 @@ def _memory_overlap_score(
         float(len(symbol_set)), 1.0
     )
     support = _clip01((0.72 * active_overlap) + (0.18 * hypothetical_overlap))
+    direct_overlap = max(active_overlap, hypothetical_overlap)
+    if contradicted_overlap <= 0.0 and direct_overlap >= 0.95:
+        support = max(support, 0.68 if active_overlap > 0.0 else 0.60)
     conflict = _clip01((0.74 * contradicted_overlap) + (0.12 * max(0.0, hypothetical_overlap - active_overlap)))
     rationale = "memory_unmatched"
     if contradicted_overlap > 0.0 and active_overlap > 0.0:
@@ -336,15 +339,24 @@ def run_grounding_verifier_stack(
                 )
             )
 
-        if record.hidden_cause_candidate or world_status == "conflicted":
+        hidden_cause_repair = bool(
+            record.hidden_cause_candidate
+            or world_status == "conflicted"
+            or str(record.repair_action or "") == "trigger_hidden_cause_abduction"
+        )
+        if hidden_cause_repair:
             repairs.append(
                 GroundingRepairAction(
                     action_id=f"repair:hidden_cause:{record.hypothesis_id}",
                     target_id=str(record.hypothesis_id),
                     action_type="trigger_hidden_cause_abduction",
-                    priority=_clip01(0.55 + (0.25 * world_conflict) + (0.20 * float(record.hidden_cause_candidate))),
+                    priority=_clip01(0.55 + (0.25 * world_conflict) + (0.20 * float(hidden_cause_repair))),
                     pressure=_clip01(max(world_conflict, float(record.conflict))),
-                    reason="world_model_conflict",
+                    reason=(
+                        "verification_hidden_cause_gap"
+                        if str(record.repair_action or "") == "trigger_hidden_cause_abduction"
+                        else "world_model_conflict"
+                    ),
                     source_segment=segment_index,
                     provenance=tuple(record.provenance),
                 )

@@ -9,6 +9,13 @@ import torch
 import torch.nn as nn
 
 
+SALIENCY_PROPOSAL_NODE_TYPE = "saliency_proposal"
+NET_PROPOSAL_NODE_TYPE = "net_proposal"
+ABDUCED_PROPOSAL_NODE_TYPE = "abduced_proposal"
+_PROPOSAL_NODE_SUFFIX = "_proposal"
+_PROPOSAL_BASE_TYPES = frozenset({"saliency", "net", "abduced"})
+
+
 def _stable_bucket(text: str, buckets: int) -> int:
     if buckets <= 0:
         raise ValueError("buckets must be positive")
@@ -82,6 +89,18 @@ def _record_signature_text(atom: Any) -> str:
     if isinstance(atom, str):
         return atom
     return _record_signature(atom)
+
+
+def _record_base_node_type(node_type: str) -> str:
+    if node_type.endswith(_PROPOSAL_NODE_SUFFIX):
+        base_type = node_type[: -len(_PROPOSAL_NODE_SUFFIX)]
+        if base_type in _PROPOSAL_BASE_TYPES:
+            return base_type
+    return node_type
+
+
+def _record_is_proposal_node_type(node_type: str) -> bool:
+    return _record_base_node_type(node_type) != node_type
 
 
 @dataclass(frozen=True)
@@ -539,7 +558,7 @@ class WorldGraphEncoder(nn.Module):
         best_by_signature: Dict[str, Tuple[int, int, Tuple[str, Any]]] = {}
         for idx, (node_type, atom) in enumerate(fact_records):
             signature = _record_signature(atom)
-            rank = type_priority.get(node_type, 0)
+            rank = type_priority.get(_record_base_node_type(node_type), 0)
             existing = best_by_signature.get(signature)
             if existing is None or rank > existing[1]:
                 first_idx = idx if existing is None else existing[0]
@@ -553,7 +572,7 @@ class WorldGraphEncoder(nn.Module):
             reserved: List[Tuple[int, int, Tuple[str, Any]]] = []
             seen_types = set()
             for item in ranked:
-                node_type = item[2][0]
+                node_type = _record_base_node_type(item[2][0])
                 if node_type in seen_types:
                     continue
                 seen_types.add(node_type)
@@ -580,16 +599,18 @@ class WorldGraphEncoder(nn.Module):
         left_atom: Any,
         right_atom: Any,
     ) -> Optional[str]:
+        left_base_type = _record_base_node_type(left_type)
+        right_base_type = _record_base_node_type(right_type)
         relation: Optional[str] = None
         if set(_record_term_keys(left_atom)) & set(_record_term_keys(right_atom)):
             relation = "shared_term"
         elif _record_family(left_atom) == _record_family(right_atom):
             relation = "same_pred"
-        elif left_type == right_type:
+        elif left_base_type == right_base_type:
             relation = "cooccurs"
         if relation is None:
             return None
-        if "saliency" in (left_type, right_type):
+        if "saliency" in (left_base_type, right_base_type):
             return "saliency"
         return relation
 
@@ -751,16 +772,17 @@ class WorldGraphEncoder(nn.Module):
 
     @staticmethod
     def _source_metadata(node_types: Sequence[str]) -> Dict[str, float]:
+        base_types = tuple(_record_base_node_type(node_type) for node_type in node_types)
         counts: Dict[str, float] = {
-            "observed_facts": float(sum(1 for node_type in node_types if node_type == "observed")),
-            "observed_now_facts": float(sum(1 for node_type in node_types if node_type == "observed_now")),
-            "memory_facts": float(sum(1 for node_type in node_types if node_type == "memory")),
-            "memory_grounding_records": float(sum(1 for node_type in node_types if node_type == "memory_grounding")),
-            "grounding_ontology_records": float(sum(1 for node_type in node_types if node_type == "grounding_ontology")),
-            "grounding_ontology_facts": float(sum(1 for node_type in node_types if node_type == "grounding_ontology_fact")),
+            "observed_facts": float(sum(1 for node_type in base_types if node_type == "observed")),
+            "observed_now_facts": float(sum(1 for node_type in base_types if node_type == "observed_now")),
+            "memory_facts": float(sum(1 for node_type in base_types if node_type == "memory")),
+            "memory_grounding_records": float(sum(1 for node_type in base_types if node_type == "memory_grounding")),
+            "grounding_ontology_records": float(sum(1 for node_type in base_types if node_type == "grounding_ontology")),
+            "grounding_ontology_facts": float(sum(1 for node_type in base_types if node_type == "grounding_ontology_fact")),
             "grounding_world_state_records": float(
                 sum(
-                    1 for node_type in node_types
+                    1 for node_type in base_types
                     if node_type in (
                         "grounding_world_state_active",
                         "grounding_world_state_hypothetical",
@@ -770,7 +792,7 @@ class WorldGraphEncoder(nn.Module):
             ),
             "grounding_world_state_facts": float(
                 sum(
-                    1 for node_type in node_types
+                    1 for node_type in base_types
                     if node_type in (
                         "grounding_world_state_active_fact",
                         "grounding_world_state_hypothetical_fact",
@@ -779,39 +801,43 @@ class WorldGraphEncoder(nn.Module):
                 )
             ),
             "grounding_world_state_active_records": float(
-                sum(1 for node_type in node_types if node_type == "grounding_world_state_active")
+                sum(1 for node_type in base_types if node_type == "grounding_world_state_active")
             ),
             "grounding_world_state_hypothetical_records": float(
-                sum(1 for node_type in node_types if node_type == "grounding_world_state_hypothetical")
+                sum(1 for node_type in base_types if node_type == "grounding_world_state_hypothetical")
             ),
             "grounding_world_state_contradicted_records": float(
-                sum(1 for node_type in node_types if node_type == "grounding_world_state_contradicted")
+                sum(1 for node_type in base_types if node_type == "grounding_world_state_contradicted")
             ),
             "grounding_world_state_active_facts": float(
-                sum(1 for node_type in node_types if node_type == "grounding_world_state_active_fact")
+                sum(1 for node_type in base_types if node_type == "grounding_world_state_active_fact")
             ),
             "grounding_world_state_hypothetical_facts": float(
-                sum(1 for node_type in node_types if node_type == "grounding_world_state_hypothetical_fact")
+                sum(1 for node_type in base_types if node_type == "grounding_world_state_hypothetical_fact")
             ),
             "grounding_world_state_contradicted_facts": float(
-                sum(1 for node_type in node_types if node_type == "grounding_world_state_contradicted_fact")
+                sum(1 for node_type in base_types if node_type == "grounding_world_state_contradicted_fact")
             ),
-            "grounding_hypotheses": float(sum(1 for node_type in node_types if node_type == "grounding_hypothesis")),
-            "grounding_verification_records": float(sum(1 for node_type in node_types if node_type == "grounding_verification")),
-            "grounding_hidden_cause_records": float(sum(1 for node_type in node_types if node_type == "grounding_hidden_cause")),
-            "grounding_validation_records": float(sum(1 for node_type in node_types if node_type == "grounding_validation")),
-            "grounding_repair_actions": float(sum(1 for node_type in node_types if node_type == "grounding_repair")),
-            "saliency_facts": float(sum(1 for node_type in node_types if node_type == "saliency")),
-            "net_facts": float(sum(1 for node_type in node_types if node_type == "net")),
-            "grounding_derived_facts": float(sum(1 for node_type in node_types if node_type == "grounding")),
-            "interlingua_facts": float(sum(1 for node_type in node_types if node_type == "interlingua")),
-            "grounding_graph_records": float(sum(1 for node_type in node_types if node_type == "interlingua")),
-            "context_facts": float(sum(1 for node_type in node_types if node_type == "context")),
-            "world_context_facts": float(sum(1 for node_type in node_types if node_type == "world_context")),
-            "abduced_support_facts": float(sum(1 for node_type in node_types if node_type == "abduced")),
-            "goal_context_facts": float(sum(1 for node_type in node_types if node_type == "goal")),
-            "target_context_facts": float(sum(1 for node_type in node_types if node_type == "target")),
-            "trace_target_facts": float(sum(1 for node_type in node_types if node_type == "trace_target")),
+            "grounding_hypotheses": float(sum(1 for node_type in base_types if node_type == "grounding_hypothesis")),
+            "grounding_verification_records": float(sum(1 for node_type in base_types if node_type == "grounding_verification")),
+            "grounding_hidden_cause_records": float(sum(1 for node_type in base_types if node_type == "grounding_hidden_cause")),
+            "grounding_validation_records": float(sum(1 for node_type in base_types if node_type == "grounding_validation")),
+            "grounding_repair_actions": float(sum(1 for node_type in base_types if node_type == "grounding_repair")),
+            "saliency_facts": float(sum(1 for node_type in base_types if node_type == "saliency")),
+            "net_facts": float(sum(1 for node_type in base_types if node_type == "net")),
+            "grounding_derived_facts": float(sum(1 for node_type in base_types if node_type == "grounding")),
+            "interlingua_facts": float(sum(1 for node_type in base_types if node_type == "interlingua")),
+            "grounding_graph_records": float(sum(1 for node_type in base_types if node_type == "interlingua")),
+            "context_facts": float(sum(1 for node_type in base_types if node_type == "context")),
+            "world_context_facts": float(sum(1 for node_type in base_types if node_type == "world_context")),
+            "abduced_support_facts": float(sum(1 for node_type in base_types if node_type == "abduced")),
+            "goal_context_facts": float(sum(1 for node_type in base_types if node_type == "goal")),
+            "target_context_facts": float(sum(1 for node_type in base_types if node_type == "target")),
+            "trace_target_facts": float(sum(1 for node_type in base_types if node_type == "trace_target")),
+            "proposal_facts": float(sum(1 for node_type in node_types if _record_is_proposal_node_type(node_type))),
+            "saliency_proposal_facts": float(sum(1 for node_type in node_types if node_type == SALIENCY_PROPOSAL_NODE_TYPE)),
+            "net_proposal_facts": float(sum(1 for node_type in node_types if node_type == NET_PROPOSAL_NODE_TYPE)),
+            "abduced_proposal_facts": float(sum(1 for node_type in node_types if node_type == ABDUCED_PROPOSAL_NODE_TYPE)),
         }
         return counts
 
@@ -827,7 +853,7 @@ class WorldGraphEncoder(nn.Module):
         if device is None:
             device = base_graph.node_states.device
         appended_records: List[Tuple[str, Any]] = list(extra_records or ())
-        appended_records.extend(("saliency", atom) for atom in (saliency_facts or ()))
+        appended_records.extend((SALIENCY_PROPOSAL_NODE_TYPE, atom) for atom in (saliency_facts or ()))
         appended_records.extend(("context", atom) for atom in (context_facts or ()))
         if not appended_records:
             metadata = dict(base_graph.metadata)
@@ -925,7 +951,7 @@ class WorldGraphEncoder(nn.Module):
         if trace_bundle is not None:
             fact_records.extend(("trace_target", atom) for atom in getattr(trace_bundle, "target_facts", ()))
         if saliency_facts is not None:
-            fact_records.extend(("saliency", atom) for atom in saliency_facts)
+            fact_records.extend((SALIENCY_PROPOSAL_NODE_TYPE, atom) for atom in saliency_facts)
         if context_facts is not None:
             fact_records.extend(("context", atom) for atom in context_facts)
         if extra_records is not None:

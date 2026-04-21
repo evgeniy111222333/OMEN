@@ -3,12 +3,14 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from omen_prolog import HornAtom, HornClause, SymbolicTaskContext, Var
+from omen_scale import OMENScale, OMENScaleConfig
 from omen_symbolic.creative_types import RuleCandidate
 from omen_symbolic.execution_trace import build_symbolic_trace_bundle_with_artifacts
 
@@ -62,6 +64,91 @@ class SymbolicTaskContextWorldStateTest(unittest.TestCase):
         self.assertEqual(counts["grounding_world_state_active_facts"], 1.0)
         self.assertEqual(counts["grounding_world_state_hypothetical_facts"], 1.0)
         self.assertEqual(counts["grounding_world_state_contradicted_facts"], 1.0)
+
+    def test_reasoning_lane_keeps_proposals_out_of_observed_and_reasoning_aggregates(self) -> None:
+        observed = HornAtom(301, (1, 1))
+        memory = HornAtom(302, (1, 2))
+        ontology = HornAtom(303, (1, 3))
+        active = HornAtom(304, (1, 4))
+        saliency = HornAtom(305, (1, 5))
+        net = HornAtom(306, (1, 6))
+        grounding = HornAtom(307, (1, 7))
+        world_context = HornAtom(308, (1, 8))
+        abduced = HornAtom(309, (1, 9))
+
+        ctx = SymbolicTaskContext(
+            observed_facts=frozenset({observed, saliency, net}),
+            memory_derived_facts=frozenset({memory}),
+            grounding_ontology_facts=frozenset({ontology}),
+            grounding_world_state_active_facts=frozenset({active}),
+            saliency_derived_facts=frozenset({saliency}),
+            net_derived_facts=frozenset({net}),
+            grounding_derived_facts=frozenset({grounding}),
+            world_context_facts=frozenset({world_context}),
+            abduced_support_facts=frozenset({abduced}),
+        )
+
+        self.assertEqual(ctx.observed_facts, frozenset({observed, memory}))
+
+        reasoning = ctx.reasoning_facts()
+        self.assertIn(observed, reasoning)
+        self.assertIn(memory, reasoning)
+        self.assertIn(ontology, reasoning)
+        self.assertIn(active, reasoning)
+        self.assertNotIn(saliency, reasoning)
+        self.assertNotIn(net, reasoning)
+        self.assertNotIn(grounding, reasoning)
+        self.assertNotIn(world_context, reasoning)
+        self.assertNotIn(abduced, reasoning)
+
+        labels = {label for label, _ in ctx.source_fact_records()}
+        counts = ctx.source_counts()
+
+        self.assertIn("saliency_proposal", labels)
+        self.assertIn("net_proposal", labels)
+        self.assertIn("grounding", labels)
+        self.assertIn("world_context", labels)
+        self.assertIn("abduced_proposal", labels)
+        self.assertEqual(counts["proposal_facts"], 3.0)
+        self.assertEqual(counts["saliency_proposal_facts"], 1.0)
+        self.assertEqual(counts["net_proposal_facts"], 1.0)
+        self.assertEqual(counts["abduced_proposal_facts"], 1.0)
+
+    def test_program_anchor_prefers_canonical_support_over_raw_trace_observations(self) -> None:
+        cfg = OMENScaleConfig.demo()
+        cfg.net_enabled = False
+        cfg.osf_enabled = False
+        cfg.emc_enabled = False
+        cfg.saliency_enabled = False
+        cfg.continuous_cycle_enabled = False
+        cfg.creative_cycle_enabled = False
+        model = OMENScale(cfg)
+
+        goal = HornAtom(401, (1, 2))
+        target = HornAtom(402, (2, 3))
+        trace_target = HornAtom(403, (3, 4))
+        trace_observed = HornAtom(404, (4, 5))
+        active = HornAtom(405, (5, 6))
+        ontology = HornAtom(406, (6, 7))
+        ctx = SymbolicTaskContext(
+            goal=goal,
+            target_facts=frozenset({target}),
+            grounding_ontology_facts=frozenset({ontology}),
+            grounding_world_state_active_facts=frozenset({active}),
+            execution_trace=SimpleNamespace(
+                target_facts=frozenset({trace_target}),
+                observed_facts=frozenset({trace_observed}),
+            ),
+        )
+
+        anchors = model._program_anchor_facts(ctx)
+
+        self.assertIn(goal, anchors)
+        self.assertIn(target, anchors)
+        self.assertIn(trace_target, anchors)
+        self.assertIn(active, anchors)
+        self.assertIn(ontology, anchors)
+        self.assertNotIn(trace_observed, anchors)
 
     def test_source_records_surface_interlingua_records_from_grounding_artifacts(self) -> None:
         _bundle, artifacts = build_symbolic_trace_bundle_with_artifacts(

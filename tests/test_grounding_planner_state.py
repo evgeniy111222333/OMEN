@@ -219,7 +219,40 @@ class GroundingPlannerStateTest(unittest.TestCase):
         self.assertEqual(summary["planner_state_hidden_cause_operators"], 1.0)
         self.assertGreaterEqual(planner_state.hidden_cause_pressure, 0.65)
 
-    def test_build_planner_world_state_consumes_artifact_verification_hypotheses_and_lineage(self) -> None:
+    def test_build_planner_world_state_excludes_heuristic_world_state_records_from_planner_surface(self) -> None:
+        heuristic_record = GroundingWorldStateRecord(
+            record_id="hypothetical:heuristic:stone",
+            hypothesis_id="heuristic:stone",
+            record_type="relation",
+            world_status="hypothetical",
+            segment_index=0,
+            symbols=("fire", "creates", "stone"),
+            support=0.54,
+            conflict=0.18,
+            confidence=0.61,
+            repair_action="require_grounding_confirmation",
+            claim_source="fallback_extraction",
+            provenance=("scene:claim:heuristic_stone", "heuristic_authority:low"),
+        )
+        ctx = SymbolicTaskContext(
+            observed_now_facts=frozenset(),
+            grounding_world_state_records=(heuristic_record,),
+            metadata={"grounding_uncertainty": 0.3},
+        )
+
+        planner_state = build_planner_world_state(ctx)
+        summary = planner_state.summary()
+
+        self.assertEqual(len(planner_state.hypothetical_records), 0)
+        self.assertEqual(len(planner_state.proposal_records), 1)
+        self.assertEqual(len(planner_state.resources), 0)
+        self.assertEqual(len(planner_state.operators), 0)
+        self.assertEqual(len(planner_state.alternative_worlds), 0)
+        self.assertEqual(summary["planner_state_hypothetical_records"], 0.0)
+        self.assertEqual(summary["planner_state_proposal_records"], 1.0)
+        self.assertEqual(summary["planner_state_heuristic_world_state_records"], 1.0)
+
+    def test_build_planner_world_state_keeps_artifact_verification_hypotheses_and_graph_out_of_planner_surface(self) -> None:
         verification_supported = GroundingVerificationRecord(
             hypothesis_id="door_open",
             segment_index=0,
@@ -301,12 +334,16 @@ class GroundingPlannerStateTest(unittest.TestCase):
         summary = planner_state.summary()
 
         self.assertEqual(len(planner_state.active_records), 0)
+        self.assertEqual(len(planner_state.hypothetical_records), 0)
+        self.assertEqual(len(planner_state.contradicted_records), 0)
         self.assertEqual(len(planner_state.verification_records), 2)
         self.assertEqual(len(planner_state.hypothesis_records), 2)
         self.assertEqual(len(planner_state.graph_records), 2)
-        self.assertIn("dispatcher", planner_state.resource_symbols)
-        self.assertTrue(any(operator.predicate == "opens" for operator in planner_state.operators))
-        self.assertGreaterEqual(len(planner_state.alternative_worlds), 2)
+        self.assertEqual(len(planner_state.resource_symbols), 0)
+        self.assertEqual(len(planner_state.resources), 0)
+        self.assertFalse(any(operator.predicate == "opens" for operator in planner_state.operators))
+        self.assertEqual(len(planner_state.operators), 0)
+        self.assertEqual(len(planner_state.alternative_worlds), 0)
         self.assertIn("interlingua_relation", planner_state.lineage_symbols)
         self.assertGreaterEqual(summary["planner_state_verification_records"], 2.0)
         self.assertGreaterEqual(summary["planner_state_conflicted_verification_records"], 1.0)
@@ -316,10 +353,10 @@ class GroundingPlannerStateTest(unittest.TestCase):
         self.assertGreaterEqual(summary["planner_state_graph_records"], 2.0)
         self.assertGreaterEqual(summary["planner_state_graph_relation_records"], 1.0)
         self.assertGreaterEqual(summary["planner_state_lineage_symbols"], 3.0)
-        self.assertGreaterEqual(summary["planner_state_hypothetical_operators"], 1.0)
-        self.assertGreaterEqual(summary["planner_state_contradictions"], 1.0)
+        self.assertEqual(summary["planner_state_hypothetical_operators"], 0.0)
+        self.assertEqual(summary["planner_state_contradictions"], 0.0)
 
-    def test_build_planner_world_state_projects_grounding_candidate_rules(self) -> None:
+    def test_build_planner_world_state_keeps_grounding_candidate_rules_out_of_planner_surface(self) -> None:
         candidate_rule = RuleCandidate(
             clause=HornClause(
                 head=HornAtom(901, (Var("X"), Var("Y"))),
@@ -362,17 +399,15 @@ class GroundingPlannerStateTest(unittest.TestCase):
         self.assertIn("grounding_rule_compiler", planner_state.lineage_symbols)
         self.assertIn("semantic_mode:rule", planner_state.lineage_symbols)
         self.assertIn("claim_source:speaker_turn", planner_state.lineage_symbols)
-        self.assertTrue(any(operator.predicate == "generates" for operator in planner_state.operators))
-        operator = next(operator for operator in planner_state.operators if operator.predicate == "generates")
-        self.assertEqual(operator.status, "hypothetical")
-        self.assertEqual(operator.inputs, ("stars", "dust_cloud"))
-        self.assertEqual(operator.outputs, ("planets",))
-        self.assertEqual(operator.conditions, ("dust_cloud",))
-        self.assertEqual(operator.modality, "must")
+        self.assertFalse(any(operator.predicate == "generates" for operator in planner_state.operators))
+        self.assertEqual(len(planner_state.resources), 0)
+        self.assertEqual(len(planner_state.operators), 0)
+        self.assertEqual(len(planner_state.alternative_worlds), 0)
+        self.assertEqual(summary["planner_state_hypothetical_operators"], 0.0)
         self.assertGreaterEqual(summary["planner_state_grounding_candidate_rules"], 1.0)
         self.assertGreaterEqual(summary["planner_state_grounding_candidate_rule_records"], 1.0)
         self.assertGreaterEqual(summary["planner_state_candidate_rule_symbols"], 1.0)
-        self.assertGreaterEqual(summary["planner_state_hypothetical_operators"], 1.0)
+        self.assertEqual(summary["planner_state_hypothetical_records"], 0.0)
 
     def test_build_planner_world_state_ignores_heuristic_grounding_candidate_rules(self) -> None:
         candidate_rule = RuleCandidate(

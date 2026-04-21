@@ -290,6 +290,36 @@ def _looks_structured_field_line(line: str) -> bool:
     return False
 
 
+def _looks_state_marker_line(line: str) -> bool:
+    stripped = str(line or "").strip()
+    if not stripped:
+        return False
+    lower = stripped.lower()
+    if re.match(r"^(state|goal|target|status|next)\b", lower):
+        return True
+    split = _split_inline_field(stripped)
+    if split is None:
+        return False
+    key, _value, _sep = split
+    return key.strip().lower() in {"state", "goal", "target", "status", "next"}
+
+
+def _looks_instructional_line(line: str) -> bool:
+    stripped = str(line or "").strip()
+    if not stripped:
+        return False
+    lower = stripped.lower()
+    if re.match(r"^(step|крок)\s*\d*\b", lower):
+        return True
+    numbered = re.match(r"^\(?\d+[.)]\s+(.*)$", lower)
+    if numbered is None:
+        return False
+    body = numbered.group(1).strip()
+    if not body:
+        return False
+    return any(marker in body for marker in _INSTRUCTIONAL_MARKERS)
+
+
 def _looks_comment_prose_line(line: str) -> bool:
     stripped = line.strip()
     marker = ""
@@ -454,13 +484,9 @@ def _build_routing_ledger(
     instruction_like_lines = sum(
         1
         for line in probe
-        if re.match(r"^(step|\d+\.)\s", line.lower()) or re.match(r"^(step\d+|\d+\)|\d+\.)", line.lower())
+        if _looks_instructional_line(line)
     )
-    state_marker_lines = sum(
-        1
-        for line in probe
-        if re.search(r"\b(step|state|goal|target|status|next)\b", line.lower())
-    )
+    state_marker_lines = sum(1 for line in probe if _looks_state_marker_line(line))
     relation_hits = len(
         re.findall(r"\b(is|becomes|causes|leads to|requires|must|not|after|before|however)\b", lower)
     )
@@ -912,7 +938,7 @@ def infer_source_profile(
         domain = "structured_observation"
     elif natural_route:
         modality = "natural_text"
-        domain = "observation_text" if natural_support > 0.0 else "text"
+        domain = "observation_text"
     else:
         modality = "unknown"
         domain = "text"

@@ -45,6 +45,11 @@ from omen_symbolic.execution_trace import (
     TRACE_STATE_VALUE_PRED,
 )
 from omen_symbolic.executor import run_symbolic_executor
+from omen_symbolic.world_graph import (
+    ABDUCED_PROPOSAL_NODE_TYPE,
+    NET_PROPOSAL_NODE_TYPE,
+    SALIENCY_PROPOSAL_NODE_TYPE,
+)
 from omen_symbolic.universal_bits import (
     universal_int_bits,
     universal_float_bits,
@@ -441,10 +446,9 @@ class SymbolicTaskContext:
     """
     Canonical symbolic context with first-class fact provenance buckets.
 
-    `observed_facts` remains the backward-compatible aggregate, while the
-    source-specific fields preserve whether facts were observed now, recalled
-    from memory, derived from saliency, derived from NET, attached as world
-    context, or materialized as abductive/creative support.
+    `observed_facts` remains the backward-compatible aggregate of admitted
+    observed/recalled atoms only. Proposal and statused buckets stay explicit
+    so symbolic consumers do not silently treat them as reasoning truth.
     """
     observed_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
     observed_now_facts: FrozenSet[HornAtom] = field(default_factory=frozenset)
@@ -526,18 +530,30 @@ class SymbolicTaskContext:
         self.world_context_summary = dict(self.world_context_summary)
         self.metadata = dict(self.metadata)
 
-        if not self.observed_now_facts and self.observed_facts:
-            self.observed_now_facts = self.observed_facts
+        proposal_facts = (
+            set(self.saliency_derived_facts)
+            | set(self.net_derived_facts)
+            | set(self.grounding_derived_facts)
+            | set(self.world_context_facts)
+            | set(self.abduced_support_facts)
+        )
+        statused_facts = (
+            set(self.grounding_ontology_facts)
+            | set(self.grounding_world_state_active_facts)
+            | set(self.grounding_world_state_hypothetical_facts)
+            | set(self.grounding_world_state_contradicted_facts)
+        )
+        legacy_observed = frozenset(
+            atom
+            for atom in self.observed_facts
+            if atom not in proposal_facts and atom not in statused_facts
+        )
+        if not self.observed_now_facts and legacy_observed:
+            self.observed_now_facts = legacy_observed
 
-        merged = set(self.observed_facts)
+        merged = set(legacy_observed)
         merged.update(self.observed_now_facts)
         merged.update(self.memory_derived_facts)
-        merged.update(self.grounding_ontology_facts)
-        merged.update(self.saliency_derived_facts)
-        merged.update(self.net_derived_facts)
-        merged.update(self.grounding_world_state_active_facts)
-        merged.update(self.world_context_facts)
-        merged.update(self.abduced_support_facts)
         self.observed_facts = frozenset(merged)
 
     @property
@@ -545,6 +561,7 @@ class SymbolicTaskContext:
         return self.memory_derived_facts
 
     def reasoning_facts(self) -> FrozenSet[HornAtom]:
+        # Only admitted symbolic material belongs on the reasoning surface.
         merged = set(self.observed_facts)
         merged.update(self.grounding_ontology_facts)
         merged.update(self.grounding_world_state_active_facts)
@@ -597,11 +614,11 @@ class SymbolicTaskContext:
             ("grounding_repair", self.grounding_repair_actions),
             ("memory_grounding", self.memory_grounding_records),
             ("interlingua", self.grounding_graph_records()),
-            ("saliency", self.saliency_derived_facts),
-            ("net", self.net_derived_facts),
+            (SALIENCY_PROPOSAL_NODE_TYPE, self.saliency_derived_facts),
+            (NET_PROPOSAL_NODE_TYPE, self.net_derived_facts),
             ("grounding", self.grounding_derived_facts),
             ("world_context", self.world_context_facts),
-            ("abduced", self.abduced_support_facts),
+            (ABDUCED_PROPOSAL_NODE_TYPE, self.abduced_support_facts),
         )
         for label, facts in source_groups:
             for atom in sorted(facts, key=repr):
@@ -633,6 +650,11 @@ class SymbolicTaskContext:
         return tuple(getattr(self.grounding_artifacts, "grounding_graph_records", ()) or ())
 
     def source_counts(self) -> Dict[str, float]:
+        proposal_atoms = (
+            set(self.saliency_derived_facts)
+            | set(self.net_derived_facts)
+            | set(self.abduced_support_facts)
+        )
         return {
             "observed_now_facts": float(len(self.observed_now_facts)),
             "memory_derived_facts": float(len(self.memory_derived_facts)),
@@ -664,6 +686,10 @@ class SymbolicTaskContext:
             "grounding_derived_facts": float(len(self.grounding_derived_facts)),
             "world_context_facts": float(len(self.world_context_facts)),
             "abduced_support_facts": float(len(self.abduced_support_facts)),
+            "proposal_facts": float(len(proposal_atoms)),
+            "saliency_proposal_facts": float(len(self.saliency_derived_facts)),
+            "net_proposal_facts": float(len(self.net_derived_facts)),
+            "abduced_proposal_facts": float(len(self.abduced_support_facts)),
             "target_facts": float(len(self.target_facts)),
         }
 
@@ -6340,8 +6366,10 @@ class DifferentiableProver(nn.Module):
         #  Tse realizuie tsilespriamovanyi poshuk zamist vypadkovoi heneratsii:
         #   R* = argmin_R [Length(R) + λ·PredError(R, Trace)]
         observed = self.kb.facts
-        if self.task_context is not None and self.task_context.observed_facts:
-            observed = observed | self.task_context.observed_facts
+        if self.task_context is not None:
+            task_reasoning_facts = self.task_context.reasoning_facts()
+            if task_reasoning_facts:
+                observed = observed | task_reasoning_facts
 
         lam_mdl = float(getattr(self, "_mdl_lambda", 0.5))
         mdl_ranked = self._mdl_sort_candidates(raw_candidates, observed, lam=lam_mdl)

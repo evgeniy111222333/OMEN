@@ -65,6 +65,36 @@ class GroundingTextSemanticsTest(unittest.TestCase):
         self.assertGreaterEqual(float(first.profile.get("structured_text", 0.0)), 0.8)
         self.assertEqual(first.parser_candidates[0].parser_name, "kv_record_parser")
 
+    def test_infer_source_profile_keeps_markdown_prose_chunks_in_observation_domain(self) -> None:
+        text = (
+            "world-state writeback, memory writeback/recall, planner ingress або generation state є суперечність між цим\n"
+            "документом і детермінізаційним masterplan, пріоритет для цих підсистем має runtime concept."
+        )
+
+        profile = infer_source_profile(text)
+
+        self.assertEqual(profile.modality, "natural_text")
+        self.assertEqual(profile.domain, "observation_text")
+        self.assertEqual(profile.subtype, "generic_text")
+        self.assertEqual(float(profile.evidence.get("feature_state_marker_lines", 0.0)), 0.0)
+        self.assertEqual(profile.parser_candidates[0].parser_name, "clause_segmenter")
+
+    def test_infer_source_profile_keeps_numbered_concept_bullets_generic_without_procedural_cues(self) -> None:
+        text = (
+            "Product objective:\n"
+            "1. Transform raw observations into a structured world state.\n"
+            "2. Compress experience statistically and conceptually."
+        )
+
+        profile = infer_source_profile(text)
+
+        self.assertEqual(profile.modality, "natural_text")
+        self.assertEqual(profile.domain, "observation_text")
+        self.assertEqual(profile.subtype, "generic_text")
+        self.assertEqual(profile.verification_path, "natural_language_claim_verification")
+        self.assertEqual(float(profile.evidence.get("feature_instruction_like_lines", 0.0)), 0.0)
+        self.assertEqual(profile.parser_candidates[0].parser_name, "clause_segmenter")
+
     def test_ground_text_document_keeps_natural_language_semantics_out_of_document_layer(self) -> None:
         text = (
             'Факт 1: Об\'єкти типу "Зірки" генерують об\'єкти типу "Планети".\n'
@@ -482,8 +512,8 @@ class GroundingTextSemanticsTest(unittest.TestCase):
         seeded = model._seed_grounding_memory_records(prompt)
         self.assertGreaterEqual(len(seeded), 2)
         self.assertTrue(any("grounding_world_state:" in getattr(record, "graph_key", "") for record in seeded))
-        self.assertTrue(any("grounding_verification:" in getattr(record, "graph_key", "") for record in seeded))
-        self.assertTrue(any("grounding_hypothesis:" in getattr(record, "graph_key", "") for record in seeded))
+        self.assertFalse(any("grounding_verification:" in getattr(record, "graph_key", "") for record in seeded))
+        self.assertFalse(any("grounding_hypothesis:" in getattr(record, "graph_key", "") for record in seeded))
 
         write_stats = model._write_grounding_memory_records(seeded, confidence=1.0)
         self.assertGreaterEqual(write_stats["written"], 1.0)
@@ -497,7 +527,7 @@ class GroundingTextSemanticsTest(unittest.TestCase):
             any(
                 prefix in getattr(record, "graph_key", "")
                 for record in recalled
-                for prefix in ("grounding_world_state:", "grounding_verification:", "grounding_hypothesis:")
+                for prefix in ("grounding_world_state:", "grounding_ontology:")
             )
         )
 
