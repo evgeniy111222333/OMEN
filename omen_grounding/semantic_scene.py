@@ -4,6 +4,7 @@ from typing import Dict, Optional, Set
 
 from .backbone import SemanticGroundingBackbone
 from .heuristic_backbone import HeuristicFallbackSemanticBackbone
+from .learned_backbone import get_default_learned_grounding_backbone
 from .semantic_context import build_semantic_context_objects
 from .scene_types import SemanticClaim, SemanticEntity, SemanticEvent, SemanticGoal, SemanticSceneGraph, SemanticState
 from .structural_scene import build_structural_scene_graph, structural_primary_segment_indices
@@ -43,6 +44,86 @@ def _empty_scene(document: GroundedTextDocument) -> SemanticSceneGraph:
         language=document.language,
         source_text=document.source_text,
         metadata=metadata,
+    )
+
+
+def _copy_scene_with_metadata(
+    scene: SemanticSceneGraph,
+    metadata_updates: Dict[str, float],
+) -> SemanticSceneGraph:
+    metadata = dict(scene.metadata)
+    metadata.update({key: float(value) for key, value in metadata_updates.items()})
+    return SemanticSceneGraph(
+        language=scene.language,
+        source_text=scene.source_text,
+        entities=scene.entities,
+        states=scene.states,
+        events=scene.events,
+        goals=scene.goals,
+        claims=scene.claims,
+        mentions=scene.mentions,
+        discourse_relations=scene.discourse_relations,
+        temporal_markers=scene.temporal_markers,
+        explanations=scene.explanations,
+        coreference_links=scene.coreference_links,
+        metadata=metadata,
+    )
+
+
+def _annotate_backbone_runtime(
+    scene: SemanticSceneGraph,
+    document: GroundedTextDocument,
+    *,
+    default_heuristic_active: bool,
+    default_learned_active: bool,
+    default_learned_attempted: bool,
+    explicit_backbone_active: bool,
+    missing_semantic_backbone: bool,
+    retained_fallback_segments: float = 0.0,
+) -> SemanticSceneGraph:
+    total_segments = float(len(tuple(getattr(document, "segments", ()) or ())))
+    fallback_active = float(
+        scene.metadata.get(
+            "scene_fallback_backbone_active",
+            1.0 if default_heuristic_active else 0.0,
+        )
+    )
+    fallback_low_authority = float(
+        scene.metadata.get(
+            "scene_fallback_low_authority",
+            1.0 if fallback_active > 0.0 else 0.0,
+        )
+    )
+    learned_active = float(scene.metadata.get("scene_learned_backbone_active", 0.0))
+    trainable_active = float(
+        scene.metadata.get(
+            "scene_trainable_backbone_active",
+            learned_active,
+        )
+    )
+    retained_segments = max(0.0, float(retained_fallback_segments))
+    if total_segments > 0.0:
+        retained_segments = min(retained_segments, total_segments)
+    else:
+        retained_segments = 0.0
+    retained_rate = retained_segments / total_segments if total_segments > 0.0 else 0.0
+    return _copy_scene_with_metadata(
+        scene,
+        {
+            "scene_fallback_backbone_active": fallback_active,
+            "scene_fallback_low_authority": fallback_low_authority,
+            "scene_default_heuristic_backbone_active": 1.0 if default_heuristic_active else 0.0,
+            "scene_default_learned_backbone_active": 1.0 if default_learned_active else 0.0,
+            "scene_default_learned_backbone_attempted": 1.0 if default_learned_attempted else 0.0,
+            "scene_explicit_backbone_active": 1.0 if explicit_backbone_active else 0.0,
+            "scene_trainable_backbone_active": trainable_active,
+            "scene_learned_backbone_active": learned_active,
+            "scene_missing_semantic_backbone": 1.0 if missing_semantic_backbone else 0.0,
+            "scene_backbone_degraded_mode": 1.0 if default_heuristic_active else 0.0,
+            "scene_total_segments": total_segments,
+            "scene_heuristic_fallback_retained_segments": retained_segments if fallback_active > 0.0 else 0.0,
+            "scene_heuristic_fallback_retained_rate": retained_rate if fallback_active > 0.0 else 0.0,
+        },
     )
 
 
@@ -361,30 +442,100 @@ def build_semantic_scene_graph(
     document: GroundedTextDocument,
     *,
     backbone: Optional[SemanticGroundingBackbone] = None,
+    allow_heuristic_fallback: bool = True,
 ) -> SemanticSceneGraph:
     if backbone is None:
         structural_primary = build_structural_scene_graph(document)
         if structural_primary is not None:
-            return structural_primary
-    active_backbone: SemanticGroundingBackbone = backbone or HeuristicFallbackSemanticBackbone()
+            return _annotate_backbone_runtime(
+                structural_primary,
+                document,
+                default_heuristic_active=False,
+                default_learned_active=False,
+                default_learned_attempted=False,
+                explicit_backbone_active=False,
+                missing_semantic_backbone=False,
+                retained_fallback_segments=0.0,
+            )
+    explicit_backbone_active = backbone is not None
+    default_heuristic_active = False
+    default_learned_active = False
+    default_learned_attempted = False
+    active_backbone: Optional[SemanticGroundingBackbone] = backbone
+    if active_backbone is None:
+        default_learned_attempted = True
+        try:
+            active_backbone = get_default_learned_grounding_backbone()
+            default_learned_active = active_backbone is not None
+        except Exception:
+            active_backbone = None
     try:
-        proposed = active_backbone.build_scene_graph(document)
+        proposed = active_backbone.build_scene_graph(document) if active_backbone is not None else None
     except Exception:
         proposed = None
+    if proposed is None and backbone is None and allow_heuristic_fallback:
+        default_learned_active = False
+        default_heuristic_active = True
+        try:
+            proposed = HeuristicFallbackSemanticBackbone().build_scene_graph(document)
+        except Exception:
+            proposed = None
     if proposed is not None and backbone is None:
         structural_overlay = build_structural_scene_graph(document, allow_partial=True)
         structured_segments = set(structural_primary_segment_indices(document))
         if structural_overlay is not None and structured_segments:
-            return _merge_scene_graphs(
+            merged_scene = _merge_scene_graphs(
                 document,
                 proposed,
                 structural_overlay,
                 structured_segments=structured_segments,
             )
+            return _annotate_backbone_runtime(
+                merged_scene,
+                document,
+                default_heuristic_active=default_heuristic_active,
+                default_learned_active=default_learned_active,
+                default_learned_attempted=default_learned_attempted,
+                explicit_backbone_active=explicit_backbone_active,
+                missing_semantic_backbone=False,
+                retained_fallback_segments=float(
+                    merged_scene.metadata.get("scene_segment_owner_fallback_primary", 0.0)
+                ),
+            )
     if proposed is not None:
-        return proposed
+        retained_fallback_segments = 0.0
+        if float(proposed.metadata.get("scene_fallback_backbone_active", 0.0)) > 0.0:
+            retained_fallback_segments = float(len(tuple(getattr(document, "segments", ()) or ())))
+        return _annotate_backbone_runtime(
+            proposed,
+            document,
+            default_heuristic_active=default_heuristic_active,
+            default_learned_active=default_learned_active,
+            default_learned_attempted=default_learned_attempted,
+            explicit_backbone_active=explicit_backbone_active,
+            missing_semantic_backbone=False,
+            retained_fallback_segments=retained_fallback_segments,
+        )
     if backbone is None:
         structural_overlay = build_structural_scene_graph(document, allow_partial=True)
         if structural_overlay is not None:
-            return structural_overlay
-    return _empty_scene(document)
+            return _annotate_backbone_runtime(
+                structural_overlay,
+                document,
+                default_heuristic_active=False,
+                default_learned_active=False,
+                default_learned_attempted=default_learned_attempted,
+                explicit_backbone_active=False,
+                missing_semantic_backbone=not allow_heuristic_fallback,
+                retained_fallback_segments=0.0,
+            )
+    return _annotate_backbone_runtime(
+        _empty_scene(document),
+        document,
+        default_heuristic_active=False,
+        default_learned_active=False,
+        default_learned_attempted=default_learned_attempted,
+        explicit_backbone_active=explicit_backbone_active,
+        missing_semantic_backbone=backbone is None and not allow_heuristic_fallback,
+        retained_fallback_segments=0.0,
+    )

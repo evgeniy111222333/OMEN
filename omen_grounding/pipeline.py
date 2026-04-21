@@ -35,6 +35,7 @@ def ground_text_to_symbolic(
     language: str = "text",
     max_segments: int = 24,
     backbone: Optional[SemanticGroundingBackbone] = None,
+    allow_heuristic_fallback: bool = True,
     memory_records: Optional[Sequence[object]] = None,
 ) -> TextGroundingPipelineResult:
     document = ground_text_document(
@@ -42,7 +43,11 @@ def ground_text_to_symbolic(
         language=language,
         max_segments=max_segments,
     )
-    scene = build_semantic_scene_graph(document, backbone=backbone)
+    scene = build_semantic_scene_graph(
+        document,
+        backbone=backbone,
+        allow_heuristic_fallback=allow_heuristic_fallback,
+    )
     interlingua = build_canonical_interlingua(scene)
     compiled = compile_canonical_interlingua(interlingua, document=document)
     verification = verify_symbolic_hypotheses(

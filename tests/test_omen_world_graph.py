@@ -355,6 +355,35 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertEqual(routing.subtype, "scientific_text")
         self.assertEqual(routing.verification_path, "scientific_claim_verification")
 
+    def test_ast_language_router_does_not_infer_normative_family_from_topic_words_alone(self) -> None:
+        cfg = OMENScaleConfig.demo()
+        cfg.allow_noncanonical_ablation = True
+        cfg.net_enabled = False
+        cfg.osf_enabled = False
+        cfg.emc_enabled = False
+        cfg.saliency_enabled = False
+        cfg.continuous_cycle_enabled = False
+        cfg.creative_cycle_enabled = False
+        model = OMENScale(cfg)
+
+        def encode_row(text: str) -> torch.Tensor:
+            encoded = list(text.encode("utf-8"))[: cfg.seq_len]
+            if len(encoded) < cfg.seq_len:
+                encoded = encoded + [0] * (cfg.seq_len - len(encoded))
+            return torch.tensor(encoded[:-1], dtype=torch.long)
+
+        row = encode_row(
+            "Цей документ є нормативним masterplan-доповненням. "
+            "Для ownership, authority, planner truth і verification пріоритет має deterministic boundary."
+        )
+
+        routing = model._source_routing_from_bytes(row)
+
+        self.assertEqual(routing.modality, "natural_text")
+        self.assertNotEqual(routing.subtype, "normative_text")
+        self.assertEqual(routing.verification_path, "natural_language_claim_verification")
+        self.assertEqual(routing.parser_candidates[0].parser_name, "clause_segmenter")
+
     def test_ast_language_router_covers_log_config_table_dialogue_and_mixed_families(self) -> None:
         cfg = OMENScaleConfig.demo()
         cfg.allow_noncanonical_ablation = True
@@ -1165,6 +1194,13 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertGreaterEqual(out["sym_grounding_verification_records"], 1.0)
         self.assertGreaterEqual(out["sym_grounding_diagnostic_artifacts"], 1.0)
         self.assertGreaterEqual(out["sym_grounding_proposal_artifacts"], 1.0)
+        self.assertGreater(out["sym_grounding_backbone_total_loss"], 0.0)
+        self.assertGreater(out["sym_grounding_backbone_loss_weight"], 0.0)
+        self.assertGreaterEqual(out["sym_grounding_backbone_route_loss"], 0.0)
+        self.assertGreaterEqual(out["sym_grounding_backbone_struct_loss"], 0.0)
+        self.assertGreaterEqual(out["sym_grounding_backbone_ling_loss"], 0.0)
+        self.assertGreaterEqual(out["sym_grounding_backbone_scene_loss"], 0.0)
+        self.assertGreaterEqual(out["sym_grounding_backbone_inter_loss"], 0.0)
         self.assertGreaterEqual(out["sym_grounding_support_ratio"], 0.5)
         self.assertGreaterEqual(out["sym_grounding_uncertainty"], 0.0)
         self.assertGreaterEqual(out["sym_grounding_repair_pressure"], 0.0)
@@ -1239,6 +1275,15 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertGreater(out["sym_source_script_latin"], 0.5)
         self.assertGreaterEqual(out["sym_grounding_contract_document_segments"], 2.0)
         self.assertGreaterEqual(out["sym_grounding_contract_document_structural_units"], 1.0)
+        self.assertEqual(out["sym_trace_scene_learned_backbone_active"], 1.0)
+        self.assertEqual(out["sym_trace_scene_default_learned_backbone_active"], 1.0)
+        self.assertEqual(out["sym_trace_scene_trainable_backbone_active"], 1.0)
+        self.assertGreaterEqual(out["sym_trace_scene_bootstrap_teacher_active"], 1.0)
+        self.assertGreaterEqual(out["sym_trace_scene_l1_typed_segments"], 2.0)
+        self.assertGreaterEqual(out["sym_trace_scene_l2_structural_segments"], 2.0)
+        self.assertGreaterEqual(out["sym_trace_scene_l3_linguistic_segments"], 2.0)
+        self.assertGreaterEqual(out["sym_trace_scene_l4_learned_proposals"], 1.0)
+        self.assertGreaterEqual(out["sym_trace_scene_l5_canonical_proposals"], 1.0)
 
     def test_dialogue_forward_uses_structural_primary_scene_path(self) -> None:
         cfg = OMENScaleConfig.demo()
@@ -1265,6 +1310,9 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertEqual(out["source_subtype"], "dialogue_text")
         self.assertEqual(out["source_verification_path"], "dialogue_state_verification")
         self.assertEqual(out["sym_source_modality_natural_text"], 1.0)
+        self.assertEqual(out["sym_trace_scene_learned_backbone_active"], 0.0)
+        self.assertEqual(out["sym_trace_scene_default_learned_backbone_active"], 0.0)
+        self.assertEqual(out["sym_trace_scene_trainable_backbone_active"], 0.0)
         self.assertEqual(out["sym_trace_scene_structural_primary_active"], 1.0)
         self.assertGreaterEqual(out["sym_trace_scene_structural_primary_segments"], 2.0)
         self.assertGreaterEqual(out["sym_trace_scene_structural_primary_units_used"], 2.0)

@@ -179,6 +179,7 @@ class OMENScaleConfig:
     sym_decoder_surprise_enabled: bool = True
     sym_decoder_surprise_lambda: float = 0.05
     sym_decoder_surprise_threshold: float = 0.35
+    grounding_backbone_loss_weight: float = 0.05
     sym_cycle_loss_weight: float = 0.10
     sym_abduction_loss_weight: float = 0.05
     program_anchor_enabled: bool = True

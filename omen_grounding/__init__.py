@@ -1,4 +1,11 @@
-from .backbone import SemanticGroundingBackbone
+from .backbone import (
+    GroundingBackboneOutputs,
+    GroundingLayerCarrier,
+    GroundingLossBreakdown,
+    GroundingProposal,
+    GroundingSupervisionTargets,
+    SemanticGroundingBackbone,
+)
 from .context_atoms import (
     GROUND_COREFERENCE_PRED,
     GROUND_DISCOURSE_PRED,
@@ -28,6 +35,10 @@ from .heuristic_backbone import (
     HeuristicFallbackSemanticBackbone,
     extract_goal_hints,
     extract_relation_hints,
+)
+from .learned_backbone import (
+    LearnedSemanticGroundingBackbone,
+    get_default_learned_grounding_backbone,
 )
 from .source_routing import infer_script_profile, infer_source_profile, verification_path_for_source
 from .planner_semantics import (
@@ -198,7 +209,14 @@ __all__ = [
     "GroundingOrchestratorResult",
     "GroundingOntologyConcept",
     "GroundingOntologyGrowthResult",
+    "GroundingBackboneOutputs",
+    "GroundingLayerCarrier",
+    "GroundingLossBreakdown",
+    "GroundingProposal",
+    "GroundingSupervisionTargets",
     "HeuristicFallbackSemanticBackbone",
+    "LearnedSemanticGroundingBackbone",
+    "get_default_learned_grounding_backbone",
     "grounding_emc_features",
     "grounding_memory_families",
     "grounding_memory_records",

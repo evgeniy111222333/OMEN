@@ -8,7 +8,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from omen_grounding import SemanticSceneGraph, SemanticEntity, SemanticEvent, ground_text_to_symbolic
+from omen_grounding import (
+    LearnedSemanticGroundingBackbone,
+    SemanticEntity,
+    SemanticEvent,
+    SemanticSceneGraph,
+    ground_text_document,
+    ground_text_to_symbolic,
+)
 
 
 class _FixedBackbone:
@@ -51,7 +58,11 @@ class GroundingScenePipelineTest(unittest.TestCase):
         self.assertGreaterEqual(len(result.scene.events), 2)
         self.assertGreaterEqual(len(result.scene.goals), 1)
         self.assertGreaterEqual(len(result.scene.claims), 3)
-        self.assertEqual(result.scene.metadata.get("scene_fallback_backbone_active"), 1.0)
+        self.assertEqual(result.scene.metadata.get("scene_fallback_backbone_active"), 0.0)
+        self.assertEqual(result.scene.metadata.get("scene_default_heuristic_backbone_active", 1.0), 0.0)
+        self.assertEqual(result.scene.metadata.get("scene_learned_backbone_active", 0.0), 1.0)
+        self.assertEqual(result.scene.metadata.get("scene_default_learned_backbone_active", 0.0), 1.0)
+        self.assertEqual(result.scene.metadata.get("scene_bootstrap_teacher_active", 0.0), 1.0)
         self.assertEqual(result.document.metadata.get("grounding_document_semantic_authority"), 0.0)
         self.assertGreaterEqual(len(result.interlingua.entities), 3)
         self.assertGreaterEqual(len(result.interlingua.relations), 2)
@@ -89,7 +100,9 @@ class GroundingScenePipelineTest(unittest.TestCase):
 
         self.assertEqual(result.document.metadata.get("grounding_multilingual"), 1.0)
         self.assertGreaterEqual(result.scene.metadata.get("scene_claims", 0.0), 1.0)
-        self.assertEqual(result.scene.metadata.get("scene_fallback_backbone_active", 0.0), 1.0)
+        self.assertEqual(result.scene.metadata.get("scene_fallback_backbone_active", 0.0), 0.0)
+        self.assertEqual(result.scene.metadata.get("scene_learned_backbone_active", 0.0), 1.0)
+        self.assertEqual(result.scene.metadata.get("scene_bootstrap_teacher_active", 0.0), 1.0)
         self.assertGreaterEqual(result.interlingua.metadata.get("interlingua_relations", 0.0), 1.0)
         self.assertTrue(any(segment.counterexample for segment in result.compiled.segments))
         self.assertGreaterEqual(result.compiled.metadata.get("compiled_deferred_hypotheses", 0.0), 1.0)
@@ -117,10 +130,11 @@ class GroundingScenePipelineTest(unittest.TestCase):
         self.assertEqual(result.document.metadata.get("grounding_explanation_hints", 1.0), 0.0)
         self.assertEqual(result.document.metadata.get("grounding_temporal_hints", 1.0), 0.0)
         self.assertEqual(result.document.metadata.get("grounding_modal_hints", 1.0), 0.0)
-        self.assertEqual(result.scene.metadata.get("scene_fallback_backbone_active", 0.0), 1.0)
-        self.assertEqual(result.scene.metadata.get("scene_fallback_low_authority", 0.0), 1.0)
-        self.assertGreaterEqual(result.scene.metadata.get("scene_fallback_event_proposals", 0.0), 3.0)
-        self.assertGreaterEqual(result.scene.metadata.get("scene_fallback_relation_proposals", 0.0), 3.0)
+        self.assertEqual(result.scene.metadata.get("scene_fallback_backbone_active", 0.0), 0.0)
+        self.assertEqual(result.scene.metadata.get("scene_learned_backbone_active", 0.0), 1.0)
+        self.assertEqual(result.scene.metadata.get("scene_bootstrap_teacher_active", 0.0), 1.0)
+        self.assertGreaterEqual(result.scene.metadata.get("scene_bootstrap_teacher_event_proposals", 0.0), 3.0)
+        self.assertGreaterEqual(result.scene.metadata.get("scene_bootstrap_teacher_relation_proposals", 0.0), 3.0)
         self.assertGreaterEqual(result.scene.metadata.get("scene_event_conditions", 0.0), 1.0)
         self.assertGreaterEqual(result.scene.metadata.get("scene_event_explanations", 0.0), 1.0)
         self.assertGreaterEqual(result.scene.metadata.get("scene_event_temporal_anchors", 0.0), 1.0)
@@ -159,6 +173,8 @@ class GroundingScenePipelineTest(unittest.TestCase):
         self.assertGreater(float(result.document.metadata.get("grounding_document_semantic_authority", 0.0)), 0.0)
         self.assertEqual(result.scene.metadata.get("scene_structural_primary_active", 0.0), 1.0)
         self.assertEqual(result.scene.metadata.get("scene_fallback_backbone_active", 1.0), 0.0)
+        self.assertEqual(result.scene.metadata.get("scene_default_heuristic_backbone_active", 1.0), 0.0)
+        self.assertEqual(result.scene.metadata.get("scene_heuristic_fallback_retained_rate", 1.0), 0.0)
         self.assertGreaterEqual(result.document.metadata.get("grounding_key_value_units", 0.0), 3.0)
         self.assertGreaterEqual(len(result.scene.states), 3)
         self.assertEqual(len(result.scene.events), 0)
@@ -218,7 +234,9 @@ class GroundingScenePipelineTest(unittest.TestCase):
         self.assertGreater(float(result.document.metadata.get("grounding_document_semantic_authority", 0.0)), 0.0)
         self.assertEqual(result.scene.metadata.get("scene_structural_primary_active", 0.0), 1.0)
         self.assertEqual(result.scene.metadata.get("scene_structural_primary_hybrid_active", 1.0), 0.0)
-        self.assertEqual(result.scene.metadata.get("scene_fallback_backbone_active", 0.0), 1.0)
+        self.assertEqual(result.scene.metadata.get("scene_fallback_backbone_active", 0.0), 0.0)
+        self.assertEqual(result.scene.metadata.get("scene_learned_backbone_active", 0.0), 1.0)
+        self.assertEqual(result.scene.metadata.get("scene_bootstrap_teacher_active", 0.0), 1.0)
         self.assertGreaterEqual(len(result.scene.states), 2)
         self.assertGreaterEqual(len(result.scene.events), 1)
         self.assertTrue(
@@ -258,7 +276,9 @@ class GroundingScenePipelineTest(unittest.TestCase):
 
         self.assertEqual(result.scene.metadata.get("scene_structural_primary_active", 0.0), 1.0)
         self.assertEqual(result.scene.metadata.get("scene_structural_primary_hybrid_active", 0.0), 1.0)
-        self.assertEqual(result.scene.metadata.get("scene_fallback_backbone_active", 0.0), 1.0)
+        self.assertEqual(result.scene.metadata.get("scene_fallback_backbone_active", 0.0), 0.0)
+        self.assertEqual(result.scene.metadata.get("scene_learned_backbone_active", 0.0), 1.0)
+        self.assertEqual(result.scene.metadata.get("scene_bootstrap_teacher_active", 0.0), 1.0)
         self.assertGreaterEqual(result.scene.metadata.get("scene_segment_owner_hybrid", 0.0), 2.0)
         self.assertGreaterEqual(result.scene.metadata.get("scene_segment_owner_fallback_primary", 0.0), 1.0)
         self.assertEqual(result.scene.metadata.get("scene_hybrid_retained_fallback_events", 1.0), 0.0)
@@ -405,6 +425,8 @@ class GroundingScenePipelineTest(unittest.TestCase):
     def test_pipeline_uses_injected_backbone_scene_graph(self) -> None:
         result = ground_text_to_symbolic("unstructured placeholder text", language="text", backbone=_FixedBackbone())
 
+        self.assertEqual(result.scene.metadata.get("scene_explicit_backbone_active", 0.0), 1.0)
+        self.assertEqual(result.scene.metadata.get("scene_default_heuristic_backbone_active", 1.0), 0.0)
         self.assertEqual(len(result.scene.entities), 2)
         self.assertEqual(len(result.scene.events), 1)
         self.assertEqual(len(result.interlingua.relations), 1)
@@ -414,6 +436,51 @@ class GroundingScenePipelineTest(unittest.TestCase):
             for relation in segment.relations
         }
         self.assertIn(("alpha", "causes", "beta"), compiled_relations)
+
+    def test_pipeline_can_disable_default_heuristic_backbone_for_unstructured_text(self) -> None:
+        result = ground_text_to_symbolic(
+            "unstructured placeholder text",
+            language="text",
+            allow_heuristic_fallback=False,
+        )
+
+        self.assertEqual(result.scene.metadata.get("scene_fallback_backbone_active", 1.0), 0.0)
+        self.assertEqual(result.scene.metadata.get("scene_default_heuristic_backbone_active", 1.0), 0.0)
+        self.assertEqual(result.scene.metadata.get("scene_learned_backbone_active", 0.0), 1.0)
+        self.assertEqual(result.scene.metadata.get("scene_default_learned_backbone_active", 0.0), 1.0)
+        self.assertEqual(result.scene.metadata.get("scene_missing_semantic_backbone", 1.0), 0.0)
+        self.assertEqual(result.scene.metadata.get("scene_heuristic_fallback_retained_segments", 1.0), 0.0)
+        self.assertEqual(result.scene.metadata.get("scene_heuristic_fallback_retained_rate", 1.0), 0.0)
+        self.assertEqual(len(result.scene.entities), 0)
+
+    def test_learned_backbone_exposes_l1_l5_carriers_and_losses(self) -> None:
+        document = ground_text_document(
+            "dispatcher opens door\nhowever dispatcher opens door failed\ngoal safe_exit",
+            language="text",
+            max_segments=8,
+        )
+        backbone = LearnedSemanticGroundingBackbone()
+
+        outputs = backbone.forward_document(document)
+        losses = backbone.compute_grounding_losses(document)
+
+        self.assertIsNotNone(outputs.scene)
+        assert outputs.scene is not None
+        self.assertEqual(outputs.scene.metadata.get("scene_learned_backbone_active", 0.0), 1.0)
+        self.assertEqual(outputs.scene.metadata.get("scene_bootstrap_teacher_active", 0.0), 1.0)
+        self.assertGreaterEqual(len(outputs.l1_typed_perception), len(document.segments))
+        self.assertGreaterEqual(len(outputs.l2_structural_grounding), len(document.segments))
+        self.assertGreaterEqual(len(outputs.l3_linguistic_grounding), len(document.segments))
+        self.assertGreaterEqual(len(outputs.l4_scene_proposals), 3)
+        self.assertGreaterEqual(len(outputs.l5_interlingua_proposals), 1)
+        self.assertIsNotNone(losses.route_loss)
+        self.assertIsNotNone(losses.struct_loss)
+        self.assertIsNotNone(losses.ling_loss)
+        self.assertIsNotNone(losses.scene_loss)
+        self.assertIsNotNone(losses.inter_loss)
+        self.assertIsNotNone(losses.total_loss)
+        assert losses.total_loss is not None
+        self.assertGreaterEqual(float(losses.total_loss.detach().cpu().item()), 0.0)
 
 
 if __name__ == "__main__":

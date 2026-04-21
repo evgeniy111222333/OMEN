@@ -95,6 +95,20 @@ class GroundingTextSemanticsTest(unittest.TestCase):
         self.assertEqual(float(profile.evidence.get("feature_instruction_like_lines", 0.0)), 0.0)
         self.assertEqual(profile.parser_candidates[0].parser_name, "clause_segmenter")
 
+    def test_infer_source_profile_does_not_infer_normative_family_from_topic_words_alone(self) -> None:
+        text = (
+            "This document is a normative masterplan addendum to concept.md.\n"
+            "The canonical model is described below."
+        )
+
+        profile = infer_source_profile(text)
+
+        self.assertEqual(profile.modality, "natural_text")
+        self.assertEqual(profile.domain, "observation_text")
+        self.assertNotEqual(profile.subtype, "normative_text")
+        self.assertEqual(profile.verification_path, "natural_language_claim_verification")
+        self.assertEqual(profile.parser_candidates[0].parser_name, "clause_segmenter")
+
     def test_ground_text_document_keeps_natural_language_semantics_out_of_document_layer(self) -> None:
         text = (
             'Факт 1: Об\'єкти типу "Зірки" генерують об\'єкти типу "Планети".\n'
@@ -313,7 +327,10 @@ class GroundingTextSemanticsTest(unittest.TestCase):
         self.assertGreaterEqual(float(bundle.metadata.get("grounding_counterexample_segments", 0.0)), 1.0)
         self.assertGreaterEqual(float(bundle.metadata.get("scene_entities", 0.0)), 2.0)
         self.assertGreaterEqual(float(bundle.metadata.get("scene_claims", 0.0)), 1.0)
-        self.assertEqual(float(bundle.metadata.get("scene_fallback_backbone_active", 0.0)), 1.0)
+        self.assertEqual(float(bundle.metadata.get("scene_fallback_backbone_active", 1.0)), 0.0)
+        self.assertEqual(float(bundle.metadata.get("scene_learned_backbone_active", 0.0)), 1.0)
+        self.assertEqual(float(bundle.metadata.get("scene_default_learned_backbone_active", 0.0)), 1.0)
+        self.assertEqual(float(bundle.metadata.get("scene_bootstrap_teacher_active", 0.0)), 1.0)
         self.assertGreaterEqual(float(bundle.metadata.get("interlingua_entities", 0.0)), 2.0)
         self.assertGreaterEqual(float(bundle.metadata.get("interlingua_relations", 0.0)), 1.0)
         self.assertGreaterEqual(float(bundle.metadata.get("interlingua_graph_records", 0.0)), 2.0)
@@ -440,10 +457,13 @@ class GroundingTextSemanticsTest(unittest.TestCase):
         self.assertEqual(float(ctx.metadata.get("trace_grounding_relation_hints", 0.0)), 0.0)
         self.assertEqual(float(ctx.metadata.get("trace_grounding_document_semantic_authority", 0.0)), 0.0)
         self.assertGreaterEqual(float(ctx.metadata.get("trace_grounding_tokens", 0.0)), 2.0)
-        self.assertEqual(float(ctx.metadata.get("trace_scene_fallback_backbone_active", 0.0)), 1.0)
-        self.assertEqual(float(ctx.metadata.get("trace_scene_backbone_replaceable", 0.0)), 1.0)
-        self.assertGreaterEqual(float(ctx.metadata.get("trace_scene_fallback_goal_proposals", 0.0)), 1.0)
-        self.assertGreaterEqual(float(ctx.metadata.get("trace_scene_fallback_relation_proposals", 0.0)), 1.0)
+        self.assertEqual(float(ctx.metadata.get("trace_scene_fallback_backbone_active", 1.0)), 0.0)
+        self.assertEqual(float(ctx.metadata.get("trace_scene_backbone_replaceable", 1.0)), 0.0)
+        self.assertEqual(float(ctx.metadata.get("trace_scene_learned_backbone_active", 0.0)), 1.0)
+        self.assertEqual(float(ctx.metadata.get("trace_scene_default_learned_backbone_active", 0.0)), 1.0)
+        self.assertEqual(float(ctx.metadata.get("trace_scene_bootstrap_teacher_active", 0.0)), 1.0)
+        self.assertGreaterEqual(float(ctx.metadata.get("trace_scene_bootstrap_teacher_goal_proposals", 0.0)), 1.0)
+        self.assertGreaterEqual(float(ctx.metadata.get("trace_scene_bootstrap_teacher_relation_proposals", 0.0)), 1.0)
         self.assertGreaterEqual(float(ctx.metadata.get("trace_scene_entities", 0.0)), 2.0)
         self.assertGreaterEqual(float(ctx.metadata.get("trace_interlingua_entities", 0.0)), 2.0)
         self.assertGreaterEqual(float(ctx.metadata.get("trace_interlingua_relations", 0.0)), 1.0)

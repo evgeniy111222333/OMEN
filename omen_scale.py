@@ -86,6 +86,7 @@ from omen_symbolic.execution_trace import (
 from omen_grounding import (
     GroundingSourceProfile,
     build_planner_world_state,
+    get_default_learned_grounding_backbone,
     grounding_memory_corroboration,
     grounding_memory_families,
     grounding_memory_records,
@@ -2023,6 +2024,35 @@ class OMENScale(nn.Module):
 
     def set_semantic_grounding_backbone(self, backbone: Optional[object]) -> None:
         self.semantic_grounding_backbone = backbone
+
+    def _grounding_backbone_loss_weight(self) -> float:
+        return max(float(getattr(self.cfg, "grounding_backbone_loss_weight", 0.05)), 0.0)
+
+    def _prepare_semantic_grounding_backbone(self) -> Optional[object]:
+        backbone = self.semantic_grounding_backbone
+        if backbone is None:
+            try:
+                backbone = get_default_learned_grounding_backbone()
+            except Exception:
+                return None
+        if hasattr(backbone, "to"):
+            try:
+                backbone.to(next(self.parameters()).device)
+            except Exception:
+                pass
+        return backbone
+
+    @staticmethod
+    def _grounding_backbone_total_loss_tensor(grounding_artifacts: Optional[object]) -> Optional[torch.Tensor]:
+        if grounding_artifacts is None:
+            return None
+        grounding_losses = getattr(grounding_artifacts, "grounding_losses", None)
+        if grounding_losses is None:
+            return None
+        total_loss = getattr(grounding_losses, "total_loss", None)
+        if torch.is_tensor(total_loss):
+            return total_loss
+        return None
 
     @staticmethod
     def canonical_architecture() -> CanonicalArchitectureSpec:
@@ -5263,8 +5293,9 @@ class OMENScale(nn.Module):
         src_row: torch.Tensor,
         *,
         memory_records: Optional[Sequence[object]] = None,
+        collect_grounding_losses: bool = False,
     ):
-        if not memory_records:
+        if not memory_records and not collect_grounding_losses:
             return self._ast_trace_from_bytes(src_row), self._ast_grounding_artifacts_from_bytes(src_row)
         try:
             code = self._decode_source_bytes(src_row)
@@ -5273,6 +5304,8 @@ class OMENScale(nn.Module):
         if not str(code or "").strip():
             return None, None
         detected_lang = self._ast_lang_from_bytes(src_row)
+        if collect_grounding_losses:
+            self._prepare_semantic_grounding_backbone()
         try:
             return build_symbolic_trace_bundle_with_artifacts(
                 code,
@@ -5281,6 +5314,7 @@ class OMENScale(nn.Module):
                 max_counterexamples=int(getattr(self.cfg, "sym_trace_max_counterexamples", 4)),
                 semantic_backbone=self.semantic_grounding_backbone,
                 memory_records=tuple(memory_records or ()),
+                collect_grounding_losses=collect_grounding_losses,
             )
         except Exception:
             return self._ast_trace_from_bytes(src_row), self._ast_grounding_artifacts_from_bytes(src_row)
@@ -5889,9 +5923,11 @@ class OMENScale(nn.Module):
 
         #   1:    ( on-the-fly  miss) 
         ast_facts = self._ast_facts_from_bytes(src_row)
+        collect_grounding_losses = self.training and self._grounding_backbone_loss_weight() > 0.0
         trace_bundle, grounding_artifacts = self._ast_trace_and_grounding_from_bytes(
             src_row,
             memory_records=recalled_grounding_records,
+            collect_grounding_losses=collect_grounding_losses,
         )
         grounding_source = grounding_artifacts if grounding_artifacts is not None else trace_bundle
         ast_lang = self._ast_lang_from_bytes(src_row)
@@ -6108,6 +6144,12 @@ class OMENScale(nn.Module):
                 "grounding_validation_records": float(len(trace_grounding_validation_records)),
                 "grounding_repair_actions": float(len(trace_grounding_repair_actions)),
                 "grounding_facts": float(len(grounding_derived)),
+                "grounding_route_loss": float(grounding_metadata.get("grounding_route_loss", 0.0)),
+                "grounding_struct_loss": float(grounding_metadata.get("grounding_struct_loss", 0.0)),
+                "grounding_ling_loss": float(grounding_metadata.get("grounding_ling_loss", 0.0)),
+                "grounding_scene_loss": float(grounding_metadata.get("grounding_scene_loss", 0.0)),
+                "grounding_inter_loss": float(grounding_metadata.get("grounding_inter_loss", 0.0)),
+                "grounding_total_loss": float(grounding_metadata.get("grounding_total_loss", 0.0)),
                 **grounding_quality,
                 "verifier_stack_memory_records": float(
                     grounding_metadata.get("verifier_stack_memory_records", 0.0)
@@ -6344,6 +6386,12 @@ class OMENScale(nn.Module):
                 "grounding_validation_records": float(len(trace_grounding_validation_records)),
                 "grounding_repair_actions": float(len(trace_grounding_repair_actions)),
                 "grounding_facts": float(len(grounding_derived)),
+                "grounding_route_loss": float(grounding_metadata.get("grounding_route_loss", 0.0)),
+                "grounding_struct_loss": float(grounding_metadata.get("grounding_struct_loss", 0.0)),
+                "grounding_ling_loss": float(grounding_metadata.get("grounding_ling_loss", 0.0)),
+                "grounding_scene_loss": float(grounding_metadata.get("grounding_scene_loss", 0.0)),
+                "grounding_inter_loss": float(grounding_metadata.get("grounding_inter_loss", 0.0)),
+                "grounding_total_loss": float(grounding_metadata.get("grounding_total_loss", 0.0)),
                 **grounding_quality,
                 "verifier_stack_memory_records": float(
                     grounding_metadata.get("verifier_stack_memory_records", 0.0)
@@ -7272,6 +7320,10 @@ class OMENScale(nn.Module):
             program_anchor_loss=program_anchor_loss,
         )
         query_stats = getattr(self.sym_query_gen, "last_query_info", {}) if self.sym_query_gen is not None else {}
+        grounding_backbone_weight = self._grounding_backbone_loss_weight()
+        grounding_backbone_tensor = self._grounding_backbone_total_loss_tensor(
+            getattr(task_context, "grounding_artifacts", None)
+        )
         query_aux_tensor = query_stats.get("aux_loss_tensor")
         if self.training and torch.is_tensor(query_aux_tensor):
             out["total"] = out["total"] + float(getattr(self.cfg, "sym_query_lambda", 0.05)) * query_aux_tensor
@@ -7280,6 +7332,11 @@ class OMENScale(nn.Module):
             out["total"] = out["total"] + float(
                 getattr(self.cfg, "sym_decoder_surprise_lambda", 0.05)
             ) * decoder_probe_tensor
+        if self.training and grounding_backbone_weight > 0.0 and torch.is_tensor(grounding_backbone_tensor):
+            out["total"] = out["total"] + grounding_backbone_weight * grounding_backbone_tensor.to(
+                device=out["total"].device,
+                dtype=out["total"].dtype,
+            )
         out["rule_utility_credit"] = float(rule_utility_credit)
         out["rule_utility_adjusted_bits"] = float(rule_utility_adjusted)
 
@@ -7486,6 +7543,13 @@ class OMENScale(nn.Module):
         out["sym_decoder_miss"] = float(task_context.metadata.get("decoder_miss", 0.0))
         out["sym_decoder_surprise"] = float(task_context.metadata.get("decoder_surprise", 0.0))
         out["sym_decoder_probe_ce"] = float(task_context.metadata.get("decoder_probe_ce", 0.0))
+        out["sym_grounding_backbone_route_loss"] = float(task_context.metadata.get("grounding_route_loss", 0.0))
+        out["sym_grounding_backbone_struct_loss"] = float(task_context.metadata.get("grounding_struct_loss", 0.0))
+        out["sym_grounding_backbone_ling_loss"] = float(task_context.metadata.get("grounding_ling_loss", 0.0))
+        out["sym_grounding_backbone_scene_loss"] = float(task_context.metadata.get("grounding_scene_loss", 0.0))
+        out["sym_grounding_backbone_inter_loss"] = float(task_context.metadata.get("grounding_inter_loss", 0.0))
+        out["sym_grounding_backbone_total_loss"] = float(task_context.metadata.get("grounding_total_loss", 0.0))
+        out["sym_grounding_backbone_loss_weight"] = grounding_backbone_weight
         out["sym_trigger_abduction"] = float(task_context.trigger_abduction)
         out["sym_mem_recalled"] = float(len(recalled_memory_facts))
         out["sym_mem_grounding_recalled"] = float(len(recalled_memory_grounding_records))
@@ -7679,6 +7743,33 @@ class OMENScale(nn.Module):
         )
         out["sym_trace_scene_explanations"] = float(
             task_context.metadata.get("trace_scene_explanations", 0.0)
+        )
+        out["sym_trace_scene_learned_backbone_active"] = float(
+            task_context.metadata.get("trace_scene_learned_backbone_active", 0.0)
+        )
+        out["sym_trace_scene_default_learned_backbone_active"] = float(
+            task_context.metadata.get("trace_scene_default_learned_backbone_active", 0.0)
+        )
+        out["sym_trace_scene_trainable_backbone_active"] = float(
+            task_context.metadata.get("trace_scene_trainable_backbone_active", 0.0)
+        )
+        out["sym_trace_scene_bootstrap_teacher_active"] = float(
+            task_context.metadata.get("trace_scene_bootstrap_teacher_active", 0.0)
+        )
+        out["sym_trace_scene_l1_typed_segments"] = float(
+            task_context.metadata.get("trace_scene_l1_typed_segments", 0.0)
+        )
+        out["sym_trace_scene_l2_structural_segments"] = float(
+            task_context.metadata.get("trace_scene_l2_structural_segments", 0.0)
+        )
+        out["sym_trace_scene_l3_linguistic_segments"] = float(
+            task_context.metadata.get("trace_scene_l3_linguistic_segments", 0.0)
+        )
+        out["sym_trace_scene_l4_learned_proposals"] = float(
+            task_context.metadata.get("trace_scene_l4_learned_proposals", 0.0)
+        )
+        out["sym_trace_scene_l5_canonical_proposals"] = float(
+            task_context.metadata.get("trace_scene_l5_canonical_proposals", 0.0)
         )
         out["sym_trace_scene_structural_primary_active"] = float(
             task_context.metadata.get("trace_scene_structural_primary_active", 0.0)

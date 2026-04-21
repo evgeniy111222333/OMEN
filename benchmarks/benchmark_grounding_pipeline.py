@@ -96,12 +96,71 @@ def _percentile(values: Sequence[float], ratio: float) -> float:
     return float(ranked[pos])
 
 
-def _benchmark_pipeline(case: GroundingBenchmarkCase, *, iterations: int, max_segments: int) -> Dict[str, float]:
+def _language_for_path(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in {".py", ".pyw"}:
+        return "python"
+    if suffix == ".json":
+        return "json"
+    if suffix in {".log", ".out"}:
+        return "log"
+    if suffix in {".ini", ".cfg", ".conf", ".toml", ".yaml", ".yml"}:
+        return "config"
+    return "text"
+
+
+def _load_file_cases(
+    input_files: Sequence[str],
+    input_globs: Sequence[str],
+    *,
+    file_char_limit: int = 0,
+) -> List[GroundingBenchmarkCase]:
+    file_paths: List[Path] = []
+    seen: set[str] = set()
+    for raw_path in input_files:
+        path = Path(raw_path)
+        resolved = path if path.is_absolute() else (ROOT / path)
+        resolved = resolved.resolve()
+        if resolved.is_file() and str(resolved) not in seen:
+            seen.add(str(resolved))
+            file_paths.append(resolved)
+    for raw_glob in input_globs:
+        for path in sorted(ROOT.glob(raw_glob)):
+            resolved = path.resolve()
+            if resolved.is_file() and str(resolved) not in seen:
+                seen.add(str(resolved))
+                file_paths.append(resolved)
+    cases: List[GroundingBenchmarkCase] = []
+    for idx, path in enumerate(file_paths):
+        with path.open("r", encoding="utf-8") as handle:
+            text = handle.read(file_char_limit) if file_char_limit > 0 else handle.read()
+        cases.append(
+            GroundingBenchmarkCase(
+                name=f"file_{idx:02d}_{path.stem[:18]}",
+                language=_language_for_path(path),
+                text=text,
+            )
+        )
+    return cases
+
+
+def _benchmark_pipeline(
+    case: GroundingBenchmarkCase,
+    *,
+    iterations: int,
+    max_segments: int,
+    allow_heuristic_fallback: bool = True,
+) -> Dict[str, float]:
     latencies_ms: List[float] = []
     result = None
     for _ in range(max(1, iterations)):
         start = time.perf_counter()
-        result = ground_text_to_symbolic(case.text, language=case.language, max_segments=max_segments)
+        result = ground_text_to_symbolic(
+            case.text,
+            language=case.language,
+            max_segments=max_segments,
+            allow_heuristic_fallback=allow_heuristic_fallback,
+        )
         latencies_ms.append((time.perf_counter() - start) * 1000.0)
     assert result is not None
     return {
@@ -138,6 +197,13 @@ def _benchmark_pipeline(case: GroundingBenchmarkCase, *, iterations: int, max_se
         "char_cov": float(result.document.metadata.get("grounding_span_char_coverage", 0.0)),
         "byte_cov": float(result.document.metadata.get("grounding_span_byte_coverage", 0.0)),
         "sem_auth": float(result.document.metadata.get("grounding_document_semantic_authority", 0.0)),
+        "fb_rate": float(result.scene.metadata.get("scene_heuristic_fallback_retained_rate", 0.0)),
+        "fb_segments": float(result.scene.metadata.get("scene_heuristic_fallback_retained_segments", 0.0)),
+        "fb_default": float(result.scene.metadata.get("scene_default_heuristic_backbone_active", 0.0)),
+        "lb_active": float(result.scene.metadata.get("scene_learned_backbone_active", 0.0)),
+        "lb_default": float(result.scene.metadata.get("scene_default_learned_backbone_active", 0.0)),
+        "teacher_boot": float(result.scene.metadata.get("scene_bootstrap_teacher_active", 0.0)),
+        "missing_backbone": float(result.scene.metadata.get("scene_missing_semantic_backbone", 0.0)),
     }
 
 
@@ -165,7 +231,32 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Lightweight grounding pipeline benchmark.")
     parser.add_argument("--iterations", type=int, default=12, help="Iterations per case.")
     parser.add_argument("--max-segments", type=int, default=8, help="Max segments for ground_text_to_symbolic.")
+    parser.add_argument("--input-file", action="append", default=[], help="Extra input file to benchmark.")
+    parser.add_argument("--input-glob", action="append", default=[], help="Extra input glob relative to repo root.")
+    parser.add_argument(
+        "--file-char-limit",
+        type=int,
+        default=0,
+        help="Read at most this many characters from each extra input file (0 means full file).",
+    )
+    parser.add_argument(
+        "--compare-no-fallback",
+        action="store_true",
+        help="Also run each case with implicit heuristic fallback disabled.",
+    )
+    parser.add_argument(
+        "--skip-trace",
+        action="store_true",
+        help="Skip symbolic trace timing to keep runs lightweight on real files.",
+    )
     args = parser.parse_args()
+    cases = tuple(CASES) + tuple(
+        _load_file_cases(
+            args.input_file,
+            args.input_glob,
+            file_char_limit=max(0, int(args.file_char_limit)),
+        )
+    )
 
     print(f"grounding benchmark iterations={args.iterations} max_segments={args.max_segments}")
     print(
@@ -177,6 +268,11 @@ def main() -> None:
         "char_cov".rjust(10),
         "byte_cov".rjust(10),
         "sem_auth".rjust(10),
+        "fb_rate".rjust(10),
+        "fb_def".rjust(8),
+        "lb_act".rjust(8),
+        "lb_def".rjust(8),
+        "teach".rjust(8),
         "par_ag".rjust(10),
         "byte_tr".rjust(10),
         "events".rjust(8),
@@ -190,10 +286,38 @@ def main() -> None:
         "world".rjust(8),
         "cited".rjust(8),
         "rlife".rjust(8),
+        "dep_ev".rjust(8),
+        "dep_hyp".rjust(8),
+        "dep_wld".rjust(8),
     )
-    for case in CASES:
+    for case in cases:
         pipeline_stats = _benchmark_pipeline(case, iterations=args.iterations, max_segments=args.max_segments)
-        trace_stats = _benchmark_trace(case, iterations=args.iterations)
+        if args.skip_trace:
+            trace_stats = {
+                "trace_mean_ms": 0.0,
+                "trace_p95_ms": 0.0,
+                "trace_grounding_facts": 0.0,
+                "trace_interlingua_relations": 0.0,
+                "trace_validation_records": 0.0,
+                "trace_hidden_cause_records": 0.0,
+                "trace_byte_span": 0.0,
+                "parser_ag": 0.0,
+            }
+        else:
+            trace_stats = _benchmark_trace(case, iterations=args.iterations)
+        dep_events = 0.0
+        dep_hypotheses = 0.0
+        dep_world = 0.0
+        if args.compare_no_fallback:
+            no_fallback_stats = _benchmark_pipeline(
+                case,
+                iterations=args.iterations,
+                max_segments=args.max_segments,
+                allow_heuristic_fallback=False,
+            )
+            dep_events = pipeline_stats["scene_events"] - no_fallback_stats["scene_events"]
+            dep_hypotheses = pipeline_stats["compiled_hypotheses"] - no_fallback_stats["compiled_hypotheses"]
+            dep_world = pipeline_stats["world_state_records"] - no_fallback_stats["world_state_records"]
         print(
             case.name.ljust(24),
             f"{pipeline_stats['pipeline_mean_ms']:.2f}".rjust(12),
@@ -203,6 +327,11 @@ def main() -> None:
             f"{pipeline_stats['char_cov']:.2f}".rjust(10),
             f"{pipeline_stats['byte_cov']:.2f}".rjust(10),
             f"{pipeline_stats['sem_auth']:.2f}".rjust(10),
+            f"{pipeline_stats['fb_rate']:.2f}".rjust(10),
+            f"{pipeline_stats['fb_default']:.0f}".rjust(8),
+            f"{pipeline_stats['lb_active']:.0f}".rjust(8),
+            f"{pipeline_stats['lb_default']:.0f}".rjust(8),
+            f"{pipeline_stats['teacher_boot']:.0f}".rjust(8),
             f"{trace_stats['parser_ag']:.2f}".rjust(10),
             f"{trace_stats['trace_byte_span']:.2f}".rjust(10),
             f"{pipeline_stats['scene_events']:.0f}".rjust(8),
@@ -216,6 +345,9 @@ def main() -> None:
             f"{pipeline_stats['world_state_records']:.0f}".rjust(8),
             f"{pipeline_stats['world_state_cited_records']:.0f}".rjust(8),
             f"{pipeline_stats['world_state_rule_lifecycle_records']:.0f}".rjust(8),
+            f"{dep_events:.0f}".rjust(8),
+            f"{dep_hypotheses:.0f}".rjust(8),
+            f"{dep_world:.0f}".rjust(8),
         )
 
 

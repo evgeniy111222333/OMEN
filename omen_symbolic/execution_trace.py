@@ -11,6 +11,7 @@ from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 from omen_grounding import (
     CompiledSymbolicSegment,
     GroundingDocumentSummary,
+    GroundingLossBreakdown,
     GroundingRuntimeContract,
     SemanticGroundingBackbone,
     compile_scene_context_graph_records,
@@ -23,6 +24,7 @@ from omen_grounding import (
     extract_relation_hints,
     extract_structured_pairs,
     ground_text_document,
+    get_default_learned_grounding_backbone,
     is_counterexample_text,
     normalize_symbol_text,
     run_grounding_orchestrator,
@@ -106,6 +108,7 @@ class GroundingRuntimeArtifacts:
     grounding_world_state_hypothetical_facts: FrozenSet[Any] = field(default_factory=frozenset)
     grounding_world_state_contradicted_facts: FrozenSet[Any] = field(default_factory=frozenset)
     grounding_graph_records: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_losses: Optional[GroundingLossBreakdown] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -150,6 +153,7 @@ def _build_grounding_runtime_artifacts(
     language: str,
     source_text: str,
     max_steps: int,
+    grounding_losses: Optional[GroundingLossBreakdown] = None,
 ) -> GroundingRuntimeArtifacts:
     pipeline = orchestrated.pipeline
     document = pipeline.document
@@ -212,6 +216,7 @@ def _build_grounding_runtime_artifacts(
         grounding_world_state_hypothetical_facts=grounding_world_state_hypothetical_facts,
         grounding_world_state_contradicted_facts=grounding_world_state_contradicted_facts,
         grounding_graph_records=tuple(grounding_graph_records) + tuple(grounding_context_records),
+        grounding_losses=grounding_losses,
         metadata={
             **dict(pipeline.document.metadata),
             **dict(pipeline.scene.metadata),
@@ -228,6 +233,7 @@ def _build_grounding_runtime_artifacts(
             **dict(grounding_context_stats),
             **dict(grounding_graph_stats),
             **dict(orchestrated.metadata),
+            **(grounding_losses.as_metadata() if grounding_losses is not None else {}),
             "grounding_schema_version_v1": 1.0,
             "grounding_contract_document_segments": float(document_summary.segment_count),
             "grounding_contract_document_structural_units": float(document_summary.structural_unit_count),
@@ -1382,11 +1388,13 @@ class _ObservationTraceBuilder:
         max_steps: int = 24,
         max_counterexamples: int = 4,
         semantic_backbone: Optional[SemanticGroundingBackbone] = None,
+        collect_grounding_losses: bool = False,
     ):
         self.language = language or "text"
         self.max_steps = max(1, int(max_steps))
         self.max_counterexamples = max(0, int(max_counterexamples))
         self.semantic_backbone = semantic_backbone
+        self.collect_grounding_losses = bool(collect_grounding_losses)
 
     def build(self, text: str) -> Optional[SymbolicExecutionTraceBundle]:
         bundle, _artifacts = self.build_with_artifacts(text)
@@ -1406,11 +1414,27 @@ class _ObservationTraceBuilder:
             memory_records=memory_records,
         )
         pipeline = orchestrated.pipeline
+        grounding_losses: Optional[GroundingLossBreakdown] = None
+        if self.collect_grounding_losses:
+            active_backbone = self.semantic_backbone
+            if active_backbone is None:
+                scene_metadata = dict(getattr(getattr(pipeline, "scene", None), "metadata", {}) or {})
+                if float(scene_metadata.get("scene_default_learned_backbone_active", 0.0)) > 0.0:
+                    try:
+                        active_backbone = get_default_learned_grounding_backbone()
+                    except Exception:
+                        active_backbone = None
+            if active_backbone is not None and hasattr(active_backbone, "compute_grounding_losses"):
+                try:
+                    grounding_losses = active_backbone.compute_grounding_losses(pipeline.document)
+                except Exception:
+                    grounding_losses = None
         artifacts = _build_grounding_runtime_artifacts(
             orchestrated,
             language=self.language,
             source_text=text,
             max_steps=self.max_steps,
+            grounding_losses=grounding_losses,
         )
         segments = list(pipeline.compiled.segments)
         if not segments:
@@ -1646,6 +1670,7 @@ def build_symbolic_trace_bundle(
     max_counterexamples: int = 4,
     semantic_backbone: Optional[SemanticGroundingBackbone] = None,
     memory_records: Optional[Sequence[object]] = None,
+    collect_grounding_losses: bool = False,
 ) -> Optional[SymbolicExecutionTraceBundle]:
     bundle, _artifacts = build_symbolic_trace_bundle_with_artifacts(
         code,
@@ -1654,6 +1679,7 @@ def build_symbolic_trace_bundle(
         max_counterexamples=max_counterexamples,
         semantic_backbone=semantic_backbone,
         memory_records=memory_records,
+        collect_grounding_losses=collect_grounding_losses,
     )
     return bundle
 
@@ -1665,6 +1691,7 @@ def build_symbolic_trace_bundle_with_artifacts(
     max_counterexamples: int = 4,
     semantic_backbone: Optional[SemanticGroundingBackbone] = None,
     memory_records: Optional[Sequence[object]] = None,
+    collect_grounding_losses: bool = False,
 ) -> Tuple[Optional[SymbolicExecutionTraceBundle], Optional[GroundingRuntimeArtifacts]]:
     normalized_hint = (lang_hint or "python").lower()
     if not code.strip():
@@ -1682,5 +1709,6 @@ def build_symbolic_trace_bundle_with_artifacts(
         max_steps=max_steps,
         max_counterexamples=max_counterexamples,
         semantic_backbone=semantic_backbone,
+        collect_grounding_losses=collect_grounding_losses,
     )
     return observation_builder.build_with_artifacts(code, memory_records=memory_records)
