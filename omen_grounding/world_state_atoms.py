@@ -15,6 +15,9 @@ GROUND_WORLD_HYPOTHETICAL_GOAL_PRED = 922
 GROUND_WORLD_CONTRADICTED_RELATION_PRED = 923
 GROUND_WORLD_CONTRADICTED_STATE_PRED = 924
 GROUND_WORLD_CONTRADICTED_GOAL_PRED = 925
+GROUND_WORLD_ACTIVE_HIDDEN_CAUSE_PRED = 926
+GROUND_WORLD_HYPOTHETICAL_HIDDEN_CAUSE_PRED = 927
+GROUND_WORLD_CONTRADICTED_HIDDEN_CAUSE_PRED = 928
 
 
 def _stable_hash(text: str) -> int:
@@ -51,12 +54,15 @@ def _predicate_for_record(record: GroundingWorldStateRecord) -> int | None:
         ("active", "relation"): GROUND_WORLD_ACTIVE_RELATION_PRED,
         ("active", "state"): GROUND_WORLD_ACTIVE_STATE_PRED,
         ("active", "goal"): GROUND_WORLD_ACTIVE_GOAL_PRED,
+        ("active", "hidden_cause"): GROUND_WORLD_ACTIVE_HIDDEN_CAUSE_PRED,
         ("hypothetical", "relation"): GROUND_WORLD_HYPOTHETICAL_RELATION_PRED,
         ("hypothetical", "state"): GROUND_WORLD_HYPOTHETICAL_STATE_PRED,
         ("hypothetical", "goal"): GROUND_WORLD_HYPOTHETICAL_GOAL_PRED,
+        ("hypothetical", "hidden_cause"): GROUND_WORLD_HYPOTHETICAL_HIDDEN_CAUSE_PRED,
         ("contradicted", "relation"): GROUND_WORLD_CONTRADICTED_RELATION_PRED,
         ("contradicted", "state"): GROUND_WORLD_CONTRADICTED_STATE_PRED,
         ("contradicted", "goal"): GROUND_WORLD_CONTRADICTED_GOAL_PRED,
+        ("contradicted", "hidden_cause"): GROUND_WORLD_CONTRADICTED_HIDDEN_CAUSE_PRED,
     }
     return mapping.get((status, record_type))
 
@@ -64,7 +70,7 @@ def _predicate_for_record(record: GroundingWorldStateRecord) -> int | None:
 def _fact_args_for_record(record: GroundingWorldStateRecord) -> Tuple[int, ...]:
     symbols = tuple(str(item) for item in record.symbols)
     record_type = str(record.record_type or "").strip().lower()
-    if record_type == "relation" and len(symbols) >= 3:
+    if record_type in {"relation", "hidden_cause"} and len(symbols) >= 3:
         return (_entity_symbol(symbols[0]), _lex_symbol(symbols[1]), _entity_symbol(symbols[2]))
     if record_type == "state" and len(symbols) >= 2:
         return (_entity_symbol(symbols[0]), _lex_symbol(symbols[1]))
@@ -103,5 +109,16 @@ def compile_world_state_symbolic_atoms(
         "grounding_world_state_active_facts": float(len(active)),
         "grounding_world_state_hypothetical_facts": float(len(hypothetical)),
         "grounding_world_state_contradicted_facts": float(len(contradicted)),
+        "grounding_world_state_hidden_cause_facts": float(
+            sum(
+                1
+                for fact in (*active, *hypothetical, *contradicted)
+                if getattr(fact, "pred", None) in {
+                    GROUND_WORLD_ACTIVE_HIDDEN_CAUSE_PRED,
+                    GROUND_WORLD_HYPOTHETICAL_HIDDEN_CAUSE_PRED,
+                    GROUND_WORLD_CONTRADICTED_HIDDEN_CAUSE_PRED,
+                }
+            )
+        ),
     }
     return active, hypothetical, contradicted, stats

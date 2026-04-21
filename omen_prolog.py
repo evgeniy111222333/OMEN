@@ -454,6 +454,7 @@ class SymbolicTaskContext:
     grounding_hypotheses: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_candidate_rules: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_verification_records: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_hidden_cause_records: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_validation_records: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_repair_actions: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_world_state_records: Tuple[Any, ...] = field(default_factory=tuple)
@@ -497,6 +498,12 @@ class SymbolicTaskContext:
         else:
             self.grounding_candidate_rules = tuple(self.grounding_candidate_rules or ())
         self.grounding_verification_records = tuple(self.grounding_verification_records or ())
+        if not self.grounding_hidden_cause_records and self.grounding_artifacts is not None:
+            self.grounding_hidden_cause_records = tuple(
+                getattr(self.grounding_artifacts, "grounding_hidden_cause_records", ()) or ()
+            )
+        else:
+            self.grounding_hidden_cause_records = tuple(self.grounding_hidden_cause_records or ())
         self.grounding_validation_records = tuple(self.grounding_validation_records or ())
         self.grounding_repair_actions = tuple(self.grounding_repair_actions or ())
         self.grounding_world_state_records = tuple(self.grounding_world_state_records or ())
@@ -579,6 +586,7 @@ class SymbolicTaskContext:
             ("grounding_world_state_contradicted_fact", self.grounding_world_state_contradicted_facts),
             ("grounding_hypothesis", self.grounding_hypotheses),
             ("grounding_verification", self.grounding_verification_records),
+            ("grounding_hidden_cause", self.grounding_hidden_cause_records),
             ("grounding_validation", self.grounding_validation_records),
             ("grounding_repair", self.grounding_repair_actions),
             ("memory_grounding", self.memory_grounding_records),
@@ -629,6 +637,7 @@ class SymbolicTaskContext:
             "grounding_hypotheses": float(len(self.grounding_hypotheses)),
             "grounding_candidate_rules": float(len(self.grounding_candidate_rules)),
             "grounding_verification_records": float(len(self.grounding_verification_records)),
+            "grounding_hidden_cause_records": float(len(self.grounding_hidden_cause_records)),
             "grounding_validation_records": float(len(self.grounding_validation_records)),
             "grounding_repair_actions": float(len(self.grounding_repair_actions)),
             "grounding_world_state_records": float(len(self.grounding_world_state_records)),

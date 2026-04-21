@@ -5,11 +5,36 @@ from typing import Dict, List, Mapping, Tuple
 
 from .symbolic_compiler import SymbolicCompilationResult
 from .types import GroundingSpan
-from .verification import GroundingVerificationReport, GroundingVerificationRecord
+from .verification import (
+    GroundingHiddenCauseRecord,
+    GroundingVerificationRecord,
+    GroundingVerificationReport,
+)
 
 
 def _clip01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
+
+
+def _hidden_cause_world_state_record(record: GroundingHiddenCauseRecord) -> "GroundingWorldStateRecord":
+    return GroundingWorldStateRecord(
+        record_id=f"hypothetical:{record.proposal_id}",
+        hypothesis_id=str(record.proposal_id),
+        record_type="hidden_cause",
+        world_status="hypothetical",
+        segment_index=int(record.source_segment),
+        symbols=tuple(str(item) for item in record.symbols),
+        source_span=record.source_span,
+        support=_clip01(record.support),
+        conflict=_clip01(record.conflict),
+        confidence=_clip01(record.confidence),
+        repair_action="trigger_hidden_cause_abduction",
+        epistemic_status="proposed",
+        claim_source="hidden_cause_abduction",
+        semantic_mode="instance",
+        quantifier_mode="instance",
+        provenance=tuple(str(item) for item in record.provenance),
+    )
 
 
 @dataclass(frozen=True)
@@ -137,6 +162,11 @@ def build_grounding_world_state_writeback(
             )
         )
 
+    records.extend(
+        _hidden_cause_world_state_record(record)
+        for record in tuple(getattr(verification, "hidden_cause_records", ()) or ())
+    )
+
     total = float(len(records))
     active = sum(1 for record in records if record.world_status == "active")
     hypothetical = sum(1 for record in records if record.world_status == "hypothetical")
@@ -149,6 +179,7 @@ def build_grounding_world_state_writeback(
     generic = sum(1 for record in records if record.semantic_mode == "generic")
     rule = sum(1 for record in records if record.semantic_mode == "rule")
     obligation = sum(1 for record in records if record.semantic_mode == "obligation")
+    hidden_cause_records = sum(1 for record in records if record.record_type == "hidden_cause")
     rule_lifecycle_records = sum(
         1
         for record in records
@@ -180,14 +211,17 @@ def build_grounding_world_state_writeback(
     contradicted_ratio = float(contradicted) / max(total, 1.0)
     repair_ratio = float(repairable) / max(total, 1.0)
     nonasserted_ratio = float(nonasserted) / max(total, 1.0)
+    hidden_cause_ratio = float(hidden_cause_records) / max(total, 1.0)
     branching_pressure = _clip01(
         (hypothetical_ratio * (0.45 + 0.45 * mean_support))
         + (0.30 * nonasserted_ratio)
+        + (0.20 * hidden_cause_ratio)
     )
     contradiction_pressure = _clip01(
         (0.70 * contradicted_ratio)
         + (0.20 * mean_conflict)
         + (0.10 * repair_ratio)
+        + (0.08 * hidden_cause_ratio)
     )
     metadata = {
         "grounding_world_state_records": total,
@@ -205,6 +239,8 @@ def build_grounding_world_state_writeback(
         "grounding_world_state_generic_records": float(generic),
         "grounding_world_state_rule_records": float(rule),
         "grounding_world_state_obligation_records": float(obligation),
+        "grounding_world_state_hidden_cause_records": float(hidden_cause_records),
+        "grounding_world_state_hidden_cause_ratio": hidden_cause_ratio,
         "grounding_world_state_rule_lifecycle_records": float(rule_lifecycle_records),
         "grounding_world_state_rule_lifecycle_ratio": float(rule_lifecycle_records) / max(total, 1.0),
         "grounding_world_state_nonasserted_ratio": nonasserted_ratio,

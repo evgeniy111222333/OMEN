@@ -2351,6 +2351,7 @@ class OMENScale(nn.Module):
             "grounding_world_state_hypothetical_facts",
             "grounding_world_state_contradicted_facts",
             "grounding_verification_records",
+            "grounding_hidden_cause_records",
             "grounding_validation_records",
             "grounding_repair_actions",
             "grounding_hypotheses",
@@ -2589,6 +2590,7 @@ class OMENScale(nn.Module):
                 "grounding_world_state_hypothetical_facts",
                 "grounding_world_state_contradicted_facts",
                 "grounding_verification_records",
+                "grounding_hidden_cause_records",
                 "grounding_validation_records",
                 "grounding_repair_actions",
                 "grounding_hypotheses",
@@ -4220,6 +4222,7 @@ class OMENScale(nn.Module):
         grounding_world_state_contradicted_facts: Optional[Sequence[HornAtom]] = None,
         grounding_hypotheses: Optional[Sequence[object]] = None,
         grounding_verification_records: Optional[Sequence[object]] = None,
+        grounding_hidden_cause_records: Optional[Sequence[object]] = None,
         grounding_validation_records: Optional[Sequence[object]] = None,
         grounding_repair_actions: Optional[Sequence[object]] = None,
         saliency_derived_facts: Optional[Sequence[HornAtom]] = None,
@@ -4262,6 +4265,7 @@ class OMENScale(nn.Module):
         )
         grounding_hypothesis_records = list(grounding_hypotheses or ())
         grounding_verification = list(grounding_verification_records or ())
+        grounding_hidden_cause = list(grounding_hidden_cause_records or ())
         grounding_validation = list(grounding_validation_records or ())
         grounding_repair = list(grounding_repair_actions or ())
         saliency_facts = self._dedupe_facts(
@@ -4301,6 +4305,7 @@ class OMENScale(nn.Module):
             grounding_world_state_contradicted_facts=frozenset(grounding_world_state_contradicted),
             grounding_hypotheses=tuple(grounding_hypothesis_records),
             grounding_verification_records=tuple(grounding_verification),
+            grounding_hidden_cause_records=tuple(grounding_hidden_cause),
             grounding_validation_records=tuple(grounding_validation),
             grounding_repair_actions=tuple(grounding_repair),
             saliency_derived_facts=frozenset(saliency_facts),
@@ -4323,6 +4328,7 @@ class OMENScale(nn.Module):
                 tuple(grounding_ontology)
                 + tuple(grounding_world_state)
                 + tuple(grounding_verification)
+                + tuple(grounding_hidden_cause)
                 + tuple(grounding_validation)
                 + tuple(grounding_repair)
                 + tuple(grounding_hypothesis_records)
@@ -4432,6 +4438,7 @@ class OMENScale(nn.Module):
             tuple(getattr(source, "grounding_ontology_records", ()) or ())
             + tuple(getattr(source, "grounding_world_state_records", ()) or ())
             + tuple(getattr(source, "grounding_verification_records", ()) or ())
+            + tuple(getattr(source, "grounding_hidden_cause_records", ()) or ())
             + tuple(getattr(source, "grounding_validation_records", ()) or ())
             + tuple(getattr(source, "grounding_repair_actions", ()) or ())
             + tuple(getattr(source, "grounding_hypotheses", ()) or ())
@@ -5756,6 +5763,7 @@ class OMENScale(nn.Module):
         grounding_world_state_contradicted_facts: Optional[Sequence[HornAtom]] = None,
         grounding_hypotheses: Optional[Sequence[object]] = None,
         grounding_verification_records: Optional[Sequence[object]] = None,
+        grounding_hidden_cause_records: Optional[Sequence[object]] = None,
         grounding_validation_records: Optional[Sequence[object]] = None,
         grounding_repair_actions: Optional[Sequence[object]] = None,
         net_facts: Optional[List[HornAtom]] = None,
@@ -5788,6 +5796,7 @@ class OMENScale(nn.Module):
         trace_grounding_world_state_contradicted_facts = list(grounding_world_state_contradicted_facts or [])
         trace_grounding_hypotheses = list(grounding_hypotheses or [])
         trace_grounding_verification_records = list(grounding_verification_records or [])
+        trace_grounding_hidden_cause_records = list(grounding_hidden_cause_records or [])
         trace_grounding_validation_records = list(grounding_validation_records or [])
         trace_grounding_repair_actions = list(grounding_repair_actions or [])
         saliency_derived: List[HornAtom] = []
@@ -5893,6 +5902,9 @@ class OMENScale(nn.Module):
             trace_grounding_hypotheses.extend(list(getattr(grounding_source, "grounding_hypotheses", ())))
             trace_grounding_verification_records.extend(
                 list(getattr(grounding_source, "grounding_verification_records", ()))
+            )
+            trace_grounding_hidden_cause_records.extend(
+                list(getattr(grounding_source, "grounding_hidden_cause_records", ()))
             )
             trace_grounding_validation_records.extend(
                 list(getattr(grounding_source, "grounding_validation_records", ()))
@@ -6013,6 +6025,7 @@ class OMENScale(nn.Module):
             grounding_world_state_contradicted_facts=trace_grounding_world_state_contradicted_facts,
             grounding_hypotheses=trace_grounding_hypotheses,
             grounding_verification_records=trace_grounding_verification_records,
+            grounding_hidden_cause_records=trace_grounding_hidden_cause_records,
             grounding_validation_records=trace_grounding_validation_records,
             grounding_repair_actions=trace_grounding_repair_actions,
             saliency_derived_facts=saliency_derived,
@@ -6048,6 +6061,7 @@ class OMENScale(nn.Module):
                 "grounding_world_state_contradicted_facts": float(len(trace_grounding_world_state_contradicted_facts)),
                 "grounding_hypotheses": float(len(trace_grounding_hypotheses)),
                 "grounding_verification_records": float(len(trace_grounding_verification_records)),
+                "grounding_hidden_cause_records": float(len(trace_grounding_hidden_cause_records)),
                 "grounding_validation_records": float(len(trace_grounding_validation_records)),
                 "grounding_repair_actions": float(len(trace_grounding_repair_actions)),
                 "grounding_facts": float(len(grounding_derived)),
@@ -6098,6 +6112,7 @@ class OMENScale(nn.Module):
         grounding_world_state_contradicted_facts: Optional[Sequence[HornAtom]] = None,
         grounding_hypotheses: Optional[Sequence[object]] = None,
         grounding_verification_records: Optional[Sequence[object]] = None,
+        grounding_hidden_cause_records: Optional[Sequence[object]] = None,
         grounding_validation_records: Optional[Sequence[object]] = None,
         grounding_repair_actions: Optional[Sequence[object]] = None,
         saliency_out: Optional[object] = None,
@@ -6118,6 +6133,7 @@ class OMENScale(nn.Module):
         trace_grounding_world_state_contradicted_facts = list(grounding_world_state_contradicted_facts or [])
         trace_grounding_hypotheses = list(grounding_hypotheses or [])
         trace_grounding_verification_records = list(grounding_verification_records or [])
+        trace_grounding_hidden_cause_records = list(grounding_hidden_cause_records or [])
         trace_grounding_validation_records = list(grounding_validation_records or [])
         trace_grounding_repair_actions = list(grounding_repair_actions or [])
         saliency_derived: List[HornAtom] = []
@@ -6178,6 +6194,9 @@ class OMENScale(nn.Module):
             trace_grounding_hypotheses.extend(list(getattr(grounding_source, "grounding_hypotheses", ())))
             trace_grounding_verification_records.extend(
                 list(getattr(grounding_source, "grounding_verification_records", ()))
+            )
+            trace_grounding_hidden_cause_records.extend(
+                list(getattr(grounding_source, "grounding_hidden_cause_records", ()))
             )
             trace_grounding_validation_records.extend(
                 list(getattr(grounding_source, "grounding_validation_records", ()))
@@ -6249,6 +6268,7 @@ class OMENScale(nn.Module):
             grounding_world_state_contradicted_facts=trace_grounding_world_state_contradicted_facts,
             grounding_hypotheses=trace_grounding_hypotheses,
             grounding_verification_records=trace_grounding_verification_records,
+            grounding_hidden_cause_records=trace_grounding_hidden_cause_records,
             grounding_validation_records=trace_grounding_validation_records,
             grounding_repair_actions=trace_grounding_repair_actions,
             saliency_derived_facts=saliency_derived,
@@ -6277,6 +6297,7 @@ class OMENScale(nn.Module):
                 "grounding_world_state_contradicted_facts": float(len(trace_grounding_world_state_contradicted_facts)),
                 "grounding_hypotheses": float(len(trace_grounding_hypotheses)),
                 "grounding_verification_records": float(len(trace_grounding_verification_records)),
+                "grounding_hidden_cause_records": float(len(trace_grounding_hidden_cause_records)),
                 "grounding_validation_records": float(len(trace_grounding_validation_records)),
                 "grounding_repair_actions": float(len(trace_grounding_repair_actions)),
                 "grounding_facts": float(len(grounding_derived)),
@@ -7468,6 +7489,7 @@ class OMENScale(nn.Module):
             len(task_context.grounding_world_state_contradicted_facts)
         )
         out["sym_grounding_verification_records"] = float(len(task_context.grounding_verification_records))
+        out["sym_grounding_hidden_cause_records"] = float(len(task_context.grounding_hidden_cause_records))
         out["sym_grounding_validation_records"] = float(len(task_context.grounding_validation_records))
         out["sym_grounding_repair_actions"] = float(len(task_context.grounding_repair_actions))
         out["sym_grounding_hypotheses"] = float(len(task_context.grounding_hypotheses))
@@ -7637,6 +7659,9 @@ class OMENScale(nn.Module):
         out["sym_trace_grounding_ontology_records"] = float(
             task_context.metadata.get("trace_grounding_ontology_records", 0.0)
         )
+        out["sym_trace_grounding_hidden_cause_records"] = float(
+            task_context.metadata.get("trace_grounding_hidden_cause_records", 0.0)
+        )
         out["sym_trace_grounding_ontology_facts"] = float(
             task_context.metadata.get("trace_grounding_ontology_facts", 0.0)
         )
@@ -7772,6 +7797,12 @@ class OMENScale(nn.Module):
         out["planner_state_hidden_cause_candidates"] = float(
             planner_state_summary.get("planner_state_hidden_cause_candidates", 0.0)
         )
+        out["planner_state_hidden_cause_records"] = float(
+            planner_state_summary.get("planner_state_hidden_cause_records", 0.0)
+        )
+        out["planner_state_hidden_cause_operators"] = float(
+            planner_state_summary.get("planner_state_hidden_cause_operators", 0.0)
+        )
         out["planner_state_goal_facts"] = float(planner_state_summary.get("planner_state_goal_facts", 0.0))
         out["planner_state_resources"] = float(planner_state_summary.get("planner_state_resources", 0.0))
         out["planner_state_resource_records"] = float(
@@ -7886,6 +7917,9 @@ class OMENScale(nn.Module):
         )
         out["world_graph_grounding_verification_records"] = float(
             world_graph_batch.metadata.get("grounding_verification_records", 0.0)
+        )
+        out["world_graph_grounding_hidden_cause_records"] = float(
+            world_graph_batch.metadata.get("grounding_hidden_cause_records", 0.0)
         )
         out["world_graph_grounding_validation_records"] = float(
             world_graph_batch.metadata.get("grounding_validation_records", 0.0)

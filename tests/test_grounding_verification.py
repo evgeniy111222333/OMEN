@@ -88,9 +88,19 @@ class GroundingVerificationTest(unittest.TestCase):
 
         self.assertEqual(report.metadata.get("verification_conflicted_hypotheses"), 1.0)
         self.assertGreaterEqual(report.metadata.get("verification_hidden_cause_pressure", 0.0), 1.0)
+        self.assertEqual(report.metadata.get("verification_hidden_cause_records"), 1.0)
         self.assertEqual(report.records[0].verification_status, "conflicted")
         self.assertTrue(report.records[0].hidden_cause_candidate)
         self.assertEqual(report.records[0].repair_action, "trigger_hidden_cause_abduction")
+        self.assertEqual(len(report.hidden_cause_records), 1)
+        hidden = report.hidden_cause_records[0]
+        self.assertEqual(hidden.trigger_hypothesis_id, "rel:door")
+        self.assertEqual(hidden.missing_slot, "cause")
+        self.assertEqual(hidden.symbols[:3], ("door_5", "requires_hidden_cause", "missing_opens_with_event_green_card"))
+        self.assertIn("candidate_agent:external_actor", hidden.symbols)
+        self.assertIn("anchor_predicate:opens_with", hidden.symbols)
+        self.assertIn("anchor_object:green_card", hidden.symbols)
+        self.assertTrue(any(item.startswith("trigger_hypothesis:rel:door") for item in hidden.provenance))
 
     def test_verification_uses_document_scene_and_interlingua_alignment(self) -> None:
         result = ground_text_to_symbolic(

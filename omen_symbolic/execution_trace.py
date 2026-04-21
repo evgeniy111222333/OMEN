@@ -72,6 +72,7 @@ class SymbolicExecutionTraceBundle:
     grounding_hypotheses: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_candidate_rules: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_verification_records: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_hidden_cause_records: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_validation_records: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_repair_actions: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_world_state_records: Tuple[Any, ...] = field(default_factory=tuple)
@@ -95,6 +96,7 @@ class GroundingRuntimeArtifacts:
     grounding_hypotheses: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_candidate_rules: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_verification_records: Tuple[Any, ...] = field(default_factory=tuple)
+    grounding_hidden_cause_records: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_validation_records: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_repair_actions: Tuple[Any, ...] = field(default_factory=tuple)
     grounding_world_state_records: Tuple[Any, ...] = field(default_factory=tuple)
@@ -132,6 +134,7 @@ def _has_grounding_runtime_artifacts(artifacts: Optional[GroundingRuntimeArtifac
             artifacts.grounding_hypotheses,
             artifacts.grounding_candidate_rules,
             artifacts.grounding_verification_records,
+            artifacts.grounding_hidden_cause_records,
             artifacts.grounding_validation_records,
             artifacts.grounding_repair_actions,
             artifacts.grounding_world_state_records,
@@ -199,6 +202,7 @@ def _build_grounding_runtime_artifacts(
         grounding_hypotheses=tuple(pipeline.compiled.hypotheses),
         grounding_candidate_rules=tuple(getattr(pipeline.compiled, "candidate_rules", ()) or ()),
         grounding_verification_records=tuple(pipeline.verification.records),
+        grounding_hidden_cause_records=tuple(getattr(pipeline.verification, "hidden_cause_records", ()) or ()),
         grounding_validation_records=tuple(pipeline.verifier_stack.validation_records),
         grounding_repair_actions=tuple(pipeline.verifier_stack.repair_actions),
         grounding_world_state_records=tuple(pipeline.world_state.records),
@@ -1479,6 +1483,7 @@ class _ObservationTraceBuilder:
             grounding_hypotheses=artifacts.grounding_hypotheses,
             grounding_candidate_rules=artifacts.grounding_candidate_rules,
             grounding_verification_records=artifacts.grounding_verification_records,
+            grounding_hidden_cause_records=artifacts.grounding_hidden_cause_records,
             grounding_validation_records=artifacts.grounding_validation_records,
             grounding_repair_actions=artifacts.grounding_repair_actions,
             grounding_world_state_records=artifacts.grounding_world_state_records,

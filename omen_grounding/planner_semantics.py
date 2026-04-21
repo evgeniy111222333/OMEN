@@ -81,7 +81,7 @@ def _resource_candidates(record: Any) -> Tuple[str, ...]:
     record_type = _record_type(record)
     symbols = _record_symbols(record)
     annotations = _record_annotations(record)
-    if record_type == "relation" and len(symbols) >= 3:
+    if record_type in {"relation", "hidden_cause"} and len(symbols) >= 3:
         extra = tuple(annotations.get("if", ())) + tuple(annotations.get("cause", ())) + tuple(annotations.get("time", ()))
         return (symbols[0], symbols[2], *extra)
     if record_type == "state" and len(symbols) >= 1:
@@ -160,7 +160,7 @@ def build_planner_operators(
 ) -> Tuple[PlannerOperator, ...]:
     operators: List[PlannerOperator] = []
     for record in records:
-        if _record_type(record) != "relation":
+        if _record_type(record) not in {"relation", "hidden_cause"}:
             continue
         symbols = _record_symbols(record)
         if len(symbols) < 3:
@@ -214,7 +214,7 @@ def build_planner_alternative_worlds(
         operator_ids = [
             str(getattr(record, "record_id", ""))
             for record in records
-            if _record_type(record) == "relation"
+            if _record_type(record) in {"relation", "hidden_cause"}
         ]
         contradiction_symbols = [
             " | ".join(_record_symbols(record))
@@ -246,7 +246,7 @@ def build_planner_alternative_worlds(
                     [
                         str(getattr(record, "record_id", ""))
                         for record in active_records
-                        if _record_type(record) == "relation"
+                        if _record_type(record) in {"relation", "hidden_cause"}
                     ],
                     limit=limit * 8,
                 ),

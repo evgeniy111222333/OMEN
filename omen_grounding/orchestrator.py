@@ -195,6 +195,7 @@ def run_grounding_orchestrator(
     corroboration = grounding_memory_corroboration(
         tuple(pipeline.world_state.records)
         + tuple(pipeline.verification.records)
+        + tuple(getattr(pipeline.verification, "hidden_cause_records", ()) or ())
         + tuple(pipeline.verifier_stack.validation_records)
         + tuple(pipeline.verifier_stack.repair_actions)
         + tuple(pipeline.compiled.hypotheses),

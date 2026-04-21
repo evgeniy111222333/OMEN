@@ -324,6 +324,16 @@ class PlannerWorldState:
             "planner_state_hidden_cause_candidates",
             float(sum(1 for record in self.verification_records if bool(getattr(record, "hidden_cause_candidate", False)))),
         )
+        summary.setdefault(
+            "planner_state_hidden_cause_records",
+            float(
+                sum(
+                    1
+                    for record in (*self.active_records, *self.hypothetical_records, *self.contradicted_records)
+                    if _record_type(record) == "hidden_cause"
+                )
+            ),
+        )
         summary.setdefault("planner_state_hypothesis_records", float(len(self.hypothesis_records)))
         summary.setdefault("planner_state_grounding_candidate_rules", float(len(self.candidate_rules)))
         summary.setdefault(
@@ -399,6 +409,10 @@ class PlannerWorldState:
         summary.setdefault(
             "planner_state_modal_operators",
             float(sum(1 for operator in self.operators if operator.modality)),
+        )
+        summary.setdefault(
+            "planner_state_hidden_cause_operators",
+            float(sum(1 for operator in self.operators if operator.predicate == "requires_hidden_cause")),
         )
         summary.setdefault(
             "planner_state_active_operators",
@@ -608,6 +622,13 @@ def build_planner_world_state(task_context: Any) -> PlannerWorldState:
         "planner_state_hidden_cause_candidates": float(
             sum(1 for record in verification_records if bool(getattr(record, "hidden_cause_candidate", False)))
         ),
+        "planner_state_hidden_cause_records": float(
+            sum(
+                1
+                for record in (*active_records, *hypothetical_records, *contradicted_records)
+                if _record_type(record) == "hidden_cause"
+            )
+        ),
         "planner_state_hypothesis_records": float(len(hypothesis_records)),
         "planner_state_deferred_hypotheses": float(
             sum(1 for record in hypothesis_records if bool(getattr(record, "deferred", False)))
@@ -653,6 +674,9 @@ def build_planner_world_state(task_context: Any) -> PlannerWorldState:
         "planner_state_causal_operators": float(sum(1 for operator in operators if operator.causes)),
         "planner_state_temporal_operators": float(sum(1 for operator in operators if operator.temporals)),
         "planner_state_modal_operators": float(sum(1 for operator in operators if operator.modality)),
+        "planner_state_hidden_cause_operators": float(
+            sum(1 for operator in operators if operator.predicate == "requires_hidden_cause")
+        ),
         "planner_state_active_operators": float(sum(1 for operator in operators if operator.status == "active")),
         "planner_state_hypothetical_operators": float(
             sum(1 for operator in operators if operator.status == "hypothetical")

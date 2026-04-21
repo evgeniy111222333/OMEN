@@ -72,6 +72,11 @@ CASES: Sequence[GroundingBenchmarkCase] = (
         language="text",
         text="Rule all stars generate planets.",
     ),
+    GroundingBenchmarkCase(
+        name="hidden_cause_door",
+        language="text",
+        text="door opens but no green card",
+    ),
 )
 
 
@@ -113,8 +118,14 @@ def _benchmark_pipeline(case: GroundingBenchmarkCase, *, iterations: int, max_se
             result.world_state.metadata.get("grounding_world_state_nonasserted_records", 0.0)
         ),
         "verification_records": float(result.verification.metadata.get("verification_records", 0.0)),
+        "verification_hidden_cause_records": float(
+            result.verification.metadata.get("verification_hidden_cause_records", 0.0)
+        ),
         "verification_nonasserted_pressure": float(
             result.verification.metadata.get("verification_nonasserted_pressure", 0.0)
+        ),
+        "world_state_hidden_cause_records": float(
+            result.world_state.metadata.get("grounding_world_state_hidden_cause_records", 0.0)
         ),
         "char_cov": float(result.document.metadata.get("grounding_span_char_coverage", 0.0)),
         "byte_cov": float(result.document.metadata.get("grounding_span_byte_coverage", 0.0)),
@@ -136,6 +147,7 @@ def _benchmark_trace(case: GroundingBenchmarkCase, *, iterations: int) -> Dict[s
         "trace_grounding_facts": float(bundle.metadata.get("grounding_facts", 0.0)),
         "trace_interlingua_relations": float(bundle.metadata.get("interlingua_relations", 0.0)),
         "trace_validation_records": float(bundle.metadata.get("verifier_stack_records", 0.0)),
+        "trace_hidden_cause_records": float(bundle.metadata.get("verification_hidden_cause_records", 0.0)),
         "trace_byte_span": float(bundle.metadata.get("grounding_byte_span_traceability", 0.0)),
         "parser_ag": float(bundle.metadata.get("grounding_parser_agreement", 0.0)),
     }
@@ -163,6 +175,8 @@ def main() -> None:
         "coref".rjust(8),
         "attr".rjust(8),
         "nonasrt".rjust(8),
+        "hcause".rjust(8),
+        "hcwld".rjust(8),
         "rules".rjust(8),
         "hyp".rjust(8),
         "world".rjust(8),
@@ -187,6 +201,8 @@ def main() -> None:
             f"{pipeline_stats['scene_coreference_links']:.0f}".rjust(8),
             f"{pipeline_stats['compiled_attributed_hypotheses']:.0f}".rjust(8),
             f"{pipeline_stats['compiled_nonasserted_hypotheses']:.0f}".rjust(8),
+            f"{pipeline_stats['verification_hidden_cause_records']:.0f}".rjust(8),
+            f"{pipeline_stats['world_state_hidden_cause_records']:.0f}".rjust(8),
             f"{pipeline_stats['compiled_candidate_rules']:.0f}".rjust(8),
             f"{pipeline_stats['compiled_hypotheses']:.0f}".rjust(8),
             f"{pipeline_stats['world_state_records']:.0f}".rjust(8),

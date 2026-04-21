@@ -72,9 +72,56 @@ class GroundingVerificationRecord:
         ).strip()
 
 
+@dataclass(frozen=True)
+class GroundingHiddenCauseRecord:
+    proposal_id: str
+    trigger_hypothesis_id: str
+    source_segment: int
+    symbols: Tuple[str, ...] = field(default_factory=tuple)
+    source_span: Optional[GroundingSpan] = None
+    support: float = 0.0
+    conflict: float = 0.0
+    confidence: float = 0.0
+    missing_slot: str = "cause"
+    candidate_agent: str = ""
+    candidate_event: str = ""
+    reason: str = ""
+    provenance: Tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def graph_key(self) -> str:
+        return f"grounding_hidden_cause:{self.proposal_id}"
+
+    @property
+    def graph_terms(self) -> Tuple[str, ...]:
+        terms = [*self.symbols, "hidden_cause"]
+        if self.missing_slot:
+            terms.append(f"missing_slot:{self.missing_slot}")
+        if self.candidate_agent:
+            terms.append(f"candidate_agent:{self.candidate_agent}")
+        if self.candidate_event:
+            terms.append(f"candidate_event:{self.candidate_event}")
+        if self.reason:
+            terms.append(f"reason:{self.reason}")
+        return tuple(str(term) for term in terms if str(term).strip())
+
+    @property
+    def graph_family(self) -> str:
+        return "grounding_hidden_cause"
+
+    @property
+    def graph_text(self) -> str:
+        symbols = " | ".join(self.symbols)
+        return (
+            f"hidden_cause support={self.support:.2f} conflict={self.conflict:.2f} "
+            f"confidence={self.confidence:.2f} reason={self.reason} {symbols}"
+        ).strip()
+
+
 @dataclass
 class GroundingVerificationReport:
     records: Tuple[GroundingVerificationRecord, ...] = field(default_factory=tuple)
+    hidden_cause_records: Tuple[GroundingHiddenCauseRecord, ...] = field(default_factory=tuple)
     metadata: Dict[str, float] = field(default_factory=dict)
 
 
@@ -131,6 +178,11 @@ def _normalize_symbol(value: object) -> str:
     return text.strip("_")
 
 
+def _normalized_or(value: object, fallback: str) -> str:
+    normalized = _normalize_symbol(value)
+    return normalized or fallback
+
+
 def _claim_id_from_provenance(hypothesis: CompiledSymbolicHypothesis) -> str:
     prefix = f"{str(hypothesis.kind)}:"
     for item in hypothesis.provenance:
@@ -138,6 +190,101 @@ def _claim_id_from_provenance(hypothesis: CompiledSymbolicHypothesis) -> str:
         if text.startswith(prefix):
             return text[len(prefix) :]
     return ""
+
+
+def _hidden_cause_reason(
+    *,
+    segment_counterexample: float,
+    polarity_conflict: float,
+    conflict_hint: float,
+) -> str:
+    if segment_counterexample > 0.0:
+        return "counterexample_gap"
+    if polarity_conflict > 0.0:
+        return "polarity_split"
+    if conflict_hint > 0.0:
+        return "conflict_context"
+    return "low_support_gap"
+
+
+def _build_hidden_cause_record(
+    hypothesis: CompiledSymbolicHypothesis,
+    *,
+    support: float,
+    conflict: float,
+    segment_counterexample: float,
+    polarity_conflict: float,
+    conflict_hint: float,
+    causal_support: float,
+) -> GroundingHiddenCauseRecord:
+    symbols = tuple(str(item) for item in hypothesis.symbols if str(item).strip())
+    subject = symbols[0] if len(symbols) >= 1 else "context"
+    predicate = symbols[1] if len(symbols) >= 2 else "state_change"
+    object_ = symbols[2] if len(symbols) >= 3 else "unknown_target"
+    predicate_key = _normalized_or(predicate, "state_change")
+    object_key = _normalized_or(object_, "unknown_target")
+    candidate_event = f"missing_{predicate_key}_event"
+    if object_key and object_key != "unknown_target":
+        candidate_event = f"{candidate_event}_{object_key}"
+    candidate_agent = (
+        "external_actor"
+        if predicate_key in {"opens", "opens_with", "unlocks", "activates", "starts", "triggers"}
+        else "unknown_agent"
+    )
+    reason = _hidden_cause_reason(
+        segment_counterexample=segment_counterexample,
+        polarity_conflict=polarity_conflict,
+        conflict_hint=conflict_hint,
+    )
+    proposal_support = _clip01(
+        0.30
+        + (0.25 * segment_counterexample)
+        + (0.20 * polarity_conflict)
+        + (0.15 * conflict_hint)
+        + (0.10 * float(bool(hypothesis.deferred)))
+    )
+    proposal_conflict = _clip01(
+        (0.22 * (1.0 - _clip01(hypothesis.confidence)))
+        + (0.12 * max(0.0, 1.0 - causal_support))
+        + (0.06 * max(0.0, support - 0.55))
+    )
+    proposal_confidence = _clip01(
+        0.34
+        + (0.24 * conflict)
+        + (0.16 * (1.0 - support))
+        + (0.12 * segment_counterexample)
+        + (0.08 * polarity_conflict)
+        + (0.06 * conflict_hint)
+    )
+    proposal_symbols = (
+        str(subject),
+        "requires_hidden_cause",
+        candidate_event,
+        "missing_slot:cause",
+        f"candidate_agent:{candidate_agent}",
+        f"candidate_event:{candidate_event}",
+        f"anchor_predicate:{predicate_key}",
+        f"anchor_object:{object_key}",
+    )
+    provenance = tuple(str(item) for item in hypothesis.provenance) + (
+        f"trigger_hypothesis:{hypothesis.hypothesis_id}",
+        f"hidden_cause_reason:{reason}",
+    )
+    return GroundingHiddenCauseRecord(
+        proposal_id=f"hidden_cause:{hypothesis.hypothesis_id}",
+        trigger_hypothesis_id=str(hypothesis.hypothesis_id),
+        source_segment=int(hypothesis.segment_index),
+        symbols=proposal_symbols,
+        source_span=hypothesis.source_span,
+        support=proposal_support,
+        conflict=proposal_conflict,
+        confidence=proposal_confidence,
+        missing_slot="cause",
+        candidate_agent=candidate_agent,
+        candidate_event=candidate_event,
+        reason=reason,
+        provenance=provenance,
+    )
 
 
 def _structural_evidence_scores(
@@ -357,6 +504,7 @@ def verify_symbolic_hypotheses(
     if not compilation.hypotheses:
         return GroundingVerificationReport(
             records=tuple(),
+            hidden_cause_records=tuple(),
             metadata={
                 "verification_records": 0.0,
                 "verification_supported_hypotheses": 0.0,
@@ -373,6 +521,9 @@ def verify_symbolic_hypotheses(
                 "verification_nonasserted_pressure": 0.0,
                 "verification_scene_alignment": 0.0,
                 "verification_interlingua_alignment": 0.0,
+                "verification_hidden_cause_records": 0.0,
+                "verification_hidden_cause_mean_confidence": 0.0,
+                "verification_hidden_cause_mean_support": 0.0,
             },
         )
 
@@ -380,6 +531,7 @@ def verify_symbolic_hypotheses(
     relation_polarities = _relation_polarity_groups(compilation.hypotheses)
     counterexample_by_segment = _segment_counterexample_map(compilation)
     records: List[GroundingVerificationRecord] = []
+    hidden_cause_records: List[GroundingHiddenCauseRecord] = []
     document_alignments: List[float] = []
     structural_alignments: List[float] = []
     structural_provenances: List[float] = []
@@ -500,6 +652,18 @@ def verify_symbolic_hypotheses(
         ):
             status = "conflicted"
         repair_action = _repair_action(status, hidden_cause_candidate=hidden_cause_candidate)
+        if hidden_cause_candidate:
+            hidden_cause_records.append(
+                _build_hidden_cause_record(
+                    hypothesis,
+                    support=support,
+                    conflict=conflict,
+                    segment_counterexample=segment_counterexample,
+                    polarity_conflict=polarity_conflict,
+                    conflict_hint=conflict_hint,
+                    causal_support=causal_support,
+                )
+            )
         records.append(
             GroundingVerificationRecord(
                 hypothesis_id=str(hypothesis.hypothesis_id),
@@ -527,6 +691,7 @@ def verify_symbolic_hypotheses(
     hidden_cause = sum(1 for record in records if record.hidden_cause_candidate)
     repair_actions = sum(1 for record in records if record.repair_action != "accept_to_world_state")
     total = float(len(records))
+    hidden_total = float(len(hidden_cause_records))
     metadata = {
         "verification_records": total,
         "verification_supported_hypotheses": float(supported),
@@ -583,8 +748,18 @@ def verify_symbolic_hypotheses(
             sum(interlingua_alignments) / max(total, 1.0)
             if interlingua_alignments else 0.0
         ),
+        "verification_hidden_cause_records": hidden_total,
+        "verification_hidden_cause_mean_confidence": (
+            sum(float(record.confidence) for record in hidden_cause_records) / max(hidden_total, 1.0)
+            if hidden_cause_records else 0.0
+        ),
+        "verification_hidden_cause_mean_support": (
+            sum(float(record.support) for record in hidden_cause_records) / max(hidden_total, 1.0)
+            if hidden_cause_records else 0.0
+        ),
     }
     return GroundingVerificationReport(
         records=tuple(records),
+        hidden_cause_records=tuple(hidden_cause_records),
         metadata=metadata,
     )
