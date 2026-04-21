@@ -5,6 +5,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from .heuristic_policy import is_heuristic_claim_source
 from .interlingua_types import CanonicalInterlingua
 from .scene_types import SemanticSceneGraph
 from .symbolic_compiler import CompiledSymbolicHypothesis, SymbolicCompilationResult
@@ -160,9 +161,11 @@ def _status_from_scores(support: float, conflict: float) -> str:
     return "deferred"
 
 
-def _repair_action(status: str, *, hidden_cause_candidate: bool) -> str:
+def _repair_action(status: str, *, hidden_cause_candidate: bool, heuristic_only: bool = False) -> str:
     if hidden_cause_candidate:
         return "trigger_hidden_cause_abduction"
+    if heuristic_only:
+        return "require_grounding_confirmation"
     if status == "conflicted":
         return "preserve_conflict_scope"
     if status == "deferred":
@@ -174,7 +177,7 @@ def _normalize_symbol(value: object) -> str:
     text = str(value or "").strip().casefold()
     if not text:
         return ""
-    text = re.sub(r"[^0-9a-z]+", "_", text)
+    text = re.sub(r"[\W_]+", "_", text, flags=re.UNICODE)
     return text.strip("_")
 
 
@@ -192,19 +195,124 @@ def _claim_id_from_provenance(hypothesis: CompiledSymbolicHypothesis) -> str:
     return ""
 
 
+def _shares_fragment_stem(left: str, right: str) -> bool:
+    left_text = str(left or "").strip()
+    right_text = str(right or "").strip()
+    common = min(len(left_text), len(right_text), 6)
+    if common < 4:
+        return False
+    return any(
+        left_text[:stem_len] == right_text[:stem_len]
+        for stem_len in range(common, 3, -1)
+    )
+
+
+def _counterexample_overlap_score(
+    hypothesis: CompiledSymbolicHypothesis,
+    document: Optional[GroundedTextDocument],
+) -> float:
+    if document is None or hypothesis.kind != "relation":
+        return 0.0
+    anchor_fragments: List[str] = []
+    for symbol in hypothesis.symbols[:3]:
+        normalized = _normalize_symbol(symbol)
+        if not normalized:
+            continue
+        anchor_fragments.append(normalized)
+        anchor_fragments.extend(
+            part
+            for part in normalized.split("_")
+            if len(part) >= 4
+        )
+    anchors = tuple(dict.fromkeys(anchor_fragments))
+    if not anchors:
+        return 0.0
+    best = 0.0
+    for segment in document.segments:
+        if (
+            not getattr(segment, "counterexample", False)
+            or int(getattr(segment, "index", -1)) == int(hypothesis.segment_index)
+        ):
+            continue
+        segment_tokens: List[str] = []
+        normalized_text = _normalize_symbol(
+            getattr(segment, "normalized_text", "") or getattr(segment, "text", "")
+        )
+        if normalized_text:
+            segment_tokens.append(normalized_text)
+            segment_tokens.extend(
+                part
+                for part in normalized_text.split("_")
+                if len(part) >= 4
+            )
+        for token in getattr(segment, "tokens", ()):
+            normalized_token = _normalize_symbol(token)
+            if normalized_token:
+                segment_tokens.append(normalized_token)
+        for unit in getattr(segment, "structural_units", ()) or ():
+            normalized_unit = _normalize_symbol(getattr(unit, "text", ""))
+            if normalized_unit:
+                segment_tokens.append(normalized_unit)
+                segment_tokens.extend(
+                    part
+                    for part in normalized_unit.split("_")
+                    if len(part) >= 4
+                )
+        candidates = tuple(dict.fromkeys(segment_tokens))
+        if not candidates:
+            continue
+        matched = sum(
+            1
+            for anchor in anchors
+            if any(
+                anchor == candidate
+                or anchor in candidate
+                or candidate in anchor
+                or _shares_fragment_stem(anchor, candidate)
+                for candidate in candidates
+            )
+        )
+        best = max(best, float(matched) / max(float(len(anchors)), 1.0))
+    return _clip01(best)
+
+
 def _hidden_cause_reason(
     *,
     segment_counterexample: float,
+    counterexample_overlap: float,
     polarity_conflict: float,
+    negative_polarity: float,
     conflict_hint: float,
 ) -> str:
     if segment_counterexample > 0.0:
         return "counterexample_gap"
+    if counterexample_overlap > 0.0:
+        return "latent_counterexample_overlap"
     if polarity_conflict > 0.0:
         return "polarity_split"
+    if negative_polarity > 0.0:
+        return "negative_polarity_gap"
     if conflict_hint > 0.0:
         return "conflict_context"
     return "low_support_gap"
+
+
+def _predicate_supports_hidden_cause(hypothesis: CompiledSymbolicHypothesis) -> bool:
+    if len(hypothesis.symbols) < 2:
+        return False
+    predicate_key = _normalized_or(hypothesis.symbols[1], "")
+    return predicate_key in {
+        "opens",
+        "opens_with",
+        "unlocks",
+        "activates",
+        "starts",
+        "triggers",
+        "causes",
+        "creates",
+        "generates",
+        "becomes",
+    }
 
 
 def _build_hidden_cause_record(
@@ -213,7 +321,9 @@ def _build_hidden_cause_record(
     support: float,
     conflict: float,
     segment_counterexample: float,
+    counterexample_overlap: float,
     polarity_conflict: float,
+    negative_polarity: float,
     conflict_hint: float,
     causal_support: float,
 ) -> GroundingHiddenCauseRecord:
@@ -233,13 +343,17 @@ def _build_hidden_cause_record(
     )
     reason = _hidden_cause_reason(
         segment_counterexample=segment_counterexample,
+        counterexample_overlap=counterexample_overlap,
         polarity_conflict=polarity_conflict,
+        negative_polarity=negative_polarity,
         conflict_hint=conflict_hint,
     )
     proposal_support = _clip01(
         0.30
         + (0.25 * segment_counterexample)
+        + (0.18 * counterexample_overlap)
         + (0.20 * polarity_conflict)
+        + (0.15 * negative_polarity)
         + (0.15 * conflict_hint)
         + (0.10 * float(bool(hypothesis.deferred)))
     )
@@ -253,7 +367,9 @@ def _build_hidden_cause_record(
         + (0.24 * conflict)
         + (0.16 * (1.0 - support))
         + (0.12 * segment_counterexample)
+        + (0.10 * counterexample_overlap)
         + (0.08 * polarity_conflict)
+        + (0.06 * negative_polarity)
         + (0.06 * conflict_hint)
     )
     proposal_symbols = (
@@ -524,6 +640,7 @@ def verify_symbolic_hypotheses(
                 "verification_hidden_cause_records": 0.0,
                 "verification_hidden_cause_mean_confidence": 0.0,
                 "verification_hidden_cause_mean_support": 0.0,
+                "verification_heuristic_records": 0.0,
             },
         )
 
@@ -581,10 +698,13 @@ def verify_symbolic_hypotheses(
             epistemic_conflict = 0.12
         scene_alignment = _scene_alignment_score(hypothesis, scene)
         interlingua_alignment = _interlingua_alignment_score(hypothesis, interlingua)
+        heuristic_claim = is_heuristic_claim_source(getattr(hypothesis, "claim_source", ""))
         polarity_conflict = 1.0 if (
             hypothesis.kind == "relation"
             and len(relation_polarities.get(tuple(hypothesis.symbols), ())) > 1
         ) else 0.0
+        counterexample_overlap = _counterexample_overlap_score(hypothesis, document)
+        negative_polarity = 1.0 if str(hypothesis.conflict_tag or "") == "negative_polarity" else 0.0
         conflict_hint = 1.0 if (
             str(hypothesis.conflict_tag or "") not in {"", "negative_polarity"}
         ) else 0.0
@@ -609,11 +729,13 @@ def verify_symbolic_hypotheses(
             + (0.06 * scene_alignment)
             + (0.06 * interlingua_alignment)
             + kind_bonus
+            - (0.08 * negative_polarity)
         )
         conflict = _clip01(
             (0.30 * float(bool(hypothesis.deferred)))
             + (0.25 * segment_counterexample)
             + (0.20 * polarity_conflict)
+            + (0.18 * negative_polarity)
             + (0.15 * low_confidence)
             + (0.10 * conflict_hint)
             + (0.12 * epistemic_conflict)
@@ -629,6 +751,9 @@ def verify_symbolic_hypotheses(
             - (0.03 * conditional_support)
             - (0.02 * temporal_support)
         )
+        if heuristic_claim:
+            support = min(support, 0.54)
+            conflict = max(conflict, 0.18)
         document_alignments.append(float(document_alignment))
         structural_alignments.append(float(structural_alignment))
         structural_provenances.append(float(structural_provenance))
@@ -640,7 +765,13 @@ def verify_symbolic_hypotheses(
         interlingua_alignments.append(float(interlingua_alignment))
         hidden_cause_candidate = bool(
             hypothesis.kind == "relation"
-            and (segment_counterexample > 0.0 or polarity_conflict > 0.0 or conflict_hint > 0.0)
+            and (
+                segment_counterexample > 0.0
+                or polarity_conflict > 0.0
+                or negative_polarity > 0.0
+                or conflict_hint > 0.0
+            )
+            and not heuristic_claim
             and causal_support <= 0.0
             and support < 0.80
         )
@@ -648,18 +779,53 @@ def verify_symbolic_hypotheses(
         if (
             status == "deferred"
             and conflict >= 0.55
-            and (segment_counterexample > 0.0 or conflict_hint > 0.0 or polarity_conflict > 0.0)
+            and (
+                segment_counterexample > 0.0
+                or conflict_hint > 0.0
+                or polarity_conflict > 0.0
+                or negative_polarity > 0.0
+            )
         ):
             status = "conflicted"
-        repair_action = _repair_action(status, hidden_cause_candidate=hidden_cause_candidate)
-        if hidden_cause_candidate:
+        heuristic_gap_signal = bool(
+            heuristic_claim
+            and hypothesis.kind == "relation"
+            and causal_support <= 0.0
+            and (
+                counterexample_overlap > 0.0
+                or (
+                    _predicate_supports_hidden_cause(hypothesis)
+                    and (
+                        segment_counterexample > 0.0
+                        or polarity_conflict > 0.0
+                        or negative_polarity > 0.0
+                        or conflict_hint > 0.0
+                    )
+                )
+            )
+        )
+        if (
+            heuristic_claim
+            and status in {"supported", "conflicted"}
+        ):
+            status = "deferred"
+        elif status == "supported" and hidden_cause_candidate:
+            status = "deferred"
+        repair_action = _repair_action(
+            status,
+            hidden_cause_candidate=hidden_cause_candidate,
+            heuristic_only=heuristic_claim,
+        )
+        if hidden_cause_candidate or heuristic_gap_signal:
             hidden_cause_records.append(
                 _build_hidden_cause_record(
                     hypothesis,
                     support=support,
                     conflict=conflict,
                     segment_counterexample=segment_counterexample,
+                    counterexample_overlap=counterexample_overlap,
                     polarity_conflict=polarity_conflict,
+                    negative_polarity=negative_polarity,
                     conflict_hint=conflict_hint,
                     causal_support=causal_support,
                 )
@@ -689,6 +855,9 @@ def verify_symbolic_hypotheses(
     deferred = sum(1 for record in records if record.verification_status == "deferred")
     conflicted = sum(1 for record in records if record.verification_status == "conflicted")
     hidden_cause = sum(1 for record in records if record.hidden_cause_candidate)
+    heuristic_total = sum(
+        1 for hypothesis in compilation.hypotheses if is_heuristic_claim_source(getattr(hypothesis, "claim_source", ""))
+    )
     repair_actions = sum(1 for record in records if record.repair_action != "accept_to_world_state")
     total = float(len(records))
     hidden_total = float(len(hidden_cause_records))
@@ -757,6 +926,7 @@ def verify_symbolic_hypotheses(
             sum(float(record.support) for record in hidden_cause_records) / max(hidden_total, 1.0)
             if hidden_cause_records else 0.0
         ),
+        "verification_heuristic_records": float(heuristic_total),
     }
     return GroundingVerificationReport(
         records=tuple(records),

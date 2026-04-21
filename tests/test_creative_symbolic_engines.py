@@ -451,6 +451,62 @@ class CreativeSymbolicEnginesTest(unittest.TestCase):
         self.assertGreaterEqual(report.metrics["grounding_rule_candidates"], 1.0)
         self.assertGreaterEqual(report.metrics["grounding_rule_selected"], 1.0)
 
+    def test_creative_cycle_filters_heuristic_grounding_candidate_rules(self) -> None:
+        coordinator = CreativeCycleCoordinator(enabled=False)
+        heuristic_candidate = RuleCandidate(
+            clause=rule(
+                atom(711, Var("X"), Var("Y")),
+                atom(712, Var("X")),
+                atom(713, Var("Y")),
+            ),
+            source="grounding_rule_compiler",
+            score=0.91,
+            utility=0.84,
+            metadata={
+                "hypothesis_id": "rule:heuristic",
+                "semantic_mode": "rule",
+                "quantifier_mode": "generic_all",
+                "claim_source": "fallback_extraction",
+                "subject_name": "stars",
+                "predicate_name": "generates",
+                "object_name": "planets",
+                "support_set": ("semantic:rule", "heuristic_authority:low"),
+                "provenance": ("scene:claim:heuristic_rule", "heuristic_authority:low"),
+            },
+        )
+        authoritative_candidate = RuleCandidate(
+            clause=rule(
+                atom(721, Var("X"), Var("Y")),
+                atom(722, Var("X")),
+                atom(723, Var("Y")),
+            ),
+            source="grounding_rule_compiler",
+            score=0.79,
+            utility=0.73,
+            metadata={
+                "hypothesis_id": "rule:authoritative",
+                "semantic_mode": "rule",
+                "quantifier_mode": "generic_all",
+                "claim_source": "speaker_turn",
+                "subject_name": "stars",
+                "predicate_name": "creates",
+                "object_name": "planets",
+            },
+        )
+        prover = SimpleNamespace(
+            task_context=SymbolicTaskContext(
+                observed_facts=frozenset(),
+                grounding_candidate_rules=(heuristic_candidate, authoritative_candidate),
+                provenance="test",
+            )
+        )
+
+        grounded = coordinator._grounding_candidate_rules(prover)
+
+        self.assertEqual(len(grounded), 1)
+        self.assertEqual(grounded[0].metadata.get("hypothesis_id"), "rule:authoritative")
+        self.assertEqual(grounded[0].metadata.get("grounding_seed"), 1.0)
+
     def test_oee_feedback_preserves_structural_supporting_rules_under_hash_collision(self) -> None:
         engine = OntologyExpansionEngine(gap_threshold=0.2, contradiction_threshold=1)
         pred_id = 900777

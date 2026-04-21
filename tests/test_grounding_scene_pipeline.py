@@ -61,9 +61,11 @@ class GroundingScenePipelineTest(unittest.TestCase):
         self.assertGreaterEqual(result.compiled.metadata.get("compiled_hypotheses", 0.0), 3.0)
         self.assertGreaterEqual(result.compiled.metadata.get("compiled_mean_confidence", 0.0), 0.5)
         self.assertGreaterEqual(result.verification.metadata.get("verification_records", 0.0), 3.0)
-        self.assertGreaterEqual(result.verification.metadata.get("verification_supported_hypotheses", 0.0), 1.0)
+        self.assertGreaterEqual(result.verification.metadata.get("verification_deferred_hypotheses", 0.0), 3.0)
+        self.assertGreaterEqual(result.verification.metadata.get("verification_heuristic_records", 0.0), 3.0)
         self.assertGreaterEqual(result.world_state.metadata.get("grounding_world_state_records", 0.0), 3.0)
-        self.assertGreaterEqual(result.world_state.metadata.get("grounding_world_state_active_records", 0.0), 1.0)
+        self.assertGreaterEqual(result.world_state.metadata.get("grounding_world_state_hypothetical_records", 0.0), 3.0)
+        self.assertGreaterEqual(result.world_state.metadata.get("grounding_world_state_heuristic_records", 0.0), 3.0)
         compiled_relations = {
             relation
             for segment in result.compiled.segments
@@ -91,11 +93,14 @@ class GroundingScenePipelineTest(unittest.TestCase):
         self.assertGreaterEqual(result.interlingua.metadata.get("interlingua_relations", 0.0), 1.0)
         self.assertTrue(any(segment.counterexample for segment in result.compiled.segments))
         self.assertGreaterEqual(result.compiled.metadata.get("compiled_deferred_hypotheses", 0.0), 1.0)
-        self.assertGreaterEqual(result.verification.metadata.get("verification_conflicted_hypotheses", 0.0), 1.0)
+        self.assertGreaterEqual(result.verification.metadata.get("verification_deferred_hypotheses", 0.0), 1.0)
+        self.assertGreaterEqual(result.verification.metadata.get("verification_hidden_cause_records", 0.0), 1.0)
         self.assertGreaterEqual(result.verification.metadata.get("verification_repair_pressure", 0.0), 0.3)
-        self.assertGreaterEqual(result.world_state.metadata.get("grounding_world_state_contradicted_records", 0.0), 1.0)
+        self.assertGreaterEqual(result.world_state.metadata.get("grounding_world_state_hypothetical_records", 0.0), 1.0)
+        self.assertGreaterEqual(result.world_state.metadata.get("grounding_world_state_hidden_cause_records", 0.0), 1.0)
         self.assertTrue(any(hypothesis.deferred for hypothesis in result.compiled.hypotheses))
         self.assertTrue(any(record.hidden_cause_candidate or record.verification_status != "supported" for record in result.verification.records))
+        self.assertTrue(any(record.record_type == "hidden_cause" for record in result.world_state.records))
 
     def test_pipeline_propagates_condition_temporal_explanation_and_coreference(self) -> None:
         text = (
@@ -212,7 +217,7 @@ class GroundingScenePipelineTest(unittest.TestCase):
         self.assertGreater(float(result.document.metadata.get("grounding_document_state_authority", 0.0)), 0.0)
         self.assertGreater(float(result.document.metadata.get("grounding_document_semantic_authority", 0.0)), 0.0)
         self.assertEqual(result.scene.metadata.get("scene_structural_primary_active", 0.0), 1.0)
-        self.assertEqual(result.scene.metadata.get("scene_structural_primary_hybrid_active", 0.0), 1.0)
+        self.assertEqual(result.scene.metadata.get("scene_structural_primary_hybrid_active", 1.0), 0.0)
         self.assertEqual(result.scene.metadata.get("scene_fallback_backbone_active", 0.0), 1.0)
         self.assertGreaterEqual(len(result.scene.states), 2)
         self.assertGreaterEqual(len(result.scene.events), 1)
@@ -236,8 +241,34 @@ class GroundingScenePipelineTest(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                not any(str(item).startswith("structural_unit:") for item in hypothesis.provenance)
+                hypothesis.claim_source == "fallback_extraction"
+                and any(str(item).startswith("heuristic_authority:") for item in hypothesis.provenance)
                 for hypothesis in relation_hypotheses
+            )
+        )
+
+    def test_pipeline_enforces_hybrid_segment_ownership_for_dialogue_plus_free_text(self) -> None:
+        text = (
+            "User: goal safe_exit.\n"
+            "Assistant: if alarm is active open gate after inspection.\n"
+            "Weather is storm."
+        )
+
+        result = ground_text_to_symbolic(text, language="text", max_segments=8)
+
+        self.assertEqual(result.scene.metadata.get("scene_structural_primary_active", 0.0), 1.0)
+        self.assertEqual(result.scene.metadata.get("scene_structural_primary_hybrid_active", 0.0), 1.0)
+        self.assertEqual(result.scene.metadata.get("scene_fallback_backbone_active", 0.0), 1.0)
+        self.assertGreaterEqual(result.scene.metadata.get("scene_segment_owner_hybrid", 0.0), 2.0)
+        self.assertGreaterEqual(result.scene.metadata.get("scene_segment_owner_fallback_primary", 0.0), 1.0)
+        self.assertGreaterEqual(result.scene.metadata.get("scene_hybrid_retained_fallback_events", 0.0), 1.0)
+        self.assertTrue(any(int(event.source_segment) in {0, 1} for event in result.scene.events))
+        self.assertFalse(
+            any(
+                int(claim.source_segment) in {0, 1}
+                and claim.claim_source == "fallback_extraction"
+                and claim.speaker_entity_id
+                for claim in result.scene.claims
             )
         )
 
@@ -285,7 +316,7 @@ class GroundingScenePipelineTest(unittest.TestCase):
         self.assertTrue(any(claim.speaker_entity_id for claim in result.scene.claims))
         self.assertTrue(
             any(
-                hypothesis.speaker_key and hypothesis.claim_source == "speaker_turn"
+                hypothesis.speaker_key and hypothesis.claim_source == "structural_nl_fallback"
                 for hypothesis in result.compiled.hypotheses
             )
         )
@@ -338,7 +369,7 @@ class GroundingScenePipelineTest(unittest.TestCase):
             all(record.world_status != "active" for record in result.world_state.records if record.epistemic_status == "cited")
         )
 
-    def test_pipeline_compiles_rule_like_relations_into_candidate_rules(self) -> None:
+    def test_pipeline_keeps_heuristic_rule_like_relations_out_of_candidate_rules(self) -> None:
         text = "Rule all stars generate planets."
 
         result = ground_text_to_symbolic(text, language="text", max_segments=6)
@@ -347,15 +378,18 @@ class GroundingScenePipelineTest(unittest.TestCase):
         self.assertGreaterEqual(result.interlingua.metadata.get("interlingua_rule_claim_frames", 0.0), 1.0)
         self.assertGreaterEqual(result.compiled.metadata.get("compiled_rule_hypotheses", 0.0), 1.0)
         self.assertGreaterEqual(result.compiled.metadata.get("compiled_quantified_hypotheses", 0.0), 1.0)
-        self.assertGreaterEqual(result.compiled.metadata.get("compiled_candidate_rules", 0.0), 1.0)
-        self.assertGreaterEqual(len(result.compiled.candidate_rules), 1)
-        top_rule = result.compiled.candidate_rules[0]
-        self.assertEqual(top_rule.source, "grounding_rule_compiler")
-        self.assertEqual(top_rule.metadata.get("semantic_mode"), "rule")
-        self.assertEqual(top_rule.metadata.get("quantifier_mode"), "generic_all")
-        self.assertEqual(top_rule.metadata.get("predicate_name"), "generates")
-        self.assertTrue(hasattr(top_rule.clause, "head"))
-        self.assertTrue(hasattr(top_rule.clause, "body"))
+        self.assertGreaterEqual(result.compiled.metadata.get("compiled_filtered_heuristic_candidate_rules", 0.0), 1.0)
+        self.assertEqual(result.compiled.metadata.get("compiled_candidate_rules", 0.0), 0.0)
+        self.assertEqual(len(result.compiled.candidate_rules), 0)
+        self.assertGreaterEqual(result.verification.metadata.get("verification_heuristic_records", 0.0), 1.0)
+        self.assertTrue(
+            any(
+                hypothesis.claim_source == "fallback_extraction"
+                and hypothesis.semantic_mode == "rule"
+                and hypothesis.quantifier_mode == "generic_all"
+                for hypothesis in result.compiled.hypotheses
+            )
+        )
 
     def test_pipeline_uses_injected_backbone_scene_graph(self) -> None:
         result = ground_text_to_symbolic("unstructured placeholder text", language="text", backbone=_FixedBackbone())

@@ -20,6 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 
+from omen_grounding.heuristic_policy import candidate_rule_is_heuristic
 from omen_symbolic.abduction_search import (
     bridge_variable_count as structural_bridge_variable_count,
     rank_goal_directed_bodies,
@@ -497,6 +498,11 @@ class SymbolicTaskContext:
             )
         else:
             self.grounding_candidate_rules = tuple(self.grounding_candidate_rules or ())
+        self.grounding_candidate_rules = tuple(
+            candidate
+            for candidate in self.grounding_candidate_rules
+            if not candidate_rule_is_heuristic(candidate)
+        )
         self.grounding_verification_records = tuple(self.grounding_verification_records or ())
         if not self.grounding_hidden_cause_records and self.grounding_artifacts is not None:
             self.grounding_hidden_cause_records = tuple(

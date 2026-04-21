@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from omen_grounding import ground_text_document
+from omen_grounding import ground_text_document, infer_source_profile
 from omen_scale import OMENScale
 from omen_scale_config import OMENScaleConfig
 from omen_symbolic.execution_trace import (
@@ -42,6 +42,29 @@ def _assert_span_roundtrip(testcase: unittest.TestCase, source_text: str, span) 
 
 
 class GroundingTextSemanticsTest(unittest.TestCase):
+    def test_infer_source_profile_uses_deterministic_route_registry_and_evidence_ledger(self) -> None:
+        text = (
+            "[service]\n"
+            "host = localhost\n"
+            "port = 8080\n"
+            "mode = production"
+        )
+
+        first = infer_source_profile(text)
+        second = infer_source_profile(text)
+
+        self.assertEqual(first, second)
+        self.assertEqual(first.modality, "structured_text")
+        self.assertEqual(first.subtype, "config_text")
+        self.assertEqual(first.verification_path, "config_schema_verification")
+        self.assertEqual(float(first.evidence.get("route_registry_version", 0.0)), 1.0)
+        self.assertEqual(float(first.evidence.get("route_tie_break_precedence", 0.0)), 1.0)
+        self.assertGreaterEqual(float(first.evidence.get("feature_config_like_lines", 0.0)), 3.0)
+        self.assertGreaterEqual(float(first.evidence.get("feature_structured_field_lines", 0.0)), 2.0)
+        self.assertEqual(float(first.evidence.get("route_rule_structured_text", 0.0)), 1.0)
+        self.assertGreaterEqual(float(first.profile.get("structured_text", 0.0)), 0.8)
+        self.assertEqual(first.parser_candidates[0].parser_name, "kv_record_parser")
+
     def test_ground_text_document_keeps_natural_language_semantics_out_of_document_layer(self) -> None:
         text = (
             'Факт 1: Об\'єкти типу "Зірки" генерують об\'єкти типу "Планети".\n'
@@ -269,9 +292,10 @@ class GroundingTextSemanticsTest(unittest.TestCase):
         self.assertGreaterEqual(float(bundle.metadata.get("compiled_deferred_hypotheses", 0.0)), 1.0)
         self.assertGreaterEqual(float(bundle.metadata.get("compiled_mean_confidence", 0.0)), 0.5)
         self.assertGreaterEqual(float(bundle.metadata.get("verification_records", 0.0)), 1.0)
-        self.assertGreaterEqual(float(bundle.metadata.get("verification_conflicted_hypotheses", 0.0)), 1.0)
+        self.assertGreaterEqual(float(bundle.metadata.get("verification_deferred_hypotheses", 0.0)), 1.0)
+        self.assertGreaterEqual(float(bundle.metadata.get("verification_hidden_cause_records", 0.0)), 1.0)
         self.assertGreaterEqual(float(bundle.metadata.get("grounding_world_state_records", 0.0)), 1.0)
-        self.assertGreaterEqual(float(bundle.metadata.get("grounding_world_state_contradicted_records", 0.0)), 1.0)
+        self.assertGreaterEqual(float(bundle.metadata.get("grounding_world_state_hypothetical_records", 0.0)), 1.0)
         self.assertGreaterEqual(float(bundle.metadata.get("grounding_symbolic_facts", 0.0)), 1.0)
         self.assertGreaterEqual(len(bundle.grounding_facts), 1)
         self.assertGreaterEqual(len(bundle.grounding_target_facts), 1)
@@ -357,11 +381,12 @@ class GroundingTextSemanticsTest(unittest.TestCase):
         self.assertGreaterEqual(float(bundle.metadata.get("interlingua_claim_frames", 0.0)), 1.0)
         self.assertGreaterEqual(float(bundle.metadata.get("interlingua_cited_claim_frames", 0.0)), 1.0)
         self.assertGreaterEqual(float(bundle.metadata.get("compiled_nonasserted_hypotheses", 0.0)), 1.0)
-        self.assertGreaterEqual(float(bundle.metadata.get("compiled_candidate_rules", 0.0)), 1.0)
+        self.assertGreaterEqual(float(bundle.metadata.get("compiled_filtered_heuristic_candidate_rules", 0.0)), 1.0)
+        self.assertEqual(float(bundle.metadata.get("compiled_candidate_rules", 0.0)), 0.0)
         self.assertGreaterEqual(float(bundle.metadata.get("verification_nonasserted_pressure", 0.0)), 1.0)
         self.assertGreaterEqual(float(bundle.metadata.get("grounding_world_state_nonasserted_records", 0.0)), 1.0)
         self.assertGreaterEqual(float(bundle.metadata.get("grounding_world_state_cited_records", 0.0)), 1.0)
-        self.assertGreaterEqual(len(bundle.grounding_candidate_rules), 1)
+        self.assertEqual(len(bundle.grounding_candidate_rules), 0)
 
     def test_generation_context_surfaces_trace_grounding_metrics_for_utf8_prompt(self) -> None:
         cfg = OMENScaleConfig.demo()
@@ -407,10 +432,11 @@ class GroundingTextSemanticsTest(unittest.TestCase):
         self.assertGreaterEqual(float(ctx.metadata.get("trace_compiled_mean_confidence", 0.0)), 0.5)
         self.assertGreaterEqual(float(ctx.metadata.get("trace_grounding_world_state_records", 0.0)), 1.0)
         self.assertGreaterEqual(float(ctx.metadata.get("trace_grounding_ontology_records", 0.0)), 0.0)
-        self.assertGreaterEqual(float(ctx.metadata.get("trace_grounding_world_state_active_facts", 0.0)), 1.0)
+        self.assertGreaterEqual(float(ctx.metadata.get("trace_grounding_world_state_hypothetical_facts", 0.0)), 1.0)
         self.assertGreaterEqual(float(ctx.metadata.get("trace_verification_records", 0.0)), 1.0)
         self.assertGreaterEqual(float(ctx.metadata.get("grounding_facts", 0.0)), 1.0)
         self.assertGreaterEqual(float(ctx.metadata.get("grounding_world_state_active_records", 0.0)), 0.0)
+        self.assertGreaterEqual(float(ctx.metadata.get("grounding_world_state_hypothetical_records", 0.0)), 1.0)
         self.assertGreaterEqual(float(ctx.metadata.get("grounding_hypotheses", 0.0)), 1.0)
         self.assertGreaterEqual(float(ctx.metadata.get("grounding_verification_records", 0.0)), 1.0)
         self.assertGreaterEqual(float(ctx.metadata.get("grounding_ontology_records", 0.0)), 0.0)
@@ -423,7 +449,7 @@ class GroundingTextSemanticsTest(unittest.TestCase):
         self.assertGreater(float(ctx.metadata.get("grounding_contract_document_byte_coverage", 0.0)), 0.0)
         self.assertEqual(float(ctx.metadata.get("grounding_contract_identity_present", 0.0)), 1.0)
         self.assertIsNotNone(ctx.grounding_artifacts)
-        self.assertGreaterEqual(len(ctx.grounding_world_state_active_facts), 1)
+        self.assertGreaterEqual(len(ctx.grounding_world_state_hypothetical_facts), 1)
         self.assertGreaterEqual(len(ctx.reasoning_facts()), len(ctx.observed_facts))
         self.assertGreaterEqual(len(ctx.grounding_derived_facts), 1)
         labels = {label for label, _ in ctx.source_fact_records()}

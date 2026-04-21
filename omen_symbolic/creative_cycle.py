@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from omen_grounding.heuristic_policy import candidate_rule_is_heuristic
 from omen_symbolic.aesthetic_engine import AestheticEvolutionEngine
 from omen_symbolic.analogy_engine import AnalogyMetaphorEngine
 from omen_symbolic.counterfactual_engine import CounterfactualWorldEngine
@@ -510,6 +511,8 @@ class CreativeCycleCoordinator:
         grounded: List[RuleCandidate] = []
         for candidate in direct:
             if not isinstance(candidate, RuleCandidate):
+                continue
+            if candidate_rule_is_heuristic(candidate):
                 continue
             metadata = dict(getattr(candidate, "metadata", {}) or {})
             metadata.setdefault("grounding_seed", 1.0)

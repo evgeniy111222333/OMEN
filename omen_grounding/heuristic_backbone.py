@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from .backbone import SemanticGroundingBackbone
 from .claim_semantics import infer_claim_semantics
+from .heuristic_policy import append_heuristic_evidence
 from .semantic_context import build_semantic_context_objects
 from .scene_types import (
     SemanticClaim,
@@ -854,7 +855,11 @@ class HeuristicFallbackSemanticBackbone(SemanticGroundingBackbone):
                 segment.text,
                 structural_units=tuple(getattr(segment, "structural_units", ()) or ()),
             )
-            segment_claim_evidence = _segment_evidence_refs(segment)
+            segment_claim_evidence = append_heuristic_evidence(
+                _segment_evidence_refs(segment),
+                source="heuristic_backbone",
+                role="fallback_extraction",
+            )
             segment_speaker_id: Optional[str] = None
             segment_speaker_name = claim_profile.speaker_name or None
             if segment_speaker_name:
@@ -941,7 +946,8 @@ class HeuristicFallbackSemanticBackbone(SemanticGroundingBackbone):
                         source_segment=seg_idx,
                         source_span=state.span or segment.span,
                         confidence=max(0.62, state.confidence),
-                        status="supported",
+                        status="proposal",
+                        evidence_refs=segment_claim_evidence,
                     )
                 )
                 claims.append(
@@ -959,7 +965,7 @@ class HeuristicFallbackSemanticBackbone(SemanticGroundingBackbone):
                         speaker_entity_id=segment_speaker_id,
                         speaker_name=segment_speaker_name,
                         epistemic_status=claim_profile.epistemic_status,
-                        claim_source=claim_profile.claim_source,
+                        claim_source="fallback_extraction",
                         semantic_mode=claim_profile.semantic_mode,
                         quantifier_mode=claim_profile.quantifier_mode,
                         evidence_refs=segment_claim_evidence,
@@ -1032,6 +1038,7 @@ class HeuristicFallbackSemanticBackbone(SemanticGroundingBackbone):
                         confidence=event.confidence,
                         polarity="negative" if segment.counterexample else "positive",
                         status="proposal",
+                        evidence_refs=segment_claim_evidence,
                         metadata={
                             "counterexample_segment": 1.0 if segment.counterexample else 0.0,
                             "fallback_backbone": 1.0,
@@ -1074,7 +1081,7 @@ class HeuristicFallbackSemanticBackbone(SemanticGroundingBackbone):
                         speaker_entity_id=segment_speaker_id,
                         speaker_name=segment_speaker_name,
                         epistemic_status=claim_profile.epistemic_status,
-                        claim_source=claim_profile.claim_source,
+                        claim_source="fallback_extraction",
                         semantic_mode=claim_profile.semantic_mode,
                         quantifier_mode=claim_profile.quantifier_mode,
                         evidence_refs=segment_claim_evidence,
@@ -1117,6 +1124,7 @@ class HeuristicFallbackSemanticBackbone(SemanticGroundingBackbone):
                         confidence=relation.confidence,
                         polarity="negative" if segment.counterexample else "positive",
                         status="proposal",
+                        evidence_refs=segment_claim_evidence,
                         metadata={
                             "counterexample_segment": 1.0 if segment.counterexample else 0.0,
                             "fallback_backbone": 1.0,
@@ -1141,7 +1149,7 @@ class HeuristicFallbackSemanticBackbone(SemanticGroundingBackbone):
                         speaker_entity_id=segment_speaker_id,
                         speaker_name=segment_speaker_name,
                         epistemic_status=claim_profile.epistemic_status,
-                        claim_source=claim_profile.claim_source,
+                        claim_source="fallback_extraction",
                         semantic_mode=claim_profile.semantic_mode,
                         quantifier_mode=claim_profile.quantifier_mode,
                         evidence_refs=segment_claim_evidence,
@@ -1168,6 +1176,7 @@ class HeuristicFallbackSemanticBackbone(SemanticGroundingBackbone):
                         source_span=goal.span or segment.span,
                         confidence=goal.confidence,
                         status="proposal",
+                        evidence_refs=segment_claim_evidence,
                     )
                 )
                 claims.append(
@@ -1186,7 +1195,7 @@ class HeuristicFallbackSemanticBackbone(SemanticGroundingBackbone):
                         speaker_entity_id=segment_speaker_id,
                         speaker_name=segment_speaker_name,
                         epistemic_status=claim_profile.epistemic_status,
-                        claim_source=claim_profile.claim_source,
+                        claim_source="fallback_extraction",
                         semantic_mode=claim_profile.semantic_mode,
                         quantifier_mode=claim_profile.quantifier_mode,
                         evidence_refs=segment_claim_evidence,

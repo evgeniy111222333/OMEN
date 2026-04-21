@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .types import GroundingParserCandidate, GroundingSourceProfile
@@ -97,6 +98,19 @@ _ROUTER_LANGUAGE_MARKERS: Dict[str, Tuple[Tuple[str, float], ...]] = {
     ),
 }
 
+_LANGUAGE_PRECEDENCE: Tuple[str, ...] = (
+    "python",
+    "typescript",
+    "javascript",
+    "rust",
+    "go",
+    "cpp",
+    "c",
+    "java",
+    "bash",
+    "lua",
+)
+
 _NATURAL_SECTION_HEADING_MARKERS = {
     "abstract",
     "introduction",
@@ -110,17 +124,103 @@ _NATURAL_SECTION_HEADING_MARKERS = {
     "summary",
 }
 
+_SCIENTIFIC_MARKERS = (
+    "abstract",
+    "introduction",
+    "background",
+    "method",
+    "methods",
+    "results",
+    "discussion",
+    "conclusion",
+    "references",
+    "doi",
+    "dataset",
+    "experiment",
+    "baseline",
+    "hypothesis",
+    "statistically significant",
+)
+_INSTRUCTIONAL_MARKERS = (
+    "step ",
+    "how to",
+    "install",
+    "usage",
+    "follow",
+    "first",
+    "then",
+    "finally",
+    "must",
+    "should",
+)
+_LEGAL_MARKERS = (
+    "hereby",
+    "shall",
+    "pursuant",
+    "agreement",
+    "contract",
+    "section ",
+    "article ",
+)
+_MEDICAL_MARKERS = (
+    "patient",
+    "diagnosis",
+    "treatment",
+    "symptom",
+    "symptoms",
+    "dose",
+    "dosage",
+    "mg",
+    "clinical",
+)
+_NARRATIVE_MARKERS = (
+    "once",
+    "suddenly",
+    "afterward",
+    "remembered",
+    "walked",
+    "looked",
+    "said",
+)
+
+
+@dataclass(frozen=True)
+class _RoutingLedger:
+    stripped: str
+    lower: str
+    raw_lines: Tuple[str, ...]
+    lines: Tuple[str, ...]
+    probe: Tuple[str, ...]
+    parser_supported: Optional[str]
+    json_like_records: int
+    dialogue_like_lines: int
+    natural_heading_lines: int
+    comment_prose_lines: int
+    structured_field_lines: int
+    delimited_structured_lines: int
+    section_header_lines: int
+    log_like_lines: int
+    config_like_lines: int
+    table_like_lines: int
+    instruction_like_lines: int
+    state_marker_lines: int
+    relation_hits: int
+    sentence_hits: int
+    scientific_hits: int
+    legal_hits: int
+    medical_hits: int
+    narrative_hits: int
+    code_block_starters: int
+    code_punctuation_markers: int
+    code_indent_lines: int
+    code_body_lines: int
+    language_marker_hits: Dict[str, int]
+    language_weight_hits: Dict[str, float]
+    language_regex_hits: Dict[str, int]
+
 
 def _clip01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
-
-
-def _weighted_marker_score(text: str, markers: Tuple[Tuple[str, float], ...]) -> float:
-    score = 0.0
-    for marker, weight in markers:
-        if marker in text:
-            score += weight
-    return score
 
 
 def _normalized_score_map(scores: Dict[str, float]) -> Dict[str, float]:
@@ -129,18 +229,6 @@ def _normalized_score_map(scores: Dict[str, float]) -> Dict[str, float]:
     if total <= 1e-8:
         return {key: 0.0 for key in clipped}
     return {key: round(value / total, 4) for key, value in clipped.items()}
-
-
-def _best_scored_label(
-    scores: Dict[str, float],
-    *,
-    default: str,
-    min_score: float,
-) -> str:
-    if not scores:
-        return default
-    label, score = max(scores.items(), key=lambda item: item[1])
-    return label if score >= min_score else default
 
 
 def _split_inline_field(line: str) -> Tuple[str, str, str] | None:
@@ -257,215 +345,426 @@ def infer_script_profile(text: str) -> Tuple[str, Dict[str, float]]:
     return script, script_profile
 
 
-def _infer_structured_text_subtype(
+def _marker_presence_hits(text: str, markers: Tuple[Tuple[str, float], ...]) -> Tuple[int, float]:
+    hits = 0
+    weight_total = 0.0
+    for marker, weight in markers:
+        if marker in text:
+            hits += 1
+            weight_total += float(weight)
+    return hits, weight_total
+
+
+def _count_marker_hits(text: str, markers: Sequence[str]) -> int:
+    return sum(1 for marker in markers if marker in text)
+
+
+def _language_regex_hits(text: str) -> Dict[str, int]:
+    hits: Dict[str, int] = {language: 0 for language in _ROUTER_LANGUAGE_MARKERS}
+    if re.search(r"^\s*def\s+\w+\s*\(", text, flags=re.MULTILINE):
+        hits["python"] += 1
+    if re.search(r"^\s*for\s+\w+\s+in\s+range\s*\(", text, flags=re.MULTILINE):
+        hits["python"] += 1
+    if re.search(r"^\s*if\b.+:\s*$", text, flags=re.MULTILINE):
+        hits["python"] += 1
+    if "print(" in text:
+        hits["python"] += 1
+    if re.search(r"^\s*(raise|return)\b", text, flags=re.MULTILINE):
+        hits["python"] += 1
+    if re.search(r"\[[^\]]+\bfor\b[^\]]+\bin\b[^\]]+\]", text):
+        hits["python"] += 1
+    if re.search(r"^\s*class\s+\w+\s*\{", text, flags=re.MULTILINE):
+        hits["javascript"] += 1
+        hits["typescript"] += 1
+    if re.search(r"^\s*fn\s+\w+\s*\(", text, flags=re.MULTILINE):
+        hits["rust"] += 1
+    if re.search(r"^\s*package\s+\w+", text, flags=re.MULTILINE):
+        hits["go"] += 1
+    if re.search(r"^\s*#include\s+[<\"]", text, flags=re.MULTILINE):
+        hits["c"] += 1
+        hits["cpp"] += 1
+    return hits
+
+
+def _build_routing_ledger(
     stripped: str,
-    lower: str,
-    probe: Sequence[str],
     *,
-    json_like_records: int,
-) -> str:
-    log_score = 0.0
+    parser_lang: Optional[str],
+    supported_languages: Sequence[str],
+) -> _RoutingLedger:
+    lower = stripped.lower()
+    raw_lines = tuple(line for line in stripped.splitlines() if line.strip())
+    lines = tuple(line.strip() for line in raw_lines)
+    probe = lines[: min(len(lines), 8)]
+    supported = tuple(sorted(set(supported_languages) | set(_ROUTER_LANGUAGE_MARKERS.keys())))
+
+    language_marker_hits: Dict[str, int] = {}
+    language_weight_hits: Dict[str, float] = {}
+    regex_hits = _language_regex_hits(stripped)
+    for language in supported:
+        marker_hits, weight_total = _marker_presence_hits(lower, _ROUTER_LANGUAGE_MARKERS.get(language, ()))
+        language_marker_hits[language] = marker_hits
+        language_weight_hits[language] = weight_total
+        if language in regex_hits:
+            language_marker_hits[language] += regex_hits[language]
+            language_weight_hits[language] += float(regex_hits[language])
+
+    json_like_records = 0
+    structured_field_lines = 0
+    delimited_structured_lines = 0
+    for line in probe:
+        if line.startswith("{") and line.endswith("}") and ":" in line:
+            json_like_records += 1
+            continue
+        if _looks_structured_field_line(line):
+            structured_field_lines += 1
+        if line.count("|") >= 2 or line.count("\t") >= 2 or line.count(",") >= 3:
+            delimited_structured_lines += 1
+
     dialogue_like_lines = sum(
         1
         for line in probe
         if re.match(r"^(user|assistant|speaker|q|a)\s*[:>-]", line.lower())
     )
-    if re.search(r"traceback|exception|stack trace", lower):
-        log_score += 1.6
-    level_prefixed_lines = sum(
-        1
-        for line in probe
-        if re.match(r"^(info|warn|warning|error|debug|trace)\b", line.lower())
-    )
-    if any(
-        re.search(r"^\d{4}-\d{2}-\d{2}", line)
-        or re.match(r"^(info|warn|warning|error|debug|trace)\b", line.lower())
-        for line in probe
-    ):
-        log_score += 1.0
-    if level_prefixed_lines >= 1:
-        log_score += 1.2
-    if any(
-        re.match(r"^(info|warn|warning|error|debug|trace)\b", line.lower())
-        and "=" in line
-        for line in probe
-    ):
-        log_score += 1.2
-    if sum(
+    natural_heading_lines = sum(1 for line in probe if _looks_natural_section_heading_line(line))
+    comment_prose_lines = sum(1 for line in raw_lines if _looks_comment_prose_line(line))
+    section_header_lines = sum(1 for line in probe if re.match(r"^\[[^\]]+\]$", line.strip()))
+    log_like_lines = sum(
         1
         for line in probe
         if re.search(r"^\d{4}-\d{2}-\d{2}", line)
         or re.search(r"\b(info|warn|warning|error|debug|trace)\b", line.lower())
-    ) >= 2:
-        log_score += 1.6
-
-    table_score = 0.0
-    if sum(1 for line in probe if "|" in line) >= 2:
-        table_score += 1.8
-    if sum(1 for line in probe if "\t" in line) >= 2:
-        table_score += 1.6
-    if sum(1 for line in probe if line.count(",") >= 2) >= 2:
-        table_score += 1.2
-    if any(line.count("|") >= 2 or line.count("\t") >= 2 or line.count(",") >= 3 for line in probe):
-        table_score += 1.0
-
-    config_score = 0.0
-    if sum(1 for line in probe if re.match(r"^\[[^\]]+\]$", line.strip())) >= 1:
-        config_score += 1.8
-    if sum(1 for line in probe if _looks_structured_field_line(line)) >= 2:
-        config_score += 1.4
-    if any(re.match(r"^[A-Za-z0-9_.-]+\.[A-Za-z0-9_.-]+\s*=\s*.+$", line) for line in probe):
-        config_score += 1.0
-    if sum(1 for line in probe if line.startswith(("export ", "--", "set ", "env "))) >= 1:
-        config_score += 1.0
-    if dialogue_like_lines >= 2:
-        config_score = max(config_score - 1.5, 0.0)
-
-    state_score = 0.0
+    )
+    config_like_lines = sum(
+        1
+        for line in probe
+        if (
+            re.match(r"^\[[^\]]+\]$", line.strip())
+            or (
+                not re.match(r"^(user|assistant|speaker|q|a)\s*[:>-]", line.lower())
+                and re.match(r"^[A-Za-z0-9_.-]+\s*[:=]\s*.+$", line)
+            )
+        )
+    )
+    table_like_lines = sum(
+        1
+        for line in probe
+        if "|" in line or "\t" in line or line.count(",") >= 2
+    )
+    instruction_like_lines = sum(
+        1
+        for line in probe
+        if re.match(r"^(step|\d+\.)\s", line.lower()) or re.match(r"^(step\d+|\d+\)|\d+\.)", line.lower())
+    )
     state_marker_lines = sum(
         1
         for line in probe
         if re.search(r"\b(step|state|goal|target|status|next)\b", line.lower())
     )
-    if state_marker_lines >= 1:
-        state_score += 1.0
-    if state_marker_lines >= 2:
-        state_score += 1.0
-    if any(re.match(r"^(step\d+|\d+\)|\d+\.)", line.lower()) for line in probe):
-        state_score += 0.8
-
-    key_value_score = 0.35 * sum(1 for line in probe if _looks_structured_field_line(line))
-    if re.search(r"^\s*[\[{]", stripped):
-        key_value_score += 0.6
-
-    structured_scores = {
-        "json_records": float(json_like_records) * 2.0 + (1.0 if stripped.startswith(("{", "[")) else 0.0),
-        "log_text": log_score,
-        "table_text": table_score,
-        "config_text": config_score,
-        "key_value_records": key_value_score + state_score,
-    }
-    return _best_scored_label(structured_scores, default="key_value_records", min_score=1.0)
-
-
-def _infer_natural_text_subtype(
-    stripped: str,
-    lower: str,
-    probe: Sequence[str],
-    *,
-    relation_hits: int,
-) -> str:
-    scientific_score = 0.0
-    for marker, weight in (
-        ("abstract", 1.1),
-        ("introduction", 1.0),
-        ("background", 1.0),
-        ("method", 1.0),
-        ("methods", 1.0),
-        ("results", 1.0),
-        ("discussion", 1.0),
-        ("conclusion", 0.8),
-        ("references", 0.7),
-        ("doi", 0.8),
-        ("dataset", 0.8),
-        ("experiment", 0.8),
-        ("baseline", 0.6),
-        ("hypothesis", 0.7),
-        ("statistically significant", 1.0),
-    ):
-        if marker in lower:
-            scientific_score += weight
+    relation_hits = len(
+        re.findall(r"\b(is|becomes|causes|leads to|requires|must|not|after|before|however)\b", lower)
+    )
+    sentence_hits = len(re.findall(r"[.!?](?:\s|$)", stripped))
+    scientific_hits = _count_marker_hits(lower, _SCIENTIFIC_MARKERS)
     if re.search(r"\[[0-9]{1,3}\]", stripped):
-        scientific_score += 0.8
+        scientific_hits += 1
     if re.search(r"\bet al\.", lower):
-        scientific_score += 0.8
+        scientific_hits += 1
     if re.search(r"\bp\s*[<=>]\s*0\.\d+", lower):
-        scientific_score += 1.0
+        scientific_hits += 1
+    legal_hits = _count_marker_hits(lower, _LEGAL_MARKERS)
+    medical_hits = _count_marker_hits(lower, _MEDICAL_MARKERS)
+    narrative_hits = _count_marker_hits(lower, _NARRATIVE_MARKERS)
+    code_block_starters = sum(
+        1
+        for line in probe
+        if line.startswith(("def ", "class ", "fn ", "function ", "package ", "#include", "#!/"))
+    )
+    code_punctuation_markers = sum(1 for token in ("{", "}", ";", "(", ")", "=>") if token in stripped)
+    code_indent_lines = sum(1 for line in raw_lines[1:] if line.startswith(("    ", "\t")))
+    code_body_lines = sum(
+        1
+        for line in raw_lines
+        if re.match(r"^\s*(raise|return|yield|break|continue)\b", line)
+        or re.match(r"^\s+[A-Za-z_][A-Za-z0-9_]*\s*=", line)
+        or re.search(r"\[[^\]]+\bfor\b[^\]]+\bin\b[^\]]+\]", line)
+    )
 
-    instructional_score = 0.0
-    for marker, weight in (
-        ("step ", 0.8),
-        ("how to", 1.0),
-        ("install", 0.9),
-        ("run", 0.6),
-        ("usage", 0.8),
-        ("follow", 0.7),
-        ("first", 0.5),
-        ("then", 0.5),
-        ("finally", 0.6),
-        ("must", 0.5),
-        ("should", 0.5),
-    ):
-        if marker in lower:
-            instructional_score += weight
-    if sum(1 for line in probe if re.match(r"^(step|\d+\.)\s", line.lower())) >= 2:
-        instructional_score += 1.0
+    parser_supported = (
+        parser_lang
+        if isinstance(parser_lang, str) and parser_lang in _ROUTER_LANGUAGE_MARKERS
+        else None
+    )
+    return _RoutingLedger(
+        stripped=stripped,
+        lower=lower,
+        raw_lines=raw_lines,
+        lines=lines,
+        probe=probe,
+        parser_supported=parser_supported,
+        json_like_records=json_like_records,
+        dialogue_like_lines=dialogue_like_lines,
+        natural_heading_lines=natural_heading_lines,
+        comment_prose_lines=comment_prose_lines,
+        structured_field_lines=structured_field_lines,
+        delimited_structured_lines=delimited_structured_lines,
+        section_header_lines=section_header_lines,
+        log_like_lines=log_like_lines,
+        config_like_lines=config_like_lines,
+        table_like_lines=table_like_lines,
+        instruction_like_lines=instruction_like_lines,
+        state_marker_lines=state_marker_lines,
+        relation_hits=relation_hits,
+        sentence_hits=sentence_hits,
+        scientific_hits=scientific_hits,
+        legal_hits=legal_hits,
+        medical_hits=medical_hits,
+        narrative_hits=narrative_hits,
+        code_block_starters=code_block_starters,
+        code_punctuation_markers=code_punctuation_markers,
+        code_indent_lines=code_indent_lines,
+        code_body_lines=code_body_lines,
+        language_marker_hits=language_marker_hits,
+        language_weight_hits=language_weight_hits,
+        language_regex_hits=regex_hits,
+    )
 
-    dialogue_score = 0.0
-    if sum(1 for line in probe if re.match(r"^(user|assistant|speaker|q|a)\s*[:>-]", line.lower())) >= 1:
-        dialogue_score += 1.6
-    if stripped.count("?") >= 2:
-        dialogue_score += 0.7
-    if stripped.count('"') >= 4:
-        dialogue_score += 0.4
 
-    legal_score = 0.0
-    for marker, weight in (
-        ("hereby", 1.0),
-        ("shall", 0.9),
-        ("pursuant", 0.9),
-        ("agreement", 0.7),
-        ("contract", 0.8),
-        ("section ", 0.6),
-        ("article ", 0.6),
-        ("whereas", 0.8),
-        ("liability", 0.7),
-    ):
-        if marker in lower:
-            legal_score += weight
+def _language_strength_tuple(ledger: _RoutingLedger, language: str) -> Tuple[int, int, float, int, int]:
+    parser_match = 1 if ledger.parser_supported == language else 0
+    marker_hits = int(ledger.language_marker_hits.get(language, 0))
+    regex_hits = int(ledger.language_regex_hits.get(language, 0))
+    weight_hits = float(ledger.language_weight_hits.get(language, 0.0))
+    precedence = -_LANGUAGE_PRECEDENCE.index(language) if language in _LANGUAGE_PRECEDENCE else -999
+    return (marker_hits, regex_hits, weight_hits, parser_match, precedence)
 
-    medical_score = 0.0
-    for marker, weight in (
-        ("patient", 0.8),
-        ("diagnosis", 0.9),
-        ("symptom", 0.7),
-        ("treatment", 0.8),
-        ("dose", 0.8),
-        ("dosage", 0.8),
-        ("contraindication", 0.9),
-        ("trial", 0.6),
-        ("clinical", 0.8),
-    ):
-        if marker in lower:
-            medical_score += weight
 
-    narrative_score = 0.0
-    for marker, weight in (
-        ("chapter", 0.6),
-        ("suddenly", 0.6),
-        ("she said", 0.7),
-        ("he said", 0.7),
-        ("they said", 0.7),
-        ("once ", 0.5),
-    ):
-        if marker in lower:
-            narrative_score += weight
+def _select_code_language(ledger: _RoutingLedger) -> Tuple[str, int, float, int, int]:
+    languages = tuple(ledger.language_marker_hits.keys()) or _LANGUAGE_PRECEDENCE
+    ranked = sorted(languages, key=lambda language: _language_strength_tuple(ledger, language), reverse=True)
+    top = ranked[0] if ranked else "python"
+    if ledger.parser_supported is not None:
+        parser_tuple = _language_strength_tuple(ledger, ledger.parser_supported)
+        top_tuple = _language_strength_tuple(ledger, top)
+        if parser_tuple[0] >= max(top_tuple[0] - 1, 0) and parser_tuple[1] >= top_tuple[1]:
+            top = ledger.parser_supported
+    top_tuple = _language_strength_tuple(ledger, top)
+    return top, top_tuple[0], top_tuple[2], top_tuple[1], top_tuple[3]
 
-    claim_score = 0.25 * float(relation_hits)
-    if re.search(r"\btherefore\b|\bwe conclude\b|\bthis shows\b|\bclaim\b", lower):
-        claim_score += 0.8
 
-    natural_scores = {
-        "scientific_text": scientific_score,
-        "instructional_text": instructional_score,
-        "dialogue_text": dialogue_score,
-        "legal_text": legal_score,
-        "medical_text": medical_score,
-        "narrative_text": narrative_score,
-        "claim_text": claim_score,
-        "generic_text": 0.4,
+def _supports_for_ledger(
+    ledger: _RoutingLedger,
+    *,
+    top_language_hits: int,
+    top_language_weight: float,
+    parser_match: int,
+) -> Dict[str, float]:
+    parser_bias = parser_match
+    parser_only_hint = (
+        parser_match >= 1
+        and top_language_hits == 0
+        and ledger.code_block_starters == 0
+        and ledger.code_body_lines == 0
+        and ledger.code_indent_lines == 0
+    )
+    strong_structured_carrier = (
+        ledger.json_like_records >= 1
+        or ledger.log_like_lines >= 2
+        or ledger.table_like_lines >= 2
+        or ledger.section_header_lines >= 1
+        or ledger.structured_field_lines >= 2
+    )
+    if parser_only_hint and strong_structured_carrier:
+        parser_bias = 0
+    code_language_hits = top_language_hits
+    code_language_weight = top_language_weight
+    has_code_specific_signal = (
+        top_language_hits >= 2
+        or ledger.code_block_starters >= 1
+        or ledger.code_body_lines >= 1
+        or ledger.code_indent_lines >= 2
+        or parser_bias >= 1
+    )
+    if not has_code_specific_signal:
+        code_language_hits = 0
+        code_language_weight = 0.0
+    punctuation_support = min(ledger.code_punctuation_markers, 3) if has_code_specific_signal else 0
+    code_support = float(
+        code_language_hits
+        + ledger.code_block_starters
+        + punctuation_support
+        + min(ledger.code_indent_lines, 2)
+        + min(ledger.code_body_lines, 2)
+        + parser_bias
+    )
+    structured_support = float(
+        (3 * ledger.json_like_records)
+        + (2 * ledger.log_like_lines)
+        + (2 * ledger.table_like_lines)
+        + (2 * ledger.section_header_lines)
+        + ledger.config_like_lines
+        + ledger.structured_field_lines
+        + min(ledger.state_marker_lines, 2)
+        + ledger.delimited_structured_lines
+    )
+    natural_support = float(
+        (2 * ledger.dialogue_like_lines)
+        + (2 * ledger.natural_heading_lines)
+        + ledger.comment_prose_lines
+        + min(ledger.relation_hits, 4)
+        + min(ledger.sentence_hits, 3)
+        + min(ledger.scientific_hits, 3)
+        + min(ledger.instruction_like_lines, 2)
+        + min(ledger.legal_hits, 2)
+        + min(ledger.medical_hits, 2)
+        + min(ledger.narrative_hits, 2)
+    )
+    mixed_support = 0.0
+    non_code_support = max(structured_support, natural_support, float(ledger.comment_prose_lines))
+    if code_support > 0.0 and non_code_support > 0.0:
+        mixed_support = max(2.0, min(code_support, non_code_support) + 1.0)
+    return {
+        "code": round(code_support + (0.25 * code_language_weight), 4),
+        "structured_text": round(structured_support, 4),
+        "natural_text": round(natural_support, 4),
+        "mixed": round(mixed_support, 4),
     }
-    return _best_scored_label(natural_scores, default="generic_text", min_score=0.8)
+
+
+def _has_code_route(ledger: _RoutingLedger, code_support: float) -> bool:
+    strong_structured_carrier = (
+        ledger.json_like_records >= 1
+        or ledger.log_like_lines >= 2
+        or ledger.table_like_lines >= 2
+        or ledger.section_header_lines >= 1
+        or ledger.structured_field_lines >= 2
+    )
+    parser_code_hint = (
+        ledger.parser_supported is not None
+        and ledger.parser_supported not in {"text", "json"}
+        and not strong_structured_carrier
+    )
+    return bool(
+        code_support >= 3.0
+        or ledger.code_block_starters >= 1
+        or (ledger.code_indent_lines >= 2 and ledger.code_body_lines >= 1)
+        or (parser_code_hint and (ledger.code_punctuation_markers >= 1 or ledger.code_body_lines >= 1))
+    )
+
+
+def _has_structured_route(ledger: _RoutingLedger) -> bool:
+    if ledger.stripped.startswith("#!/"):
+        return False
+    if ledger.json_like_records >= 1:
+        return True
+    if ledger.log_like_lines >= 2 or ledger.table_like_lines >= 2:
+        return True
+    if ledger.section_header_lines >= 1:
+        return True
+    code_like_signal = (
+        ledger.code_block_starters >= 1
+        or ledger.code_body_lines >= 1
+        or ledger.code_punctuation_markers >= 3
+        or max((int(value) for value in ledger.language_marker_hits.values()), default=0) >= 2
+    )
+    if code_like_signal:
+        return False
+    if ledger.config_like_lines >= 2 and ledger.dialogue_like_lines == 0 and ledger.natural_heading_lines == 0:
+        return True
+    if (
+        ledger.structured_field_lines >= 1
+        and ledger.dialogue_like_lines == 0
+        and ledger.natural_heading_lines == 0
+        and ledger.relation_hits == 0
+        and ledger.sentence_hits == 0
+        and ledger.comment_prose_lines == 0
+    ):
+        return True
+    return (
+        ledger.structured_field_lines >= 2
+        and ledger.dialogue_like_lines == 0
+        and ledger.natural_heading_lines == 0
+    )
+
+
+def _has_natural_route(ledger: _RoutingLedger, script: str) -> bool:
+    if ledger.dialogue_like_lines >= 1:
+        return True
+    if ledger.natural_heading_lines >= 1 or ledger.scientific_hits >= 1:
+        return True
+    if ledger.instruction_like_lines >= 1 or ledger.relation_hits >= 1 or ledger.sentence_hits >= 1:
+        return True
+    if ledger.comment_prose_lines >= 1 or ledger.legal_hits >= 1 or ledger.medical_hits >= 1 or ledger.narrative_hits >= 1:
+        return True
+    return script in {"latin", "cyrillic", "mixed"} and bool(re.search(r"[A-Za-zА-Яа-яІіЇїЄєҐґ]", ledger.stripped))
+
+
+def _has_mixed_route(ledger: _RoutingLedger, *, code_route: bool, structured_route: bool, natural_route: bool) -> bool:
+    if not code_route:
+        return False
+    if structured_route:
+        return True
+    return bool(
+        natural_route
+        and (
+            ledger.comment_prose_lines >= 1
+            or ledger.natural_heading_lines >= 1
+            or ledger.instruction_like_lines >= 1
+            or ledger.dialogue_like_lines >= 1
+            or ledger.relation_hits >= 1
+        )
+    )
+
+
+def _infer_structured_text_subtype(ledger: _RoutingLedger) -> str:
+    rules = (
+        ("json_records", ledger.json_like_records >= 1),
+        (
+            "log_text",
+            ledger.log_like_lines >= 1 and ledger.log_like_lines >= max(ledger.table_like_lines, ledger.config_like_lines),
+        ),
+        (
+            "table_text",
+            ledger.table_like_lines >= 2 and ledger.table_like_lines >= max(ledger.log_like_lines, ledger.config_like_lines),
+        ),
+        (
+            "config_text",
+            ledger.section_header_lines >= 1
+            or (
+                ledger.config_like_lines >= 2
+                and ledger.delimited_structured_lines == 0
+                and ledger.natural_heading_lines == 0
+                and ledger.instruction_like_lines == 0
+            ),
+        ),
+        ("key_value_records", ledger.structured_field_lines >= 1 or ledger.state_marker_lines >= 1),
+    )
+    for subtype, matched in rules:
+        if matched:
+            return subtype
+    return "key_value_records"
+
+
+def _infer_natural_text_subtype(ledger: _RoutingLedger) -> str:
+    rules = (
+        ("scientific_text", ledger.scientific_hits >= 1 or ledger.natural_heading_lines >= 1),
+        ("dialogue_text", ledger.dialogue_like_lines >= 1),
+        (
+            "instructional_text",
+            ledger.instruction_like_lines >= 1
+            or (ledger.state_marker_lines >= 2 and ledger.sentence_hits == 0)
+            or ("how to" in ledger.lower),
+        ),
+        ("legal_text", ledger.legal_hits >= 2),
+        ("medical_text", ledger.medical_hits >= 2),
+        ("narrative_text", ledger.narrative_hits >= 2),
+        ("claim_text", ledger.relation_hits >= 1),
+        ("generic_text", True),
+    )
+    for subtype, matched in rules:
+        if matched:
+            return subtype
+    return "generic_text"
 
 
 def verification_path_for_source(modality: str, subtype: str) -> str:
@@ -486,6 +785,10 @@ def verification_path_for_source(modality: str, subtype: str) -> str:
             return "scientific_claim_verification"
         if subtype == "dialogue_text":
             return "dialogue_state_verification"
+        if subtype == "legal_text":
+            return "legal_clause_verification"
+        if subtype == "medical_text":
+            return "medical_fact_verification"
         return "natural_language_claim_verification"
     return "fallback_verification"
 
@@ -566,236 +869,145 @@ def infer_source_profile(
             ambiguity=1.0,
             profile={"code": 0.0, "natural_text": 0.0, "structured_text": 0.0, "mixed": 0.0, "unknown": 1.0},
             script_profile=script_profile,
-            evidence={"code_score": 0.0, "structured_score": 0.0, "observation_score": 0.0},
+            evidence={"route_registry_version": 1.0, "code_score": 0.0, "structured_score": 0.0, "observation_score": 0.0},
         )
         return GroundingSourceProfile(**{**empty.__dict__, "parser_candidates": build_parser_candidates(empty)})
 
-    lower = stripped.lower()
-    raw_lines = [line for line in stripped.splitlines() if line.strip()]
-    lines = [line.strip() for line in raw_lines]
-    probe = lines[: min(len(lines), 8)]
-    supported = tuple(sorted(set(supported_languages) | set(_ROUTER_LANGUAGE_MARKERS.keys())))
-    language_scores: Dict[str, float] = {
-        lang: _weighted_marker_score(lower, _ROUTER_LANGUAGE_MARKERS.get(lang, ()))
-        for lang in supported
-    }
-
-    if re.search(r"^\s*def\s+\w+\s*\(", stripped, flags=re.MULTILINE):
-        language_scores["python"] = language_scores.get("python", 0.0) + 1.5
-    if re.search(r"^\s*for\s+\w+\s+in\s+range\s*\(", stripped, flags=re.MULTILINE):
-        language_scores["python"] = language_scores.get("python", 0.0) + 2.0
-    if re.search(r"^\s*if\b.+:\s*$", stripped, flags=re.MULTILINE):
-        language_scores["python"] = language_scores.get("python", 0.0) + 1.2
-    if "print(" in lower:
-        language_scores["python"] = language_scores.get("python", 0.0) + 0.8
-    if any(line.endswith(":") for line in probe) and any(line.startswith(("    ", "\t")) for line in raw_lines[1:]):
-        language_scores["python"] = language_scores.get("python", 0.0) + 1.0
-    if re.search(r"^\s*class\s+\w+\s*\{", stripped, flags=re.MULTILINE):
-        language_scores["javascript"] = language_scores.get("javascript", 0.0) + 0.8
-        language_scores["typescript"] = language_scores.get("typescript", 0.0) + 0.8
-    if re.search(r"^\s*fn\s+\w+\s*\(", stripped, flags=re.MULTILINE):
-        language_scores["rust"] = language_scores.get("rust", 0.0) + 1.4
-    if re.search(r"^\s*package\s+\w+", stripped, flags=re.MULTILINE):
-        language_scores["go"] = language_scores.get("go", 0.0) + 1.2
-    if re.search(r"^\s*#include\s+[<\"]", stripped, flags=re.MULTILINE):
-        language_scores["c"] = language_scores.get("c", 0.0) + 1.2
-        language_scores["cpp"] = language_scores.get("cpp", 0.0) + 1.2
-
-    general_code_score = 0.0
-    if any(token in stripped for token in ("{", "}", ";", "(", ")", "=>")):
-        general_code_score += 0.8
-    if any(line.startswith(("def ", "class ", "fn ", "function ", "package ", "#include")) for line in probe):
-        general_code_score += 1.0
-    if any(line.startswith(("    ", "\t")) for line in raw_lines[1:]):
-        general_code_score += 0.5
-
-    structured_score = 0.0
-    json_like_records = 0
-    dialogue_like_lines = sum(
-        1
-        for line in probe
-        if re.match(r"^(user|assistant|speaker|q|a)\s*[:>-]", line.lower())
+    ledger = _build_routing_ledger(
+        stripped,
+        parser_lang=parser_lang,
+        supported_languages=supported_languages,
     )
-    natural_heading_lines = sum(1 for line in probe if _looks_natural_section_heading_line(line))
-    comment_prose_lines = sum(1 for line in raw_lines if _looks_comment_prose_line(line))
-    for line in probe:
-        if line.startswith("{") and line.endswith("}") and ":" in line:
-            json_like_records += 1
-            structured_score += 1.3
-            try:
-                json.loads(line)
-                structured_score += 0.8
-            except Exception:
-                pass
-        elif _looks_structured_field_line(line):
-            structured_score += 0.5
-        if line.count("|") >= 2 or line.count("\t") >= 2 or line.count(",") >= 3:
-            structured_score += 0.8
-    log_like_lines = sum(
-        1
-        for line in probe
-        if re.search(r"^\d{4}-\d{2}-\d{2}", line)
-        or re.search(r"\b(info|warn|warning|error|debug|trace)\b", line.lower())
+    selected_language, top_language_hits, top_language_weight, _top_regex_hits, parser_match = _select_code_language(ledger)
+    supports = _supports_for_ledger(
+        ledger,
+        top_language_hits=top_language_hits,
+        top_language_weight=top_language_weight,
+        parser_match=parser_match,
     )
-    if log_like_lines >= 1:
-        structured_score += 1.0
-    if log_like_lines >= 2:
-        structured_score += 0.8
-    config_like_lines = sum(
-        1
-        for line in probe
-        if (
-            re.match(r"^\[[^\]]+\]$", line.strip())
-            or (
-                not re.match(r"^(user|assistant|speaker|q|a)\s*[:>-]", line.lower())
-                and re.match(r"^[A-Za-z0-9_.-]+\s*[:=]\s*.+$", line)
-            )
-        )
+    code_support = float(supports["code"])
+    structured_support = float(supports["structured_text"])
+    natural_support = float(supports["natural_text"])
+    mixed_support = float(supports["mixed"])
+
+    script, script_profile = infer_script_profile(stripped)
+    code_route = _has_code_route(ledger, code_support)
+    structured_route = _has_structured_route(ledger)
+    natural_route = _has_natural_route(ledger, script)
+    mixed_route = _has_mixed_route(
+        ledger,
+        code_route=code_route,
+        structured_route=structured_route,
+        natural_route=natural_route,
     )
-    if config_like_lines >= 1:
-        structured_score += 1.0
-    if config_like_lines >= 2:
-        structured_score += 0.6
-    table_like_lines = sum(
-        1
-        for line in probe
-        if "|" in line or "\t" in line or line.count(",") >= 2
-    )
-    if table_like_lines >= 1:
-        structured_score += 1.0
-    if table_like_lines >= 2:
-        structured_score += 0.6
-    if json_like_records >= 2:
-        structured_score += 1.4
-    if any(re.search(r"\b(step|state|goal|target|status|next)\b", line.lower()) for line in probe):
-        structured_score += 1.1
-    if dialogue_like_lines >= 2:
-        structured_score = max(structured_score - 1.5, 0.0)
-    if natural_heading_lines >= 1:
-        structured_score = max(structured_score - 0.6 * float(natural_heading_lines), 0.0)
 
-    relation_hits = len(re.findall(r"\b(is|becomes|causes|leads to|requires|must|not|after|before|however)\b", lower))
-    sentence_hits = len(re.findall(r"[.!?](?:\s|$)", stripped))
-    observation_score = min(float(relation_hits) * 0.45, 3.2) + min(float(sentence_hits) * 0.25, 1.5)
-    if natural_heading_lines >= 1:
-        observation_score += 0.9 + 0.35 * float(natural_heading_lines - 1)
-    if comment_prose_lines >= 1:
-        observation_score += 0.55 + 0.25 * float(comment_prose_lines - 1)
-    if dialogue_like_lines >= 2:
-        observation_score += 1.0
-
-    ranked_languages = sorted(language_scores.items(), key=lambda item: item[1], reverse=True)
-    top_lang, top_score = ranked_languages[0] if ranked_languages else ("python", 0.0)
-    second_score = ranked_languages[1][1] if len(ranked_languages) > 1 else 0.0
-    parser_supported = parser_lang if isinstance(parser_lang, str) and parser_lang in language_scores else None
-    code_score = top_score + general_code_score
-    if parser_supported is not None:
-        code_score = max(code_score, language_scores.get(parser_supported, 0.0) + general_code_score + 0.4)
-
-    domain_scores = {
-        "code": code_score,
-        "structured_observation": structured_score,
-        "observation_text": observation_score,
-    }
-
-    short_structured_hint = (
-        json_like_records >= 1
-        or log_like_lines >= 1
-        or config_like_lines >= 1
-        or table_like_lines >= 1
-    )
-    if structured_score >= max(code_score * 1.05, observation_score * 0.95, 2.2) or (
-        short_structured_hint and structured_score >= 1.4 and code_score < 1.0 and observation_score < 0.8
-    ):
-        language = "json" if json_like_records > 0 else "text"
-        domain = "structured_observation"
-        selected_score = structured_score
-    elif observation_score >= max(code_score * 1.10, structured_score * 0.90, 1.5):
-        language = "text"
-        domain = "observation_text"
-        selected_score = observation_score
-    elif code_score >= 1.6:
-        language = top_lang
-        if parser_supported is not None and (
-            top_score < 1.5 or language_scores.get(parser_supported, 0.0) >= top_score - 0.2
-        ):
-            language = parser_supported
-        domain = "code"
-        selected_score = code_score
-    else:
-        language = "text"
-        domain = "text"
-        selected_score = max(structured_score, observation_score, code_score)
-
-    domain_runner_up = (
-        max(score for key, score in domain_scores.items() if key != domain)
-        if domain in domain_scores
-        else 0.0
-    )
-    parser_agreement = 0.15 if parser_supported is not None and language == parser_supported else 0.0
-    confidence = 0.35 + 0.08 * min(selected_score, 6.0) + 0.10 * max(top_score - second_score, 0.0)
-    confidence += 0.08 * max(selected_score - domain_runner_up, 0.0) + parser_agreement
-    confidence = max(0.05, min(confidence, 0.99))
-
-    natural_text_score = max(observation_score, 0.6 if domain == "text" else 0.0)
-    mixed_score = min(code_score, max(structured_score, natural_text_score))
-    modality_scores = {
-        "code": code_score,
-        "natural_text": natural_text_score,
-        "structured_text": structured_score,
-        "mixed": mixed_score,
-        "unknown": 0.8 if domain == "text" and max(code_score, structured_score, observation_score) < 1.2 else 0.0,
-    }
-    profile = _normalized_score_map(modality_scores)
-
-    if domain == "code":
-        primary_modality = "code"
-    elif domain == "structured_observation":
-        primary_modality = "structured_text"
-    elif domain in ("observation_text", "text"):
-        primary_modality = "natural_text"
-    else:
-        primary_modality = "unknown"
-
-    modality = primary_modality
-    mixed_noncode_signal = natural_text_score >= 0.4 or structured_score >= 2.0
-    if domain != "empty" and code_score >= 1.6 and mixed_score >= 1.0 and mixed_noncode_signal:
+    if mixed_route:
         modality = "mixed"
+        domain = "code"
+    elif code_route:
+        modality = "code"
+        domain = "code"
+    elif structured_route:
+        modality = "structured_text"
+        domain = "structured_observation"
+    elif natural_route:
+        modality = "natural_text"
+        domain = "observation_text" if natural_support > 0.0 else "text"
+    else:
+        modality = "unknown"
+        domain = "text"
+
+    if modality == "code":
+        language = selected_language
+    elif modality == "structured_text":
+        language = "json" if ledger.json_like_records > 0 else "text"
+    else:
+        language = "text"
 
     if modality == "code":
         subtype = "program_source"
     elif modality == "structured_text":
-        subtype = _infer_structured_text_subtype(
-            stripped,
-            lower,
-            probe,
-            json_like_records=json_like_records,
-        )
+        subtype = _infer_structured_text_subtype(ledger)
     elif modality == "natural_text":
-        subtype = _infer_natural_text_subtype(
-            stripped,
-            lower,
-            probe,
-            relation_hits=relation_hits,
-        )
+        subtype = _infer_natural_text_subtype(ledger)
     elif modality == "mixed":
-        subtype = "mixed_code_structured" if structured_score >= natural_text_score else "mixed_code_text"
+        subtype = (
+            "mixed_code_structured"
+            if (
+                structured_route
+                or ledger.instruction_like_lines >= 1
+                or ledger.comment_prose_lines >= 1
+                or ledger.state_marker_lines >= 1
+            )
+            else "mixed_code_text"
+        )
     else:
         subtype = "unknown"
+
     verification_path = verification_path_for_source(modality, subtype)
+    profile_scores = {
+        "code": code_support,
+        "natural_text": natural_support if modality != "unknown" else 0.0,
+        "structured_text": structured_support,
+        "mixed": mixed_support,
+        "unknown": 1.0 if modality == "unknown" else 0.0,
+    }
+    profile = _normalized_score_map(profile_scores)
+    selected_support = max(profile_scores.get(modality, 0.0), mixed_support if modality == "mixed" else 0.0)
+    runner_up = max(
+        value for key, value in profile_scores.items() if key != modality
+    ) if len(profile_scores) > 1 else 0.0
+    parser_agreement = 1.0 if ledger.parser_supported is not None and language == ledger.parser_supported else 0.0
+    confidence = 0.35 + (0.08 * min(selected_support, 6.0)) + (0.06 * max(selected_support - runner_up, 0.0))
+    confidence += 0.05 * parser_agreement
+    if modality == "unknown":
+        confidence = min(confidence, 0.25)
+    confidence = max(0.05, min(confidence, 0.99))
+    ambiguity = _clip01(max(1.0 - confidence, profile.get("mixed", 0.0), profile.get("unknown", 0.0)))
 
     evidence = {
-        "code_score": round(code_score, 4),
-        "structured_score": round(structured_score, 4),
-        "observation_score": round(observation_score, 4),
-        "natural_text_score": round(natural_text_score, 4),
-        "mixed_score": round(mixed_score, 4),
-        "top_language_score": round(top_score, 4),
-        "second_language_score": round(second_score, 4),
-        "parser_agreement": 1.0 if parser_supported is not None and language == parser_supported else 0.0,
+        "route_registry_version": 1.0,
+        "route_tie_break_precedence": 1.0,
+        "route_rule_code": 1.0 if code_route else 0.0,
+        "route_rule_structured_text": 1.0 if structured_route else 0.0,
+        "route_rule_natural_text": 1.0 if natural_route else 0.0,
+        "route_rule_mixed": 1.0 if mixed_route else 0.0,
+        "feature_json_like_records": float(ledger.json_like_records),
+        "feature_dialogue_like_lines": float(ledger.dialogue_like_lines),
+        "feature_natural_heading_lines": float(ledger.natural_heading_lines),
+        "feature_comment_prose_lines": float(ledger.comment_prose_lines),
+        "feature_structured_field_lines": float(ledger.structured_field_lines),
+        "feature_delimited_structured_lines": float(ledger.delimited_structured_lines),
+        "feature_section_header_lines": float(ledger.section_header_lines),
+        "feature_log_like_lines": float(ledger.log_like_lines),
+        "feature_config_like_lines": float(ledger.config_like_lines),
+        "feature_table_like_lines": float(ledger.table_like_lines),
+        "feature_instruction_like_lines": float(ledger.instruction_like_lines),
+        "feature_state_marker_lines": float(ledger.state_marker_lines),
+        "feature_relation_hits": float(ledger.relation_hits),
+        "feature_sentence_hits": float(ledger.sentence_hits),
+        "feature_scientific_hits": float(ledger.scientific_hits),
+        "feature_legal_hits": float(ledger.legal_hits),
+        "feature_medical_hits": float(ledger.medical_hits),
+        "feature_narrative_hits": float(ledger.narrative_hits),
+        "feature_code_block_starters": float(ledger.code_block_starters),
+        "feature_code_punctuation_markers": float(ledger.code_punctuation_markers),
+        "feature_code_indent_lines": float(ledger.code_indent_lines),
+        "feature_code_body_lines": float(ledger.code_body_lines),
+        "top_language_score": float(top_language_hits),
+        "second_language_score": float(
+            sorted((float(value) for value in ledger.language_marker_hits.values()), reverse=True)[1]
+            if len(ledger.language_marker_hits) > 1
+            else 0.0
+        ),
+        "parser_agreement": parser_agreement,
+        "code_score": round(code_support, 4),
+        "structured_score": round(structured_support, 4),
+        "observation_score": round(natural_support, 4),
+        "natural_text_score": round(natural_support, 4),
+        "mixed_score": round(mixed_support, 4),
     }
-    ambiguity = _clip01(max(1.0 - confidence, profile.get("mixed", 0.0), profile.get("unknown", 0.0)))
-    script, script_profile = infer_script_profile(stripped)
+
     result = GroundingSourceProfile(
         language=language,
         script=script,

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Tuple
 
+from .heuristic_policy import is_heuristic_claim_source, record_is_heuristic
 from .symbolic_compiler import SymbolicCompilationResult
 from .types import GroundingSpan
 from .verification import (
@@ -114,6 +115,8 @@ def build_grounding_world_state_writeback(
         epistemic_status = str(getattr(hypothesis, "epistemic_status", "asserted") or "asserted")
         semantic_mode = str(getattr(hypothesis, "semantic_mode", "instance") or "instance")
         quantifier_mode = str(getattr(hypothesis, "quantifier_mode", "instance") or "instance")
+        claim_source = str(getattr(hypothesis, "claim_source", "document") or "document")
+        heuristic_claim = is_heuristic_claim_source(claim_source)
         nonasserted = epistemic_status in {"cited", "questioned", "hedged"}
         rule_lifecycle = semantic_mode in {"generic", "rule", "obligation"} or quantifier_mode in {"generic_all", "directive"}
         if verification_record is None:
@@ -128,8 +131,10 @@ def build_grounding_world_state_writeback(
             provenance = tuple(str(item) for item in hypothesis.provenance)
         else:
             verification_status = str(verification_record.verification_status)
-            if verification_status == "supported":
-                world_status = "hypothetical" if (nonasserted or rule_lifecycle) else "active"
+            if heuristic_claim:
+                world_status = "hypothetical"
+            elif verification_status == "supported":
+                world_status = "hypothetical" if (nonasserted or rule_lifecycle or heuristic_claim) else "active"
             elif verification_status == "conflicted":
                 world_status = "contradicted"
             else:
@@ -139,6 +144,9 @@ def build_grounding_world_state_writeback(
             repair_action = str(verification_record.repair_action or "none")
             if rule_lifecycle and verification_status == "supported":
                 repair_action = "route_to_symbolic_rule_lifecycle"
+            if heuristic_claim:
+                world_status = "hypothetical"
+                repair_action = "require_grounding_confirmation"
             provenance = tuple(str(item) for item in verification_record.provenance)
         records.append(
             GroundingWorldStateRecord(
@@ -155,7 +163,7 @@ def build_grounding_world_state_writeback(
                 repair_action=repair_action,
                 speaker_key=str(getattr(hypothesis, "speaker_key", "") or ""),
                 epistemic_status=epistemic_status,
-                claim_source=str(getattr(hypothesis, "claim_source", "document") or "document"),
+                claim_source=claim_source,
                 semantic_mode=semantic_mode,
                 quantifier_mode=quantifier_mode,
                 provenance=provenance,
@@ -180,6 +188,7 @@ def build_grounding_world_state_writeback(
     rule = sum(1 for record in records if record.semantic_mode == "rule")
     obligation = sum(1 for record in records if record.semantic_mode == "obligation")
     hidden_cause_records = sum(1 for record in records if record.record_type == "hidden_cause")
+    heuristic_records = sum(1 for record in records if record_is_heuristic(record))
     rule_lifecycle_records = sum(
         1
         for record in records
@@ -241,6 +250,7 @@ def build_grounding_world_state_writeback(
         "grounding_world_state_obligation_records": float(obligation),
         "grounding_world_state_hidden_cause_records": float(hidden_cause_records),
         "grounding_world_state_hidden_cause_ratio": hidden_cause_ratio,
+        "grounding_world_state_heuristic_records": float(heuristic_records),
         "grounding_world_state_rule_lifecycle_records": float(rule_lifecycle_records),
         "grounding_world_state_rule_lifecycle_ratio": float(rule_lifecycle_records) / max(total, 1.0),
         "grounding_world_state_nonasserted_ratio": nonasserted_ratio,

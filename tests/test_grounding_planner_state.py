@@ -175,6 +175,50 @@ class GroundingPlannerStateTest(unittest.TestCase):
         self.assertGreaterEqual(planner_state.summary()["planner_state_temporal_operators"], 1.0)
         self.assertGreaterEqual(planner_state.summary()["planner_state_modal_operators"], 1.0)
 
+    def test_build_planner_world_state_projects_hidden_cause_records_as_hypothetical_operators(self) -> None:
+        hidden_cause_record = GroundingWorldStateRecord(
+            record_id="hypothetical:hidden_cause:door_open",
+            hypothesis_id="hidden_cause:door_open",
+            record_type="hidden_cause",
+            world_status="hypothetical",
+            segment_index=0,
+            symbols=(
+                "door_5",
+                "requires_hidden_cause",
+                "missing_opens_with_event_green_card",
+                "missing_slot:cause",
+                "candidate_agent:external_actor",
+                "anchor_predicate:opens_with",
+                "anchor_object:green_card",
+            ),
+            support=0.74,
+            conflict=0.18,
+            confidence=0.77,
+            repair_action="trigger_hidden_cause_abduction",
+            provenance=("trigger_hypothesis:rel:door",),
+        )
+        ctx = SymbolicTaskContext(
+            observed_now_facts=frozenset(),
+            grounding_world_state_records=(hidden_cause_record,),
+            metadata={"grounding_hidden_cause_pressure": 0.65},
+        )
+
+        planner_state = build_planner_world_state(ctx)
+        summary = planner_state.summary()
+
+        self.assertEqual(len(planner_state.hypothetical_records), 1)
+        self.assertIn("door_5", planner_state.resource_symbols)
+        self.assertIn("missing_opens_with_event_green_card", planner_state.resource_symbols)
+        self.assertEqual(len(planner_state.operators), 1)
+        operator = planner_state.operators[0]
+        self.assertEqual(operator.predicate, "requires_hidden_cause")
+        self.assertEqual(operator.inputs, ("door_5",))
+        self.assertEqual(operator.outputs, ("missing_opens_with_event_green_card",))
+        self.assertEqual(operator.status, "hypothetical")
+        self.assertEqual(summary["planner_state_hidden_cause_records"], 1.0)
+        self.assertEqual(summary["planner_state_hidden_cause_operators"], 1.0)
+        self.assertGreaterEqual(planner_state.hidden_cause_pressure, 0.65)
+
     def test_build_planner_world_state_consumes_artifact_verification_hypotheses_and_lineage(self) -> None:
         verification_supported = GroundingVerificationRecord(
             hypothesis_id="door_open",
@@ -329,6 +373,49 @@ class GroundingPlannerStateTest(unittest.TestCase):
         self.assertGreaterEqual(summary["planner_state_grounding_candidate_rule_records"], 1.0)
         self.assertGreaterEqual(summary["planner_state_candidate_rule_symbols"], 1.0)
         self.assertGreaterEqual(summary["planner_state_hypothetical_operators"], 1.0)
+
+    def test_build_planner_world_state_ignores_heuristic_grounding_candidate_rules(self) -> None:
+        candidate_rule = RuleCandidate(
+            clause=HornClause(
+                head=HornAtom(911, (Var("X"), Var("Y"))),
+                body=(
+                    HornAtom(912, (Var("X"),)),
+                    HornAtom(913, (Var("Y"),)),
+                ),
+            ),
+            source="grounding_rule_compiler",
+            score=0.88,
+            utility=0.81,
+            metadata={
+                "hypothesis_id": "rule:heuristic",
+                "semantic_mode": "rule",
+                "quantifier_mode": "generic_all",
+                "epistemic_status": "asserted",
+                "claim_source": "fallback_extraction",
+                "subject_name": "stars",
+                "predicate_name": "generates",
+                "object_name": "planets",
+                "relation_modifiers": ("if:dust_cloud",),
+                "support_set": ("semantic:rule", "heuristic_authority:low"),
+                "provenance": ("scene:claim:heuristic_rule", "heuristic_authority:low"),
+            },
+        )
+        ctx = SymbolicTaskContext(
+            observed_now_facts=frozenset(),
+            grounding_candidate_rules=(candidate_rule,),
+            metadata={"grounding_uncertainty": 0.18},
+        )
+
+        planner_state = build_planner_world_state(ctx)
+        summary = planner_state.summary()
+
+        self.assertEqual(len(planner_state.candidate_rules), 0)
+        self.assertEqual(len(planner_state.candidate_rule_symbols), 0)
+        self.assertFalse(any(operator.predicate == "generates" for operator in planner_state.operators))
+        self.assertEqual(summary["planner_state_grounding_candidate_rules"], 0.0)
+        self.assertEqual(summary["planner_state_grounding_candidate_rule_records"], 0.0)
+        self.assertEqual(summary["planner_state_candidate_rule_symbols"], 0.0)
+        self.assertEqual(summary["planner_state_heuristic_candidate_rules"], 0.0)
 
 
 if __name__ == "__main__":

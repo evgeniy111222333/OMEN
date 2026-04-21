@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Sequence, Tuple
 
+from .heuristic_policy import record_is_heuristic
+
 
 def _clip01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
@@ -19,6 +21,10 @@ def _record_type(record: Any) -> str:
 def _record_symbols(record: Any) -> Tuple[str, ...]:
     symbols = getattr(record, "symbols", ()) or ()
     return tuple(str(item).strip() for item in symbols if str(item).strip())
+
+
+def _planner_authoritative_record(record: Any) -> bool:
+    return not record_is_heuristic(record)
 
 
 def _record_annotations(record: Any) -> Dict[str, Tuple[str, ...]]:
@@ -112,6 +118,8 @@ def build_planner_resources(
 ) -> Tuple[PlannerResource, ...]:
     aggregated: Dict[str, Dict[str, Any]] = {}
     for record in records:
+        if not _planner_authoritative_record(record):
+            continue
         status = _record_status(record)
         for symbol in _resource_candidates(record):
             state = aggregated.setdefault(
@@ -160,6 +168,8 @@ def build_planner_operators(
 ) -> Tuple[PlannerOperator, ...]:
     operators: List[PlannerOperator] = []
     for record in records:
+        if not _planner_authoritative_record(record):
+            continue
         if _record_type(record) not in {"relation", "hidden_cause"}:
             continue
         symbols = _record_symbols(record)
@@ -214,16 +224,19 @@ def build_planner_alternative_worlds(
         operator_ids = [
             str(getattr(record, "record_id", ""))
             for record in records
+            if _planner_authoritative_record(record)
             if _record_type(record) in {"relation", "hidden_cause"}
         ]
         contradiction_symbols = [
             " | ".join(_record_symbols(record))
             for record in records
+            if _planner_authoritative_record(record)
             if _record_status(record) == "contradicted"
         ]
         resource_symbols = [
             symbol
             for record in records
+            if _planner_authoritative_record(record)
             for symbol in _resource_candidates(record)
         ]
         alternatives.append(
@@ -246,6 +259,7 @@ def build_planner_alternative_worlds(
                     [
                         str(getattr(record, "record_id", ""))
                         for record in active_records
+                        if _planner_authoritative_record(record)
                         if _record_type(record) in {"relation", "hidden_cause"}
                     ],
                     limit=limit * 8,
@@ -254,6 +268,7 @@ def build_planner_alternative_worlds(
                     [
                         symbol
                         for record in active_records
+                        if _planner_authoritative_record(record)
                         for symbol in _resource_candidates(record)
                     ],
                     limit=limit * 12,

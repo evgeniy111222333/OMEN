@@ -77,6 +77,14 @@ CASES: Sequence[GroundingBenchmarkCase] = (
         language="text",
         text="door opens but no green card",
     ),
+    GroundingBenchmarkCase(
+        name="uk_rule_exception",
+        language="uk",
+        text=(
+            'Правило: "Зелена картка" відчиняє "Двері".\n'
+            "Факт: У Боба немає зеленої картки."
+        ),
+    ),
 )
 
 

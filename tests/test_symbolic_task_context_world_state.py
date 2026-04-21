@@ -8,7 +8,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from omen_prolog import HornAtom, SymbolicTaskContext
+from omen_prolog import HornAtom, HornClause, SymbolicTaskContext, Var
+from omen_symbolic.creative_types import RuleCandidate
 from omen_symbolic.execution_trace import build_symbolic_trace_bundle_with_artifacts
 
 
@@ -79,7 +80,7 @@ class SymbolicTaskContextWorldStateTest(unittest.TestCase):
         self.assertIn("interlingua", labels)
         self.assertGreaterEqual(counts["grounding_graph_records"], 1.0)
 
-    def test_source_records_surface_grounding_candidate_rules_from_artifacts(self) -> None:
+    def test_source_records_do_not_surface_heuristic_candidate_rules_from_artifacts(self) -> None:
         _bundle, artifacts = build_symbolic_trace_bundle_with_artifacts(
             "Rule all stars generate planets.",
             lang_hint="text",
@@ -93,8 +94,53 @@ class SymbolicTaskContextWorldStateTest(unittest.TestCase):
         labels = {label for label, _ in ctx.source_fact_records()}
         counts = ctx.source_counts()
 
-        self.assertIn("grounding_candidate_rule", labels)
-        self.assertGreaterEqual(counts["grounding_candidate_rules"], 1.0)
+        self.assertNotIn("grounding_candidate_rule", labels)
+        self.assertEqual(counts["grounding_candidate_rules"], 0.0)
+
+    def test_source_records_drop_direct_heuristic_candidate_rules(self) -> None:
+        heuristic_candidate = RuleCandidate(
+            clause=HornClause(
+                head=HornAtom(301, (Var("X"), Var("Y"))),
+                body=(
+                    HornAtom(302, (Var("X"),)),
+                    HornAtom(303, (Var("Y"),)),
+                ),
+            ),
+            source="grounding_rule_compiler",
+            score=0.88,
+            utility=0.81,
+            metadata={
+                "claim_source": "fallback_extraction",
+                "subject_name": "stars",
+                "predicate_name": "generates",
+                "object_name": "planets",
+                "provenance": ("heuristic_authority:low",),
+            },
+        )
+        ctx = SymbolicTaskContext(grounding_candidate_rules=(heuristic_candidate,))
+
+        labels = {label for label, _ in ctx.source_fact_records()}
+        counts = ctx.source_counts()
+
+        self.assertNotIn("grounding_candidate_rule", labels)
+        self.assertEqual(counts["grounding_candidate_rules"], 0.0)
+
+    def test_source_records_surface_hidden_cause_records_from_artifacts(self) -> None:
+        _bundle, artifacts = build_symbolic_trace_bundle_with_artifacts(
+            "door opens but no green card",
+            lang_hint="text",
+            max_steps=8,
+            max_counterexamples=2,
+        )
+        self.assertIsNotNone(artifacts)
+        assert artifacts is not None
+
+        ctx = SymbolicTaskContext(grounding_artifacts=artifacts)
+        labels = {label for label, _ in ctx.source_fact_records()}
+        counts = ctx.source_counts()
+
+        self.assertIn("grounding_hidden_cause", labels)
+        self.assertGreaterEqual(counts["grounding_hidden_cause_records"], 1.0)
 
 
 if __name__ == "__main__":

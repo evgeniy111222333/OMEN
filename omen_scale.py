@@ -4439,9 +4439,9 @@ class OMENScale(nn.Module):
             + tuple(getattr(source, "grounding_world_state_records", ()) or ())
             + tuple(getattr(source, "grounding_verification_records", ()) or ())
             + tuple(getattr(source, "grounding_hidden_cause_records", ()) or ())
+            + tuple(getattr(source, "grounding_hypotheses", ()) or ())
             + tuple(getattr(source, "grounding_validation_records", ()) or ())
             + tuple(getattr(source, "grounding_repair_actions", ()) or ())
-            + tuple(getattr(source, "grounding_hypotheses", ()) or ())
         )
         if include_graph_records:
             records = records + tuple(getattr(source, "grounding_graph_records", ()) or ())

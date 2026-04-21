@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from .heuristic_policy import candidate_rule_is_heuristic
 from .planner_guidance import PlannerConstraint, PlannerRepairDirective, build_planner_guidance
 from .planner_semantics import (
     PlannerAlternativeWorld,
@@ -142,6 +143,7 @@ class _PlannerBridgeRecord:
     record_id: str
     record_type: str
     world_status: str
+    claim_source: str = ""
     symbols: Tuple[str, ...] = field(default_factory=tuple)
     support: float = 0.0
     conflict: float = 0.0
@@ -157,6 +159,7 @@ def _bridge_verification_record(record: Any) -> _PlannerBridgeRecord:
         record_id=f"verification:{getattr(record, 'hypothesis_id', 'unknown')}",
         record_type=_record_type(record),
         world_status=_verification_world_status(record),
+        claim_source=str(getattr(record, "claim_source", "") or ""),
         symbols=_record_symbols(record),
         support=support,
         conflict=conflict,
@@ -174,6 +177,7 @@ def _bridge_hypothesis_record(record: Any) -> _PlannerBridgeRecord:
         record_id=f"hypothesis:{getattr(record, 'hypothesis_id', 'unknown')}",
         record_type=str(getattr(record, "kind", "") or "unknown").strip().lower() or "unknown",
         world_status=_hypothesis_world_status(record),
+        claim_source=str(getattr(record, "claim_source", "") or ""),
         symbols=_record_symbols(record),
         support=confidence,
         conflict=0.72 if conflict_tag else (_clip01(1.0 - confidence) if deferred else 0.0),
@@ -192,6 +196,7 @@ def _bridge_graph_record(record: Any) -> _PlannerBridgeRecord:
         record_id=f"graph:{getattr(record, 'record_id', 'unknown')}",
         record_type=_record_type(record),
         world_status="hypothetical",
+        claim_source="graph_context",
         symbols=_record_graph_terms(record),
         support=0.0,
         conflict=0.0,
@@ -217,6 +222,7 @@ def _bridge_candidate_rule(candidate: Any) -> Optional[_PlannerBridgeRecord]:
         record_id=f"candidate_rule:{metadata.get('hypothesis_id', repr(getattr(candidate, 'clause', candidate)))}",
         record_type="relation",
         world_status="hypothetical",
+        claim_source=str(metadata.get("claim_source", "") or ""),
         symbols=symbols,
         support=score,
         conflict=conflict,
@@ -337,6 +343,10 @@ class PlannerWorldState:
         summary.setdefault("planner_state_hypothesis_records", float(len(self.hypothesis_records)))
         summary.setdefault("planner_state_grounding_candidate_rules", float(len(self.candidate_rules)))
         summary.setdefault(
+            "planner_state_heuristic_candidate_rules",
+            float(self.metadata.get("planner_state_heuristic_candidate_rules", 0.0)),
+        )
+        summary.setdefault(
             "planner_state_deferred_hypotheses",
             float(sum(1 for record in self.hypothesis_records if bool(getattr(record, "deferred", False)))),
         )
@@ -441,7 +451,11 @@ class PlannerWorldState:
 def build_planner_world_state(task_context: Any) -> PlannerWorldState:
     records = _task_context_grounding_values(task_context, "grounding_world_state_records")
     ontology_records = _task_context_grounding_values(task_context, "grounding_ontology_records")
-    candidate_rules = _task_context_grounding_values(task_context, "grounding_candidate_rules")
+    raw_candidate_rules = _task_context_grounding_values(task_context, "grounding_candidate_rules")
+    candidate_rules = tuple(
+        candidate for candidate in raw_candidate_rules if not candidate_rule_is_heuristic(candidate)
+    )
+    heuristic_candidate_rules = float(len(raw_candidate_rules) - len(candidate_rules))
     verification_records = _task_context_grounding_values(task_context, "grounding_verification_records")
     hypothesis_records = _task_context_grounding_values(task_context, "grounding_hypotheses")
     graph_records = _task_context_grounding_values(task_context, "grounding_graph_records")
@@ -596,6 +610,7 @@ def build_planner_world_state(task_context: Any) -> PlannerWorldState:
         "planner_state_hypothetical_records": float(len(hypothetical_records)),
         "planner_state_contradicted_records": float(len(contradicted_records)),
         "planner_state_grounding_candidate_rules": float(len(candidate_rules)),
+        "planner_state_heuristic_candidate_rules": heuristic_candidate_rules,
         "planner_state_grounding_candidate_rule_records": float(len(candidate_rule_bridge_records)),
         "planner_state_verification_records": float(len(verification_records)),
         "planner_state_supported_verification_records": float(

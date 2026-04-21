@@ -7,6 +7,15 @@ current OMEN repository.
 
 It complements `concept.md`. It does not replace the canonical product concept.
 
+For the deterministic authority model of routing, grounding, verification,
+world-state writeback, memory interaction, planner ingress, and generation
+state, this document should now be read together with
+`DETERMINISTIC_RUNTIME_CONCEPT_UK.md`.
+
+For rigid ownership boundaries between learned proposal layers and symbolic
+truth-maintenance layers, this document should also be read together with
+`NEURO_SYMBOLIC_BOUNDARY_UK.md`.
+
 Its purpose is narrower and deeper:
 
 - describe how grounding works in the current code
@@ -43,7 +52,7 @@ substantially more powerful without changing its fundamental identity.
 
 The long-term target is therefore:
 
-`bytes -> typed perception -> semantic scene graph -> canonical interlingua -> probabilistic symbolic compilation -> verification/repair -> persistent world state`
+`bytes -> typed perception -> semantic scene graph -> canonical interlingua -> deterministic symbolic lowering with explicit epistemic scoring -> verification/repair -> persistent world state`
 
 ## 3. What Exists in the Current Code
 
@@ -1521,7 +1530,7 @@ raw natural language and mixed real-world inputs.
 
 The final target should therefore be:
 
-`carrier bytes -> typed perception -> structural grounding -> linguistic grounding -> semantic scene graph -> canonical interlingua -> probabilistic symbolic compilation -> verification/repair -> world state -> reasoning/planning/generation`
+`carrier bytes -> typed perception -> structural grounding -> linguistic grounding -> semantic scene graph -> canonical interlingua -> deterministic symbolic lowering with explicit epistemic scoring -> verification/repair -> world state -> reasoning/planning/generation`
 
 That is the architecture required if OMEN is to evolve from a strong
 research-grade neuro-symbolic runtime into a truly robust, multilingual,

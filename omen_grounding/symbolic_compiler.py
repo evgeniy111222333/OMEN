@@ -4,6 +4,7 @@ import zlib
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from .heuristic_policy import record_is_heuristic
 from .interlingua import build_canonical_interlingua
 from .interlingua_types import CanonicalClaimFrame, CanonicalInterlingua
 from .scene_types import SemanticSceneGraph
@@ -356,6 +357,8 @@ def compile_canonical_interlingua(
     def _compile_candidate_rule(hypothesis: CompiledSymbolicHypothesis) -> Optional[Any]:
         if hypothesis.kind != "relation":
             return None
+        if record_is_heuristic(hypothesis):
+            return None
         if hypothesis.semantic_mode not in {"generic", "rule", "obligation"}:
             return None
         if len(hypothesis.symbols) < 3:
@@ -423,6 +426,13 @@ def compile_canonical_interlingua(
     metadata = dict(interlingua.metadata)
     deferred_hypotheses = sum(1 for hypothesis in hypotheses if hypothesis.deferred)
     conflict_hypotheses = sum(1 for hypothesis in hypotheses if hypothesis.conflict_tag)
+    heuristic_rule_hypotheses = sum(
+        1
+        for hypothesis in hypotheses
+        if hypothesis.kind == "relation"
+        and hypothesis.semantic_mode in {"generic", "rule", "obligation"}
+        and record_is_heuristic(hypothesis)
+    )
     mean_confidence = (
         sum(float(hypothesis.confidence) for hypothesis in hypotheses) / float(len(hypotheses))
         if hypotheses else 0.0
@@ -485,6 +495,7 @@ def compile_canonical_interlingua(
                 )
             ),
             "compiled_candidate_rules": float(len(candidate_rules)),
+            "compiled_filtered_heuristic_candidate_rules": float(heuristic_rule_hypotheses),
             "compiled_grounding_rule_bridge_active": 1.0 if candidate_rules else 0.0,
         }
     )

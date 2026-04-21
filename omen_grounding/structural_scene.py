@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 from .claim_semantics import infer_claim_semantics
+from .heuristic_policy import append_heuristic_evidence
 from .semantic_context import build_semantic_context_objects
 from .scene_types import (
     SemanticClaim,
@@ -454,7 +455,11 @@ def build_structural_scene_graph(
                     alias=raw_key,
                 )
                 state_id = f"state:struct:natural:{seg_idx}:{state_idx}"
-                evidence_refs = natural_evidence_refs + (f"state_hint:{key_name}",)
+                evidence_refs = append_heuristic_evidence(
+                    natural_evidence_refs + (f"state_hint:{key_name}",),
+                    source="structural_nl_fallback",
+                    role="fallback_extraction",
+                )
                 states.append(
                     SemanticState(
                         state_id=state_id,
@@ -464,7 +469,7 @@ def build_structural_scene_graph(
                         source_segment=seg_idx,
                         source_span=state_span,
                         confidence=state_confidence,
-                        status="supported",
+                        status="proposal",
                         evidence_refs=evidence_refs,
                     )
                 )
@@ -483,7 +488,7 @@ def build_structural_scene_graph(
                         speaker_entity_id=segment_speaker_id,
                         speaker_name=segment_speaker_name,
                         epistemic_status=claim_profile.epistemic_status,
-                        claim_source=claim_profile.claim_source,
+                        claim_source="structural_nl_fallback",
                         semantic_mode=claim_profile.semantic_mode,
                         quantifier_mode=claim_profile.quantifier_mode,
                         evidence_refs=evidence_refs,
@@ -508,7 +513,11 @@ def build_structural_scene_graph(
                     alias=str(getattr(goal, "goal_value", goal_value)),
                 )
                 goal_id = f"goal:struct:natural:{seg_idx}:{goal_idx}"
-                evidence_refs = natural_evidence_refs + (f"goal_hint:{goal_name}",)
+                evidence_refs = append_heuristic_evidence(
+                    natural_evidence_refs + (f"goal_hint:{goal_name}",),
+                    source="structural_nl_fallback",
+                    role="fallback_extraction",
+                )
                 goals.append(
                     SemanticGoal(
                         goal_id=goal_id,
@@ -518,7 +527,7 @@ def build_structural_scene_graph(
                         source_segment=seg_idx,
                         source_span=getattr(goal, "span", None) or segment.span,
                         confidence=confidence,
-                        status="supported",
+                        status="proposal",
                         evidence_refs=evidence_refs,
                     )
                 )
@@ -538,7 +547,7 @@ def build_structural_scene_graph(
                         speaker_entity_id=segment_speaker_id,
                         speaker_name=segment_speaker_name,
                         epistemic_status=claim_profile.epistemic_status,
-                        claim_source=claim_profile.claim_source,
+                        claim_source="structural_nl_fallback",
                         semantic_mode=claim_profile.semantic_mode,
                         quantifier_mode=claim_profile.quantifier_mode,
                         evidence_refs=evidence_refs,
@@ -572,7 +581,11 @@ def build_structural_scene_graph(
                     alias=str(getattr(relation, "right", right_name)),
                 )
                 event_id = f"event:struct:natural:{seg_idx}:{relation_idx}"
-                evidence_refs = natural_evidence_refs + (f"relation_hint:{predicate}",)
+                evidence_refs = append_heuristic_evidence(
+                    natural_evidence_refs + (f"relation_hint:{predicate}",),
+                    source="structural_nl_fallback",
+                    role="fallback_extraction",
+                )
                 events.append(
                     SemanticEvent(
                         event_id=event_id,
@@ -588,7 +601,7 @@ def build_structural_scene_graph(
                         source_span=getattr(relation, "span", None) or segment.span,
                         confidence=confidence,
                         polarity="negative" if bool(getattr(segment, "counterexample", False)) else "positive",
-                        status="supported",
+                        status="proposal",
                         evidence_refs=evidence_refs,
                     )
                 )
@@ -609,7 +622,7 @@ def build_structural_scene_graph(
                         speaker_entity_id=segment_speaker_id,
                         speaker_name=segment_speaker_name,
                         epistemic_status=claim_profile.epistemic_status,
-                        claim_source=claim_profile.claim_source,
+                        claim_source="structural_nl_fallback",
                         semantic_mode=claim_profile.semantic_mode,
                         quantifier_mode=claim_profile.quantifier_mode,
                         evidence_refs=evidence_refs,

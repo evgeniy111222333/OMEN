@@ -4,6 +4,21 @@
 
 Цей документ є канонічною концепцією OMEN у поточному репозиторії.
 
+Нормативне доповнення для детермінізації зовнішнього ingest/grounding/runtime
+контуру: `docs/masterplans/DETERMINISTIC_RUNTIME_CONCEPT_UK.md`.
+
+Нормативне доповнення для жорсткого розподілу відповідальностей між нейронною
+та символьною частинами:
+`docs/masterplans/NEURO_SYMBOLIC_BOUNDARY_UK.md`.
+
+Якщо для routing, grounding, verification, world-state writeback, memory
+writeback/recall, planner ingress або generation state є суперечність між цим
+документом і детермінізаційним masterplan, пріоритет для цих підсистем має
+`DETERMINISTIC_RUNTIME_CONCEPT_UK.md`.
+
+Якщо суперечність стосується ownership між neuro, symbolic і boundary-шарами,
+пріоритет має `NEURO_SYMBOLIC_BOUNDARY_UK.md`.
+
 Він замінює історичну багатошарову версію концепту, в якій змішувалися:
 
 - ранні гіпотези;
