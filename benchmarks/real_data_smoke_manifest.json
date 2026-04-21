@@ -9,7 +9,7 @@
     "tags": ["real", "code"]
   },
   "concept_docs": {
-    "path": "../concept.md",
+    "path": "../docs/masterplans/concept.md",
     "language": "ukrainian",
     "family": "docs",
     "source": "local_docs",
