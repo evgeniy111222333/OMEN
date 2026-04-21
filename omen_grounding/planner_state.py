@@ -285,6 +285,9 @@ class PlannerWorldState:
 
     def summary(self) -> Dict[str, float]:
         summary = dict(self.metadata)
+        candidate_rule_record_count = float(
+            summary.get("planner_state_grounding_candidate_rule_records", float(len(self.candidate_rules)))
+        )
         summary.setdefault("planner_state_ontology_records", float(len(self.ontology_records)))
         summary.setdefault("planner_state_active_records", float(len(self.active_records)))
         summary.setdefault("planner_state_hypothetical_records", float(len(self.hypothetical_records)))
@@ -451,6 +454,33 @@ class PlannerWorldState:
         summary.setdefault(
             "planner_state_alternative_worlds",
             float(len(self.alternative_worlds)),
+        )
+        summary.setdefault(
+            "planner_state_actionable_records",
+            float(len(self.active_records) + len(self.hypothetical_records) + len(self.contradicted_records)),
+        )
+        summary.setdefault(
+            "planner_state_authoritative_records",
+            float(
+                len(self.ontology_records)
+                + len(self.active_records)
+                + len(self.hypothetical_records)
+                + len(self.contradicted_records)
+            ),
+        )
+        summary.setdefault(
+            "planner_state_diagnostic_records",
+            float(
+                len(self.proposal_records)
+                + len(self.verification_records)
+                + len(self.hypothesis_records)
+                + len(self.graph_records)
+            )
+            + candidate_rule_record_count,
+        )
+        summary.setdefault(
+            "planner_state_diagnostic_symbols",
+            float(len(self.lineage_symbols) + len(self.candidate_rule_symbols)),
         )
         return summary
 
@@ -724,6 +754,27 @@ def build_planner_world_state(task_context: Any) -> PlannerWorldState:
             getattr(task_context, "metadata", {}).get("grounding_hidden_cause_pressure", 0.0)
         ),
         "planner_state_alternative_worlds": float(len(alternative_worlds)),
+        "planner_state_actionable_records": float(
+            len(planner_active_world_state_records)
+            + len(planner_hypothetical_world_state_records)
+            + len(planner_contradicted_world_state_records)
+        ),
+        "planner_state_authoritative_records": float(
+            len(ontology_records)
+            + len(planner_active_world_state_records)
+            + len(planner_hypothetical_world_state_records)
+            + len(planner_contradicted_world_state_records)
+        ),
+        "planner_state_diagnostic_records": float(
+            len(proposal_records)
+            + len(verification_records)
+            + len(hypothesis_records)
+            + len(graph_records)
+            + len(candidate_rule_bridge_records)
+        ),
+        "planner_state_diagnostic_symbols": float(
+            len(lineage_symbols) + len(candidate_rule_symbols)
+        ),
     }
 
     return PlannerWorldState(

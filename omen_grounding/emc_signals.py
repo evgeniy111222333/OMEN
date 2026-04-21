@@ -34,15 +34,6 @@ def grounding_emc_features(metadata: Mapping[str, Any] | None) -> Dict[str, floa
     """
     meta = metadata or {}
 
-    def _meta_value(*keys: str, default: float = 0.0) -> float:
-        for key in keys:
-            if key in meta:
-                try:
-                    return float(meta[key])
-                except (TypeError, ValueError):
-                    continue
-        return default
-
     uncertainty = _clip01(meta.get("grounding_uncertainty", 0.0))
     support = _clip01(
         meta.get(
@@ -53,8 +44,21 @@ def grounding_emc_features(metadata: Mapping[str, Any] | None) -> Dict[str, floa
             ),
         )
     )
+    world_state_acceptance = _clip01(meta.get("grounding_world_state_acceptance_ratio", support))
+    verifier_world_support = _clip01(meta.get("verifier_world_model_support", support))
+    verifier_temporal_support = _clip01(meta.get("verifier_temporal_consistency", support))
+    verifier_world_conflict = _clip01(meta.get("verifier_world_model_conflict", 0.0))
+    verifier_temporal_conflict = _clip01(meta.get("verifier_temporal_conflict", 0.0))
     verification_support = _clip01(
-        meta.get("grounding_verification_support", meta.get("verification_acceptance_ratio", support)),
+        meta.get(
+            "grounding_verification_support",
+            (0.42 * world_state_acceptance)
+            + (0.22 * verifier_world_support)
+            + (0.16 * verifier_temporal_support)
+            + (0.12 * support)
+            + (0.05 * (1.0 - verifier_world_conflict))
+            + (0.03 * (1.0 - verifier_temporal_conflict)),
+        ),
         default=support,
     )
     source_confidence = _clip01(meta.get("source_confidence", 1.0), default=1.0)
@@ -100,28 +104,15 @@ def grounding_emc_features(metadata: Mapping[str, Any] | None) -> Dict[str, floa
         interlingua_grounding,
         _clip01(meta.get("grounding_memory_corroboration", 0.0)),
     )
-    hypothesis_count = _meta_value("compiled_hypotheses", "trace_compiled_hypotheses")
-    if hypothesis_count > 0.0:
-        deferred_ratio = _clip01(
-            _meta_value("compiled_deferred_hypotheses", "trace_compiled_deferred_hypotheses")
-            / max(hypothesis_count, 1.0)
-        )
-        mean_confidence = _clip01(
-            _meta_value("compiled_mean_confidence", "trace_compiled_mean_confidence", default=0.5),
-            default=0.5,
-        )
-        grounding_memory_signal = max(
-            grounding_memory_signal,
-            _clip01((1.0 - deferred_ratio) * mean_confidence),
-        )
-    else:
-        deferred_ratio = 0.0
-        mean_confidence = 1.0
 
     proof_instability = _clip01(
         meta.get(
             "grounding_proof_instability",
-            (0.55 * deferred_ratio) + (0.45 * (1.0 - mean_confidence)),
+            (0.40 * _clip01(meta.get("grounding_world_state_branching_pressure", 0.0)))
+            + (0.22 * _clip01(meta.get("grounding_world_state_contradiction_pressure", 0.0)))
+            + (0.16 * _clip01(meta.get("grounding_repair_pressure", meta.get("verification_repair_pressure", 0.0))))
+            + (0.12 * _clip01(meta.get("grounding_hidden_cause_pressure", 0.0)))
+            + (0.10 * parser_disagreement),
         )
     )
     hypothesis_branching = _clip01(
@@ -129,7 +120,8 @@ def grounding_emc_features(metadata: Mapping[str, Any] | None) -> Dict[str, floa
             "grounding_hypothesis_branching_pressure",
             max(
                 _clip01(meta.get("grounding_world_state_branching_pressure", 0.0)),
-                deferred_ratio,
+                _clip01(meta.get("grounding_world_state_hypothetical_ratio", 0.0)),
+                0.75 * _clip01(meta.get("grounding_hidden_cause_pressure", 0.0)),
             ),
         )
     )
@@ -171,10 +163,8 @@ def grounding_emc_features(metadata: Mapping[str, Any] | None) -> Dict[str, floa
     )
     verification_pressure = _clip01(
         (uncertainty * (1.0 - max(support, verification_support)))
-        + (0.18 * deferred_ratio)
-        + (0.12 * (1.0 - mean_confidence))
-        + (0.18 * verification_repair)
-        + (0.10 * conflict_pressure)
+        + (0.22 * verification_repair)
+        + (0.12 * conflict_pressure)
         + (0.18 * world_state_contradiction)
         + (0.16 * proof_instability)
         + (0.12 * contradiction_density)

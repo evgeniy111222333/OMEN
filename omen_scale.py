@@ -4515,35 +4515,9 @@ class OMENScale(nn.Module):
         uncertain_claims = float(raw.get("interlingua_uncertain_claims", 0.0))
         hypothesis_count = float(raw.get("compiled_hypotheses", 0.0))
         deferred_hypotheses = float(raw.get("compiled_deferred_hypotheses", 0.0))
-        compiled_conflict_hypotheses = float(
-            raw.get("compiled_conflict_hypotheses", raw.get("trace_compiled_conflict_hypotheses", 0.0))
-        )
         mean_confidence_default = 1.0 if hypothesis_count <= 0.0 else 0.5
         mean_confidence = max(
             min(float(raw.get("compiled_mean_confidence", mean_confidence_default)), 1.0),
-            0.0,
-        )
-        verification_total = float(raw.get("verification_records", raw.get("trace_verification_records", 0.0)))
-        verification_supported = float(
-            raw.get(
-                "verification_supported_hypotheses",
-                raw.get("trace_verification_supported_hypotheses", 0.0),
-            )
-        )
-        verification_deferred = float(
-            raw.get(
-                "verification_deferred_hypotheses",
-                raw.get("trace_verification_deferred_hypotheses", 0.0),
-            )
-        )
-        verification_conflicted = float(
-            raw.get(
-                "verification_conflicted_hypotheses",
-                raw.get("trace_verification_conflicted_hypotheses", 0.0),
-            )
-        )
-        verification_acceptance = max(
-            min(float(raw.get("verification_acceptance_ratio", 0.0)), 1.0),
             0.0,
         )
         verification_conflict = max(
@@ -4640,10 +4614,6 @@ class OMENScale(nn.Module):
         graph_support = min(graph_records / claim_support_base, 1.0)
         uncertain_ratio = min(uncertain_claims / claim_support_base, 1.0)
         deferred_ratio = min(deferred_hypotheses / max(hypothesis_count, 1.0), 1.0)
-        verification_supported_ratio = min(verification_supported / max(verification_total, 1.0), 1.0)
-        verification_deferred_ratio = min(verification_deferred / max(verification_total, 1.0), 1.0)
-        verification_conflicted_ratio = min(verification_conflicted / max(verification_total, 1.0), 1.0)
-        hypothesis_conflict_ratio = min(compiled_conflict_hypotheses / max(hypothesis_count, 1.0), 1.0)
         world_state_hypothetical_ratio = max(
             min(float(raw.get("grounding_world_state_hypothetical_ratio", 0.0)), 1.0),
             0.0,
@@ -4662,27 +4632,34 @@ class OMENScale(nn.Module):
             ),
             1.0,
         )
+        # Control-facing grounding quality stays anchored on canonical world-state,
+        # ontology, parser/span traceability, memory corroboration, and verifier
+        # conflict/support pressures. Proposal-heavy hypothesis/verification counts
+        # remain telemetry, but no longer drive control pressure implicitly.
         proof_instability = min(
             max(
-                (0.24 * deferred_ratio)
-                + (0.18 * verification_deferred_ratio)
-                + (0.16 * hypothesis_conflict_ratio)
-                + (0.14 * verification_conflicted_ratio)
-                + (0.12 * verification_repair)
-                + (0.10 * (1.0 - mean_confidence))
-                + (0.10 * world_state_branching),
+                (0.28 * world_state_branching)
+                + (0.18 * world_state_contradiction)
+                + (0.14 * verification_repair)
+                + (0.10 * hidden_cause_pressure)
+                + (0.08 * parser_disagreement)
+                + (0.08 * (1.0 - span_traceability))
+                + (0.08 * memory_recall_instability)
+                + (0.06 * (1.0 - ontology_support))
+                + (0.08 * verifier_world_model_conflict)
+                + (0.06 * verifier_temporal_conflict),
                 0.0,
             ),
             1.0,
         )
         contradiction_density = min(
             max(
-                (0.28 * verification_conflict)
-                + (0.22 * verification_conflicted_ratio)
-                + (0.18 * world_state_contradiction)
-                + (0.14 * world_state_conflict)
-                + (0.10 * verifier_world_model_conflict)
-                + (0.08 * verifier_temporal_conflict),
+                (0.30 * world_state_contradiction)
+                + (0.20 * world_state_conflict)
+                + (0.18 * verification_conflict)
+                + (0.12 * verifier_world_model_conflict)
+                + (0.10 * verifier_temporal_conflict)
+                + (0.10 * hidden_cause_pressure),
                 0.0,
             ),
             1.0,
@@ -4691,8 +4668,7 @@ class OMENScale(nn.Module):
             max(
                 world_state_branching,
                 world_state_hypothetical_ratio,
-                deferred_ratio,
-                verification_deferred_ratio,
+                0.75 * hidden_cause_pressure,
             ),
             1.0,
         )
@@ -4723,17 +4699,31 @@ class OMENScale(nn.Module):
         support_ratio = min(
             max(
                 (0.32 * compiled_coverage)
-                + (0.24 * graph_support)
-                + (0.18 * mean_confidence)
-                + (0.16 * verification_acceptance)
-                + (0.06 * verification_supported_ratio)
-                + (0.10 * world_state_acceptance)
-                + (0.08 * parser_agreement)
+                + (0.22 * world_state_acceptance)
+                + (0.12 * parser_agreement)
+                + (0.10 * span_traceability)
+                + (0.12 * memory_corroboration)
+                + (0.12 * ontology_support)
+                + (0.10 * verifier_world_model_support)
+                + (0.08 * verifier_temporal_consistency),
+                0.0,
+            ),
+            1.0,
+        )
+        verification_support = min(
+            max(
+                (0.28 * world_state_acceptance)
+                + (0.18 * verifier_world_model_support)
+                + (0.14 * verifier_temporal_consistency)
+                + (0.10 * support_ratio)
+                + (0.08 * ontology_support)
+                + (0.06 * parser_agreement)
                 + (0.06 * span_traceability)
-                + (0.08 * memory_corroboration)
-                + (0.10 * ontology_support)
-                + (0.08 * verifier_world_model_support)
-                + (0.06 * verifier_temporal_consistency),
+                + (0.04 * memory_corroboration)
+                + (0.03 * (1.0 - verification_conflict))
+                + (0.01 * (1.0 - verification_repair))
+                + (0.01 * (1.0 - verifier_world_model_conflict))
+                + (0.01 * (1.0 - verifier_temporal_conflict)),
                 0.0,
             ),
             1.0,
@@ -4743,16 +4733,14 @@ class OMENScale(nn.Module):
                 (0.40 * uncertain_ratio)
                 + (0.16 * (1.0 - compiled_coverage))
                 + (0.12 * counterexample_sparse)
-                + (0.10 * deferred_ratio)
-                + (0.08 * (1.0 - mean_confidence))
                 + (0.16 * verification_conflict)
                 + (0.14 * verification_repair)
-                + (0.08 * world_state_branching)
-                + (0.08 * world_state_contradiction)
+                + (0.10 * world_state_branching)
+                + (0.10 * world_state_contradiction)
                 + (0.08 * world_state_conflict)
                 + (0.10 * (1.0 - parser_agreement))
                 + (0.08 * (1.0 - span_traceability))
-                + (0.08 * (1.0 - memory_corroboration))
+                + (0.08 * memory_recall_instability)
                 + (0.08 * (1.0 - ontology_support))
                 + (0.10 * verifier_world_model_conflict)
                 + (0.08 * verifier_temporal_conflict)
@@ -4762,7 +4750,7 @@ class OMENScale(nn.Module):
                 + (0.08 * contradiction_density)
                 + (0.06 * world_model_mismatch)
                 + (0.06 * coreference_pressure)
-                + (0.08 * memory_recall_instability),
+                + (0.06 * hidden_cause_pressure),
                 0.0,
             ),
             1.0,
@@ -4773,7 +4761,7 @@ class OMENScale(nn.Module):
             "grounding_graph_support": graph_support,
             "grounding_support_ratio": support_ratio,
             "grounding_uncertainty": uncertainty,
-            "grounding_verification_support": verification_acceptance,
+            "grounding_verification_support": verification_support,
             "grounding_conflict_pressure": verification_conflict,
             "grounding_repair_pressure": verification_repair,
             "grounding_hidden_cause_pressure": hidden_cause_pressure,
@@ -7543,6 +7531,19 @@ class OMENScale(nn.Module):
         out["sym_grounding_world_state_contradicted_facts"] = float(
             len(task_context.grounding_world_state_contradicted_facts)
         )
+        out["sym_grounding_diagnostic_artifacts"] = float(
+            len(task_context.grounding_verification_records)
+            + len(task_context.grounding_hidden_cause_records)
+            + len(task_context.grounding_validation_records)
+            + len(task_context.grounding_repair_actions)
+            + len(task_context.grounding_hypotheses)
+            + len(task_context.grounding_graph_records())
+        )
+        out["sym_grounding_proposal_artifacts"] = float(
+            len(task_context.grounding_verification_records)
+            + len(task_context.grounding_hidden_cause_records)
+            + len(task_context.grounding_hypotheses)
+        )
         out["sym_grounding_verification_records"] = float(len(task_context.grounding_verification_records))
         out["sym_grounding_hidden_cause_records"] = float(len(task_context.grounding_hidden_cause_records))
         out["sym_grounding_validation_records"] = float(len(task_context.grounding_validation_records))
@@ -7844,20 +7845,56 @@ class OMENScale(nn.Module):
         out["planner_state_proposal_records"] = float(
             planner_state_summary.get("planner_state_proposal_records", 0.0)
         )
+        out["planner_state_actionable_records"] = float(
+            planner_state_summary.get("planner_state_actionable_records", 0.0)
+        )
+        out["planner_state_authoritative_records"] = float(
+            planner_state_summary.get("planner_state_authoritative_records", 0.0)
+        )
+        out["planner_state_diagnostic_records"] = float(
+            planner_state_summary.get("planner_state_diagnostic_records", 0.0)
+        )
         out["planner_state_heuristic_world_state_records"] = float(
             planner_state_summary.get("planner_state_heuristic_world_state_records", 0.0)
         )
         out["planner_state_verification_records"] = float(
             planner_state_summary.get("planner_state_verification_records", 0.0)
         )
+        out["planner_state_supported_verification_records"] = float(
+            planner_state_summary.get("planner_state_supported_verification_records", 0.0)
+        )
+        out["planner_state_deferred_verification_records"] = float(
+            planner_state_summary.get("planner_state_deferred_verification_records", 0.0)
+        )
+        out["planner_state_conflicted_verification_records"] = float(
+            planner_state_summary.get("planner_state_conflicted_verification_records", 0.0)
+        )
         out["planner_state_hypothesis_records"] = float(
             planner_state_summary.get("planner_state_hypothesis_records", 0.0)
+        )
+        out["planner_state_deferred_hypotheses"] = float(
+            planner_state_summary.get("planner_state_deferred_hypotheses", 0.0)
+        )
+        out["planner_state_conflicted_hypotheses"] = float(
+            planner_state_summary.get("planner_state_conflicted_hypotheses", 0.0)
+        )
+        out["planner_state_grounding_candidate_rules"] = float(
+            planner_state_summary.get("planner_state_grounding_candidate_rules", 0.0)
+        )
+        out["planner_state_grounding_candidate_rule_records"] = float(
+            planner_state_summary.get("planner_state_grounding_candidate_rule_records", 0.0)
         )
         out["planner_state_graph_records"] = float(
             planner_state_summary.get("planner_state_graph_records", 0.0)
         )
+        out["planner_state_candidate_rule_symbols"] = float(
+            planner_state_summary.get("planner_state_candidate_rule_symbols", 0.0)
+        )
         out["planner_state_lineage_symbols"] = float(
             planner_state_summary.get("planner_state_lineage_symbols", 0.0)
+        )
+        out["planner_state_diagnostic_symbols"] = float(
+            planner_state_summary.get("planner_state_diagnostic_symbols", 0.0)
         )
         out["planner_state_hidden_cause_candidates"] = float(
             planner_state_summary.get("planner_state_hidden_cause_candidates", 0.0)
@@ -8690,58 +8727,95 @@ class OMENScale(nn.Module):
 
             h_for_decode = h_ctx if (self.net_enabled or self.osf_enabled) else None
             planner_state = build_planner_world_state(step_context)
+            planner_state_summary = planner_state.summary()
             symbolic_goal = planner_state.primary_goal or getattr(self.prover, "last_goal", None) or step_context.goal
             symbolic_facts = (
                 getattr(self.prover, "last_context_facts", frozenset())
                 or frozenset(planner_state.symbolic_facts)
             )
             generate_info["planner_state_active_records"] = float(
-                planner_state.metadata.get("planner_state_active_records", 0.0)
+                planner_state_summary.get("planner_state_active_records", 0.0)
             )
             generate_info["planner_state_hypothetical_records"] = float(
-                planner_state.metadata.get("planner_state_hypothetical_records", 0.0)
+                planner_state_summary.get("planner_state_hypothetical_records", 0.0)
             )
             generate_info["planner_state_contradicted_records"] = float(
-                planner_state.metadata.get("planner_state_contradicted_records", 0.0)
+                planner_state_summary.get("planner_state_contradicted_records", 0.0)
             )
             generate_info["planner_state_proposal_records"] = float(
-                planner_state.metadata.get("planner_state_proposal_records", 0.0)
+                planner_state_summary.get("planner_state_proposal_records", 0.0)
+            )
+            generate_info["planner_state_actionable_records"] = float(
+                planner_state_summary.get("planner_state_actionable_records", 0.0)
+            )
+            generate_info["planner_state_authoritative_records"] = float(
+                planner_state_summary.get("planner_state_authoritative_records", 0.0)
+            )
+            generate_info["planner_state_diagnostic_records"] = float(
+                planner_state_summary.get("planner_state_diagnostic_records", 0.0)
             )
             generate_info["planner_state_heuristic_world_state_records"] = float(
-                planner_state.metadata.get("planner_state_heuristic_world_state_records", 0.0)
+                planner_state_summary.get("planner_state_heuristic_world_state_records", 0.0)
             )
             generate_info["planner_state_verification_records"] = float(
-                planner_state.metadata.get("planner_state_verification_records", 0.0)
+                planner_state_summary.get("planner_state_verification_records", 0.0)
+            )
+            generate_info["planner_state_supported_verification_records"] = float(
+                planner_state_summary.get("planner_state_supported_verification_records", 0.0)
+            )
+            generate_info["planner_state_deferred_verification_records"] = float(
+                planner_state_summary.get("planner_state_deferred_verification_records", 0.0)
+            )
+            generate_info["planner_state_conflicted_verification_records"] = float(
+                planner_state_summary.get("planner_state_conflicted_verification_records", 0.0)
             )
             generate_info["planner_state_hypothesis_records"] = float(
-                planner_state.metadata.get("planner_state_hypothesis_records", 0.0)
+                planner_state_summary.get("planner_state_hypothesis_records", 0.0)
+            )
+            generate_info["planner_state_deferred_hypotheses"] = float(
+                planner_state_summary.get("planner_state_deferred_hypotheses", 0.0)
+            )
+            generate_info["planner_state_conflicted_hypotheses"] = float(
+                planner_state_summary.get("planner_state_conflicted_hypotheses", 0.0)
+            )
+            generate_info["planner_state_grounding_candidate_rules"] = float(
+                planner_state_summary.get("planner_state_grounding_candidate_rules", 0.0)
+            )
+            generate_info["planner_state_grounding_candidate_rule_records"] = float(
+                planner_state_summary.get("planner_state_grounding_candidate_rule_records", 0.0)
             )
             generate_info["planner_state_graph_records"] = float(
-                planner_state.metadata.get("planner_state_graph_records", 0.0)
+                planner_state_summary.get("planner_state_graph_records", 0.0)
+            )
+            generate_info["planner_state_candidate_rule_symbols"] = float(
+                planner_state_summary.get("planner_state_candidate_rule_symbols", 0.0)
             )
             generate_info["planner_state_lineage_symbols"] = float(
-                planner_state.metadata.get("planner_state_lineage_symbols", 0.0)
+                planner_state_summary.get("planner_state_lineage_symbols", 0.0)
+            )
+            generate_info["planner_state_diagnostic_symbols"] = float(
+                planner_state_summary.get("planner_state_diagnostic_symbols", 0.0)
             )
             generate_info["planner_state_operators"] = float(
-                planner_state.metadata.get("planner_state_operators", 0.0)
+                planner_state_summary.get("planner_state_operators", 0.0)
             )
             generate_info["planner_state_constraints"] = float(
-                planner_state.metadata.get("planner_state_constraints", 0.0)
+                planner_state_summary.get("planner_state_constraints", 0.0)
             )
             generate_info["planner_state_repair_directives"] = float(
-                planner_state.metadata.get("planner_state_repair_directives", 0.0)
+                planner_state_summary.get("planner_state_repair_directives", 0.0)
             )
             generate_info["planner_state_alternative_world_records"] = float(
-                planner_state.metadata.get("planner_state_alternative_world_records", 0.0)
+                planner_state_summary.get("planner_state_alternative_world_records", 0.0)
             )
             generate_info["planner_state_branching_pressure"] = float(
-                planner_state.metadata.get("planner_state_branching_pressure", 0.0)
+                planner_state_summary.get("planner_state_branching_pressure", 0.0)
             )
             generate_info["planner_state_contradiction_pressure"] = float(
-                planner_state.metadata.get("planner_state_contradiction_pressure", 0.0)
+                planner_state_summary.get("planner_state_contradiction_pressure", 0.0)
             )
             generate_info["planner_state_repair_pressure"] = float(
-                planner_state.metadata.get("planner_state_repair_pressure", 0.0)
+                planner_state_summary.get("planner_state_repair_pressure", 0.0)
             )
             if self.osf_enabled:
                 _intent_state = self.osf.intent_encoder(z_final)

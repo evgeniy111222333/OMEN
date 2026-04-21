@@ -1163,6 +1163,8 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertGreaterEqual(out["sym_grounding_world_state_records"], 2.0)
         self.assertGreaterEqual(out["sym_grounding_world_state_hypothetical_facts"], 1.0)
         self.assertGreaterEqual(out["sym_grounding_verification_records"], 1.0)
+        self.assertGreaterEqual(out["sym_grounding_diagnostic_artifacts"], 1.0)
+        self.assertGreaterEqual(out["sym_grounding_proposal_artifacts"], 1.0)
         self.assertGreaterEqual(out["sym_grounding_support_ratio"], 0.5)
         self.assertGreaterEqual(out["sym_grounding_uncertainty"], 0.0)
         self.assertGreaterEqual(out["sym_grounding_repair_pressure"], 0.0)
@@ -1179,9 +1181,42 @@ class WorldGraphIntegrationTest(unittest.TestCase):
         self.assertGreaterEqual(out["planner_state_hypothetical_records"], 0.0)
         self.assertGreaterEqual(out["planner_state_alternative_world_records"], 0.0)
         self.assertGreaterEqual(out["planner_state_verification_records"], 1.0)
+        self.assertGreaterEqual(out["planner_state_supported_verification_records"], 0.0)
+        self.assertGreaterEqual(out["planner_state_deferred_verification_records"], 0.0)
+        self.assertGreaterEqual(out["planner_state_conflicted_verification_records"], 0.0)
         self.assertGreaterEqual(out["planner_state_hypothesis_records"], 1.0)
+        self.assertGreaterEqual(out["planner_state_deferred_hypotheses"], 0.0)
+        self.assertGreaterEqual(out["planner_state_conflicted_hypotheses"], 0.0)
+        self.assertGreaterEqual(out["planner_state_grounding_candidate_rules"], 0.0)
+        self.assertGreaterEqual(out["planner_state_grounding_candidate_rule_records"], 0.0)
         self.assertGreaterEqual(out["planner_state_graph_records"], 1.0)
+        self.assertGreaterEqual(out["planner_state_candidate_rule_symbols"], 0.0)
         self.assertGreaterEqual(out["planner_state_lineage_symbols"], 1.0)
+        self.assertGreaterEqual(out["planner_state_diagnostic_symbols"], out["planner_state_lineage_symbols"])
+        self.assertAlmostEqual(
+            out["planner_state_actionable_records"],
+            out["planner_state_active_records"]
+            + out["planner_state_hypothetical_records"]
+            + out["planner_state_contradicted_records"],
+            places=6,
+        )
+        self.assertAlmostEqual(
+            out["planner_state_authoritative_records"],
+            out["planner_state_ontology_records"]
+            + out["planner_state_active_records"]
+            + out["planner_state_hypothetical_records"]
+            + out["planner_state_contradicted_records"],
+            places=6,
+        )
+        self.assertAlmostEqual(
+            out["planner_state_diagnostic_records"],
+            out["planner_state_proposal_records"]
+            + out["planner_state_verification_records"]
+            + out["planner_state_hypothesis_records"]
+            + out["planner_state_graph_records"]
+            + out["planner_state_grounding_candidate_rule_records"],
+            places=6,
+        )
         self.assertGreaterEqual(out["planner_state_contradiction_pressure"], 0.0)
         self.assertGreaterEqual(out["planner_state_constraint_pressure"], 0.0)
         self.assertGreaterEqual(out["planner_state_repair_pressure"], 0.0)

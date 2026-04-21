@@ -251,6 +251,9 @@ class GroundingPlannerStateTest(unittest.TestCase):
         self.assertEqual(summary["planner_state_hypothetical_records"], 0.0)
         self.assertEqual(summary["planner_state_proposal_records"], 1.0)
         self.assertEqual(summary["planner_state_heuristic_world_state_records"], 1.0)
+        self.assertEqual(summary["planner_state_actionable_records"], 0.0)
+        self.assertEqual(summary["planner_state_authoritative_records"], 0.0)
+        self.assertEqual(summary["planner_state_diagnostic_records"], 1.0)
 
     def test_build_planner_world_state_keeps_artifact_verification_hypotheses_and_graph_out_of_planner_surface(self) -> None:
         verification_supported = GroundingVerificationRecord(
@@ -355,6 +358,10 @@ class GroundingPlannerStateTest(unittest.TestCase):
         self.assertGreaterEqual(summary["planner_state_lineage_symbols"], 3.0)
         self.assertEqual(summary["planner_state_hypothetical_operators"], 0.0)
         self.assertEqual(summary["planner_state_contradictions"], 0.0)
+        self.assertEqual(summary["planner_state_actionable_records"], 0.0)
+        self.assertEqual(summary["planner_state_authoritative_records"], 0.0)
+        self.assertEqual(summary["planner_state_diagnostic_records"], 6.0)
+        self.assertGreaterEqual(summary["planner_state_diagnostic_symbols"], 3.0)
 
     def test_build_planner_world_state_keeps_grounding_candidate_rules_out_of_planner_surface(self) -> None:
         candidate_rule = RuleCandidate(
@@ -408,6 +415,8 @@ class GroundingPlannerStateTest(unittest.TestCase):
         self.assertGreaterEqual(summary["planner_state_grounding_candidate_rule_records"], 1.0)
         self.assertGreaterEqual(summary["planner_state_candidate_rule_symbols"], 1.0)
         self.assertEqual(summary["planner_state_hypothetical_records"], 0.0)
+        self.assertGreaterEqual(summary["planner_state_diagnostic_records"], 1.0)
+        self.assertGreaterEqual(summary["planner_state_diagnostic_symbols"], 1.0)
 
     def test_build_planner_world_state_ignores_heuristic_grounding_candidate_rules(self) -> None:
         candidate_rule = RuleCandidate(

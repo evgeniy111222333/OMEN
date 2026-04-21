@@ -349,6 +349,120 @@ class EMCGapProtocolTest(unittest.TestCase):
         self.assertGreaterEqual(quality["grounding_hypothesis_branching_pressure"], 0.70)
         self.assertGreater(quality["grounding_counterfactual_pressure"], 0.45)
 
+    def test_grounding_quality_features_keep_proposal_heavy_counts_diagnostic_when_world_state_is_stable(self) -> None:
+        stable = {
+            "interlingua_states": 2.0,
+            "interlingua_relations": 2.0,
+            "compiled_state_claims": 2.0,
+            "compiled_relation_claims": 2.0,
+            "verification_acceptance_ratio": 0.85,
+            "verification_conflict_pressure": 0.10,
+            "verification_repair_pressure": 0.08,
+            "verification_hidden_cause_pressure": 0.05,
+            "verification_memory_corroboration": 0.90,
+            "grounding_world_state_acceptance_ratio": 0.90,
+            "grounding_world_state_hypothetical_ratio": 0.10,
+            "grounding_world_state_branching_pressure": 0.10,
+            "grounding_world_state_contradiction_pressure": 0.08,
+            "grounding_world_state_conflict_ratio": 0.05,
+            "grounding_parser_agreement": 0.90,
+            "grounding_span_traceability": 0.92,
+            "grounding_ontology_support": 0.88,
+            "verifier_world_model_support": 0.82,
+            "verifier_world_model_conflict": 0.10,
+            "verifier_temporal_consistency": 0.84,
+            "verifier_temporal_conflict": 0.08,
+        }
+        proposal_heavy = {
+            **stable,
+            "verification_acceptance_ratio": 0.05,
+            "compiled_hypotheses": 8.0,
+            "compiled_deferred_hypotheses": 7.0,
+            "compiled_conflict_hypotheses": 6.0,
+            "compiled_mean_confidence": 0.20,
+            "verification_records": 8.0,
+            "verification_supported_hypotheses": 1.0,
+            "verification_deferred_hypotheses": 6.0,
+            "verification_conflicted_hypotheses": 1.0,
+        }
+
+        base = OMENScale._grounding_quality_features(stable)
+        pressured = OMENScale._grounding_quality_features(proposal_heavy)
+
+        self.assertAlmostEqual(
+            pressured["grounding_proof_instability"],
+            base["grounding_proof_instability"],
+            places=6,
+        )
+        self.assertAlmostEqual(
+            pressured["grounding_hypothesis_branching_pressure"],
+            base["grounding_hypothesis_branching_pressure"],
+            places=6,
+        )
+        self.assertAlmostEqual(
+            pressured["grounding_counterfactual_pressure"],
+            base["grounding_counterfactual_pressure"],
+            places=6,
+        )
+        self.assertAlmostEqual(
+            pressured["grounding_uncertainty"],
+            base["grounding_uncertainty"],
+            places=6,
+        )
+        self.assertAlmostEqual(
+            pressured["grounding_verification_support"],
+            base["grounding_verification_support"],
+            places=6,
+        )
+
+    def test_grounding_quality_features_anchor_verification_support_on_world_state_and_verifier_alignment(self) -> None:
+        grounded = OMENScale._grounding_quality_features(
+            {
+                "interlingua_states": 2.0,
+                "interlingua_relations": 2.0,
+                "compiled_state_claims": 2.0,
+                "compiled_relation_claims": 2.0,
+                "verification_acceptance_ratio": 0.10,
+                "verification_conflict_pressure": 0.08,
+                "verification_repair_pressure": 0.05,
+                "verification_memory_corroboration": 0.90,
+                "grounding_world_state_acceptance_ratio": 0.88,
+                "grounding_parser_agreement": 0.90,
+                "grounding_span_traceability": 0.92,
+                "grounding_ontology_support": 0.86,
+                "verifier_world_model_support": 0.84,
+                "verifier_world_model_conflict": 0.08,
+                "verifier_temporal_consistency": 0.82,
+                "verifier_temporal_conflict": 0.06,
+            }
+        )
+        ungrounded = OMENScale._grounding_quality_features(
+            {
+                "interlingua_states": 2.0,
+                "interlingua_relations": 2.0,
+                "compiled_state_claims": 2.0,
+                "compiled_relation_claims": 2.0,
+                "verification_acceptance_ratio": 0.95,
+                "verification_conflict_pressure": 0.55,
+                "verification_repair_pressure": 0.40,
+                "verification_memory_corroboration": 0.25,
+                "grounding_world_state_acceptance_ratio": 0.18,
+                "grounding_parser_agreement": 0.35,
+                "grounding_span_traceability": 0.30,
+                "grounding_ontology_support": 0.22,
+                "verifier_world_model_support": 0.20,
+                "verifier_world_model_conflict": 0.70,
+                "verifier_temporal_consistency": 0.25,
+                "verifier_temporal_conflict": 0.60,
+            }
+        )
+
+        self.assertGreater(
+            grounded["grounding_verification_support"],
+            ungrounded["grounding_verification_support"],
+        )
+        self.assertLess(ungrounded["grounding_verification_support"], 0.5)
+
     def test_grounding_emc_features_raise_pressure_for_proof_instability_and_counterfactual_control(self) -> None:
         base = grounding_emc_features(
             {
@@ -383,6 +497,49 @@ class EMCGapProtocolTest(unittest.TestCase):
         self.assertGreater(pressured["grounding_verification_pressure"], base["grounding_verification_pressure"])
         self.assertGreater(pressured["grounding_abduction_pressure"], base["grounding_abduction_pressure"])
         self.assertGreater(pressured["grounding_control_pressure"], base["grounding_control_pressure"])
+
+    def test_grounding_emc_features_keep_raw_verification_acceptance_and_hypothesis_counts_diagnostic(self) -> None:
+        stable = {
+            "grounding_uncertainty": 0.28,
+            "grounding_support_ratio": 0.74,
+            "grounding_world_state_acceptance_ratio": 0.82,
+            "verifier_world_model_support": 0.78,
+            "verifier_temporal_consistency": 0.76,
+            "source_confidence": 0.92,
+            "memory_grounding_records": 2.0,
+            "trace_grounding_records": 2.0,
+            "grounding_memory_corroboration": 0.86,
+            "grounding_world_state_branching_pressure": 0.08,
+            "grounding_world_state_contradiction_pressure": 0.06,
+            "grounding_repair_pressure": 0.05,
+            "grounding_conflict_pressure": 0.04,
+        }
+        proposal_heavy = {
+            **stable,
+            "verification_acceptance_ratio": 0.02,
+            "compiled_hypotheses": 9.0,
+            "compiled_deferred_hypotheses": 8.0,
+            "compiled_mean_confidence": 0.15,
+        }
+
+        base = grounding_emc_features(stable)
+        pressured = grounding_emc_features(proposal_heavy)
+
+        self.assertAlmostEqual(
+            pressured["grounding_recall_readiness"],
+            base["grounding_recall_readiness"],
+            places=6,
+        )
+        self.assertAlmostEqual(
+            pressured["grounding_verification_pressure"],
+            base["grounding_verification_pressure"],
+            places=6,
+        )
+        self.assertAlmostEqual(
+            pressured["grounding_control_pressure"],
+            base["grounding_control_pressure"],
+            places=6,
+        )
 
     def test_action_masking_is_fp16_safe(self) -> None:
         cfg = _emc_gap_config()
